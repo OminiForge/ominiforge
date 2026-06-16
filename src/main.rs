@@ -1,9 +1,9 @@
 //! Ominiforge binary entry point.
 //!
-//! Dispatches to the front-end subcommands (`run` / `tui` / `serve`). The
-//! actual command parsing and dispatch land with the `cli` module in Phase 1;
-//! for now this is a placeholder so the binary builds and links the library.
+//! Sets up the async runtime and dispatches to the CLI. All command logic lives
+//! in `ominiforge::cli`; this file stays thin.
 
-fn main() {
-    println!("ominiforge {}", env!("CARGO_PKG_VERSION"));
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    ominiforge::cli::run().await
 }
