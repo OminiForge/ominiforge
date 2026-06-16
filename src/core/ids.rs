@@ -12,6 +12,12 @@ use serde::{Deserialize, Serialize};
 #[serde(transparent)]
 pub struct SessionId(pub String);
 
+impl std::fmt::Display for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Identifies a turn — one iteration of the agent loop — within a session.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
