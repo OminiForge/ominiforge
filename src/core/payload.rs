@@ -153,7 +153,7 @@ pub enum ToolEvent {
     },
     Completed {
         tool_call_event_id: EventId,
-        result: ToolResult,
+        result: ToolOutput,
         duration_ms: u64,
         output_bytes: usize,
         artifacts_created: Vec<ArtifactId>,
@@ -176,10 +176,11 @@ pub enum ToolSource {
 /// The recorded outcome of a tool invocation.
 ///
 /// A business-level failure is a successful invocation with `is_error = true`;
-/// protocol errors surface as a [`ToolEvent::Failed`] instead. See
+/// protocol errors surface as a [`ToolEvent::Failed`] instead. The tool layer's
+/// `ToolResult` alias is `Result<ToolOutput, ToolError>`. See
 /// `doc/tool-protocol.md` §7.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolResult {
+pub struct ToolOutput {
     pub content: Vec<Content>,
     pub is_error: bool,
     #[serde(default)]

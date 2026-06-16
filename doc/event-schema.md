@@ -203,7 +203,7 @@ enum ToolEvent {
     },
     Completed {
         tool_call_event_id: EventId,
-        result: ToolResult,          // 内联内容或 artifact 引用（由 runtime 决定）
+        result: ToolOutput,          // 内联内容或 artifact 引用（由 runtime 决定）
         duration_ms: u64,
         output_bytes: usize,
         artifacts_created: Vec<ArtifactId>,
