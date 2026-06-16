@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  nix:
+    name: Nix flake check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v16
+      - name: Nix flake check
+        run: nix flake check --print-build-logs
+
+  cargo:
+    name: Cargo checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v16
+      - name: Format
+        run: nix develop --command just fmt-check
+      - name: Check
+        run: nix develop --command just check
+      - name: Clippy
+        run: nix develop --command just clippy
+      - name: Test
+        run: nix develop --command just test
+      - name: Audit
+        run: nix develop --command just audit
+      - name: Deny
+        run: nix develop --command just deny
+      - name: Machete
+        run: nix develop --command just machete

@@ -1,0 +1,354 @@
+//! Domain event payloads. The envelope ([`super::CoreEvent`]) is shared; the
+//! payload varies by domain. See `doc/event-schema.md` §3–§10.
+//!
+//! `MonitorEvent` is intentionally absent: monitoring is a derived view built
+//! from this stream, not a payload kind (see `doc/monitor.md`).
+
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+use super::ids::{ArtifactId, EventId, SessionId, TurnId};
+
+/// Domain-tagged payload of a [`super::CoreEvent`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum EventPayload {
+    Turn(TurnEvent),
+    Model(ModelEvent),
+    Tool(ToolEvent),
+    Session(SessionEvent),
+    Artifact(ArtifactEvent),
+    Injection(InjectionEvent),
+    Error(ErrorEvent),
+}
+
+/// Turn lifecycle.
+///
+/// A turn is one iteration of the agent loop and has an explicit state machine:
+/// `pending → running → completed | failed | interrupted`. A failed or
+/// interrupted turn records its break point so it can resume without the user
+/// re-entering input. See `doc/event-schema.md` §4.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TurnEvent {
+    Started {
+        turn_id: TurnId,
+    },
+    Completed {
+        turn_id: TurnId,
+    },
+    Failed {
+        turn_id: TurnId,
+        failed_at_event_id: EventId,
+        retryable: bool,
+    },
+    Interrupted {
+        turn_id: TurnId,
+        interrupted_at_event_id: EventId,
+    },
+    Resumed {
+        turn_id: TurnId,
+        resume_from_event_id: EventId,
+    },
+}
+
+/// Model interaction, expressed as start/delta/stop for streaming.
+///
+/// A model emitting a tool call is a `ModelEvent`; the tool actually running is
+/// a [`ToolEvent`] — the two are kept separate. See `doc/event-schema.md` §5.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ModelEvent {
+    RequestStarted {
+        request_id: String,
+        provider: String,
+        model: String,
+        temperature: f32,
+        max_tokens: Option<u32>,
+        tool_schemas_count: u32,
+        input_tokens_estimate: u32,
+    },
+    ContentBlockStart {
+        request_id: String,
+        index: u32,
+        block_type: ContentBlockType,
+    },
+    TextDelta {
+        request_id: String,
+        index: u32,
+        text: String,
+    },
+    ReasoningDelta {
+        request_id: String,
+        index: u32,
+        text: String,
+    },
+    ToolCallDelta {
+        request_id: String,
+        index: u32,
+        json_delta: String,
+    },
+    ContentBlockStop {
+        request_id: String,
+        index: u32,
+    },
+    RequestCompleted {
+        request_id: String,
+        stop_reason: StopReason,
+        usage: Usage,
+        duration_ms: u64,
+        time_to_first_token_ms: Option<u64>,
+        provider_request_id: Option<String>,
+    },
+    RequestFailed {
+        request_id: String,
+        duration_ms: u64,
+        error: ErrorDetail,
+    },
+}
+
+/// The kind of content block a model is streaming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContentBlockType {
+    Text,
+    Reasoning,
+    ToolCall,
+}
+
+/// Why the model stopped generating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StopReason {
+    EndTurn,
+    MaxTokens,
+    ToolUse,
+    StopSequence,
+}
+
+/// Token accounting reported by the provider.
+///
+/// Cost is *not* stored: the monitor derives it from `usage` plus a
+/// configurable pricing table, so history can be recomputed with current
+/// prices. See `doc/monitor.md` §3, §6.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub cache_read_tokens: u32,
+    pub cache_write_tokens: u32,
+}
+
+/// Tool execution. `Started` points back at the model tool-call event that
+/// triggered it; `Completed`/`Failed` carry timing and output metadata. See
+/// `doc/event-schema.md` §6.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ToolEvent {
+    Started {
+        tool_call_event_id: EventId,
+        tool_name: String,
+        source: ToolSource,
+        input: serde_json::Value,
+        working_dir: Option<PathBuf>,
+    },
+    Completed {
+        tool_call_event_id: EventId,
+        result: ToolResult,
+        duration_ms: u64,
+        output_bytes: usize,
+        artifacts_created: Vec<ArtifactId>,
+    },
+    Failed {
+        tool_call_event_id: EventId,
+        duration_ms: u64,
+        error: ErrorDetail,
+    },
+}
+
+/// Where a tool came from. The agent loop treats both uniformly; this only
+/// drives source-aware monitoring (which MCP server is slow/failing/etc.).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ToolSource {
+    Builtin,
+    Mcp { server_name: String },
+}
+
+/// The recorded outcome of a tool invocation.
+///
+/// A business-level failure is a successful invocation with `is_error = true`;
+/// protocol errors surface as a [`ToolEvent::Failed`] instead. See
+/// `doc/tool-protocol.md` §7.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolResult {
+    pub content: Vec<Content>,
+    pub is_error: bool,
+    #[serde(default)]
+    pub error_code: Option<String>,
+}
+
+/// A unit of tool output. Payloads over 64KB are spilled to the artifact store
+/// by the runtime and referenced via [`Content::ArtifactRef`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Content {
+    Text(String),
+    Image {
+        media_type: String,
+        data: Vec<u8>,
+    },
+    ArtifactRef {
+        artifact_id: ArtifactId,
+        media_type: String,
+    },
+}
+
+/// Session lifecycle. `Created` is always the first event and snapshots the
+/// initial config so replay is self-contained. See `doc/event-schema.md` §7
+/// and `doc/session-storage.md` §3.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionEvent {
+    Created {
+        profile_id: Option<String>,
+        tools: Vec<String>,
+        workspace: Option<PathBuf>,
+    },
+    Forked {
+        parent_session_id: SessionId,
+        fork_at_seq: u64,
+    },
+    Paused,
+    Resumed,
+    Ended {
+        reason: SessionEndReason,
+    },
+}
+
+/// Why a session ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionEndReason {
+    Completed,
+    Cancelled,
+    Error,
+}
+
+/// Artifact lifecycle. The event records only a reference; content lives in the
+/// artifact store. See `doc/event-schema.md` §8.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ArtifactEvent {
+    Created {
+        artifact_id: ArtifactId,
+        /// e.g. `"file"`, `"image"`, `"code_block"`.
+        kind: String,
+        media_type: String,
+        /// Artifact-store path or URI.
+        uri: String,
+        size: u64,
+        #[serde(default)]
+        sha256: Option<String>,
+        #[serde(default)]
+        source_event_id: Option<EventId>,
+    },
+}
+
+/// Dynamic context injection, recorded so replay can reconstruct exactly what
+/// the model saw each turn. See `doc/event-schema.md` §9 and
+/// `doc/context-management.md` §5.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InjectionEvent {
+    ContextInjected {
+        source: InjectionSource,
+        content: String,
+        token_count: u32,
+    },
+}
+
+/// What produced an injection. Ordering is kept stable (Memory → Rag → Acp →
+/// Hook) to avoid needless prefix-cache churn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InjectionSource {
+    Memory,
+    #[serde(rename = "RAG")]
+    Rag,
+    #[serde(rename = "ACP")]
+    Acp,
+    Hook,
+}
+
+/// A structured error surfaced as its own event. See `doc/event-schema.md` §10.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ErrorEvent {
+    Raised(ErrorDetail),
+}
+
+/// Structured error detail, reused across model/tool/error events.
+///
+/// Carries more than a string so consumers can route on `code`, `severity`,
+/// and `retryable`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorDetail {
+    pub code: String,
+    pub message: String,
+    pub severity: ErrorSeverity,
+    pub retryable: bool,
+    #[serde(default)]
+    pub source_event_id: Option<EventId>,
+    #[serde(default)]
+    pub provider_raw: Option<serde_json::Value>,
+}
+
+/// Severity of an [`ErrorDetail`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ErrorSeverity {
+    Fatal,
+    Error,
+    Warning,
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use crate::core::{CoreEvent, EventSource, SCHEMA_VERSION, SourceKind};
+    use chrono::{TimeZone, Utc};
+
+    /// The first event of every session is `SessionEvent::Created`. This mirrors
+    /// the events.jsonl line shown in `doc/session-storage.md` §3 and pins the
+    /// externally-tagged JSON wire shape (`{"Session":{"Created":{...}}}`).
+    #[test]
+    fn session_created_event_round_trips() {
+        let event = CoreEvent {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            seq: 0,
+            session_id: SessionId("01J5M3HKEA7V2X3P1YKRN9C4WG".to_owned()),
+            timestamp: Utc.with_ymd_and_hms(2026, 6, 11, 10, 0, 0).unwrap(),
+            source: EventSource {
+                kind: SourceKind::Runtime,
+                id: "ominiforge".to_owned(),
+            },
+            parent_event_id: None,
+            turn_id: None,
+            payload: EventPayload::Session(SessionEvent::Created {
+                profile_id: Some("coding-agent".to_owned()),
+                tools: vec!["shell".to_owned(), "read_file".to_owned()],
+                workspace: None,
+            }),
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""Session":{"Created""#));
+        let decoded: CoreEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, decoded);
+    }
+
+    /// `Usage` is stored; cost is derived elsewhere. Guard the field names that
+    /// the monitor's pricing math depends on.
+    #[test]
+    fn usage_serializes_token_fields() {
+        let usage = Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_tokens: 80,
+            cache_write_tokens: 0,
+        };
+        let value = serde_json::to_value(usage).unwrap();
+        assert_eq!(value["input_tokens"], 100);
+        assert_eq!(value["cache_read_tokens"], 80);
+        assert!(value.get("cost").is_none());
+    }
+}

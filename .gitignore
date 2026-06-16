@@ -1,0 +1,25 @@
+/target/
+/result
+/result-*
+/.direnv/
+
+# Local env files
+.env
+.env.*
+!.env.example
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# agent state
+.omc
+
+# Claude Code local settings (per-user permissions, not shared)
+.claude/settings.local.json
