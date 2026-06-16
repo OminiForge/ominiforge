@@ -102,13 +102,15 @@ pending → running → completed | failed | interrupted
 
 ```rust
 enum TurnEvent {
-    Started { turn_id: TurnId },
+    Started { turn_id: TurnId, input: Option<String> },
     Completed { turn_id: TurnId },
     Failed { turn_id: TurnId, failed_at_event_id: EventId, retryable: bool },
     Interrupted { turn_id: TurnId, interrupted_at_event_id: EventId },
     Resumed { turn_id: TurnId, resume_from_event_id: EventId },
 }
 ```
+
+- Turn started 记录开启它的用户输入 `input`（无用户输入的 turn——scheduler、自动续跑——为 `None`）。Replay 从此字段重建开场 user message。
 
 - Turn failed 时记录断点位置 `failed_at_event_id`。
 - Interrupted 时记录中断位置 `interrupted_at_event_id`。

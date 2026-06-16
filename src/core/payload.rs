@@ -32,6 +32,11 @@ pub enum EventPayload {
 pub enum TurnEvent {
     Started {
         turn_id: TurnId,
+        /// The user input that opened the turn, when one did. `None` for turns
+        /// started by a non-user trigger (scheduler, autonomous continuation).
+        /// Replay reconstructs the opening user message from this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<String>,
     },
     Completed {
         turn_id: TurnId,
