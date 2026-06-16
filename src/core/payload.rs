@@ -106,11 +106,15 @@ pub enum ModelEvent {
 }
 
 /// The kind of content block a model is streaming.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// A `ToolCall` block carries the call `id` and `name` at its start so the
+/// agent loop has what it needs to dispatch the tool; the JSON arguments arrive
+/// as subsequent [`ModelEvent::ToolCallDelta`]s.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContentBlockType {
     Text,
     Reasoning,
-    ToolCall,
+    ToolCall { id: String, name: String },
 }
 
 /// Why the model stopped generating.
@@ -127,7 +131,7 @@ pub enum StopReason {
 /// Cost is *not* stored: the monitor derives it from `usage` plus a
 /// configurable pricing table, so history can be recomputed with current
 /// prices. See `doc/monitor.md` §3, §6.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,

@@ -1,0 +1,3 @@
+# Domain proper nouns that recur in docs; listing them here is cleaner than
+# backticking every occurrence. `..` preserves clippy's built-in defaults.
+doc-valid-idents = ["OpenAI", "DeepSeek", "Anthropic", "MiMo", "JSON-RPC", ".."]

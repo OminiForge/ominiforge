@@ -133,7 +133,7 @@ enum ModelEvent {
     ContentBlockStart {
         request_id: String,
         index: u32,
-        block_type: ContentBlockType, // Text | Reasoning | ToolCall
+        block_type: ContentBlockType, // Text | Reasoning | ToolCall { id, name }
     },
     TextDelta {
         request_id: String,
