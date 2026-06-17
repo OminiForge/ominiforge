@@ -11,7 +11,8 @@
         },
         "cargo": {
           "allFeatures": true
-        }
+        },
+        "linkedProjects": ["Cargo.toml"]
       }
     }
   }

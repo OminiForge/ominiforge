@@ -65,7 +65,9 @@
         shellHook = ''
           export CARGO_HOME="''${CARGO_HOME:-$HOME/.cargo}"
           export RUST_BACKTRACE="''${RUST_BACKTRACE:-1}"
-          echo "Rust dev shell ready: $(rustc --version)"
+          if [ -z "''${OMINIFORGE_LSP:-}" ]; then
+            echo "Rust dev shell ready: $(rustc --version)"
+          fi
         '';
       };
 

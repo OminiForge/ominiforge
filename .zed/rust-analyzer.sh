@@ -3,4 +3,5 @@
 set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+export OMINIFORGE_LSP=1
 exec nix develop "$repo_root" --command rust-analyzer "$@"
