@@ -119,7 +119,10 @@ enum TurnEvent {
 
 ## 5. Model 事件
 
-采用 start/delta/stop 三段表达 streaming：
+Streaming 与持久化分离：
+
+- **流式传输**（provider 边界，`llm::StreamEvent`）用 start/delta/stop 三段表达，逐 token 推送，供前端实时渲染。这是传输层概念，**不落盘**。
+- **持久化**（`ModelEvent`）按 content block 合并：collector 累积一个块的所有 delta，块结束时只写一条 `ContentBlock` 事件。一条文本/推理/工具调用 = 一行，而非每 token 一行。日志保持紧凑可读，replay 直接拿到完整块。
 
 ```rust
 enum ModelEvent {
@@ -132,29 +135,11 @@ enum ModelEvent {
         tool_schemas_count: u32,     // 本次请求携带多少 tool schema
         input_tokens_estimate: u32,  // 发送前估算（实际值在 RequestCompleted.usage）
     },
-    ContentBlockStart {
+    // 一个完整 content block（流式 delta 合并后的结果）。
+    ContentBlock {
         request_id: String,
         index: u32,
-        block_type: ContentBlockType, // Text | Reasoning | ToolCall { id, name }
-    },
-    TextDelta {
-        request_id: String,
-        index: u32,
-        text: String,
-    },
-    ReasoningDelta {
-        request_id: String,
-        index: u32,
-        text: String,
-    },
-    ToolCallDelta {
-        request_id: String,
-        index: u32,
-        json_delta: String,
-    },
-    ContentBlockStop {
-        request_id: String,
-        index: u32,
+        content: BlockContent,
     },
     RequestCompleted {
         request_id: String,
@@ -169,6 +154,13 @@ enum ModelEvent {
         duration_ms: u64,
         error: ErrorDetail,
     },
+}
+
+// 持久化的完整块。与流式 ContentBlockType + delta 一一对应，但内容已组装完整。
+enum BlockContent {
+    Text { text: String },                              // 拼接所有 text delta
+    Reasoning { text: String },                         // 拼接所有 reasoning delta
+    ToolCall { id: String, name: String, arguments: String }, // arguments JSON 已拼全
 }
 
 struct Usage {
@@ -188,7 +180,9 @@ enum StopReason {
 
 注意：
 
-- model 产生 tool call 是 ModelEvent。tool 实际执行是 ToolEvent。二者分离。
+- model 产生 tool call 是 ModelEvent（`ContentBlock` 内含 `BlockContent::ToolCall`）。tool 实际执行是 ToolEvent。二者分离。`ToolEvent::Started.tool_call_event_id` 指向承载该 tool call 的 `ContentBlock` 事件。
+- 空文本/推理块（provider 开了块但没产出内容）不落盘——零信息量，避免噪声。tool call 块始终记录。
+- 逐 token 的实时输出由 collector 转发给 `StreamSink`（presentation 层，CLI/TUI/Web 各自渲染），不进 events.jsonl。Phase 2 的 gateway 通过 EventBus 向 Web 前端广播实时 delta，与落盘的合并块并行存在、互不影响。
 - **`cost` 不存入 event**。Cost 由 monitor 层从 `usage` + 可配置 pricing table 实时派生（见 [`monitor.md`](./monitor.md)）。存 usage（不可变事实）而非 cost（依赖会变的 pricing），保证历史可用最新 pricing 重算。
 - `cache_*` token 的 provider 字段映射见 [`monitor.md`](./monitor.md) §3。
 

@@ -13,8 +13,10 @@
 
 mod collector;
 mod error;
+mod sink;
 
 pub use error::AgentError;
+pub use sink::{BlockKind, NullSink, StreamSink};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -90,6 +92,10 @@ impl Agent {
     /// `context` is mutated in place — the assistant message and any tool
     /// results are appended, leaving it ready for the next turn.
     ///
+    /// This is the headless form: streamed output is persisted but not observed
+    /// live. Use [`run_turn_with_sink`](Self::run_turn_with_sink) to render the
+    /// model's output as it streams.
+    ///
     /// # Errors
     /// [`AgentError::Model`] on provider failure, [`AgentError::Session`] on a
     /// persistence failure, or [`AgentError::MaxRounds`] if the tool loop never
@@ -99,6 +105,23 @@ impl Agent {
         writer: &mut SessionWriter,
         context: &mut Vec<Message>,
         input: String,
+    ) -> Result<TurnOutcome, AgentError> {
+        self.run_turn_with_sink(writer, context, input, &mut NullSink)
+            .await
+    }
+
+    /// Like [`run_turn`](Self::run_turn), but forwards every streamed delta to
+    /// `sink` in real time so a front-end can render the turn as it unfolds.
+    /// `sink.on_turn_end()` is called once the turn settles (on success).
+    ///
+    /// # Errors
+    /// Same as [`run_turn`](Self::run_turn).
+    pub async fn run_turn_with_sink(
+        &self,
+        writer: &mut SessionWriter,
+        context: &mut Vec<Message>,
+        input: String,
+        sink: &mut dyn StreamSink,
     ) -> Result<TurnOutcome, AgentError> {
         let turn_id = TurnId(ulid::Ulid::new().to_string());
         writer.append(
@@ -113,7 +136,9 @@ impl Agent {
         context.push(Message::User { content: input });
 
         for round in 0..self.config.max_rounds {
-            let outcome = self.run_model_round(writer, context, &turn_id).await?;
+            let outcome = self
+                .run_model_round(writer, context, &turn_id, sink)
+                .await?;
             let answer = assistant_text(&outcome.message);
             let tool_calls = assistant_tool_calls(&outcome.message);
             context.push(outcome.message.clone());
@@ -127,6 +152,7 @@ impl Agent {
                     None,
                     Some(turn_id.clone()),
                 )?;
+                sink.on_turn_end();
                 return Ok(TurnOutcome {
                     answer,
                     stop_reason: outcome.stop_reason,
@@ -164,12 +190,14 @@ impl Agent {
     // __APPEND_MARKER__
 
     /// Run one model round: send the current context, persist the streamed
-    /// response, and return the assembled assistant message.
+    /// response (forwarding deltas to `sink`), and return the assembled
+    /// assistant message.
     async fn run_model_round(
         &self,
         writer: &mut SessionWriter,
         context: &[Message],
         turn_id: &TurnId,
+        sink: &mut dyn StreamSink,
     ) -> Result<collector::RoundOutcome, AgentError> {
         let request_id = ulid::Ulid::new().to_string();
         let tools = self.tool_schemas();
@@ -201,7 +229,7 @@ impl Agent {
         let started = Instant::now();
         let stream = self.provider.stream(request).await?;
         let outcome =
-            collector::collect_round(writer, stream, &source, &request_id, turn_id).await?;
+            collector::collect_round(writer, sink, stream, &source, &request_id, turn_id).await?;
 
         writer.append(
             source,

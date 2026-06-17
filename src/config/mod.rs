@@ -1,0 +1,563 @@
+//! Configuration layer: providers, profiles, and their resolution.
+//!
+//! This module turns on-disk config (`doc/profile.md` §8) into the concrete
+//! settings the agent loop needs. It is data-only — it depends on `core` and
+//! `llm` but builds no provider; the CLI maps a [`ResolvedModel`] to a concrete
+//! [`crate::llm::Provider`].
+//!
+//! Layout discovered (architecture §15, project overrides user):
+//!
+//! ```text
+//! <root>/                       # project ./.omini  then  ~/.omini
+//!   config/providers.toml       # provider + model definitions
+//!   profiles/<name>.toml        # agent profiles
+//! ```
+//!
+//! Secrets are never read from files: a provider names an env var in
+//! `api_key_env`, and the key is read from the process environment here.
+
+mod error;
+mod profile;
+mod providers;
+
+pub use error::{ConfigError, Result};
+pub use profile::{DEFAULT_SYSTEM_PROMPT, Profile, ProfileMeta, PromptSection, ToolsSection};
+pub use providers::{ModelConfig, Pricing, ProviderConfig, ProviderType, ProvidersFile};
+
+use std::path::{Path, PathBuf};
+
+const CONFIG_SUBDIR: &str = "config";
+const PROFILES_SUBDIR: &str = "profiles";
+const PROVIDERS_FILE: &str = "providers.toml";
+const OMINI_DIR: &str = ".omini";
+const MAX_INHERITANCE_DEPTH: usize = 5;
+
+/// A fully-resolved model selection: everything needed to construct a provider
+/// and configure a turn, with profile/CLI overrides already applied.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedModel {
+    /// Provider name (e.g. `openai-main`).
+    pub provider_name: String,
+    /// Wire protocol.
+    pub provider_type: ProviderType,
+    /// API endpoint root.
+    pub base_url: String,
+    /// The API key, read from the env var named by `api_key_env`.
+    pub api_key: String,
+    /// Model id sent to the API (e.g. `gpt-4o`).
+    pub model_id: String,
+    /// Effective temperature (CLI > profile > model default).
+    pub temperature: f32,
+    /// Effective output-token cap (profile override > model default).
+    pub max_output_tokens: u32,
+    /// The model's context window (for later compaction logic).
+    pub context_window: u32,
+    /// Pricing, if configured (for the monitor).
+    pub pricing: Option<Pricing>,
+}
+
+/// Loads and resolves configuration from one or more `.omini` roots, searched
+/// in priority order (project first, then user home).
+#[derive(Debug, Clone)]
+pub struct ConfigStore {
+    /// Config roots, highest priority first.
+    roots: Vec<PathBuf>,
+}
+
+impl ConfigStore {
+    /// Discover config roots: the project `./.omini` (under `cwd`) takes
+    /// precedence over the user `~/.omini`. Either may be absent.
+    #[must_use]
+    pub fn discover(cwd: &Path) -> Self {
+        let mut roots = Vec::new();
+        roots.push(cwd.join(OMINI_DIR));
+        if let Some(home) = home_dir() {
+            let user_root = home.join(OMINI_DIR);
+            if !roots.contains(&user_root) {
+                roots.push(user_root);
+            }
+        }
+        Self::from_roots(roots)
+    }
+
+    /// Build a store over explicit roots (highest priority first). Mainly for
+    /// tests; [`discover`](Self::discover) is the normal entry point.
+    #[must_use]
+    pub const fn from_roots(roots: Vec<PathBuf>) -> Self {
+        Self { roots }
+    }
+
+    /// The config roots, highest priority first.
+    #[must_use]
+    pub fn roots(&self) -> &[PathBuf] {
+        &self.roots
+    }
+
+    /// Load and merge every root's `config/providers.toml`. A provider defined
+    /// in a higher-priority root shadows a same-named one in a lower root.
+    ///
+    /// # Errors
+    /// [`ConfigError::Parse`] / [`ConfigError::Io`] on a malformed or unreadable
+    /// file. A missing file is not an error (that root simply contributes none).
+    pub fn load_providers(&self) -> Result<ProvidersFile> {
+        let mut merged: Vec<ProviderConfig> = Vec::new();
+        for root in &self.roots {
+            let path = root.join(CONFIG_SUBDIR).join(PROVIDERS_FILE);
+            let Some(text) = read_optional(&path)? else {
+                continue;
+            };
+            let file: ProvidersFile =
+                toml::from_str(&text).map_err(|source| ConfigError::Parse {
+                    path: path.clone(),
+                    source,
+                })?;
+            for provider in file.providers {
+                if !merged.iter().any(|p| p.name == provider.name) {
+                    merged.push(provider);
+                }
+            }
+        }
+        Ok(ProvidersFile { providers: merged })
+    }
+
+    // __APPEND_MARKER__
+
+    /// Load a profile by name, resolving its `extends` chain and reading any
+    /// `system_file`. Returns the [`Profile::builtin_default`] if `name` is
+    /// `"default"` and no `default.toml` exists anywhere.
+    ///
+    /// # Errors
+    /// [`ConfigError::NotFound`] if a named (non-default) profile is missing,
+    /// parse/io errors, or [`ConfigError::InheritanceTooDeep`] /
+    /// [`ConfigError::InheritanceCycle`] on a bad `extends` chain.
+    pub fn load_profile(&self, name: &str) -> Result<Profile> {
+        self.load_profile_inner(name, &mut Vec::new())
+    }
+
+    fn load_profile_inner(&self, name: &str, seen: &mut Vec<String>) -> Result<Profile> {
+        if seen.iter().any(|s| s == name) {
+            return Err(ConfigError::InheritanceCycle(name.to_owned()));
+        }
+        if seen.len() >= MAX_INHERITANCE_DEPTH {
+            return Err(ConfigError::InheritanceTooDeep(
+                name.to_owned(),
+                MAX_INHERITANCE_DEPTH,
+            ));
+        }
+        seen.push(name.to_owned());
+
+        let Some((mut profile, dir)) = self.find_profile(name)? else {
+            // A missing "default" profile falls back to the hardcoded one; any
+            // other missing name is an error.
+            if name == "default" && seen.len() == 1 {
+                return Ok(Profile::builtin_default());
+            }
+            return Err(ConfigError::NotFound(self.profile_path(name)));
+        };
+
+        // Resolve system_file against the profile's own directory before any
+        // overlay, so each level reads its own prompt file.
+        resolve_system_file(&mut profile, &dir)?;
+
+        match profile.profile.extends.clone() {
+            Some(parent_name) => {
+                let parent = self.load_profile_inner(&parent_name, seen)?;
+                Ok(profile.overlay_onto(parent))
+            }
+            None => Ok(profile),
+        }
+    }
+
+    /// Find a profile file across roots (highest priority first), returning the
+    /// parsed profile and the directory it was loaded from.
+    fn find_profile(&self, name: &str) -> Result<Option<(Profile, PathBuf)>> {
+        for root in &self.roots {
+            let dir = root.join(PROFILES_SUBDIR);
+            let path = dir.join(format!("{name}.toml"));
+            let Some(text) = read_optional(&path)? else {
+                continue;
+            };
+            let profile: Profile = toml::from_str(&text).map_err(|source| ConfigError::Parse {
+                path: path.clone(),
+                source,
+            })?;
+            return Ok(Some((profile, dir)));
+        }
+        Ok(None)
+    }
+
+    /// The path the highest-priority root would use for profile `name` (for
+    /// error messages).
+    fn profile_path(&self, name: &str) -> PathBuf {
+        let root = self.roots.first().cloned().unwrap_or_default();
+        root.join(PROFILES_SUBDIR).join(format!("{name}.toml"))
+    }
+
+    // __APPEND_MARKER2__
+
+    /// Resolve a model selection into a [`ResolvedModel`], applying overrides.
+    ///
+    /// Precedence: `model_override` (CLI `--model`) wins over
+    /// `profile.model.default`. Temperature: `temperature_override` (CLI) wins
+    /// over `profile.model.temperature`, then the model's `default_temperature`.
+    /// Output cap: `profile.model.max_output_tokens` wins over the model's
+    /// `max_output_tokens`.
+    ///
+    /// # Errors
+    /// [`ConfigError::NoModel`] if neither override nor profile names a model;
+    /// [`ConfigError::UnknownModel`] / [`ConfigError::UnknownProvider`] if the
+    /// reference matches nothing; [`ConfigError::MissingApiKey`] if the
+    /// provider's `api_key_env` is unset; [`ConfigError::UnsupportedProviderType`]
+    /// for a provider whose type has no adapter yet.
+    pub fn resolve(
+        &self,
+        providers: &ProvidersFile,
+        profile: &Profile,
+        model_override: Option<&str>,
+        temperature_override: Option<f32>,
+    ) -> Result<ResolvedModel> {
+        let model_ref = model_override
+            .or(profile.model.default.as_deref())
+            .ok_or_else(|| ConfigError::NoModel(profile.profile.name.clone()))?;
+
+        let (provider, model) = find_model(providers, model_ref)?;
+
+        if provider.provider_type != ProviderType::OpenaiChat {
+            return Err(ConfigError::UnsupportedProviderType(
+                provider.provider_type.as_str().to_owned(),
+            ));
+        }
+
+        let api_key =
+            std::env::var(&provider.api_key_env).map_err(|_| ConfigError::MissingApiKey {
+                provider: provider.name.clone(),
+                env: provider.api_key_env.clone(),
+            })?;
+
+        let temperature = temperature_override
+            .or(profile.model.temperature)
+            .unwrap_or(model.default_temperature);
+        let max_output_tokens = profile
+            .model
+            .max_output_tokens
+            .unwrap_or(model.max_output_tokens);
+
+        Ok(ResolvedModel {
+            provider_name: provider.name.clone(),
+            provider_type: provider.provider_type,
+            base_url: provider.base_url.clone(),
+            api_key,
+            model_id: model.id.clone(),
+            temperature,
+            max_output_tokens,
+            context_window: model.context_window,
+            pricing: model.pricing,
+        })
+    }
+
+    /// The profile's system prompt, falling back to [`DEFAULT_SYSTEM_PROMPT`]
+    /// when none is set (`system_file` is already inlined by `load_profile`).
+    #[must_use]
+    pub fn system_prompt(profile: &Profile) -> String {
+        profile
+            .prompt
+            .system
+            .clone()
+            .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_owned())
+    }
+}
+
+/// Resolve a `provider/model` or short `model` reference against the configured
+/// providers. The short form matches the first provider serving that model id.
+fn find_model<'a>(
+    providers: &'a ProvidersFile,
+    model_ref: &str,
+) -> Result<(&'a ProviderConfig, &'a ModelConfig)> {
+    if let Some((provider_name, model_id)) = model_ref.split_once('/') {
+        let provider = providers
+            .providers
+            .iter()
+            .find(|p| p.name == provider_name)
+            .ok_or_else(|| ConfigError::UnknownProvider(provider_name.to_owned()))?;
+        let model = provider
+            .model(model_id)
+            .ok_or_else(|| ConfigError::UnknownModel(model_ref.to_owned()))?;
+        Ok((provider, model))
+    } else {
+        providers
+            .providers
+            .iter()
+            .find_map(|p| p.model(model_ref).map(|m| (p, m)))
+            .ok_or_else(|| ConfigError::UnknownModel(model_ref.to_owned()))
+    }
+}
+
+/// Inline a profile's `system_file` into `prompt.system`, reading it relative
+/// to the profile's directory. A `system_file` overrides an inline `system`
+/// only if `system` is unset.
+fn resolve_system_file(profile: &mut Profile, dir: &Path) -> Result<()> {
+    if profile.prompt.system.is_some() {
+        return Ok(());
+    }
+    let Some(rel) = profile.prompt.system_file.clone() else {
+        return Ok(());
+    };
+    let path = dir.join(rel);
+    let text = std::fs::read_to_string(&path).map_err(|source| ConfigError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    profile.prompt.system = Some(text);
+    Ok(())
+}
+
+/// Read a file, returning `None` if it does not exist (a missing optional config
+/// file is not an error) and an [`ConfigError::Io`] for any other failure.
+fn read_optional(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(ConfigError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// The user's home directory from `HOME`, if set.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::float_cmp)]
+
+    use super::*;
+
+    /// Write `providers.toml` and a profile into a fresh root, returning a store
+    /// scoped to that single root (so tests never touch a real `~/.omini`).
+    fn store_with(providers: &str, profiles: &[(&str, &str)]) -> (tempfile::TempDir, ConfigStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".omini");
+        std::fs::create_dir_all(root.join(CONFIG_SUBDIR)).unwrap();
+        std::fs::create_dir_all(root.join(PROFILES_SUBDIR)).unwrap();
+        std::fs::write(root.join(CONFIG_SUBDIR).join(PROVIDERS_FILE), providers).unwrap();
+        for (name, body) in profiles {
+            std::fs::write(
+                root.join(PROFILES_SUBDIR).join(format!("{name}.toml")),
+                body,
+            )
+            .unwrap();
+        }
+        let store = ConfigStore::from_roots(vec![root]);
+        (dir, store)
+    }
+
+    // `HOME` is reliably set in the test environment; using it as the
+    // `api_key_env` lets `resolve` succeed without the (now-unsafe) set_var.
+    const PROVIDERS: &str = r#"
+[[providers]]
+name = "openai-main"
+type = "openai-chat"
+base_url = "https://api.openai.com/v1"
+api_key_env = "HOME"
+
+[[providers.models]]
+id = "gpt-4o"
+context_window = 128000
+max_output_tokens = 16384
+default_temperature = 0.3
+"#;
+
+    #[test]
+    fn resolves_full_model_ref_with_overrides() {
+        let profile_body = r#"
+[profile]
+name = "coding"
+[model]
+default = "openai-main/gpt-4o"
+"#;
+        let (_d, store) = store_with(PROVIDERS, &[("coding", profile_body)]);
+        let providers = store.load_providers().unwrap();
+        let profile = store.load_profile("coding").unwrap();
+
+        // No CLI override → temperature is the model default (0.3).
+        let r = store.resolve(&providers, &profile, None, None).unwrap();
+        assert_eq!(r.provider_name, "openai-main");
+        assert_eq!(r.model_id, "gpt-4o");
+        assert_eq!(r.temperature, 0.3);
+        assert_eq!(r.max_output_tokens, 16384);
+        assert!(!r.api_key.is_empty()); // came from $HOME
+
+        // CLI temperature override wins.
+        let r2 = store
+            .resolve(&providers, &profile, None, Some(0.9))
+            .unwrap();
+        assert_eq!(r2.temperature, 0.9);
+
+        // CLI model override (short ref) wins over profile default.
+        let r3 = store
+            .resolve(&providers, &profile, Some("gpt-4o"), None)
+            .unwrap();
+        assert_eq!(r3.model_id, "gpt-4o");
+    }
+
+    #[test]
+    fn short_ref_and_unknown_refs() {
+        let (_d, store) = store_with(PROVIDERS, &[]);
+        let providers = store.load_providers().unwrap();
+        let profile = Profile::builtin_default();
+
+        assert!(matches!(
+            find_model(&providers, "gpt-4o"),
+            Ok((p, m)) if p.name == "openai-main" && m.id == "gpt-4o"
+        ));
+        assert!(matches!(
+            store.resolve(&providers, &profile, Some("nope/x"), None),
+            Err(ConfigError::UnknownProvider(_))
+        ));
+        assert!(matches!(
+            store.resolve(&providers, &profile, Some("ghost"), None),
+            Err(ConfigError::UnknownModel(_))
+        ));
+        // builtin default has no model and we pass no override.
+        assert!(matches!(
+            store.resolve(&providers, &profile, None, None),
+            Err(ConfigError::NoModel(_))
+        ));
+    }
+
+    #[test]
+    fn missing_api_key_is_reported() {
+        let providers_src = PROVIDERS.replace(
+            "api_key_env = \"HOME\"",
+            "api_key_env = \"OMINI_DEFINITELY_UNSET_VAR_XYZ\"",
+        );
+        let (_d, store) = store_with(&providers_src, &[]);
+        let providers = store.load_providers().unwrap();
+        let profile = Profile::builtin_default();
+        match store.resolve(&providers, &profile, Some("gpt-4o"), None) {
+            Err(ConfigError::MissingApiKey { env, .. }) => {
+                assert_eq!(env, "OMINI_DEFINITELY_UNSET_VAR_XYZ");
+            }
+            other => panic!("expected MissingApiKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unsupported_provider_type_is_rejected() {
+        let providers_src = PROVIDERS.replace("type = \"openai-chat\"", "type = \"anthropic\"");
+        let (_d, store) = store_with(&providers_src, &[]);
+        let providers = store.load_providers().unwrap();
+        let profile = Profile::builtin_default();
+        assert!(matches!(
+            store.resolve(&providers, &profile, Some("gpt-4o"), None),
+            Err(ConfigError::UnsupportedProviderType(_))
+        ));
+    }
+
+    #[test]
+    fn extends_chain_overlays_parent() {
+        let base = r#"
+[profile]
+name = "base"
+[prompt]
+system = "base prompt"
+[model]
+default = "openai-main/gpt-4o"
+[tools]
+builtin = ["read", "write", "shell"]
+"#;
+        let coding = r#"
+[profile]
+name = "coding"
+extends = "base"
+[model]
+temperature = 0.7
+"#;
+        let (_d, store) = store_with(PROVIDERS, &[("base", base), ("coding", coding)]);
+        let profile = store.load_profile("coding").unwrap();
+        assert_eq!(profile.prompt.system.as_deref(), Some("base prompt"));
+        assert_eq!(profile.model.default.as_deref(), Some("openai-main/gpt-4o"));
+        assert_eq!(profile.model.temperature, Some(0.7));
+    }
+
+    #[test]
+    fn missing_default_profile_falls_back_to_builtin() {
+        let (_d, store) = store_with(PROVIDERS, &[]);
+        let profile = store.load_profile("default").unwrap();
+        assert_eq!(profile.profile.name, "default");
+        assert_eq!(
+            profile.prompt.system.as_deref(),
+            Some(DEFAULT_SYSTEM_PROMPT)
+        );
+    }
+
+    #[test]
+    fn missing_named_profile_is_not_found() {
+        let (_d, store) = store_with(PROVIDERS, &[]);
+        assert!(matches!(
+            store.load_profile("ghost"),
+            Err(ConfigError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn inheritance_cycle_is_detected() {
+        let a = "[profile]\nname = \"a\"\nextends = \"b\"\n";
+        let b = "[profile]\nname = \"b\"\nextends = \"a\"\n";
+        let (_d, store) = store_with(PROVIDERS, &[("a", a), ("b", b)]);
+        assert!(matches!(
+            store.load_profile("a"),
+            Err(ConfigError::InheritanceCycle(_))
+        ));
+    }
+
+    #[test]
+    fn system_file_is_inlined_relative_to_profile_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".omini");
+        let profiles = root.join(PROFILES_SUBDIR);
+        std::fs::create_dir_all(root.join(CONFIG_SUBDIR)).unwrap();
+        std::fs::create_dir_all(profiles.join("prompts")).unwrap();
+        std::fs::write(root.join(CONFIG_SUBDIR).join(PROVIDERS_FILE), PROVIDERS).unwrap();
+        std::fs::write(profiles.join("prompts/coding.md"), "from file").unwrap();
+        std::fs::write(
+            profiles.join("withfile.toml"),
+            "[profile]\nname = \"withfile\"\n[prompt]\nsystem_file = \"prompts/coding.md\"\n",
+        )
+        .unwrap();
+
+        let store = ConfigStore::from_roots(vec![root]);
+        let profile = store.load_profile("withfile").unwrap();
+        assert_eq!(profile.prompt.system.as_deref(), Some("from file"));
+    }
+
+    #[test]
+    fn project_root_shadows_user_root_for_providers() {
+        let project = tempfile::tempdir().unwrap();
+        let user = tempfile::tempdir().unwrap();
+        for (base, name, url) in [
+            (project.path(), "shared", "https://project"),
+            (user.path(), "shared", "https://user"),
+        ] {
+            let cfg = base.join(".omini").join(CONFIG_SUBDIR);
+            std::fs::create_dir_all(&cfg).unwrap();
+            std::fs::write(
+                cfg.join(PROVIDERS_FILE),
+                format!(
+                    "[[providers]]\nname = \"{name}\"\ntype = \"openai-chat\"\nbase_url = \"{url}\"\napi_key_env = \"HOME\"\n"
+                ),
+            )
+            .unwrap();
+        }
+        let store = ConfigStore::from_roots(vec![
+            project.path().join(".omini"),
+            user.path().join(".omini"),
+        ]);
+        let providers = store.load_providers().unwrap();
+        assert_eq!(providers.providers.len(), 1);
+        assert_eq!(providers.providers[0].base_url, "https://project");
+    }
+}

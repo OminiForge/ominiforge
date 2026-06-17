@@ -12,6 +12,7 @@ pub mod core;
 // everything points down to `core`; `core` depends on nothing above it.
 pub mod agent;
 pub mod cli;
+pub mod config;
 pub mod context;
 pub mod evolution;
 pub mod gateway;

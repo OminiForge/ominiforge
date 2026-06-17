@@ -208,8 +208,9 @@ pub enum Content {
 Tool 调用产生以下事件序列：
 
 ```text
-ModelEvent::ToolCallDelta (model 产生 tool call)
-  → ToolEvent::Started { tool_name, input, source }
+ModelEvent::ContentBlock { content: BlockContent::ToolCall { id, name, arguments } }
+  (model 产生 tool call；流式 delta 合并后的完整块)
+  → ToolEvent::Started { tool_name, input, source }   (tool_call_event_id 指向上面的 ContentBlock)
   → ToolEvent::Completed { result } | ToolEvent::Failed { error }
 ```
 

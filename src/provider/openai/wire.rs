@@ -210,10 +210,23 @@ impl SseDecoder {
 
 #[derive(Debug, Deserialize)]
 pub struct ChatChunk {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub choices: Vec<ChunkChoice>,
     #[serde(default)]
     pub usage: Option<ChunkUsage>,
+}
+
+/// Deserialize a field as its [`Default`] when the JSON value is `null`.
+///
+/// `#[serde(default)]` only fills *absent* fields; some OpenAI-compatible
+/// providers (e.g. Xiaomi MiMo) send an explicit `"tool_calls": null` /
+/// `"choices": null`, which would otherwise fail a non-`Option` collection.
+fn null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Deserialize)]
@@ -230,7 +243,7 @@ pub struct ChunkDelta {
     /// DeepSeek-style separate reasoning channel.
     #[serde(default)]
     pub reasoning_content: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub tool_calls: Vec<ChunkToolCall>,
 }
 
@@ -604,5 +617,22 @@ mod tests {
         let mut asm = ChunkAssembler::default();
         assert!(!asm.finish().is_empty());
         assert!(asm.finish().is_empty());
+    }
+
+    /// Some providers (Xiaomi MiMo) send explicit `null` for `tool_calls`,
+    /// `content`, and `role` rather than omitting them. `null` must decode as
+    /// the field's default, not fail. Mirrors a real captured chunk.
+    #[test]
+    fn explicit_null_fields_decode_as_default() {
+        let c = chunk(
+            r#"{"choices":[{"delta":{"content":null,"role":null,"tool_calls":null,"reasoning_content":"hi"},"finish_reason":null,"index":0}]}"#,
+        );
+        assert_eq!(c.choices.len(), 1);
+        assert!(c.choices[0].delta.tool_calls.is_empty());
+        assert_eq!(c.choices[0].delta.reasoning_content.as_deref(), Some("hi"));
+
+        // Explicit top-level `choices: null` also decodes to empty.
+        let empty = chunk(r#"{"choices":null,"usage":null}"#);
+        assert!(empty.choices.is_empty());
     }
 }

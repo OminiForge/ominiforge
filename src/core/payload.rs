@@ -56,7 +56,12 @@ pub enum TurnEvent {
     },
 }
 
-/// Model interaction, expressed as start/delta/stop for streaming.
+/// Model interaction.
+///
+/// Streaming arrives as per-token deltas on the provider boundary
+/// (`crate::llm::StreamEvent`); persisted history consolidates each content
+/// block into one [`ModelEvent::ContentBlock`] rather than one event per token,
+/// so the log stays compact and replayable.
 ///
 /// A model emitting a tool call is a `ModelEvent`; the tool actually running is
 /// a [`ToolEvent`] — the two are kept separate. See `doc/event-schema.md` §5.
@@ -71,29 +76,15 @@ pub enum ModelEvent {
         tool_schemas_count: u32,
         input_tokens_estimate: u32,
     },
-    ContentBlockStart {
+    /// One fully-assembled content block (text, reasoning, or a tool call).
+    ///
+    /// The streaming deltas that built it are live-transport only and are not
+    /// persisted one-per-token. A `ToolCall` block's `ContentBlock` event is the
+    /// one a [`ToolEvent::Started`] points back at via `tool_call_event_id`.
+    ContentBlock {
         request_id: String,
         index: u32,
-        block_type: ContentBlockType,
-    },
-    TextDelta {
-        request_id: String,
-        index: u32,
-        text: String,
-    },
-    ReasoningDelta {
-        request_id: String,
-        index: u32,
-        text: String,
-    },
-    ToolCallDelta {
-        request_id: String,
-        index: u32,
-        json_delta: String,
-    },
-    ContentBlockStop {
-        request_id: String,
-        index: u32,
+        content: BlockContent,
     },
     RequestCompleted {
         request_id: String,
@@ -112,14 +103,35 @@ pub enum ModelEvent {
 
 /// The kind of content block a model is streaming.
 ///
-/// A `ToolCall` block carries the call `id` and `name` at its start so the
-/// agent loop has what it needs to dispatch the tool; the JSON arguments arrive
-/// as subsequent [`ModelEvent::ToolCallDelta`]s.
+/// Used on the streaming boundary ([`crate::llm::StreamEvent::BlockStart`]): a
+/// `ToolCall` block carries the call `id` and `name` at its start so the agent
+/// loop has what it needs to dispatch the tool; the JSON arguments arrive as
+/// subsequent deltas. Persisted history uses [`BlockContent`] instead, which
+/// carries the fully-assembled block.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContentBlockType {
     Text,
     Reasoning,
     ToolCall { id: String, name: String },
+}
+
+/// A fully-assembled content block, persisted as one [`ModelEvent::ContentBlock`].
+///
+/// This is the consolidated counterpart to the streaming
+/// [`ContentBlockType`] + deltas: instead of one event per token, the collector
+/// accumulates a block and records it once, here, with its complete content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BlockContent {
+    /// Assistant free-text, concatenated from all text deltas.
+    Text { text: String },
+    /// Reasoning/thinking text, concatenated from all reasoning deltas.
+    Reasoning { text: String },
+    /// A tool call with its arguments fully assembled into a JSON string.
+    ToolCall {
+        id: String,
+        name: String,
+        arguments: String,
+    },
 }
 
 /// Why the model stopped generating.
