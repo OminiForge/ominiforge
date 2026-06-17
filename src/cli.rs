@@ -262,6 +262,10 @@ impl<O: Write, E: Write> CliSink<O, E> {
     fn begin_side(&mut self, label: &str) {
         if self.channel == Channel::Side {
             self.end_side();
+        } else if self.channel == Channel::Answer {
+            // Close the answer line on stdout so the side-channel label
+            // doesn't visually glue itself onto the end of the answer text.
+            let _ = writeln!(self.out);
         }
         if self.stderr_tty {
             let _ = write!(self.err, "\x1b[2m");
@@ -621,5 +625,24 @@ mod tests {
 
         assert_eq!(String::from_utf8(sink.out.clone()).unwrap(), "the answer\n");
         assert_eq!(side(&sink), "[thinking] plan\n");
+    }
+
+    /// When answer text is followed by a side-channel block (tool call /
+    /// reasoning), the answer line must be closed on stdout so the side-channel
+    /// label doesn't visually glue itself onto the end of the answer.
+    #[test]
+    fn answer_to_side_transition_closes_stdout_line() {
+        let mut sink = buffered_sink();
+
+        sink.on_block_start(0, BlockKind::Text);
+        sink.on_text(0, "the answer");
+        sink.on_block_start(1, BlockKind::ToolCall { name: "shell" });
+        sink.on_tool_call_delta(1, r#"{"cmd":"ls"}"#);
+        sink.on_turn_end();
+
+        // stdout must have a newline before the tool call began.
+        assert_eq!(String::from_utf8(sink.out.clone()).unwrap(), "the answer\n");
+        // stderr must start on its own line, not glued to answer text.
+        assert_eq!(side(&sink), "[tool: shell] {\"cmd\":\"ls\"}\n");
     }
 }
