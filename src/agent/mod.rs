@@ -5,30 +5,52 @@
 //! `ModelEvent`s by [`collector`]); if the model asked for tools, each is
 //! dispatched (persisted as `ToolEvent`s) and its result fed back as a `Tool`
 //! message before the next round. The loop ends when the model stops without
-//! requesting tools, emitting `TurnEvent::Completed`.
+//! requesting tools **and** the working plan (if any) has no non-terminal
+//! steps left — the completion gate (`doc/plan.md` §6).
 //!
-//! The caller owns the conversation [`Message`] vector (the context view) and
-//! the [`SessionWriter`]; `run_turn` appends to both. Context compaction and
-//! prefix-cache management arrive with the `context` module (Phase 2).
+//! State has three homes by lifetime (`doc/plan.md` §3):
+//! - turn-invariant deps (provider, tools, config) live on [`Agent`];
+//! - session-scoped state (the conversation view and the working plan) lives in
+//!   [`SessionRuntime`], owned by the caller so it survives across turns;
+//! - turn-scoped state (round counter, gate/stuck counters, output
+//!   accumulation) lives in [`TurnState`], built when a turn starts and dropped
+//!   when it ends.
+//!
+//! `run_turn` borrows a [`SessionRuntime`] and a [`SessionWriter`] and appends
+//! to both. Context compaction and prefix-cache management arrive with the
+//! `context` module (Phase 2).
 
 mod collector;
 mod error;
+mod plan;
 mod sink;
 
 pub use error::AgentError;
+pub use plan::{PlanStep, StepStatus};
 pub use sink::{BlockKind, NullSink, StreamSink};
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::core::payload::{
-    Content, ErrorDetail, ErrorSeverity, ModelEvent, StopReason, ToolEvent, ToolOutput, ToolSource,
-    TurnEvent,
+    Content, ErrorDetail, ErrorEvent, ErrorSeverity, InjectionEvent, InjectionSource, ModelEvent,
+    StopReason, ToolEvent, ToolOutput, ToolSource, TurnEvent, TurnFailureReason, Usage,
 };
 use crate::core::{EventId, EventPayload, EventSource, SourceKind, TurnId};
-use crate::llm::{Message, ModelRequest, Provider, ToolCall, ToolSchema};
+use crate::llm::{LlmError, Message, ModelRequest, Provider, ToolCall, ToolSchema};
 use crate::session::SessionWriter;
 use crate::tool::{ToolError, ToolInput, ToolRegistry};
+
+use plan::{PLAN_TOOL_NAME, PlanError, PlanOp, apply_plan_op};
+
+/// How many completion-gate nudges a turn tolerates before giving up: the model
+/// stopped without finishing the plan this many times running (`doc/plan.md` §6).
+const MAX_GATE: u8 = 2;
+
+/// How many consecutive rounds a step may stay `in_progress` before the loop
+/// injects a one-shot stuck warning (`doc/plan.md` §7).
+const STUCK_THRESHOLD: u32 = 5;
 
 /// Knobs for a turn that do not change between rounds.
 #[derive(Debug, Clone)]
@@ -41,7 +63,12 @@ pub struct AgentConfig {
     pub max_tokens: Option<u32>,
     /// Per-tool-invocation time budget.
     pub tool_timeout: Duration,
-    /// Maximum model rounds in one turn before bailing on a tool-call loop.
+    /// Absolute safety net on model rounds in one turn. This is *not* the
+    /// primary loop control — the completion gate and stuck detection
+    /// (`doc/plan.md` §6–§7) catch a misbehaving turn far earlier and more
+    /// cheaply. `max_rounds` only backstops a runaway that slips past both, so
+    /// it is set generously: a routine multi-step task (read many files, run a
+    /// few commands, write output) legitimately needs dozens of rounds.
     pub max_rounds: u32,
 }
 
@@ -52,7 +79,35 @@ impl Default for AgentConfig {
             temperature: 0.0,
             max_tokens: None,
             tool_timeout: Duration::from_secs(120),
-            max_rounds: 16,
+            max_rounds: 100,
+        }
+    }
+}
+
+/// Session-scoped runtime state that survives across turns.
+///
+/// Owned by the interactive loop / CLI and borrowed by each [`TurnState`].
+/// Rebuilt from `events.jsonl` when resuming a session (replay the plan ops and
+/// the conversation view; see `doc/plan.md` §10.3 — Phase 2). In the Phase 1
+/// single-turn CLI it is built fresh per `run` and discarded, the degenerate
+/// case of the same interface.
+#[derive(Debug, Clone, Default)]
+pub struct SessionRuntime {
+    /// Conversation view sent to the model; appended each turn.
+    pub context: Vec<Message>,
+    /// Working plan; survives across turns until every step reaches a terminal
+    /// state or the model replaces it via `init` (`doc/plan.md` §10).
+    pub plan: Vec<PlanStep>,
+}
+
+impl SessionRuntime {
+    /// A runtime seeded with an initial context (typically the system message)
+    /// and an empty plan.
+    #[must_use]
+    pub const fn new(context: Vec<Message>) -> Self {
+        Self {
+            context,
+            plan: Vec::new(),
         }
     }
 }
@@ -66,6 +121,13 @@ pub struct TurnOutcome {
     pub stop_reason: StopReason,
     /// How many model rounds the turn took.
     pub rounds: u32,
+    /// Token usage summed over every model round in the turn.
+    pub usage: Usage,
+    /// `None` if the turn finished cleanly (`TurnEvent::Completed`); otherwise
+    /// why it was cut short. The work done so far still stands — the caller
+    /// decides whether to surface it, retry, or prompt the user. Mirrors the
+    /// `reason` on the persisted `TurnEvent::Failed`.
+    pub incomplete: Option<TurnFailureReason>,
 }
 
 /// Couples a model provider with a tool registry and per-turn config.
@@ -86,27 +148,28 @@ impl Agent {
         }
     }
 
-    /// Run one turn: append `input` to `context`, drive model rounds and tool
-    /// calls to completion, and persist every event through `writer`.
+    /// Run one turn: append `input` to the runtime context, drive model rounds
+    /// and tool calls to completion, and persist every event through `writer`.
     ///
-    /// `context` is mutated in place — the assistant message and any tool
-    /// results are appended, leaving it ready for the next turn.
+    /// `runtime` is mutated in place — the user message, the assistant message,
+    /// any tool results, and any plan changes are applied, leaving it ready for
+    /// the next turn.
     ///
     /// This is the headless form: streamed output is persisted but not observed
     /// live. Use [`run_turn_with_sink`](Self::run_turn_with_sink) to render the
     /// model's output as it streams.
     ///
     /// # Errors
-    /// [`AgentError::Model`] on provider failure, [`AgentError::Session`] on a
-    /// persistence failure, or [`AgentError::MaxRounds`] if the tool loop never
-    /// settles.
+    /// [`AgentError::Model`] on provider failure or [`AgentError::Session`] on a
+    /// persistence failure. Running out of round budget or stalling on the plan
+    /// is *not* an error: it returns `Ok` with [`TurnOutcome::incomplete`] set.
     pub async fn run_turn(
         &self,
         writer: &mut SessionWriter,
-        context: &mut Vec<Message>,
+        runtime: &mut SessionRuntime,
         input: String,
     ) -> Result<TurnOutcome, AgentError> {
-        self.run_turn_with_sink(writer, context, input, &mut NullSink)
+        self.run_turn_with_sink(writer, runtime, input, &mut NullSink)
             .await
     }
 
@@ -119,119 +182,420 @@ impl Agent {
     pub async fn run_turn_with_sink(
         &self,
         writer: &mut SessionWriter,
-        context: &mut Vec<Message>,
+        runtime: &mut SessionRuntime,
         input: String,
         sink: &mut dyn StreamSink,
     ) -> Result<TurnOutcome, AgentError> {
         let turn_id = TurnId(ulid::Ulid::new().to_string());
-        writer.append(
+        let mut turn = TurnState {
+            agent: self,
+            runtime,
+            writer,
+            sink,
+            turn_id,
+            round: 0,
+            answer: String::new(),
+            stop_reason: StopReason::EndTurn,
+            accumulated_usage: Usage::default(),
+            gate_count: 0,
+            step_stuck_rounds: HashMap::new(),
+        };
+        turn.run(input).await
+    }
+
+    fn tool_schemas(&self) -> Vec<ToolSchema> {
+        // Leaf-tool descriptors plus the `plan` control-tool descriptor, all
+        // sorted by name so the schema block stays byte-stable for the prefix
+        // cache (`doc/context-management.md` §3, `doc/plan.md` §5).
+        let mut schemas: Vec<ToolSchema> = self
+            .tools
+            .descriptors()
+            .into_iter()
+            .map(|d| ToolSchema {
+                name: d.name,
+                description: d.description,
+                parameters: d.input_schema,
+            })
+            .collect();
+        schemas.push(plan::descriptor());
+        schemas.sort_by(|a, b| a.name.cmp(&b.name));
+        schemas
+    }
+
+    fn model_source(&self) -> EventSource {
+        EventSource {
+            kind: SourceKind::Model,
+            id: format!("{}/{}", self.provider.name(), self.config.model),
+        }
+    }
+}
+
+/// All mutable state threaded through one turn of the agent loop.
+///
+/// Constructed when a turn starts, dropped when it ends. Owns the turn-scoped
+/// counters and output accumulation, borrows the session-scoped [`SessionRuntime`]
+/// (context + plan) plus the shared resources the turn drives. Turn-invariant
+/// deps stay on [`Agent`]; round-ephemeral values stay local to the round
+/// (`doc/plan.md` §3).
+struct TurnState<'a> {
+    // turn-invariant deps (provider, tools, config)
+    agent: &'a Agent,
+    // session-scoped state, borrowed for the turn (context + plan live here)
+    runtime: &'a mut SessionRuntime,
+    // shared resources, borrowed for the turn's duration
+    writer: &'a mut SessionWriter,
+    sink: &'a mut dyn StreamSink,
+
+    // turn identity
+    turn_id: TurnId,
+
+    // turn output accumulation — consumed by TurnOutcome on exit
+    round: u32,
+    answer: String,
+    stop_reason: StopReason,
+    accumulated_usage: Usage,
+
+    // turn-scoped plan control counters, reset every turn
+    gate_count: u8,
+    step_stuck_rounds: HashMap<String, u32>,
+}
+
+/// What the completion gate decided when the model stopped calling tools.
+enum Gate {
+    /// Every step is terminal (or there is no plan) — exit cleanly.
+    Done,
+    /// Non-terminal steps remain; a reminder was injected — run another round.
+    Continue,
+    /// The model kept stopping with work outstanding — give up (retryable).
+    GiveUp,
+}
+
+impl TurnState<'_> {
+    /// Drive the turn to completion. Built by
+    /// [`run_turn_with_sink`](Agent::run_turn_with_sink); the only entry point.
+    ///
+    /// Records `TurnEvent::Started`, then drives the round loop. A graceful stop
+    /// (clean finish, max-rounds, plan stall) returns `Ok` from [`drive`]. A
+    /// hard error (`AgentError::Model`/`Session`) bubbles out of `drive`; before
+    /// propagating it we record a terminal trace (`ErrorEvent` + `Failed`) so no
+    /// turn ends without a closing event (`doc/event-schema.md` §4).
+    ///
+    /// [`drive`]: Self::drive
+    async fn run(&mut self, input: String) -> Result<TurnOutcome, AgentError> {
+        self.writer.append(
             runtime_source(),
             EventPayload::Turn(TurnEvent::Started {
-                turn_id: turn_id.clone(),
+                turn_id: self.turn_id.clone(),
                 input: Some(input.clone()),
             }),
             None,
-            Some(turn_id.clone()),
+            Some(self.turn_id.clone()),
         )?;
-        context.push(Message::User { content: input });
+        self.runtime.context.push(Message::User { content: input });
 
-        for round in 0..self.config.max_rounds {
-            let outcome = self
-                .run_model_round(writer, context, &turn_id, sink)
-                .await?;
-            let answer = assistant_text(&outcome.message);
-            let tool_calls = assistant_tool_calls(&outcome.message);
-            context.push(outcome.message.clone());
-
-            if tool_calls.is_empty() {
-                writer.append(
-                    runtime_source(),
-                    EventPayload::Turn(TurnEvent::Completed {
-                        turn_id: turn_id.clone(),
-                    }),
-                    None,
-                    Some(turn_id.clone()),
-                )?;
-                sink.on_turn_end();
-                return Ok(TurnOutcome {
-                    answer,
-                    stop_reason: outcome.stop_reason,
-                    rounds: round + 1,
-                });
-            }
-
-            for call in tool_calls {
-                let event_id = outcome.tool_call_event_ids.get(&call.id).cloned();
-                let result = self
-                    .dispatch_tool(writer, &turn_id, &call, event_id)
-                    .await?;
-                context.push(result);
+        match self.drive().await {
+            Ok(outcome) => Ok(outcome),
+            Err(err) => {
+                self.record_hard_failure(&err);
+                Err(err)
             }
         }
+    }
 
-        // Tool loop never settled. Record where it gave up for audit, then error.
-        let last = EventId {
-            session_id: writer.session_id().clone(),
-            seq: writer.next_seq().saturating_sub(1),
-        };
-        writer.append(
+    /// The round loop. Returns `Ok` for every *graceful* outcome (clean finish,
+    /// max-rounds safety net, plan stall); a hard provider/persistence fault
+    /// short-circuits as `Err` and is given a terminal trace by [`run`](Self::run).
+    async fn drive(&mut self) -> Result<TurnOutcome, AgentError> {
+        while self.round < self.agent.config.max_rounds {
+            let outcome = self.run_model_round().await?;
+            let answer = assistant_text(&outcome.message);
+            let tool_calls = assistant_tool_calls(&outcome.message);
+            self.round += 1;
+            self.stop_reason = outcome.stop_reason;
+            self.accumulated_usage = add_usage(self.accumulated_usage, outcome.usage);
+            if !answer.is_empty() {
+                self.answer = answer;
+            }
+            self.runtime.context.push(outcome.message.clone());
+
+            if tool_calls.is_empty() {
+                match self.completion_gate()? {
+                    Gate::Done => return self.finish(),
+                    Gate::Continue => continue,
+                    Gate::GiveUp => {
+                        let incomplete = self.incomplete_step_count();
+                        return self.fail(
+                            TurnFailureReason::PlanStalled {
+                                incomplete_steps: incomplete,
+                            },
+                            true,
+                        );
+                    }
+                }
+            }
+
+            // A round counts as progress if at least one *leaf* tool call
+            // succeeded with a non-error result. Plan ops and failed/errored
+            // tools do not count, so a step that is genuinely working clears its
+            // stuck counter while one that only spins keeps climbing toward the
+            // threshold (`doc/plan.md` §7).
+            let mut progressed = false;
+            for call in tool_calls {
+                let event_id = outcome.tool_call_event_ids.get(&call.id).cloned();
+                let (result, made_progress) = self.dispatch(&call, event_id).await?;
+                progressed |= made_progress;
+                self.runtime.context.push(result);
+            }
+            self.check_stuck(progressed)?;
+        }
+
+        // The tool loop ran out of round budget. This is the absolute safety
+        // net, not a crash: record why, then hand back the partial outcome so
+        // the caller keeps whatever work already landed (`doc/plan.md` §7).
+        self.fail(
+            TurnFailureReason::MaxRoundsExceeded {
+                max_rounds: self.agent.config.max_rounds,
+            },
+            false,
+        )
+    }
+
+    /// Emit `TurnEvent::Completed`, flush the sink, and assemble the outcome.
+    fn finish(&mut self) -> Result<TurnOutcome, AgentError> {
+        self.writer.append(
             runtime_source(),
-            EventPayload::Turn(TurnEvent::Failed {
-                turn_id,
-                failed_at_event_id: last,
-                retryable: false,
+            EventPayload::Turn(TurnEvent::Completed {
+                turn_id: self.turn_id.clone(),
             }),
             None,
-            None,
+            Some(self.turn_id.clone()),
         )?;
-        Err(AgentError::MaxRounds(self.config.max_rounds))
+        self.sink.on_turn_end();
+        Ok(self.outcome(None))
+    }
+
+    /// Record a `TurnEvent::Failed` carrying `reason`, flush the sink, and
+    /// return the *partial* outcome flagged incomplete. A turn running out of
+    /// budget or stalling is a graceful stop — its side effects stand — so the
+    /// caller gets a `TurnOutcome`, never an `Err` (`doc/event-schema.md` §4).
+    fn fail(
+        &mut self,
+        reason: TurnFailureReason,
+        retryable: bool,
+    ) -> Result<TurnOutcome, AgentError> {
+        let last = EventId {
+            session_id: self.writer.session_id().clone(),
+            seq: self.writer.next_seq().saturating_sub(1),
+        };
+        self.writer.append(
+            runtime_source(),
+            EventPayload::Turn(TurnEvent::Failed {
+                turn_id: self.turn_id.clone(),
+                failed_at_event_id: last,
+                retryable,
+                reason: Some(reason.clone()),
+            }),
+            None,
+            Some(self.turn_id.clone()),
+        )?;
+        self.sink.on_turn_end();
+        Ok(self.outcome(Some(reason)))
+    }
+
+    /// Best-effort terminal trace for a hard error before it propagates: write
+    /// an `ErrorEvent::Raised` carrying the detail, then a `TurnEvent::Failed`
+    /// (`reason: None`) pointing at it. Every write is fire-and-forget — if the
+    /// persistence layer is itself the fault, the closing writes will also fail,
+    /// and we silently abandon them rather than mask the original error or loop
+    /// (`doc/event-schema.md` §4). Does not touch the sink: the caller surfaces
+    /// the `Err`, so there is no settled turn to signal.
+    fn record_hard_failure(&mut self, err: &AgentError) {
+        let detail = error_detail(err);
+        let session_id = self.writer.session_id().clone();
+        let error_seq = self.writer.append(
+            runtime_source(),
+            EventPayload::Error(ErrorEvent::Raised(detail.clone())),
+            None,
+            Some(self.turn_id.clone()),
+        );
+        // Point `failed_at` at the ErrorEvent we just wrote if it landed,
+        // otherwise at the last event that did.
+        let failed_at = EventId {
+            session_id,
+            seq: match error_seq {
+                Ok(seq) => seq,
+                Err(_) => self.writer.next_seq().saturating_sub(1),
+            },
+        };
+        let _ = self.writer.append(
+            runtime_source(),
+            EventPayload::Turn(TurnEvent::Failed {
+                turn_id: self.turn_id.clone(),
+                failed_at_event_id: failed_at,
+                retryable: detail.retryable,
+                reason: None,
+            }),
+            None,
+            Some(self.turn_id.clone()),
+        );
+    }
+
+    /// Assemble the outcome from accumulated turn state.
+    fn outcome(&mut self, incomplete: Option<TurnFailureReason>) -> TurnOutcome {
+        TurnOutcome {
+            answer: std::mem::take(&mut self.answer),
+            stop_reason: self.stop_reason,
+            rounds: self.round,
+            usage: self.accumulated_usage,
+            incomplete,
+        }
+    }
+
+    /// Count the plan steps still in a non-terminal state (for `PlanStalled`).
+    fn incomplete_step_count(&self) -> u32 {
+        let n = self
+            .runtime
+            .plan
+            .iter()
+            .filter(|s| !s.status.is_terminal())
+            .count();
+        u32::try_from(n).unwrap_or(u32::MAX)
+    }
+
+    /// Decide whether the turn may exit now that the model stopped requesting
+    /// tools. With no plan, or all steps terminal, the turn is done. Otherwise
+    /// nudge the model (up to [`MAX_GATE`] times) to finish or mark the
+    /// remaining steps (`doc/plan.md` §6).
+    fn completion_gate(&mut self) -> Result<Gate, AgentError> {
+        let incomplete = plan::render_incomplete(&self.runtime.plan);
+        if incomplete.is_empty() {
+            return Ok(Gate::Done);
+        }
+        if self.gate_count >= MAX_GATE {
+            return Ok(Gate::GiveUp);
+        }
+        self.inject_runtime(format!(
+            "<reminder>The following plan steps are not in a terminal state. \
+             Continue working on them, or mark them cancelled/blocked with a \
+             reason, then give your final answer:\n{incomplete}</reminder>"
+        ))?;
+        self.gate_count += 1;
+        Ok(Gate::Continue)
+    }
+
+    /// At the end of a tool-bearing round, advance the stuck counters. If the
+    /// round made progress (`progressed`) every in-progress step's counter is
+    /// cleared — work happened, nothing is wedged. Otherwise each in-progress
+    /// step's counter is bumped, and a step that spins past [`STUCK_THRESHOLD`]
+    /// unproductive rounds gets a one-shot warning. Because progress resets the
+    /// count, a step that stalls, recovers, then stalls again is warned each
+    /// time it crosses the threshold afresh. Steps that left `in_progress` drop
+    /// out of the map entirely (`doc/plan.md` §7).
+    fn check_stuck(&mut self, progressed: bool) -> Result<(), AgentError> {
+        let in_progress: Vec<(String, String)> = self
+            .runtime
+            .plan
+            .iter()
+            .filter(|s| s.status == StepStatus::InProgress)
+            .map(|s| (s.id.clone(), s.content.clone()))
+            .collect();
+        let live: std::collections::HashSet<&String> =
+            in_progress.iter().map(|(id, _)| id).collect();
+        self.step_stuck_rounds.retain(|id, _| live.contains(id));
+
+        if progressed {
+            // Real work landed this round — no in-progress step is wedged.
+            for (id, _) in &in_progress {
+                self.step_stuck_rounds.insert(id.clone(), 0);
+            }
+            return Ok(());
+        }
+
+        let mut warnings = Vec::new();
+        for (id, content) in in_progress {
+            let count = self.step_stuck_rounds.entry(id).or_insert(0);
+            *count += 1;
+            if *count == STUCK_THRESHOLD {
+                warnings.push(content);
+            }
+        }
+        for content in warnings {
+            self.inject_runtime(format!(
+                "<reminder>Step \"{content}\" has been in progress for \
+                 {STUCK_THRESHOLD} rounds without progress. Consider cancelling \
+                 it or restructuring the plan.</reminder>"
+            ))?;
+        }
+        Ok(())
+    }
+
+    /// Push a runtime reminder into the context (kept permanently, for prefix
+    /// cache) and mirror it as an `InjectionEvent` (`doc/plan.md` §8).
+    fn inject_runtime(&mut self, content: String) -> Result<(), AgentError> {
+        let token_count = u32::try_from(content.len() / 4).unwrap_or(u32::MAX);
+        self.writer.append(
+            runtime_source(),
+            EventPayload::Injection(InjectionEvent::ContextInjected {
+                source: InjectionSource::Runtime,
+                content: content.clone(),
+                token_count,
+            }),
+            None,
+            Some(self.turn_id.clone()),
+        )?;
+        self.runtime.context.push(Message::User { content });
+        Ok(())
     }
 
     // __APPEND_MARKER__
 
     /// Run one model round: send the current context, persist the streamed
-    /// response (forwarding deltas to `sink`), and return the assembled
+    /// response (forwarding deltas to the sink), and return the assembled
     /// assistant message.
-    async fn run_model_round(
-        &self,
-        writer: &mut SessionWriter,
-        context: &[Message],
-        turn_id: &TurnId,
-        sink: &mut dyn StreamSink,
-    ) -> Result<collector::RoundOutcome, AgentError> {
+    async fn run_model_round(&mut self) -> Result<collector::RoundOutcome, AgentError> {
         let request_id = ulid::Ulid::new().to_string();
-        let tools = self.tool_schemas();
-        let source = self.model_source();
+        let tools = self.agent.tool_schemas();
+        let source = self.agent.model_source();
+        let config = &self.agent.config;
 
         let request = ModelRequest {
-            model: self.config.model.clone(),
-            messages: context.to_vec(),
+            model: config.model.clone(),
+            messages: self.runtime.context.clone(),
             tools: tools.clone(),
-            temperature: self.config.temperature,
-            max_tokens: self.config.max_tokens,
+            temperature: config.temperature,
+            max_tokens: config.max_tokens,
         };
 
-        writer.append(
+        self.writer.append(
             source.clone(),
             EventPayload::Model(ModelEvent::RequestStarted {
                 request_id: request_id.clone(),
-                provider: self.provider.name().to_owned(),
-                model: self.config.model.clone(),
-                temperature: self.config.temperature,
-                max_tokens: self.config.max_tokens,
+                provider: self.agent.provider.name().to_owned(),
+                model: config.model.clone(),
+                temperature: config.temperature,
+                max_tokens: config.max_tokens,
                 tool_schemas_count: u32::try_from(tools.len()).unwrap_or(u32::MAX),
                 input_tokens_estimate: 0,
             }),
             None,
-            Some(turn_id.clone()),
+            Some(self.turn_id.clone()),
         )?;
 
         let started = Instant::now();
-        let stream = self.provider.stream(request).await?;
-        let outcome =
-            collector::collect_round(writer, sink, stream, &source, &request_id, turn_id).await?;
+        let stream = self.agent.provider.stream(request).await?;
+        // Split-borrow disjoint fields: the `'static` stream holds no borrow of
+        // `self`, so writer + sink can be borrowed mutably for collection.
+        let outcome = collector::collect_round(
+            self.writer,
+            self.sink,
+            stream,
+            &source,
+            &request_id,
+            &self.turn_id,
+        )
+        .await?;
 
-        writer.append(
+        self.writer.append(
             source,
             EventPayload::Model(ModelEvent::RequestCompleted {
                 request_id,
@@ -242,27 +606,124 @@ impl Agent {
                 provider_request_id: None,
             }),
             None,
-            Some(turn_id.clone()),
+            Some(self.turn_id.clone()),
         )?;
 
         Ok(outcome)
     }
 
-    /// Execute one tool call, persisting `ToolEvent`s and returning the `Tool`
-    /// message to feed back to the model.
-    async fn dispatch_tool(
-        &self,
-        writer: &mut SessionWriter,
-        turn_id: &TurnId,
+    /// Route one tool call: the `plan` control tool is intercepted and applied
+    /// to the runtime plan; every other name is a leaf tool dispatched to the
+    /// registry. Both shapes emit the same `ToolEvent` bracket so replay and
+    /// monitoring need no special case (`doc/plan.md` §5).
+    ///
+    /// The returned `bool` is whether this call counts as *progress* for stuck
+    /// detection: `true` only for a leaf tool that returned a non-error result.
+    /// Plan ops and failed/errored tools are `false` (`doc/plan.md` §7).
+    async fn dispatch(
+        &mut self,
+        call: &ToolCall,
+        tool_call_event_id: Option<EventId>,
+    ) -> Result<(Message, bool), AgentError> {
+        if call.name == PLAN_TOOL_NAME {
+            self.dispatch_plan(call, tool_call_event_id)
+                .map(|m| (m, false))
+        } else {
+            self.dispatch_tool(call, tool_call_event_id).await
+        }
+    }
+
+    /// The model's tool-call event id, or a self reference if it was not
+    /// captured (should not happen).
+    fn parent_event_id(&self, captured: Option<EventId>) -> EventId {
+        captured.unwrap_or_else(|| EventId {
+            session_id: self.writer.session_id().clone(),
+            seq: self.writer.next_seq(),
+        })
+    }
+
+    /// Apply a `plan` op to the runtime plan and return the rendered plan as the
+    /// tool result. Schema or id errors come back as an `is_error` result the
+    /// model corrects next round — never a protocol failure.
+    fn dispatch_plan(
+        &mut self,
         call: &ToolCall,
         tool_call_event_id: Option<EventId>,
     ) -> Result<Message, AgentError> {
-        // The model's tool-call event is the parent; fall back to a self
-        // reference if it was not captured (should not happen).
-        let parent = tool_call_event_id.unwrap_or_else(|| EventId {
-            session_id: writer.session_id().clone(),
-            seq: writer.next_seq(),
-        });
+        let parent = self.parent_event_id(tool_call_event_id);
+        let source = EventSource {
+            kind: SourceKind::Tool,
+            id: PLAN_TOOL_NAME.to_owned(),
+        };
+        let raw: serde_json::Value = if call.arguments.trim().is_empty() {
+            serde_json::Value::Object(serde_json::Map::new())
+        } else {
+            serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null)
+        };
+
+        let started = Instant::now();
+        self.writer.append(
+            source.clone(),
+            EventPayload::Tool(ToolEvent::Started {
+                tool_call_event_id: parent.clone(),
+                tool_name: PLAN_TOOL_NAME.to_owned(),
+                source: ToolSource::Builtin,
+                input: raw.clone(),
+                working_dir: None,
+            }),
+            Some(parent.clone()),
+            Some(self.turn_id.clone()),
+        )?;
+
+        // Decode then apply; either step can fail benignly.
+        let result: Result<String, String> = serde_json::from_value::<PlanOp>(raw)
+            .map_err(|e| format!("invalid plan op: {e}"))
+            .and_then(|op| {
+                apply_plan_op(&mut self.runtime.plan, op).map_err(|e: PlanError| e.to_string())
+            })
+            .map(|()| plan::render(&self.runtime.plan));
+
+        let output = match &result {
+            Ok(rendered) => ToolOutput {
+                content: vec![Content::Text(rendered.clone())],
+                is_error: false,
+                error_code: None,
+            },
+            Err(message) => ToolOutput {
+                content: vec![Content::Text(message.clone())],
+                is_error: true,
+                error_code: Some("invalid_plan_op".to_owned()),
+            },
+        };
+        let text = render_output(&output);
+        let bytes = output_bytes(&output);
+        self.writer.append(
+            source,
+            EventPayload::Tool(ToolEvent::Completed {
+                tool_call_event_id: parent.clone(),
+                result: output,
+                duration_ms: duration_ms(started.elapsed()),
+                output_bytes: bytes,
+                artifacts_created: Vec::new(),
+            }),
+            Some(parent),
+            Some(self.turn_id.clone()),
+        )?;
+        Ok(Message::Tool {
+            tool_call_id: call.id.clone(),
+            content: text,
+        })
+    }
+
+    /// Execute one leaf tool call, persisting `ToolEvent`s and returning the
+    /// `Tool` message to feed back to the model, paired with whether it made
+    /// progress (a non-error result; see [`dispatch`](Self::dispatch)).
+    async fn dispatch_tool(
+        &mut self,
+        call: &ToolCall,
+        tool_call_event_id: Option<EventId>,
+    ) -> Result<(Message, bool), AgentError> {
+        let parent = self.parent_event_id(tool_call_event_id);
         let source = EventSource {
             kind: SourceKind::Tool,
             id: call.name.clone(),
@@ -274,21 +735,21 @@ impl Agent {
             match serde_json::from_str(&call.arguments) {
                 Ok(value) => value,
                 Err(e) => {
-                    return Self::fail_tool(
-                        writer,
-                        turn_id,
-                        &source,
-                        &parent,
-                        call,
-                        0,
-                        "invalid_arguments",
-                        &format!("tool arguments were not valid JSON: {e}"),
-                    );
+                    return self
+                        .fail_tool(
+                            &source,
+                            &parent,
+                            call,
+                            0,
+                            "invalid_arguments",
+                            &format!("tool arguments were not valid JSON: {e}"),
+                        )
+                        .map(|m| (m, false));
                 }
             }
         };
 
-        writer.append(
+        self.writer.append(
             source.clone(),
             EventPayload::Tool(ToolEvent::Started {
                 tool_call_event_id: parent.clone(),
@@ -298,35 +759,38 @@ impl Agent {
                 working_dir: None,
             }),
             Some(parent.clone()),
-            Some(turn_id.clone()),
+            Some(self.turn_id.clone()),
         )?;
 
-        let Some(tool) = self.tools.get(&call.name) else {
-            return Self::fail_tool(
-                writer,
-                turn_id,
-                &source,
-                &parent,
-                call,
-                0,
-                "unknown_tool",
-                &format!("no such tool: {}", call.name),
-            );
+        let Some(tool) = self.agent.tools.get(&call.name) else {
+            return self
+                .fail_tool(
+                    &source,
+                    &parent,
+                    call,
+                    0,
+                    "unknown_tool",
+                    &format!("no such tool: {}", call.name),
+                )
+                .map(|m| (m, false));
         };
 
         let started = Instant::now();
         let input = ToolInput {
             call_id: call.id.clone(),
             input: args,
-            timeout: self.config.tool_timeout,
+            timeout: self.agent.config.tool_timeout,
         };
         let elapsed = |start: Instant| duration_ms(start.elapsed());
 
         match tool.invoke(input).await {
             Ok(output) => {
+                // A successful invocation that reports a business-level error
+                // (`is_error`) is not progress — the step is still spinning.
+                let made_progress = !output.is_error;
                 let text = render_output(&output);
                 let output_bytes = output_bytes(&output);
-                writer.append(
+                self.writer.append(
                     source,
                     EventPayload::Tool(ToolEvent::Completed {
                         tool_call_event_id: parent.clone(),
@@ -336,35 +800,28 @@ impl Agent {
                         artifacts_created: Vec::new(),
                     }),
                     Some(parent),
-                    Some(turn_id.clone()),
+                    Some(self.turn_id.clone()),
                 )?;
-                Ok(Message::Tool {
-                    tool_call_id: call.id.clone(),
-                    content: text,
-                })
+                Ok((
+                    Message::Tool {
+                        tool_call_id: call.id.clone(),
+                        content: text,
+                    },
+                    made_progress,
+                ))
             }
             Err(err) => {
                 let (code, message) = tool_error_parts(&err);
-                Self::fail_tool(
-                    writer,
-                    turn_id,
-                    &source,
-                    &parent,
-                    call,
-                    elapsed(started),
-                    code,
-                    &message,
-                )
+                self.fail_tool(&source, &parent, call, elapsed(started), code, &message)
+                    .map(|m| (m, false))
             }
         }
     }
 
     /// Persist a `ToolEvent::Failed` and return the error as a `Tool` message so
     /// the model can react.
-    #[allow(clippy::too_many_arguments)]
     fn fail_tool(
-        writer: &mut SessionWriter,
-        turn_id: &TurnId,
+        &mut self,
         source: &EventSource,
         parent: &EventId,
         call: &ToolCall,
@@ -372,7 +829,7 @@ impl Agent {
         code: &str,
         message: &str,
     ) -> Result<Message, AgentError> {
-        writer.append(
+        self.writer.append(
             source.clone(),
             EventPayload::Tool(ToolEvent::Failed {
                 tool_call_event_id: parent.clone(),
@@ -387,31 +844,12 @@ impl Agent {
                 },
             }),
             Some(parent.clone()),
-            Some(turn_id.clone()),
+            Some(self.turn_id.clone()),
         )?;
         Ok(Message::Tool {
             tool_call_id: call.id.clone(),
             content: format!("[{code}] {message}"),
         })
-    }
-
-    fn tool_schemas(&self) -> Vec<ToolSchema> {
-        self.tools
-            .descriptors()
-            .into_iter()
-            .map(|d| ToolSchema {
-                name: d.name,
-                description: d.description,
-                parameters: d.input_schema,
-            })
-            .collect()
-    }
-
-    fn model_source(&self) -> EventSource {
-        EventSource {
-            kind: SourceKind::Model,
-            id: format!("{}/{}", self.provider.name(), self.config.model),
-        }
     }
 }
 
@@ -436,6 +874,20 @@ fn assistant_tool_calls(message: &Message) -> Vec<ToolCall> {
     match message {
         Message::Assistant { tool_calls, .. } => tool_calls.clone(),
         _ => Vec::new(),
+    }
+}
+
+/// Accumulate per-round token usage into a turn total (saturating).
+const fn add_usage(acc: Usage, round: Usage) -> Usage {
+    Usage {
+        input_tokens: acc.input_tokens.saturating_add(round.input_tokens),
+        output_tokens: acc.output_tokens.saturating_add(round.output_tokens),
+        cache_read_tokens: acc
+            .cache_read_tokens
+            .saturating_add(round.cache_read_tokens),
+        cache_write_tokens: acc
+            .cache_write_tokens
+            .saturating_add(round.cache_write_tokens),
     }
 }
 
@@ -482,6 +934,33 @@ fn tool_error_parts(err: &ToolError) -> (&'static str, String) {
         ToolError::Timeout(d) => ("timeout", format!("timed out after {d:?}")),
         ToolError::ServerCrashed(m) => ("server_crashed", m.clone()),
         ToolError::Execution(m) => ("execution_failed", m.clone()),
+    }
+}
+
+/// Build the [`ErrorDetail`] recorded for a hard turn failure. `code`,
+/// `severity`, and `retryable` are derived from the error kind so a consumer can
+/// route on them: transport hiccups and 429/5xx statuses are worth retrying;
+/// auth, bad requests, decode faults, and any persistence error are not.
+fn error_detail(err: &AgentError) -> ErrorDetail {
+    let (code, severity, retryable) = match err {
+        AgentError::Model(LlmError::Transport(_)) => {
+            ("model_transport", ErrorSeverity::Error, true)
+        }
+        AgentError::Model(LlmError::Status { status, .. }) => {
+            let retryable = *status == 429 || (500..600).contains(status);
+            ("model_status", ErrorSeverity::Error, retryable)
+        }
+        AgentError::Model(LlmError::Decode(_)) => ("model_decode", ErrorSeverity::Error, false),
+        AgentError::Model(LlmError::Auth(_)) => ("model_auth", ErrorSeverity::Fatal, false),
+        AgentError::Session(_) => ("session", ErrorSeverity::Fatal, false),
+    };
+    ErrorDetail {
+        code: code.to_owned(),
+        message: err.to_string(),
+        severity,
+        retryable,
+        source_event_id: None,
+        provider_raw: None,
     }
 }
 
@@ -535,6 +1014,21 @@ mod tests {
         }
     }
 
+    /// A provider whose `stream()` always fails, to drive the hard-error path.
+    struct FailingProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for FailingProvider {
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn name(&self) -> &str {
+            "failing"
+        }
+
+        async fn stream(&self, _request: ModelRequest) -> Result<EventStream, LlmError> {
+            Err(LlmError::Transport("connection refused".to_owned()))
+        }
+    }
+
     fn tool_call_round(id: &str, name: &str, args: &str) -> Vec<StreamEvent> {
         vec![
             StreamEvent::BlockStart {
@@ -574,6 +1068,415 @@ mod tests {
         ]
     }
 
+    /// A round that calls the `plan` control tool with `args`.
+    fn plan_round(call_id: &str, args: &str) -> Vec<StreamEvent> {
+        tool_call_round(call_id, "plan", args)
+    }
+
+    /// An agent with no leaf tools (the `plan` control tool is always present).
+    fn planning_agent(provider: Arc<ScriptedProvider>) -> Agent {
+        Agent::new(
+            provider,
+            ToolRegistry::new(),
+            AgentConfig {
+                model: "mock".to_owned(),
+                ..AgentConfig::default()
+            },
+        )
+    }
+
+    fn injection_count(events: &[CoreEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.payload,
+                    EventPayload::Injection(InjectionEvent::ContextInjected {
+                        source: InjectionSource::Runtime,
+                        ..
+                    })
+                )
+            })
+            .count()
+    }
+
+    /// The `plan` control tool is dispatched like a leaf tool — same
+    /// `ToolEvent` bracket — but applies to `runtime.plan`, and a turn does not
+    /// finish until every step is terminal (the completion gate).
+    #[tokio::test]
+    async fn plan_drives_a_multi_round_turn_to_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            plan_round(
+                "c1",
+                r#"{"op":"init","steps":[{"content":"step one"},{"content":"step two"}]}"#,
+            ),
+            plan_round("c2", r#"{"op":"start","id":"1"}"#),
+            plan_round("c3", r#"{"op":"complete","id":"1"}"#),
+            plan_round("c4", r#"{"op":"complete","id":"2"}"#),
+            text_round("all done"),
+        ]));
+        let agent = planning_agent(provider);
+
+        let store = SessionStore::new(dir.path().join("sessions"));
+        let mut writer = store.create_new(None, None, vec![]).unwrap();
+        let sid = writer.session_id().clone();
+        let mut runtime = SessionRuntime::default();
+
+        let outcome = agent
+            .run_turn(&mut writer, &mut runtime, "do two things".to_owned())
+            .await
+            .unwrap();
+        drop(writer);
+
+        assert_eq!(outcome.answer, "all done");
+        assert_eq!(outcome.rounds, 5);
+        // Plan reached an all-terminal state and persists in the runtime.
+        assert_eq!(runtime.plan.len(), 2);
+        assert!(runtime.plan.iter().all(|s| s.status.is_terminal()));
+
+        // Plan ops are recorded as ordinary builtin ToolEvents (same bracket as
+        // leaf tools), so replay/monitor need no special case.
+        let events = store.read_events(&sid).unwrap();
+        let plan_completions = events
+            .iter()
+            .filter(|e| {
+                matches!(&e.payload, EventPayload::Tool(ToolEvent::Completed { .. }))
+                    && e.source.kind == SourceKind::Tool
+                    && e.source.id == "plan"
+            })
+            .count();
+        assert_eq!(plan_completions, 4);
+        // No gate nudge was needed — the model finished the plan on its own.
+        assert_eq!(injection_count(&events), 0);
+        assert!(seqs_are_contiguous(&events));
+    }
+
+    /// When the model stops with a non-terminal step, the completion gate
+    /// injects a reminder and runs another round instead of exiting.
+    #[tokio::test]
+    async fn completion_gate_nudges_then_lets_turn_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            plan_round("c1", r#"{"op":"init","steps":[{"content":"only step"}]}"#),
+            // Model tries to stop with the step still pending — gate nudges.
+            text_round("I think I'm done"),
+            // After the nudge it finishes the step, then answers.
+            plan_round("c2", r#"{"op":"complete","id":"1"}"#),
+            text_round("actually done now"),
+        ]));
+        let agent = planning_agent(provider);
+
+        let store = SessionStore::new(dir.path().join("sessions"));
+        let mut writer = store.create_new(None, None, vec![]).unwrap();
+        let sid = writer.session_id().clone();
+        let mut runtime = SessionRuntime::default();
+
+        let outcome = agent
+            .run_turn(&mut writer, &mut runtime, "one step".to_owned())
+            .await
+            .unwrap();
+        drop(writer);
+
+        assert_eq!(outcome.answer, "actually done now");
+        assert_eq!(outcome.rounds, 4);
+        let events = store.read_events(&sid).unwrap();
+        // Exactly one runtime reminder was injected, and it persists in context.
+        assert_eq!(injection_count(&events), 1);
+        assert!(runtime.context.iter().any(|m| matches!(
+            m,
+            Message::User { content } if content.contains("not in a terminal state")
+        )));
+    }
+
+    /// If the model keeps stopping with work outstanding, the gate gives up
+    /// after `MAX_GATE` nudges. This is a graceful, *retryable* stop: the turn
+    /// returns `Ok` flagged `PlanStalled`, and the event log records the reason.
+    #[tokio::test]
+    async fn completion_gate_gives_up_after_max_nudges() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            plan_round("c1", r#"{"op":"init","steps":[{"content":"never done"}]}"#),
+            text_round("stopping 1"),
+            text_round("stopping 2"),
+            text_round("stopping 3"),
+        ]));
+        let agent = planning_agent(provider);
+
+        let store = SessionStore::new(dir.path().join("sessions"));
+        let mut writer = store.create_new(None, None, vec![]).unwrap();
+        let sid = writer.session_id().clone();
+        let mut runtime = SessionRuntime::default();
+
+        let outcome = agent
+            .run_turn(&mut writer, &mut runtime, "loop".to_owned())
+            .await
+            .unwrap();
+        drop(writer);
+
+        // Not an error: a partial outcome flagged stalled (one step outstanding).
+        assert_eq!(
+            outcome.incomplete,
+            Some(TurnFailureReason::PlanStalled {
+                incomplete_steps: 1
+            })
+        );
+        let events = store.read_events(&sid).unwrap();
+        // MAX_GATE nudges injected, then a retryable Failed turn carrying the
+        // structured reason so replay can explain the stop.
+        assert_eq!(injection_count(&events), usize::from(MAX_GATE));
+        assert!(events.iter().any(|e| matches!(
+            &e.payload,
+            EventPayload::Turn(TurnEvent::Failed {
+                retryable: true,
+                reason: Some(TurnFailureReason::PlanStalled {
+                    incomplete_steps: 1
+                }),
+                ..
+            })
+        )));
+    }
+
+    /// Running out of round budget is the absolute safety net, not a crash:
+    /// the turn returns `Ok` flagged `MaxRoundsExceeded`, the work it did
+    /// stands, and the event log records the reason (non-retryable).
+    #[tokio::test]
+    async fn max_rounds_returns_incomplete_outcome_not_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // Every round calls a tool, so the loop never settles on its own and
+        // must hit the cap. `start id=1` is idempotent and harmless.
+        let rounds = std::iter::once(plan_round(
+            "c0",
+            r#"{"op":"init","steps":[{"content":"endless"}]}"#,
+        ))
+        .chain((0..10).map(|i| plan_round(&format!("s{i}"), r#"{"op":"start","id":"1"}"#)))
+        .collect();
+        let provider = Arc::new(ScriptedProvider::new(rounds));
+        let agent = Agent::new(
+            provider,
+            ToolRegistry::new(),
+            AgentConfig {
+                model: "mock".to_owned(),
+                max_rounds: 4,
+                ..AgentConfig::default()
+            },
+        );
+
+        let store = SessionStore::new(dir.path().join("sessions"));
+        let mut writer = store.create_new(None, None, vec![]).unwrap();
+        let sid = writer.session_id().clone();
+        let mut runtime = SessionRuntime::default();
+
+        let outcome = agent
+            .run_turn(&mut writer, &mut runtime, "go forever".to_owned())
+            .await
+            .unwrap();
+        drop(writer);
+
+        assert_eq!(outcome.rounds, 4);
+        assert_eq!(
+            outcome.incomplete,
+            Some(TurnFailureReason::MaxRoundsExceeded { max_rounds: 4 })
+        );
+        // The reason is in the log, not just the error string — replayable.
+        let events = store.read_events(&sid).unwrap();
+        assert!(events.iter().any(|e| matches!(
+            &e.payload,
+            EventPayload::Turn(TurnEvent::Failed {
+                retryable: false,
+                reason: Some(TurnFailureReason::MaxRoundsExceeded { max_rounds: 4 }),
+                ..
+            })
+        )));
+        // No clean Completed event was written.
+        assert_eq!(turn_completed_count(&events), 0);
+    }
+
+    /// A `cancel`/`block` op missing its required `reason` fails to decode and
+    /// comes back as an `is_error` tool result (not a protocol failure); the
+    /// model recovers on the next round.
+    #[tokio::test]
+    async fn invalid_plan_op_returns_error_result_and_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            plan_round("c1", r#"{"op":"init","steps":[{"content":"a step"}]}"#),
+            // cancel without a reason — rejected at decode.
+            plan_round("c2", r#"{"op":"cancel","id":"1"}"#),
+            // recovers with a proper reason.
+            plan_round("c3", r#"{"op":"cancel","id":"1","reason":"no such tool"}"#),
+            text_round("cancelled it"),
+        ]));
+        let agent = planning_agent(provider);
+
+        let store = SessionStore::new(dir.path().join("sessions"));
+        let mut writer = store.create_new(None, None, vec![]).unwrap();
+        let sid = writer.session_id().clone();
+        let mut runtime = SessionRuntime::default();
+
+        let outcome = agent
+            .run_turn(&mut writer, &mut runtime, "cancel a step".to_owned())
+            .await
+            .unwrap();
+        drop(writer);
+
+        assert_eq!(outcome.answer, "cancelled it");
+        assert_eq!(runtime.plan[0].status, StepStatus::Cancelled);
+
+        // One plan ToolEvent::Completed carries an is_error result.
+        let events = store.read_events(&sid).unwrap();
+        let had_error_result = events.iter().any(|e| {
+            matches!(
+                &e.payload,
+                EventPayload::Tool(ToolEvent::Completed { result, .. })
+                    if result.is_error && e.source.id == "plan"
+            )
+        });
+        assert!(had_error_result, "invalid plan op should yield is_error");
+    }
+
+    /// A `blocked` step is terminal: it does not trip the completion gate, so
+    /// the turn ends cleanly and the blocked state (with reason) persists in the
+    /// `SessionRuntime` for the next turn to pick up.
+    #[tokio::test]
+    async fn blocked_step_lets_turn_finish_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            plan_round("c1", r#"{"op":"init","steps":[{"content":"needs a key"}]}"#),
+            plan_round(
+                "c2",
+                r#"{"op":"block","id":"1","reason":"set OPENAI_API_KEY"}"#,
+            ),
+            text_round("blocked on your input"),
+        ]));
+        let agent = planning_agent(provider);
+
+        let store = SessionStore::new(dir.path().join("sessions"));
+        let mut writer = store.create_new(None, None, vec![]).unwrap();
+        let mut runtime = SessionRuntime::default();
+
+        let outcome = agent
+            .run_turn(&mut writer, &mut runtime, "do the thing".to_owned())
+            .await
+            .unwrap();
+        drop(writer);
+
+        // Clean finish despite an unfinished-but-blocked step.
+        assert_eq!(outcome.answer, "blocked on your input");
+        assert_eq!(runtime.plan.len(), 1);
+        assert_eq!(runtime.plan[0].status, StepStatus::Blocked);
+        assert_eq!(
+            runtime.plan[0].reason.as_deref(),
+            Some("set OPENAI_API_KEY")
+        );
+    }
+
+    /// A step stuck `in_progress` for `STUCK_THRESHOLD` tool-bearing rounds
+    /// triggers a one-shot stuck reminder.
+    #[tokio::test]
+    async fn stuck_step_triggers_a_reminder() {
+        let dir = tempfile::tempdir().unwrap();
+        // init, then keep re-issuing a (no-op) tool-bearing round so the step
+        // stays in_progress across rounds; check_stuck runs at the end of each
+        // tool-bearing round, and `start id=1` is idempotent.
+        let mut rounds = vec![
+            plan_round("c0", r#"{"op":"init","steps":[{"content":"long step"}]}"#),
+            plan_round("c1", r#"{"op":"start","id":"1"}"#),
+        ];
+        for i in 0..STUCK_THRESHOLD {
+            rounds.push(plan_round(&format!("s{i}"), r#"{"op":"start","id":"1"}"#));
+        }
+        rounds.push(plan_round("done", r#"{"op":"complete","id":"1"}"#));
+        rounds.push(text_round("finished"));
+        let provider = Arc::new(ScriptedProvider::new(rounds));
+        let agent = planning_agent(provider);
+
+        let store = SessionStore::new(dir.path().join("sessions"));
+        let mut writer = store.create_new(None, None, vec![]).unwrap();
+        let sid = writer.session_id().clone();
+        let mut runtime = SessionRuntime::default();
+
+        agent
+            .run_turn(&mut writer, &mut runtime, "slow task".to_owned())
+            .await
+            .unwrap();
+        drop(writer);
+
+        let events = store.read_events(&sid).unwrap();
+        let stuck_warning = events.iter().any(|e| matches!(
+            &e.payload,
+            EventPayload::Injection(InjectionEvent::ContextInjected { source: InjectionSource::Runtime, content, .. })
+                if content.contains("without progress")
+        ));
+        assert!(stuck_warning, "a stuck-step reminder should be injected");
+    }
+
+    /// A step that stays `in_progress` across many rounds but makes real
+    /// progress each round (a leaf tool succeeds) must NOT trip the stuck
+    /// warning: progress clears the counter, so wall-clock rounds alone never
+    /// reach the threshold. This is the false-positive the counter reset fixes.
+    #[tokio::test]
+    async fn productive_step_does_not_trigger_stuck_reminder() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("note.txt"), "content").unwrap();
+
+        // init + start, then well past STUCK_THRESHOLD rounds that each succeed
+        // at a real `read` while step 1 stays in_progress, then complete + answer.
+        let mut rounds = vec![
+            plan_round(
+                "c0",
+                r#"{"op":"init","steps":[{"content":"long but productive"}]}"#,
+            ),
+            plan_round("c1", r#"{"op":"start","id":"1"}"#),
+        ];
+        for i in 0..(STUCK_THRESHOLD + 2) {
+            rounds.push(tool_call_round(
+                &format!("r{i}"),
+                "read",
+                r#"{"path":"note.txt"}"#,
+            ));
+        }
+        rounds.push(plan_round("done", r#"{"op":"complete","id":"1"}"#));
+        rounds.push(text_round("finished"));
+        let provider = Arc::new(ScriptedProvider::new(rounds));
+
+        let mut tools = ToolRegistry::new();
+        crate::tool::register_builtin(&mut tools, workspace);
+        let agent = Agent::new(
+            provider,
+            tools,
+            AgentConfig {
+                model: "mock".to_owned(),
+                ..AgentConfig::default()
+            },
+        );
+
+        let store = SessionStore::new(dir.path().join("sessions"));
+        let mut writer = store
+            .create_new(None, None, vec!["read".to_owned()])
+            .unwrap();
+        let sid = writer.session_id().clone();
+        let mut runtime = SessionRuntime::default();
+
+        agent
+            .run_turn(&mut writer, &mut runtime, "productive task".to_owned())
+            .await
+            .unwrap();
+        drop(writer);
+
+        let events = store.read_events(&sid).unwrap();
+        let stuck_warning = events.iter().any(|e| matches!(
+            &e.payload,
+            EventPayload::Injection(InjectionEvent::ContextInjected { source: InjectionSource::Runtime, content, .. })
+                if content.contains("without progress")
+        ));
+        assert!(
+            !stuck_warning,
+            "a step making progress every round must not be flagged stuck"
+        );
+    }
+
     #[tokio::test]
     async fn turn_runs_tool_call_then_final_answer() {
         let dir = tempfile::tempdir().unwrap();
@@ -604,14 +1507,14 @@ mod tests {
             .create_new(None, None, vec!["read".to_owned()])
             .unwrap();
         let sid = writer.session_id().clone();
-        let mut context = vec![Message::System {
+        let mut runtime = SessionRuntime::new(vec![Message::System {
             content: "be helpful".to_owned(),
-        }];
+        }]);
 
         let outcome = agent
             .run_turn(
                 &mut writer,
-                &mut context,
+                &mut runtime,
                 "what does note.txt say?".to_owned(),
             )
             .await
@@ -623,8 +1526,11 @@ mod tests {
         assert_eq!(outcome.answer, "the file says: secret answer");
 
         // The tool result was fed back into the context for round 2.
-        assert!(matches!(context.last(), Some(Message::Assistant { .. })));
-        assert!(context.iter().any(|m| matches!(
+        assert!(matches!(
+            runtime.context.last(),
+            Some(Message::Assistant { .. })
+        ));
+        assert!(runtime.context.iter().any(|m| matches!(
             m,
             Message::Tool { content, .. } if content.contains("secret answer")
         )));
@@ -657,18 +1563,82 @@ mod tests {
 
         let store = SessionStore::new(dir.path().join("sessions"));
         let mut writer = store.create_new(None, None, vec![]).unwrap();
-        let mut context = Vec::new();
+        let mut runtime = SessionRuntime::default();
 
         let outcome = agent
-            .run_turn(&mut writer, &mut context, "do a thing".to_owned())
+            .run_turn(&mut writer, &mut runtime, "do a thing".to_owned())
             .await
             .unwrap();
 
         assert_eq!(outcome.answer, "recovered");
-        assert!(context.iter().any(|m| matches!(
+        assert!(runtime.context.iter().any(|m| matches!(
             m,
             Message::Tool { content, .. } if content.contains("unknown_tool")
         )));
+    }
+
+    /// A hard provider error aborts the turn as `Err`, but still leaves a
+    /// terminal trace: an `ErrorEvent::Raised` carrying the detail, then a
+    /// `TurnEvent::Failed { reason: None }` pointing at it. This is what lets
+    /// replay/monitor see *every* turn termination, not just graceful ones.
+    #[tokio::test]
+    async fn hard_model_error_records_failed_event_then_propagates() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = Agent::new(
+            Arc::new(FailingProvider),
+            ToolRegistry::new(),
+            AgentConfig {
+                model: "mock".to_owned(),
+                ..AgentConfig::default()
+            },
+        );
+
+        let store = SessionStore::new(dir.path().join("sessions"));
+        let mut writer = store.create_new(None, None, vec![]).unwrap();
+        let sid = writer.session_id().clone();
+        let mut runtime = SessionRuntime::default();
+
+        let result = agent
+            .run_turn(&mut writer, &mut runtime, "trigger a fault".to_owned())
+            .await;
+        drop(writer);
+
+        // The hard error still surfaces to the caller as `Err`.
+        assert!(matches!(result, Err(AgentError::Model(_))));
+
+        let events = store.read_events(&sid).unwrap();
+        // The error detail was recorded as its own event...
+        let error_seq = events.iter().find_map(|e| match &e.payload {
+            EventPayload::Error(ErrorEvent::Raised(detail)) => {
+                assert_eq!(detail.code, "model_transport");
+                assert!(detail.retryable, "transport faults are retryable");
+                Some(e.seq)
+            }
+            _ => None,
+        });
+        let error_seq = error_seq.expect("a hard error should record an ErrorEvent::Raised");
+
+        // ...and a Failed turn (no graceful reason) points back at it.
+        let failed = events.iter().find_map(|e| match &e.payload {
+            EventPayload::Turn(TurnEvent::Failed {
+                failed_at_event_id,
+                reason,
+                retryable,
+                ..
+            }) => Some((failed_at_event_id.clone(), reason.clone(), *retryable)),
+            _ => None,
+        });
+        let (failed_at, reason, retryable) =
+            failed.expect("a hard error should record a TurnEvent::Failed");
+        assert_eq!(reason, None, "hard errors carry no TurnFailureReason");
+        assert!(retryable);
+        assert_eq!(
+            failed_at.seq, error_seq,
+            "Failed must point at the ErrorEvent it paired with"
+        );
+        // No clean Completed was written.
+        assert_eq!(turn_completed_count(&events), 0);
+        assert!(seqs_are_contiguous(&events));
     }
 
     fn starts_with_created(events: &[CoreEvent]) -> bool {
