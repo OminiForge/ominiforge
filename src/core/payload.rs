@@ -45,6 +45,12 @@ pub enum TurnEvent {
         turn_id: TurnId,
         failed_at_event_id: EventId,
         retryable: bool,
+        /// Why the turn did not finish cleanly. Optional for backward
+        /// compatibility with logs written before the field existed; new
+        /// failures always set it so replay/monitoring can explain the stop
+        /// without guessing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<TurnFailureReason>,
     },
     Interrupted {
         turn_id: TurnId,
@@ -54,6 +60,25 @@ pub enum TurnEvent {
         turn_id: TurnId,
         resume_from_event_id: EventId,
     },
+}
+
+/// Why a turn ended without a clean `Completed`.
+///
+/// These are *graceful* stops the loop records and hands back to the caller
+/// (the turn's side effects still stand) — not transport/persistence errors.
+/// A hard error surfaces as a `Result::Err` (never a [`TurnFailureReason`]) but
+/// still leaves a trace: the loop records a `TurnEvent::Failed` with
+/// `reason: None` paired with an [`ErrorEvent::Raised`] carrying the detail, so
+/// `reason.is_some()` distinguishes a graceful stop from a hard abort. See
+/// `doc/event-schema.md` §4 and `doc/plan.md` §6–§7.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TurnFailureReason {
+    /// The absolute max-rounds safety net tripped: the tool loop ran this many
+    /// model rounds without the model giving a final answer.
+    MaxRoundsExceeded { max_rounds: u32 },
+    /// The completion gate gave up: the model kept stopping with this many
+    /// non-terminal plan steps after repeated nudges (`doc/plan.md` §6).
+    PlanStalled { incomplete_steps: u32 },
 }
 
 /// Model interaction.
@@ -280,7 +305,7 @@ pub enum InjectionEvent {
 }
 
 /// What produced an injection. Ordering is kept stable (Memory → Rag → Acp →
-/// Hook) to avoid needless prefix-cache churn.
+/// Hook → Runtime) to avoid needless prefix-cache churn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InjectionSource {
     Memory,
@@ -289,6 +314,10 @@ pub enum InjectionSource {
     #[serde(rename = "ACP")]
     Acp,
     Hook,
+    /// The agent loop itself injected the text — e.g. a completion-gate or
+    /// stuck-step reminder pushed into the context to keep a turn on track.
+    /// See `doc/plan.md` §8.
+    Runtime,
 }
 
 /// A structured error surfaced as its own event. See `doc/event-schema.md` §10.

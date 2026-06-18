@@ -14,8 +14,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
-use crate::agent::{Agent, AgentConfig, BlockKind, StreamSink};
+use crate::agent::{Agent, AgentConfig, BlockKind, SessionRuntime, StreamSink};
 use crate::config::ConfigStore;
+use crate::core::payload::TurnFailureReason;
 use crate::llm::Message;
 use crate::session::SessionStore;
 use crate::tool::{ReadTool, ShellTool, ToolRegistry, WriteTool};
@@ -167,23 +168,44 @@ async fn run_turn(args: RunArgs) -> Result<()> {
         workspace.display()
     );
 
-    let mut context = vec![Message::System {
+    let mut runtime = SessionRuntime::new(vec![Message::System {
         content: ConfigStore::system_prompt(&profile),
-    }];
+    }]);
 
     // The answer streams to stdout live as the model produces it; reasoning and
     // tool activity stream to stderr (dimmed) so they stay out of the captured
     // output. See `CliSink`.
     let mut sink = CliSink::new();
     let outcome = agent
-        .run_turn_with_sink(&mut writer, &mut context, args.prompt, &mut sink)
+        .run_turn_with_sink(&mut writer, &mut runtime, args.prompt, &mut sink)
         .await
         .context("agent turn failed")?;
 
     eprintln!(
-        "[{} round(s), stop: {:?}]",
-        outcome.rounds, outcome.stop_reason
+        "[{} round(s), stop: {:?}, tokens: {}in/{}out]",
+        outcome.rounds,
+        outcome.stop_reason,
+        outcome.usage.input_tokens,
+        outcome.usage.output_tokens,
     );
+
+    // A turn that ran out of round budget or stalled on its plan is not a crash:
+    // the work it did already landed. Warn loudly, but still exit 0 so partial
+    // output (files written, the streamed answer) is not thrown away.
+    if let Some(reason) = &outcome.incomplete {
+        let detail = match reason {
+            TurnFailureReason::MaxRoundsExceeded { max_rounds } => format!(
+                "hit the {max_rounds}-round safety limit before giving a final \
+                 answer. Any files it wrote still stand; re-run to continue, or \
+                 raise max_rounds if the task is genuinely this long."
+            ),
+            TurnFailureReason::PlanStalled { incomplete_steps } => format!(
+                "stopped with {incomplete_steps} plan step(s) unfinished after \
+                 repeated nudges. Check the plan in the session log."
+            ),
+        };
+        eprintln!("warning: turn did not complete cleanly — {detail}");
+    }
     Ok(())
 }
 

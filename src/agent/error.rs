@@ -3,7 +3,23 @@
 use crate::llm::LlmError;
 use crate::session::SessionError;
 
-/// Something went wrong executing a turn.
+/// A hard failure that aborts a turn: the model provider or event persistence
+/// broke.
+///
+/// A turn that merely ran out of round budget or stalled on its plan is *not*
+/// an error — it returns a [`TurnOutcome`] flagged incomplete with a
+/// [`TurnFailureReason`], so its side effects and partial output are preserved
+/// (see [`TurnOutcome::incomplete`]).
+///
+/// A hard failure still leaves a trace before it propagates: the loop makes a
+/// best-effort write of an `ErrorEvent::Raised` plus a `TurnEvent::Failed`
+/// (`reason: None`) so every turn termination is visible to replay/monitor. If
+/// the persistence layer itself is what broke, that closing write may also fail
+/// — it is then silently abandoned and the original error propagates unmasked.
+///
+/// [`TurnOutcome`]: super::TurnOutcome
+/// [`TurnOutcome::incomplete`]: super::TurnOutcome::incomplete
+/// [`TurnFailureReason`]: crate::core::payload::TurnFailureReason
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
     /// The model provider failed.
@@ -13,11 +29,4 @@ pub enum AgentError {
     /// Persisting an event failed.
     #[error("session error: {0}")]
     Session(#[from] SessionError),
-
-    /// The turn made too many model round-trips without finishing, indicating
-    /// a tool-call loop. The cap is [`AgentConfig::max_rounds`].
-    ///
-    /// [`AgentConfig::max_rounds`]: super::AgentConfig::max_rounds
-    #[error("turn exceeded max model rounds ({0})")]
-    MaxRounds(u32),
 }

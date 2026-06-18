@@ -104,15 +104,27 @@ pending → running → completed | failed | interrupted
 enum TurnEvent {
     Started { turn_id: TurnId, input: Option<String> },
     Completed { turn_id: TurnId },
-    Failed { turn_id: TurnId, failed_at_event_id: EventId, retryable: bool },
+    Failed {
+        turn_id: TurnId,
+        failed_at_event_id: EventId,
+        retryable: bool,
+        reason: Option<TurnFailureReason>,   // 追加字段，旧日志为 None
+    },
     Interrupted { turn_id: TurnId, interrupted_at_event_id: EventId },
     Resumed { turn_id: TurnId, resume_from_event_id: EventId },
+}
+
+enum TurnFailureReason {
+    MaxRoundsExceeded { max_rounds: u32 },   // 撞绝对安全网（兜底），非 crash
+    PlanStalled { incomplete_steps: u32 },   // 完成度门放弃（doc/plan.md §6）
 }
 ```
 
 - Turn started 记录开启它的用户输入 `input`（无用户输入的 turn——scheduler、自动续跑——为 `None`）。Replay 从此字段重建开场 user message。
 
-- Turn failed 时记录断点位置 `failed_at_event_id`。
+- Turn failed 时记录断点位置 `failed_at_event_id`，并用 `reason` 说明为什么没干净收尾——replay/monitor 无需猜测。`reason` 是追加字段（append-compatible），早于该字段的日志解析为 `None`。
+- **Failed 不等于进程崩溃**：撞 `max_rounds` 或 plan 卡死是一种*优雅停止*——turn 的副作用（已写文件等）依然成立，loop 写下 `Failed` 事件后把**部分结果**交还调用方（`TurnOutcome.incomplete` 携带同一 `reason`）。
+- **硬错误（provider / 持久化故障）也留痕**：这类故障仍以 `Result::Err`（`AgentError`）冒泡给调用方，不作为 `TurnOutcome` 返回；但在抛出前，loop 会**尽力**先写一条 `ErrorEvent::Raised(ErrorDetail)` 承载真实错误，再写 `TurnEvent::Failed { reason: None, failed_at_event_id → 那条 ErrorEvent }`。所以每个 turn 终止都在事件流里留下尾巴；`reason: None` + 配对的 `ErrorEvent` 把硬错误与优雅停止区分开（优雅停止有 `reason`、无配对 `ErrorEvent`）。持久化故障下补写本身可能再失败，此时静默放弃补写、原样抛出首个错误（绝不掩盖或递归重试）。
 - Interrupted 时记录中断位置 `interrupted_at_event_id`。
 - Resume 不开新 turn，同一 turn_id 继续，从断点续跑。
 - 用户无需重新输入即可恢复。
@@ -276,10 +288,12 @@ enum InjectionSource {
     RAG,
     ACP,
     Hook,
+    Runtime,   // agent loop self-injection (completion-gate / stuck-step reminders)
 }
 ```
 
 - 每轮 model request 前，Context Manager 执行注入并记录此事件。
+- `Runtime` 来源用于 agent loop 自身注入的提醒（完成度门、卡死警告），见 `doc/plan.md` §6–§8。文本用 `<reminder>...</reminder>` 包裹，作为真实消息永久留在 context 历史中（保 prefix cache）。
 - 注入内容保留在 context view 历史中（保 cache），同时持久化到 events.jsonl（保可审计）。
 - Compaction 时历史 injection 被摘要浓缩。
 
