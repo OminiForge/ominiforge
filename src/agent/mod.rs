@@ -23,10 +23,12 @@
 mod collector;
 mod error;
 mod plan;
+mod resume;
 mod sink;
 
 pub use error::AgentError;
 pub use plan::{PlanStep, StepStatus};
+pub use resume::rebuild_runtime;
 pub use sink::{BlockKind, NullSink, StreamSink};
 
 use std::collections::HashMap;
