@@ -112,7 +112,7 @@
 ## 状态
 
 - [x] Step 1 — 多轮循环 + resume ✅（2026-06-19）
-- [ ] Step 2 — token 计数与用量追踪
+- [x] Step 2 — token 计数与用量追踪 ✅（2026-06-20）
 - [ ] Step 3 — compaction
 - [ ] Step 4 — EventBus + monitor
 - [ ] Step 5 — MCP client
@@ -150,3 +150,38 @@ store 层 `latest()` 换成 `list()`（返回全部，ULID 序最新在前）。
 **注意 chat 是临时形态**：Step 6 TUI 完成后，`chat` 子命令移除，resume 能力
 （`rebuild_runtime` + `SessionStore::open`/`list`）移植给 TUI。这些是 UI 无关的库函数，
 迁移只是换调用方。
+
+### Step 2 完成记录（2026-06-20）
+
+实现：`src/context.rs` 落地 `ContextLedger`（measured + pending_bytes 两段模型）。
+- **measured** = 上一次请求返回的权威 `usage.input_tokens`（发出 prefix 的精确 token）；
+  **pending_bytes** = 自那次请求后追加内容的原始字节，用 `bytes/4` 启发式折算。
+  `running() = measured + pending_bytes/4`。
+- `calibrate(input_tokens)`：非 0 时 measured 换成它并清零 tail（响应/工具结果还没追加，
+  正好对齐"已发 prefix"）；为 0（provider 不返回 usage）时保持 measured、tail 继续涨——
+  纯启发式兜底（决策 A）。
+- `effective_limit = threshold × context_window − max_output_tokens`，window 为 0（未知）
+  返回 `None`，调用方跳过阈值逻辑（不把一切当超限）；预留空间不足时 floor 到 0 不回绕。
+- `estimate_tokens` 收编 `inject_runtime` 原先内联的 `len()/4`，注入记账与账本同源。
+
+接线：
+- `SessionRuntime` 加 `ledger` 字段 + 私有 `push_message`（追加 context 必经此，保账本同步）；
+  `new` 用 `ContextLedger::seeded` 从初始 context 预热；`run`/`drive`/`inject_runtime` 四处
+  `context.push` 全改道 `push_message`。
+- agent loop 在 `run_model_round` 内：发请求前 `running()` 填进 `RequestStarted.
+  input_tokens_estimate`（原先硬编码 0）；`collect_round` 拿到 usage 后、追加响应前
+  `calibrate(usage.input_tokens)`。
+- `AgentConfig` 加 `context_window` + `compaction_threshold`（default 0.8）；`context_limit()`
+  代理到 `effective_limit`。`TurnOutcome` 加 `context_tokens` + `context_limit`。
+- CLI `prepare` 从 `resolved.context_window` + `profile.context.compaction_threshold` 注入；
+  `report_turn` 打印 `[context: ~used / limit tokens (pct%)]`，越过阈值再打一行 warning
+  （Step 2 只预警，压缩留给 Step 3）。
+- `rebuild_runtime` 走 `SessionRuntime::new` 给账本播种；resume 不带权威计数，首个请求重新校准。
+- wire.rs `stream_options.include_usage` 早已为 `true`（Step 1 既存），无需改动。
+
+验证：97 测试通过（91→+6：context.rs 4 单测 + agent 2 集成）。集成测试覆盖两条路：
+provider 返回 5000 → 账本贴齐权威值、outcome 报 6000 上限且判定未超；provider 不返回 usage
+（`Usage::default()`）→ 全程纯启发式，`running == 总字节/4`。clippy pedantic+nursery 干净。
+Live（mimo/mimo-v2.5-pro）：单轮 `1068in` 真实 usage，context `~1071 / 672000`
+（0.8×1M−128k），校准正确；低阈值 throwaway profile（threshold=0.05 → limit floor 到 0）
+触发 warning 行验过，事后清理 profile + 两个 live session。

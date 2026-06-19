@@ -47,10 +47,12 @@ use super::{PlanStep, SessionRuntime, render_output};
 /// returned runtime is ready to drive the next turn.
 #[must_use]
 pub fn rebuild_runtime(events: &[CoreEvent], system: Vec<Message>) -> SessionRuntime {
-    SessionRuntime {
-        context: rebuild_context(events, system),
-        plan: rebuild_plan(events),
-    }
+    // Seed the ledger from the rebuilt context via `new`; resume carries no
+    // authoritative token count forward, so the first request after resume
+    // recalibrates it from real usage (`doc/phase2-plan.md` Step 2).
+    let mut runtime = SessionRuntime::new(rebuild_context(events, system));
+    runtime.plan = rebuild_plan(events);
+    runtime
 }
 
 /// Rebuild the conversation view: `system` followed by the messages replayed

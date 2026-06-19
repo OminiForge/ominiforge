@@ -16,6 +16,7 @@ use clap::{Parser, Subcommand};
 
 use crate::agent::{Agent, AgentConfig, BlockKind, SessionRuntime, StreamSink};
 use crate::config::ConfigStore;
+use crate::context::DEFAULT_COMPACTION_THRESHOLD;
 use crate::core::payload::TurnFailureReason;
 use crate::llm::Message;
 use crate::session::SessionStore;
@@ -205,6 +206,11 @@ fn prepare(
             temperature: resolved.temperature,
             max_tokens: Some(resolved.max_output_tokens),
             tool_timeout: Duration::from_secs(120),
+            context_window: resolved.context_window,
+            compaction_threshold: profile
+                .context
+                .compaction_threshold
+                .unwrap_or(DEFAULT_COMPACTION_THRESHOLD),
             ..AgentConfig::default()
         },
     );
@@ -272,6 +278,33 @@ fn report_turn(outcome: &crate::agent::TurnOutcome) {
         outcome.usage.input_tokens,
         outcome.usage.output_tokens,
     );
+
+    // Context-window usage: where the running estimate sits against the
+    // compaction limit. With an unknown window (no limit) just show the count.
+    // Crossing the limit prints a heads-up — Step 2 only warns; compaction
+    // itself arrives in Step 3 (`doc/phase2-plan.md`).
+    match outcome.context_limit {
+        Some(limit) => {
+            let pct = if limit == 0 {
+                100
+            } else {
+                (u64::from(outcome.context_tokens) * 100 / u64::from(limit)).min(999)
+            };
+            eprintln!(
+                "[context: ~{} / {} tokens ({pct}%)]",
+                outcome.context_tokens, limit
+            );
+            if outcome.context_tokens >= limit {
+                eprintln!(
+                    "warning: context is at or over the compaction threshold \
+                     (~{} ≥ {limit} tokens). Auto-compaction lands in a later \
+                     step; for now, start a fresh session if replies degrade.",
+                    outcome.context_tokens
+                );
+            }
+        }
+        None => eprintln!("[context: ~{} tokens (window unknown)]", outcome.context_tokens),
+    }
 
     // A turn that ran out of round budget or stalled on its plan is not a crash:
     // the work it did already landed. Warn loudly, but still continue so partial
