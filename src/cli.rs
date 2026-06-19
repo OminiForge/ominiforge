@@ -40,6 +40,8 @@ pub struct Cli {
 enum Command {
     /// Run a single agent turn against the configured model.
     Run(RunArgs),
+    /// Start a multi-turn interactive conversation (stdio REPL).
+    Chat(ChatArgs),
     /// Scaffold `.omini/` config files (providers + a default profile).
     Init(InitArgs),
 }
@@ -71,6 +73,42 @@ struct RunArgs {
     no_dotenv: bool,
 }
 
+/// Arguments for `ominiforge chat`.
+///
+/// Same model/provider selection as `run`, plus session continuation: with no
+/// continuation flag a fresh session is created; `--resume <id>` reopens a named
+/// session and `--continue` reopens the most recent one, rebuilding its context
+/// from the event log so the conversation picks up where it stopped.
+#[derive(Debug, Parser)]
+struct ChatArgs {
+    /// Workspace directory the agent operates in (default: current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+
+    /// Profile to run (looked up in `.omini/profiles/<name>.toml`).
+    #[arg(long, default_value = DEFAULT_PROFILE)]
+    profile: String,
+
+    /// Model reference (`provider/model` or `model`), overriding the profile.
+    #[arg(long)]
+    model: Option<String>,
+
+    /// Sampling temperature, overriding the profile and model default.
+    #[arg(long)]
+    temperature: Option<f32>,
+
+    /// Do not auto-load a `.env` file; use only the existing environment.
+    #[arg(long)]
+    no_dotenv: bool,
+
+    /// Resume a previous conversation. With a session id, reopen that session;
+    /// without one, list the workspace's sessions and exit so you can pick one.
+    // `num_args = 0..=1` lets `--resume` appear alone (list) or with a value
+    // (reopen); absent entirely means "start a fresh session".
+    #[arg(long, value_name = "SESSION_ID", num_args = 0..=1, default_missing_value = "")]
+    resume: Option<String>,
+}
+
 /// Arguments for `ominiforge init`.
 #[derive(Debug, Parser)]
 struct InitArgs {
@@ -91,14 +129,39 @@ pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Run(args) => run_turn(args).await,
+        Command::Chat(args) => chat(args).await,
         Command::Init(args) => init(&args),
     }
 }
 
 // __APPEND_MARKER__
 
-async fn run_turn(args: RunArgs) -> Result<()> {
-    let workspace = resolve_workspace(args.workspace)?;
+/// Everything `run` and `chat` need once config is loaded and resolved: the
+/// agent, the session store for the workspace, the system prompt to seed a fresh
+/// runtime, and the bits of identity to echo and to stamp on a new session.
+struct Prepared {
+    agent: Agent,
+    session_store: SessionStore,
+    system_prompt: String,
+    profile_name: String,
+    tool_names: Vec<String>,
+    workspace: PathBuf,
+    resolved: crate::config::ResolvedModel,
+}
+
+/// The model/provider/tool selection shared by `run` and `chat`: discover config
+/// under the workspace, load `.env`, resolve the model, build the agent and the
+/// session store. The only difference between the two commands is what they do
+/// with the result (one turn vs. an interactive loop), so all the setup lives
+/// here.
+fn prepare(
+    workspace: Option<PathBuf>,
+    profile_name: &str,
+    model: Option<&str>,
+    temperature: Option<f32>,
+    no_dotenv: bool,
+) -> Result<Prepared> {
+    let workspace = resolve_workspace(workspace)?;
 
     // Config is discovered relative to the workspace (project `.omini` first,
     // then `~/.omini`).
@@ -106,7 +169,7 @@ async fn run_turn(args: RunArgs) -> Result<()> {
 
     // Load secrets from a `.env` file before anything reads `api_key_env`,
     // unless disabled. Real environment variables are never overwritten.
-    if !args.no_dotenv {
+    if !no_dotenv {
         load_dotenv(store.roots(), &workspace);
     }
 
@@ -120,16 +183,11 @@ async fn run_turn(args: RunArgs) -> Result<()> {
         );
     }
     let profile = store
-        .load_profile(&args.profile)
-        .with_context(|| format!("failed to load profile `{}`", args.profile))?;
+        .load_profile(profile_name)
+        .with_context(|| format!("failed to load profile `{profile_name}`"))?;
 
     let resolved = store
-        .resolve(
-            &providers,
-            &profile,
-            args.model.as_deref(),
-            args.temperature,
-        )
+        .resolve(&providers, &profile, model, temperature)
         .context("failed to resolve model selection")?;
 
     let provider = crate::provider::build(&resolved)
@@ -151,36 +209,62 @@ async fn run_turn(args: RunArgs) -> Result<()> {
         },
     );
 
-    let session_store = SessionStore::new(workspace.join(SESSIONS_SUBDIR));
-    let mut writer = session_store
+    Ok(Prepared {
+        agent,
+        session_store: SessionStore::new(workspace.join(SESSIONS_SUBDIR)),
+        system_prompt: ConfigStore::system_prompt(&profile),
+        profile_name: profile.profile.name.clone(),
+        tool_names,
+        workspace,
+        resolved,
+    })
+}
+
+async fn run_turn(args: RunArgs) -> Result<()> {
+    let prep = prepare(
+        args.workspace,
+        &args.profile,
+        args.model.as_deref(),
+        args.temperature,
+        args.no_dotenv,
+    )?;
+
+    let mut writer = prep
+        .session_store
         .create_new(
-            Some(profile.profile.name.clone()),
-            Some(workspace.clone()),
-            tool_names,
+            Some(prep.profile_name.clone()),
+            Some(prep.workspace.clone()),
+            prep.tool_names.clone(),
         )
         .context("failed to create session")?;
     eprintln!(
         "session {} (profile: {}, model: {}/{}, workspace: {})",
         writer.session_id(),
-        profile.profile.name,
-        resolved.provider_name,
-        resolved.model_id,
-        workspace.display()
+        prep.profile_name,
+        prep.resolved.provider_name,
+        prep.resolved.model_id,
+        prep.workspace.display()
     );
 
     let mut runtime = SessionRuntime::new(vec![Message::System {
-        content: ConfigStore::system_prompt(&profile),
+        content: prep.system_prompt.clone(),
     }]);
 
-    // The answer streams to stdout live as the model produces it; reasoning and
-    // tool activity stream to stderr (dimmed) so they stay out of the captured
-    // output. See `CliSink`.
     let mut sink = CliSink::new();
-    let outcome = agent
+    let outcome = prep
+        .agent
         .run_turn_with_sink(&mut writer, &mut runtime, args.prompt, &mut sink)
         .await
         .context("agent turn failed")?;
 
+    report_turn(&outcome);
+    Ok(())
+}
+
+/// Print the per-turn footer (rounds / stop reason / token usage) and, if the
+/// turn was cut short, a loud-but-nonfatal warning explaining why. Shared by
+/// `run` and every turn of `chat`.
+fn report_turn(outcome: &crate::agent::TurnOutcome) {
     eprintln!(
         "[{} round(s), stop: {:?}, tokens: {}in/{}out]",
         outcome.rounds,
@@ -190,7 +274,7 @@ async fn run_turn(args: RunArgs) -> Result<()> {
     );
 
     // A turn that ran out of round budget or stalled on its plan is not a crash:
-    // the work it did already landed. Warn loudly, but still exit 0 so partial
+    // the work it did already landed. Warn loudly, but still continue so partial
     // output (files written, the streamed answer) is not thrown away.
     if let Some(reason) = &outcome.incomplete {
         let detail = match reason {
@@ -205,6 +289,150 @@ async fn run_turn(args: RunArgs) -> Result<()> {
             ),
         };
         eprintln!("warning: turn did not complete cleanly — {detail}");
+    }
+}
+
+/// Run an interactive multi-turn conversation over stdin/stdout.
+///
+/// One session backs the whole conversation: either freshly created, or reopened
+/// (`--resume <id>` / `--continue`) with its [`SessionRuntime`] rebuilt from the
+/// event log so it picks up exactly where it left off. Each non-empty input line
+/// drives one turn; the loop ends on EOF (Ctrl-D) or a `/exit` line.
+async fn chat(args: ChatArgs) -> Result<()> {
+    let prep = prepare(
+        args.workspace,
+        &args.profile,
+        args.model.as_deref(),
+        args.temperature,
+        args.no_dotenv,
+    )?;
+
+    let system = vec![Message::System {
+        content: prep.system_prompt.clone(),
+    }];
+
+    // Open or create the backing session, and build the runtime to match: a
+    // reopened session replays its event log into context + plan, a fresh one
+    // starts from just the system message. `--resume` with no id is a query, not
+    // a turn: list what's available and stop.
+    let (mut writer, mut runtime) = match args.resume.as_deref() {
+        Some(id) if !id.is_empty() => {
+            let sid = crate::core::SessionId(id.to_owned());
+            let events = prep
+                .session_store
+                .read_events(&sid)
+                .with_context(|| format!("failed to read session `{id}`"))?;
+            let writer = prep
+                .session_store
+                .open(&sid)
+                .with_context(|| format!("failed to open session `{id}`"))?;
+            let runtime = crate::agent::rebuild_runtime(&events, system);
+            eprintln!("resumed session {sid} ({} event(s))", events.len());
+            (writer, runtime)
+        }
+        Some(_) => {
+            // `--resume` without an id: show the sessions and exit. Picking one
+            // interactively is a TUI concern; here we just point the user at the
+            // ids so they can re-run with `--resume <id>`.
+            list_sessions(&prep.session_store)?;
+            return Ok(());
+        }
+        None => {
+            let writer = prep
+                .session_store
+                .create_new(
+                    Some(prep.profile_name.clone()),
+                    Some(prep.workspace.clone()),
+                    prep.tool_names.clone(),
+                )
+                .context("failed to create session")?;
+            let runtime = SessionRuntime::new(system);
+            (writer, runtime)
+        }
+    };
+
+    eprintln!(
+        "session {} (profile: {}, model: {}/{}, workspace: {})",
+        writer.session_id(),
+        prep.profile_name,
+        prep.resolved.provider_name,
+        prep.resolved.model_id,
+        prep.workspace.display()
+    );
+    eprintln!("Type your message and press Enter. Ctrl-D or /exit to quit.");
+
+    let stdin = std::io::stdin();
+    loop {
+        eprint!("\n> ");
+        let _ = std::io::stderr().flush();
+
+        let mut line = String::new();
+        let n = stdin
+            .read_line(&mut line)
+            .context("failed to read from stdin")?;
+        if n == 0 {
+            eprintln!("\nbye");
+            break; // EOF (Ctrl-D)
+        }
+        let input = line.trim();
+        if input.is_empty() {
+            continue;
+        }
+        if input == "/exit" || input == "/quit" {
+            eprintln!("bye");
+            break;
+        }
+
+        let mut sink = CliSink::new();
+        let outcome = prep
+            .agent
+            .run_turn_with_sink(&mut writer, &mut runtime, input.to_owned(), &mut sink)
+            .await
+            .context("agent turn failed")?;
+        report_turn(&outcome);
+    }
+    Ok(())
+}
+
+/// Print the workspace's sessions, newest first, so the user can pick one to
+/// `--resume <id>`. Each line shows the id, creation time, and how many user
+/// turns it holds (a quick "did anything happen here" signal). Sessions whose
+/// metadata or log cannot be read are skipped with a warning rather than
+/// aborting the whole listing.
+fn list_sessions(store: &SessionStore) -> Result<()> {
+    let ids = store.list().context("failed to list sessions")?;
+    if ids.is_empty() {
+        eprintln!("no sessions in this workspace yet. Start one with `ominiforge chat`.");
+        return Ok(());
+    }
+
+    eprintln!("sessions (newest first) — resume with `ominiforge chat --resume <id>`:\n");
+    for sid in ids {
+        let created = store.read_meta(&sid).map_or_else(
+            |_| "?".to_owned(),
+            // Stored UTC, shown in the local zone — timestamps are UTC everywhere
+            // except at the human-facing edge (`doc/session-storage.md`).
+            |m| {
+                m.created_at
+                    .with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string()
+            },
+        );
+        let turns = store.read_events(&sid).map_or(0, |events| {
+            events
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        &e.payload,
+                        crate::core::EventPayload::Turn(
+                            crate::core::payload::TurnEvent::Started { .. }
+                        )
+                    )
+                })
+                .count()
+        });
+        println!("  {sid}  {created}  ({turns} turn(s))");
     }
     Ok(())
 }

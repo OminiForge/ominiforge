@@ -253,6 +253,21 @@ backlog（待办）
 延后。等 MCP server 生态成熟后再设计 marketplace。
 当前用户直接配置 mcp.toml 手动管理。
 
+### 16. 配置可发现性（TOML + JSON Schema）— 待实现
+
+TOML 保留作为配置格式（人工编辑友好、带注释、与 Rust 生态一致）。问题是用户不知道有哪些
+字段可配。TOML 无独立 schema 标准，但 **Taplo**（事实标准 TOML LSP）支持用 **JSON Schema
+校验/补全 TOML**：在 TOML 顶部加 `#:schema <url/path>` 指令，编辑器即可自动补全 + 校验 +
+悬停文档（Cargo.toml 的补全即如此）。
+
+方案（后续实现，与功能解耦）：
+- 用 `schemars` 从 Rust 配置类型（providers / profile / pricing / limits / mcp）自动生成
+  JSON Schema，与代码同步不漂移。
+- 随仓库发布 schema 文件；`ominiforge init` 模板顶部写入 `#:schema` 指向它。
+- 新增 `ominiforge config schema`（导出 schema）与 `config validate`（校验配置文件）命令。
+
+不占用 Phase 2 主线；在经过相关配置类型的步骤里顺手给类型 derive `JsonSchema`。
+
 ## 建议实施顺序（修订）
 
 基于 P0-P2 讨论结果，建议实施顺序：
