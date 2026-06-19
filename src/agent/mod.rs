@@ -35,6 +35,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::context::{ContextLedger, DEFAULT_COMPACTION_THRESHOLD, effective_limit, estimate_tokens};
 use crate::core::payload::{
     Content, ErrorDetail, ErrorEvent, ErrorSeverity, InjectionEvent, InjectionSource, ModelEvent,
     StopReason, ToolEvent, ToolOutput, ToolSource, TurnEvent, TurnFailureReason, Usage,
@@ -72,6 +73,13 @@ pub struct AgentConfig {
     /// it is set generously: a routine multi-step task (read many files, run a
     /// few commands, write output) legitimately needs dozens of rounds.
     pub max_rounds: u32,
+    /// The model's context window in tokens, for the usage estimate's effective
+    /// limit. `0` means "unknown" (threshold tracking is skipped).
+    pub context_window: u32,
+    /// Fraction of the context window to stay under before compaction is due
+    /// (`doc/context-management.md` §4.2). Step 2 only warns at this threshold;
+    /// compaction itself lands in Step 3.
+    pub compaction_threshold: f32,
 }
 
 impl Default for AgentConfig {
@@ -82,6 +90,8 @@ impl Default for AgentConfig {
             max_tokens: None,
             tool_timeout: Duration::from_secs(120),
             max_rounds: 100,
+            context_window: 0,
+            compaction_threshold: DEFAULT_COMPACTION_THRESHOLD,
         }
     }
 }
@@ -100,17 +110,30 @@ pub struct SessionRuntime {
     /// Working plan; survives across turns until every step reaches a terminal
     /// state or the model replaces it via `init` (`doc/plan.md` §10).
     pub plan: Vec<PlanStep>,
+    /// Running input-token estimate for the context view, calibrated each round
+    /// from the provider's authoritative usage (`doc/phase2-plan.md` Step 2).
+    pub ledger: ContextLedger,
 }
 
 impl SessionRuntime {
     /// A runtime seeded with an initial context (typically the system message)
-    /// and an empty plan.
+    /// and an empty plan. The ledger is primed from the seed so the first turn's
+    /// pre-request estimate already accounts for it.
     #[must_use]
-    pub const fn new(context: Vec<Message>) -> Self {
+    pub fn new(context: Vec<Message>) -> Self {
+        let ledger = ContextLedger::seeded(&context);
         Self {
             context,
             plan: Vec::new(),
+            ledger,
         }
+    }
+
+    /// Append a message to the context view and account for its tokens. Every
+    /// addition to `context` must go through here so the ledger stays in step.
+    fn push_message(&mut self, message: Message) {
+        self.ledger.record_message(&message);
+        self.context.push(message);
     }
 }
 
@@ -130,6 +153,13 @@ pub struct TurnOutcome {
     /// decides whether to surface it, retry, or prompt the user. Mirrors the
     /// `reason` on the persisted `TurnEvent::Failed`.
     pub incomplete: Option<TurnFailureReason>,
+    /// Running input-token estimate for the context view at turn end, calibrated
+    /// from the provider's usage where available (`doc/phase2-plan.md` Step 2).
+    pub context_tokens: u32,
+    /// The token budget the context should stay under (`threshold × window −
+    /// max_output`), or `None` when the context window is unknown. `context_tokens`
+    /// exceeding this is the compaction trigger (Step 3); Step 2 only warns.
+    pub context_limit: Option<u32>,
 }
 
 /// Couples a model provider with a tool registry and per-turn config.
@@ -232,6 +262,18 @@ impl Agent {
     }
 }
 
+impl AgentConfig {
+    /// The token budget the context should stay under, or `None` if the context
+    /// window is unknown. Delegates to [`effective_limit`].
+    fn context_limit(&self) -> Option<u32> {
+        effective_limit(
+            self.context_window,
+            self.compaction_threshold,
+            self.max_tokens,
+        )
+    }
+}
+
 /// All mutable state threaded through one turn of the agent loop.
 ///
 /// Constructed when a turn starts, dropped when it ends. Owns the turn-scoped
@@ -293,7 +335,7 @@ impl TurnState<'_> {
             None,
             Some(self.turn_id.clone()),
         )?;
-        self.runtime.context.push(Message::User { content: input });
+        self.runtime.push_message(Message::User { content: input });
 
         match self.drive().await {
             Ok(outcome) => Ok(outcome),
@@ -318,7 +360,7 @@ impl TurnState<'_> {
             if !answer.is_empty() {
                 self.answer = answer;
             }
-            self.runtime.context.push(outcome.message.clone());
+            self.runtime.push_message(outcome.message.clone());
 
             if tool_calls.is_empty() {
                 match self.completion_gate()? {
@@ -346,7 +388,7 @@ impl TurnState<'_> {
                 let event_id = outcome.tool_call_event_ids.get(&call.id).cloned();
                 let (result, made_progress) = self.dispatch(&call, event_id).await?;
                 progressed |= made_progress;
-                self.runtime.context.push(result);
+                self.runtime.push_message(result);
             }
             self.check_stuck(progressed)?;
         }
@@ -450,6 +492,8 @@ impl TurnState<'_> {
             rounds: self.round,
             usage: self.accumulated_usage,
             incomplete,
+            context_tokens: self.runtime.ledger.running(),
+            context_limit: self.agent.config.context_limit(),
         }
     }
 
@@ -534,7 +578,7 @@ impl TurnState<'_> {
     /// Push a runtime reminder into the context (kept permanently, for prefix
     /// cache) and mirror it as an `InjectionEvent` (`doc/plan.md` §8).
     fn inject_runtime(&mut self, content: String) -> Result<(), AgentError> {
-        let token_count = u32::try_from(content.len() / 4).unwrap_or(u32::MAX);
+        let token_count = estimate_tokens(&content);
         self.writer.append(
             runtime_source(),
             EventPayload::Injection(InjectionEvent::ContextInjected {
@@ -545,7 +589,7 @@ impl TurnState<'_> {
             None,
             Some(self.turn_id.clone()),
         )?;
-        self.runtime.context.push(Message::User { content });
+        self.runtime.push_message(Message::User { content });
         Ok(())
     }
 
@@ -568,6 +612,11 @@ impl TurnState<'_> {
             max_tokens: config.max_tokens,
         };
 
+        // Best pre-request estimate of the prefix we're about to send: the
+        // ledger's running count, authoritative for everything measured so far
+        // plus a heuristic tail (`doc/phase2-plan.md` Step 2).
+        let input_tokens_estimate = self.runtime.ledger.running();
+
         self.writer.append(
             source.clone(),
             EventPayload::Model(ModelEvent::RequestStarted {
@@ -577,7 +626,7 @@ impl TurnState<'_> {
                 temperature: config.temperature,
                 max_tokens: config.max_tokens,
                 tool_schemas_count: u32::try_from(tools.len()).unwrap_or(u32::MAX),
-                input_tokens_estimate: 0,
+                input_tokens_estimate,
             }),
             None,
             Some(self.turn_id.clone()),
@@ -596,6 +645,12 @@ impl TurnState<'_> {
             &self.turn_id,
         )
         .await?;
+
+        // Calibrate the ledger against the provider's authoritative input-token
+        // count *before* the reply / tool results are appended: `usage.input_tokens`
+        // measures exactly the prefix we just sent. A provider that returns no
+        // usage (`0`) leaves the ledger on its heuristic (decision A).
+        self.runtime.ledger.calibrate(outcome.usage.input_tokens);
 
         self.writer.append(
             source,
@@ -1066,6 +1121,31 @@ mod tests {
             StreamEvent::Completed {
                 stop_reason: StopReason::EndTurn,
                 usage: Usage::default(),
+            },
+        ]
+    }
+
+    /// Like [`text_round`] but the `Completed` carries a provider `input_tokens`
+    /// count, so the round calibrates the context ledger (the authoritative path).
+    fn text_round_with_input_tokens(text: &str, input_tokens: u32) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::BlockStart {
+                index: 0,
+                block_type: ContentBlockType::Text,
+            },
+            StreamEvent::TextDelta {
+                index: 0,
+                text: text.to_owned(),
+            },
+            StreamEvent::BlockStop { index: 0 },
+            StreamEvent::Completed {
+                stop_reason: StopReason::EndTurn,
+                usage: Usage {
+                    input_tokens,
+                    output_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
             },
         ]
     }
@@ -1641,6 +1721,91 @@ mod tests {
         // No clean Completed was written.
         assert_eq!(turn_completed_count(&events), 0);
         assert!(seqs_are_contiguous(&events));
+    }
+
+    /// When the provider returns a real `input_tokens`, the ledger snaps to it
+    /// (authoritative), and the turn outcome reports it against the configured
+    /// limit. Heuristic estimation of the seed is overwritten by the real count.
+    #[tokio::test]
+    async fn usage_calibrates_context_ledger_and_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        // One round that reports the prefix was 5000 tokens.
+        let provider = Arc::new(ScriptedProvider::new(vec![text_round_with_input_tokens(
+            "hi", 5000,
+        )]));
+        let agent = Agent::new(
+            provider,
+            ToolRegistry::new(),
+            AgentConfig {
+                model: "mock".to_owned(),
+                context_window: 10_000,
+                compaction_threshold: 0.8,
+                max_tokens: Some(2000),
+                ..AgentConfig::default()
+            },
+        );
+
+        let store = SessionStore::new(dir.path().join("sessions"));
+        let mut writer = store.create_new(None, None, vec![]).unwrap();
+        let mut runtime = SessionRuntime::new(vec![Message::System {
+            content: "be helpful".to_owned(),
+        }]);
+
+        let outcome = agent
+            .run_turn(&mut writer, &mut runtime, "hello".to_owned())
+            .await
+            .unwrap();
+        drop(writer);
+
+        // Ledger snapped to the authoritative 5000 — the reply ("hi", 2 bytes)
+        // adds a negligible heuristic tail (0 tokens), so the running count is 5000.
+        assert_eq!(outcome.context_tokens, 5000);
+        // effective_limit = 0.8 × 10_000 − 2000 = 6000.
+        assert_eq!(outcome.context_limit, Some(6000));
+        // 5000 < 6000 → under threshold.
+        assert!(outcome.context_tokens < outcome.context_limit.unwrap());
+        // And the runtime ledger persists the calibration for the next turn.
+        assert_eq!(runtime.ledger.running(), 5000);
+    }
+
+    /// A provider that never returns usage (`input_tokens == 0`) leaves the
+    /// ledger on the pure heuristic: the running count equals `bytes / 4` over
+    /// the whole context, and no authoritative value ever lands. This is the
+    /// OpenAI-compatible-endpoint fallback (decision A).
+    #[tokio::test]
+    async fn missing_usage_falls_back_to_heuristic_estimate() {
+        let dir = tempfile::tempdir().unwrap();
+        // `text_round` carries Usage::default() → input_tokens == 0 (no usage).
+        let provider = Arc::new(ScriptedProvider::new(vec![text_round("ok")]));
+        let agent = Agent::new(
+            provider,
+            ToolRegistry::new(),
+            AgentConfig {
+                model: "mock".to_owned(),
+                context_window: 10_000,
+                ..AgentConfig::default()
+            },
+        );
+
+        let system = "s".repeat(40); // 40 bytes
+        let store = SessionStore::new(dir.path().join("sessions"));
+        let mut writer = store.create_new(None, None, vec![]).unwrap();
+        let mut runtime = SessionRuntime::new(vec![Message::System {
+            content: system.clone(),
+        }]);
+
+        let user = "u".repeat(80); // 80 bytes
+        let outcome = agent
+            .run_turn(&mut writer, &mut runtime, user.clone())
+            .await
+            .unwrap();
+        drop(writer);
+
+        // Pure heuristic: system(40) + user(80) + assistant "ok"(2) = 122 bytes
+        // → 122 / 4 = 30 tokens. No calibration happened (no usage).
+        let expected = (system.len() + user.len() + "ok".len()) / 4;
+        assert_eq!(outcome.context_tokens as usize, expected);
+        assert_eq!(runtime.ledger.running() as usize, expected);
     }
 
     fn starts_with_created(events: &[CoreEvent]) -> bool {
