@@ -35,6 +35,7 @@ use crate::core::{
 
 const META_FILE: &str = "session.toml";
 const EVENTS_FILE: &str = "events.jsonl";
+const SNAPSHOT_FILE: &str = "context_snapshot.json";
 
 /// Owns the root directory under which all session directories live, and mints,
 /// opens, and reads sessions.
@@ -201,6 +202,78 @@ impl SessionStore {
     /// Filesystem or parse errors surface as [`SessionError`].
     pub fn read_events(&self, session_id: &SessionId) -> Result<Vec<CoreEvent>> {
         event_log::read_events(&self.events_path(session_id), session_id)
+    }
+
+    /// Create a compaction session: mint an id, write `session.toml` with a
+    /// compaction origin, save the context snapshot, and emit the opening event.
+    ///
+    /// Returns a locked [`SessionWriter`] positioned after the `Created` event.
+    /// The snapshot must be a valid messages array (system + conversation).
+    ///
+    /// # Errors
+    /// Filesystem or serialization failures surface as [`SessionError`].
+    pub fn create_compaction(
+        &self,
+        parent_id: SessionId,
+        profile_id: Option<String>,
+        workspace: Option<PathBuf>,
+        tools: Vec<String>,
+        snapshot: &[crate::llm::Message],
+    ) -> Result<SessionWriter> {
+        let session_id = id::generate();
+        let dir = self.session_dir(&session_id);
+        std::fs::create_dir_all(&dir).map_err(|source| SessionError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+
+        let meta = SessionMeta {
+            id: session_id.clone(),
+            profile_id: profile_id.clone(),
+            created_at: Utc::now(),
+            workspace: workspace.clone(),
+            origin: Origin::compaction(parent_id),
+        };
+        self.write_meta(&meta)?;
+
+        let snapshot_path = dir.join(SNAPSHOT_FILE);
+        let snapshot_json = serde_json::to_string_pretty(snapshot)?;
+        std::fs::write(&snapshot_path, snapshot_json).map_err(|source| SessionError::Io {
+            path: snapshot_path,
+            source,
+        })?;
+
+        let log = EventLog::open(&self.events_path(&session_id))?;
+        let mut writer = SessionWriter {
+            session_id,
+            log,
+            next_seq: 0,
+        };
+
+        let created = EventPayload::Session(SessionEvent::Created {
+            profile_id,
+            tools,
+            workspace,
+        });
+        writer.append(runtime_source(), created, None, None)?;
+        Ok(writer)
+    }
+
+    /// Read the context snapshot for a non-new session (fork/compaction/reconfiguration).
+    ///
+    /// # Errors
+    /// [`SessionError::NotFound`] if the snapshot file is absent, otherwise a
+    /// filesystem or parse error.
+    pub fn read_snapshot(&self, session_id: &SessionId) -> Result<Vec<crate::llm::Message>> {
+        let path = self.session_dir(session_id).join(SNAPSHOT_FILE);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Err(SessionError::NotFound(session_id.clone()));
+            }
+            Err(source) => return Err(SessionError::Io { path, source }),
+        };
+        Ok(serde_json::from_str(&text)?)
     }
 
     fn write_meta(&self, meta: &SessionMeta) -> Result<()> {
@@ -450,5 +523,42 @@ mod tests {
         assert!(second_id.0 > first_id.0, "ULIDs sort in creation order");
         // Newest first.
         assert_eq!(store.list().unwrap(), vec![second_id, first_id]);
+    }
+
+    /// Compaction creates a new session with origin.kind=compaction, writes the
+    /// snapshot, and emits a Created event.
+    #[test]
+    fn create_compaction_writes_snapshot_and_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+
+        let parent = store.create_new(Some("p".to_owned()), None, vec![]).unwrap();
+        let parent_id = parent.session_id().clone();
+        drop(parent);
+
+        let snapshot = vec![
+            crate::llm::Message::System { content: "sys".to_owned() },
+            crate::llm::Message::User { content: "summary".to_owned() },
+        ];
+        let writer = store.create_compaction(
+            parent_id.clone(),
+            Some("p".to_owned()),
+            None,
+            vec!["read".to_owned()],
+            &snapshot,
+        ).unwrap();
+        let new_id = writer.session_id().clone();
+        drop(writer);
+
+        let meta = store.read_meta(&new_id).unwrap();
+        assert_eq!(meta.origin.kind, OriginKind::Compaction);
+        assert_eq!(meta.origin.parent_id, Some(parent_id));
+
+        let loaded = store.read_snapshot(&new_id).unwrap();
+        assert_eq!(loaded, snapshot);
+
+        let events = store.read_events(&new_id).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0].payload, EventPayload::Session(SessionEvent::Created { .. })));
     }
 }

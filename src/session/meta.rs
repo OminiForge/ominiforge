@@ -72,6 +72,16 @@ impl Origin {
             fork_at_seq: None,
         }
     }
+
+    /// Origin for a compaction session.
+    #[must_use]
+    pub const fn compaction(parent_id: SessionId) -> Self {
+        Self {
+            kind: OriginKind::Compaction,
+            parent_id: Some(parent_id),
+            fork_at_seq: None,
+        }
+    }
 }
 
 impl Default for Origin {

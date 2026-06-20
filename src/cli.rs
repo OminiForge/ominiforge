@@ -19,7 +19,7 @@ use crate::config::ConfigStore;
 use crate::context::DEFAULT_COMPACTION_THRESHOLD;
 use crate::core::payload::TurnFailureReason;
 use crate::llm::Message;
-use crate::session::SessionStore;
+use crate::session::{SessionStore, SessionWriter};
 use crate::tool::{ReadTool, ShellTool, ToolRegistry, WriteTool};
 
 const SESSIONS_SUBDIR: &str = ".omini/sessions";
@@ -281,8 +281,8 @@ fn report_turn(outcome: &crate::agent::TurnOutcome) {
 
     // Context-window usage: where the running estimate sits against the
     // compaction limit. With an unknown window (no limit) just show the count.
-    // Crossing the limit prints a heads-up — Step 2 only warns; compaction
-    // itself arrives in Step 3 (`doc/phase2-plan.md`).
+    // Crossing the limit prints a heads-up; in `chat` the loop then auto-compacts
+    // (single-turn `run` has no loop to compact, so the note stands on its own).
     match outcome.context_limit {
         Some(limit) => {
             let pct = if limit == 0 {
@@ -297,8 +297,7 @@ fn report_turn(outcome: &crate::agent::TurnOutcome) {
             if outcome.context_tokens >= limit {
                 eprintln!(
                     "warning: context is at or over the compaction threshold \
-                     (~{} ≥ {limit} tokens). Auto-compaction lands in a later \
-                     step; for now, start a fresh session if replies degrade.",
+                     (~{} ≥ {limit} tokens).",
                     outcome.context_tokens
                 );
             }
@@ -344,45 +343,13 @@ async fn chat(args: ChatArgs) -> Result<()> {
         content: prep.system_prompt.clone(),
     }];
 
-    // Open or create the backing session, and build the runtime to match: a
-    // reopened session replays its event log into context + plan, a fresh one
-    // starts from just the system message. `--resume` with no id is a query, not
-    // a turn: list what's available and stop.
-    let (mut writer, mut runtime) = match args.resume.as_deref() {
-        Some(id) if !id.is_empty() => {
-            let sid = crate::core::SessionId(id.to_owned());
-            let events = prep
-                .session_store
-                .read_events(&sid)
-                .with_context(|| format!("failed to read session `{id}`"))?;
-            let writer = prep
-                .session_store
-                .open(&sid)
-                .with_context(|| format!("failed to open session `{id}`"))?;
-            let runtime = crate::agent::rebuild_runtime(&events, system);
-            eprintln!("resumed session {sid} ({} event(s))", events.len());
-            (writer, runtime)
-        }
-        Some(_) => {
-            // `--resume` without an id: show the sessions and exit. Picking one
-            // interactively is a TUI concern; here we just point the user at the
-            // ids so they can re-run with `--resume <id>`.
-            list_sessions(&prep.session_store)?;
-            return Ok(());
-        }
-        None => {
-            let writer = prep
-                .session_store
-                .create_new(
-                    Some(prep.profile_name.clone()),
-                    Some(prep.workspace.clone()),
-                    prep.tool_names.clone(),
-                )
-                .context("failed to create session")?;
-            let runtime = SessionRuntime::new(system);
-            (writer, runtime)
-        }
-    };
+    // Open or create the backing session. `--resume` with no id lists sessions
+    // and signals exit (nothing to drive).
+    let (mut writer, mut runtime) =
+        match open_or_create_session(&prep, args.resume.as_deref(), system)? {
+            ChatSession::Ready(writer, runtime) => (writer, runtime),
+            ChatSession::Listed => return Ok(()),
+        };
 
     eprintln!(
         "session {} (profile: {}, model: {}/{}, workspace: {})",
@@ -415,6 +382,18 @@ async fn chat(args: ChatArgs) -> Result<()> {
             eprintln!("bye");
             break;
         }
+        if input == "/compact" {
+            swap_to_compaction(
+                &prep.agent,
+                &prep.session_store,
+                &mut writer,
+                &mut runtime,
+                None,
+                "compact",
+            )
+            .await;
+            continue;
+        }
 
         let mut sink = CliSink::new();
         let outcome = prep
@@ -423,8 +402,78 @@ async fn chat(args: ChatArgs) -> Result<()> {
             .await
             .context("agent turn failed")?;
         report_turn(&outcome);
+
+        // Auto-compaction: once the running estimate crosses the compaction
+        // limit, summarize and switch to a fresh session before the next turn
+        // (`doc/context-management.md` §4).
+        if outcome.context_limit.is_some_and(|l| outcome.context_tokens >= l) {
+            eprintln!("\nauto-compacting (context ~{} tokens)...", outcome.context_tokens);
+            swap_to_compaction(
+                &prep.agent,
+                &prep.session_store,
+                &mut writer,
+                &mut runtime,
+                None,
+                "auto-compact",
+            )
+            .await;
+        }
     }
     Ok(())
+}
+
+/// Outcome of opening the session that backs a `chat` run.
+enum ChatSession {
+    /// A fresh or resumed session, ready to drive turns.
+    Ready(SessionWriter, SessionRuntime),
+    /// `--resume` with no id: the sessions were listed; `chat` should exit.
+    Listed,
+}
+
+/// Open or create the session backing a `chat` run, building the matching
+/// runtime: `--resume <id>` reopens that session and replays its event log into
+/// context + plan; `--resume` with no id lists the workspace's sessions and
+/// signals `chat` to exit; no flag creates a fresh session seeded with `system`.
+fn open_or_create_session(
+    prep: &Prepared,
+    resume: Option<&str>,
+    system: Vec<Message>,
+) -> Result<ChatSession> {
+    match resume {
+        Some(id) if !id.is_empty() => {
+            let sid = crate::core::SessionId(id.to_owned());
+            let events = prep
+                .session_store
+                .read_events(&sid)
+                .with_context(|| format!("failed to read session `{id}`"))?;
+            let writer = prep
+                .session_store
+                .open(&sid)
+                .with_context(|| format!("failed to open session `{id}`"))?;
+            let runtime = crate::agent::rebuild_runtime(&events, system);
+            eprintln!("resumed session {sid} ({} event(s))", events.len());
+            Ok(ChatSession::Ready(writer, runtime))
+        }
+        Some(_) => {
+            // `--resume` without an id: show the sessions and exit. Picking one
+            // interactively is a TUI concern; here we just point the user at the
+            // ids so they can re-run with `--resume <id>`.
+            list_sessions(&prep.session_store)?;
+            Ok(ChatSession::Listed)
+        }
+        None => {
+            let writer = prep
+                .session_store
+                .create_new(
+                    Some(prep.profile_name.clone()),
+                    Some(prep.workspace.clone()),
+                    prep.tool_names.clone(),
+                )
+                .context("failed to create session")?;
+            let runtime = SessionRuntime::new(system);
+            Ok(ChatSession::Ready(writer, runtime))
+        }
+    }
 }
 
 /// Print the workspace's sessions, newest first, so the user can pick one to
@@ -677,6 +726,61 @@ fn pick_dotenv_path(roots: &[PathBuf], workspace: &Path) -> Option<PathBuf> {
             let ws = workspace.join(".env");
             ws.is_file().then_some(ws)
         })
+}
+
+/// Compact the current session in place: generate a summary, create a compaction
+/// session, and swap `writer`/`runtime` over to it so the conversation continues
+/// in the new session. A failure is reported but non-fatal — the caller keeps the
+/// current session. Shared by the manual `/compact` command and the automatic
+/// over-threshold trigger; `label` distinguishes them in the log.
+async fn swap_to_compaction(
+    agent: &Agent,
+    store: &SessionStore,
+    writer: &mut SessionWriter,
+    runtime: &mut SessionRuntime,
+    keep_last: Option<usize>,
+    label: &str,
+) {
+    match do_compact(agent, writer, runtime, store, keep_last).await {
+        Ok((new_writer, new_runtime)) => {
+            *writer = new_writer;
+            *runtime = new_runtime;
+            eprintln!("{label}: switched to session {}", writer.session_id());
+        }
+        Err(e) => eprintln!("{label}: failed — {e}"),
+    }
+}
+
+/// Compact the current session: generate a summary, create a compaction session,
+/// and return the new writer and runtime ready to continue.
+async fn do_compact(
+    agent: &Agent,
+    writer: &SessionWriter,
+    runtime: &SessionRuntime,
+    store: &SessionStore,
+    keep_last: Option<usize>,
+) -> Result<(SessionWriter, SessionRuntime)> {
+    let snapshot = agent
+        .compact(runtime, keep_last)
+        .await
+        .context("failed to generate summary")?
+        .context("nothing to compact")?;
+
+    let old_sid = writer.session_id().clone();
+    let meta = store.read_meta(&old_sid)?;
+
+    let new_writer = store
+        .create_compaction(
+            old_sid,
+            meta.profile_id,
+            meta.workspace,
+            Vec::new(), // tools re-registered from profile
+            &snapshot,
+        )
+        .context("failed to create compaction session")?;
+
+    let new_runtime = SessionRuntime::new(snapshot);
+    Ok((new_writer, new_runtime))
 }
 
 // __APPEND_MARKER2__
