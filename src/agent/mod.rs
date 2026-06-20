@@ -35,7 +35,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::context::{ContextLedger, DEFAULT_COMPACTION_THRESHOLD, effective_limit, estimate_tokens};
+use crate::context::{
+    ContextLedger, DEFAULT_COMPACTION_THRESHOLD, effective_limit, estimate_tokens,
+};
 use crate::core::payload::{
     Content, ErrorDetail, ErrorEvent, ErrorSeverity, InjectionEvent, InjectionSource, ModelEvent,
     StopReason, ToolEvent, ToolOutput, ToolSource, TurnEvent, TurnFailureReason, Usage,
@@ -299,7 +301,8 @@ impl Agent {
         messages.push(Message::User {
             content: "<instruction>Summarize the above conversation concisely, preserving \
                       key facts, decisions, and context needed to continue the conversation. \
-                      Keep it under 500 tokens.</instruction>".to_owned(),
+                      Keep it under 500 tokens.</instruction>"
+                .to_owned(),
         });
 
         // Use the dedicated compaction provider/model if configured, else the
@@ -1930,13 +1933,27 @@ mod tests {
     #[test]
     fn split_compaction_no_keep_summarizes_everything_after_system() {
         let ctx = vec![
-            Message::System { content: "sys".to_owned() },
-            Message::User { content: "u1".to_owned() },
-            Message::Assistant { content: Some("a1".to_owned()), tool_calls: vec![] },
-            Message::User { content: "u2".to_owned() },
+            Message::System {
+                content: "sys".to_owned(),
+            },
+            Message::User {
+                content: "u1".to_owned(),
+            },
+            Message::Assistant {
+                content: Some("a1".to_owned()),
+                tool_calls: vec![],
+            },
+            Message::User {
+                content: "u2".to_owned(),
+            },
         ];
         let (system, mid, tail) = split_for_compaction(&ctx, None);
-        assert_eq!(system, vec![Message::System { content: "sys".to_owned() }]);
+        assert_eq!(
+            system,
+            vec![Message::System {
+                content: "sys".to_owned()
+            }]
+        );
         assert_eq!(mid.len(), 3);
         assert!(tail.is_empty());
     }
@@ -1946,24 +1963,52 @@ mod tests {
     #[test]
     fn split_compaction_keeps_last_user_turn_verbatim() {
         let ctx = vec![
-            Message::System { content: "sys".to_owned() },
-            Message::User { content: "u1".to_owned() },
-            Message::Assistant { content: Some("a1".to_owned()), tool_calls: vec![] },
-            Message::User { content: "u2".to_owned() },
-            Message::Assistant { content: Some("a2".to_owned()), tool_calls: vec![] },
+            Message::System {
+                content: "sys".to_owned(),
+            },
+            Message::User {
+                content: "u1".to_owned(),
+            },
+            Message::Assistant {
+                content: Some("a1".to_owned()),
+                tool_calls: vec![],
+            },
+            Message::User {
+                content: "u2".to_owned(),
+            },
+            Message::Assistant {
+                content: Some("a2".to_owned()),
+                tool_calls: vec![],
+            },
         ];
         let (system, mid, tail) = split_for_compaction(&ctx, Some(1));
         assert_eq!(system.len(), 1);
         // u1, a1 get summarized.
-        assert_eq!(mid, vec![
-            Message::User { content: "u1".to_owned() },
-            Message::Assistant { content: Some("a1".to_owned()), tool_calls: vec![] },
-        ]);
+        assert_eq!(
+            mid,
+            vec![
+                Message::User {
+                    content: "u1".to_owned()
+                },
+                Message::Assistant {
+                    content: Some("a1".to_owned()),
+                    tool_calls: vec![]
+                },
+            ]
+        );
         // u2 onward kept verbatim.
-        assert_eq!(tail, vec![
-            Message::User { content: "u2".to_owned() },
-            Message::Assistant { content: Some("a2".to_owned()), tool_calls: vec![] },
-        ]);
+        assert_eq!(
+            tail,
+            vec![
+                Message::User {
+                    content: "u2".to_owned()
+                },
+                Message::Assistant {
+                    content: Some("a2".to_owned()),
+                    tool_calls: vec![]
+                },
+            ]
+        );
     }
 
     /// When `keep_last` exceeds the available user turns, nothing is summarized:
@@ -1971,8 +2016,12 @@ mod tests {
     #[test]
     fn split_compaction_keep_more_than_available_summarizes_nothing() {
         let ctx = vec![
-            Message::System { content: "sys".to_owned() },
-            Message::User { content: "u1".to_owned() },
+            Message::System {
+                content: "sys".to_owned(),
+            },
+            Message::User {
+                content: "u1".to_owned(),
+            },
         ];
         let (_system, mid, tail) = split_for_compaction(&ctx, Some(5));
         assert!(mid.is_empty());
@@ -1990,7 +2039,9 @@ mod tests {
         let mut runtime = SessionRuntime::new(vec![Message::System {
             content: "be helpful".to_owned(),
         }]);
-        runtime.context.push(Message::User { content: "old turn 1".to_owned() });
+        runtime.context.push(Message::User {
+            content: "old turn 1".to_owned(),
+        });
         runtime.context.push(Message::Assistant {
             content: Some("old reply 1".to_owned()),
             tool_calls: vec![],
@@ -1999,7 +2050,12 @@ mod tests {
         let snapshot = agent.compact(&runtime, None).await.unwrap().unwrap();
 
         // system preserved at front.
-        assert_eq!(snapshot[0], Message::System { content: "be helpful".to_owned() });
+        assert_eq!(
+            snapshot[0],
+            Message::System {
+                content: "be helpful".to_owned()
+            }
+        );
         // the model's reply is wrapped in a summary marker.
         assert!(matches!(
             &snapshot[1],
@@ -2036,7 +2092,9 @@ mod tests {
         let mut runtime = SessionRuntime::new(vec![Message::System {
             content: "be helpful".to_owned(),
         }]);
-        runtime.context.push(Message::User { content: "old".to_owned() });
+        runtime.context.push(Message::User {
+            content: "old".to_owned(),
+        });
 
         let snapshot = agent.compact(&runtime, None).await.unwrap().unwrap();
         assert!(matches!(

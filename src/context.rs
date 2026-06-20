@@ -82,7 +82,8 @@ impl ContextLedger {
     /// Current best estimate of the prefix size in tokens.
     #[must_use]
     pub fn running(&self) -> u32 {
-        self.measured.saturating_add(bytes_to_tokens(self.pending_bytes))
+        self.measured
+            .saturating_add(bytes_to_tokens(self.pending_bytes))
     }
 }
 
@@ -116,9 +117,9 @@ pub fn estimate_tokens(text: &str) -> u32 {
 /// call's name and argument JSON.
 pub(crate) fn message_bytes(message: &Message) -> usize {
     match message {
-        Message::System { content }
-        | Message::User { content }
-        | Message::Tool { content, .. } => content.len(),
+        Message::System { content } | Message::User { content } | Message::Tool { content, .. } => {
+            content.len()
+        }
         Message::Assistant {
             content,
             tool_calls,
@@ -208,7 +209,7 @@ mod tests {
             content: None,
             tool_calls: vec![ToolCall {
                 id: "call_1".to_owned(),
-                name: "read".to_owned(),                // 4
+                name: "read".to_owned(),                 // 4
                 arguments: r#"{"path":"a"}"#.to_owned(), // 12
             }],
         });

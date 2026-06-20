@@ -556,21 +556,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::new(dir.path());
 
-        let parent = store.create_new(Some("p".to_owned()), None, vec![]).unwrap();
+        let parent = store
+            .create_new(Some("p".to_owned()), None, vec![])
+            .unwrap();
         let parent_id = parent.session_id().clone();
         drop(parent);
 
         let snapshot = vec![
-            crate::llm::Message::System { content: "sys".to_owned() },
-            crate::llm::Message::User { content: "summary".to_owned() },
+            crate::llm::Message::System {
+                content: "sys".to_owned(),
+            },
+            crate::llm::Message::User {
+                content: "summary".to_owned(),
+            },
         ];
-        let writer = store.create_compaction(
-            parent_id.clone(),
-            Some("p".to_owned()),
-            None,
-            vec!["read".to_owned()],
-            &snapshot,
-        ).unwrap();
+        let writer = store
+            .create_compaction(
+                parent_id.clone(),
+                Some("p".to_owned()),
+                None,
+                vec!["read".to_owned()],
+                &snapshot,
+            )
+            .unwrap();
         let new_id = writer.session_id().clone();
         drop(writer);
 
@@ -583,6 +591,9 @@ mod tests {
 
         let events = store.read_events(&new_id).unwrap();
         assert_eq!(events.len(), 1);
-        assert!(matches!(events[0].payload, EventPayload::Session(SessionEvent::Created { .. })));
+        assert!(matches!(
+            events[0].payload,
+            EventPayload::Session(SessionEvent::Created { .. })
+        ));
     }
 }

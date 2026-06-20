@@ -120,7 +120,10 @@ url = "https://my-rag.example.com/sse"
         assert_eq!(fs.name, "filesystem-extra");
         assert_eq!(fs.command.as_deref(), Some("npx"));
         assert_eq!(fs.args, ["-y", "@anthropic/mcp-filesystem"]);
-        assert_eq!(fs.env.get("ROOT").map(String::as_str), Some("/home/user/projects"));
+        assert_eq!(
+            fs.env.get("ROOT").map(String::as_str),
+            Some("/home/user/projects")
+        );
         assert!(fs.is_stdio());
 
         let rag = &config.servers[1];
