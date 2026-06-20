@@ -187,8 +187,7 @@ impl McpClient {
         stdin: &mut ChildStdin,
         value: &T,
     ) -> Result<(), McpError> {
-        let mut bytes =
-            serde_json::to_vec(value).map_err(|e| McpError::Protocol(e.to_string()))?;
+        let mut bytes = serde_json::to_vec(value).map_err(|e| McpError::Protocol(e.to_string()))?;
         bytes.push(b'\n');
         stdin
             .write_all(&bytes)

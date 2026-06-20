@@ -12,9 +12,7 @@ use std::collections::HashMap;
 
 use crate::config::Pricing;
 use crate::core::CoreEvent;
-use crate::core::payload::{
-    ErrorEvent, EventPayload, ModelEvent, ToolEvent, TurnEvent, Usage,
-};
+use crate::core::payload::{ErrorEvent, EventPayload, ModelEvent, ToolEvent, TurnEvent, Usage};
 
 /// Maps a model id to its pricing, for cost derivation.
 ///
@@ -90,7 +88,11 @@ impl Monitor {
             }) => self.observe_completion(request_id, usage),
             EventPayload::Tool(ToolEvent::Started { tool_name, .. }) => {
                 self.summary.total_tool_calls = self.summary.total_tool_calls.saturating_add(1);
-                *self.summary.tools_used.entry(tool_name.clone()).or_insert(0) += 1;
+                *self
+                    .summary
+                    .tools_used
+                    .entry(tool_name.clone())
+                    .or_insert(0) += 1;
             }
             EventPayload::Tool(ToolEvent::Failed { error, .. }) => {
                 self.summary.total_tool_failures =
@@ -179,9 +181,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::float_cmp)]
 
     use super::*;
-    use crate::core::payload::{
-        ErrorDetail, ErrorSeverity, StopReason, ToolOutput, ToolSource,
-    };
+    use crate::core::payload::{ErrorDetail, ErrorSeverity, StopReason, ToolOutput, ToolSource};
     use crate::core::{
         CoreEvent, EventId, EventSource, SCHEMA_VERSION, SessionId, SourceKind, TurnId,
     };
