@@ -24,11 +24,13 @@ pub use error::{ConfigError, Result};
 pub use profile::{DEFAULT_SYSTEM_PROMPT, Profile, ProfileMeta, PromptSection, ToolsSection};
 pub use providers::{ModelConfig, Pricing, ProviderConfig, ProviderType, ProvidersFile};
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 const CONFIG_SUBDIR: &str = "config";
 const PROFILES_SUBDIR: &str = "profiles";
 const PROVIDERS_FILE: &str = "providers.toml";
+const PRICING_FILE: &str = "pricing.toml";
 const OMINI_DIR: &str = ".omini";
 const MAX_INHERITANCE_DEPTH: usize = 5;
 
@@ -118,6 +120,46 @@ impl ConfigStore {
             }
         }
         Ok(ProvidersFile { providers: merged })
+    }
+
+    /// Build the model→pricing table the monitor uses to derive cost
+    /// (`doc/monitor.md` §6.2). Pricing comes from two sources, merged with
+    /// `pricing.toml` winning: the inline `pricing` on each model in
+    /// `providers.toml` (a sensible default shipped with the model), overridden
+    /// by an explicit `.omini/config/pricing.toml` (so a user can update prices
+    /// without touching provider definitions). A missing `pricing.toml` is fine.
+    ///
+    /// # Errors
+    /// [`ConfigError::Parse`] / [`ConfigError::Io`] on a malformed or unreadable
+    /// `pricing.toml`.
+    pub fn load_pricing(&self, providers: &ProvidersFile) -> Result<HashMap<String, Pricing>> {
+        let mut table: HashMap<String, Pricing> = HashMap::new();
+
+        // Base layer: inline pricing from providers.toml.
+        for provider in &providers.providers {
+            for model in &provider.models {
+                if let Some(pricing) = model.pricing {
+                    table.entry(model.id.clone()).or_insert(pricing);
+                }
+            }
+        }
+
+        // Override layer: pricing.toml (highest-priority root wins per id).
+        for root in &self.roots {
+            let path = root.join(CONFIG_SUBDIR).join(PRICING_FILE);
+            let Some(text) = read_optional(&path)? else {
+                continue;
+            };
+            let file: PricingFile = toml::from_str(&text).map_err(|source| ConfigError::Parse {
+                path: path.clone(),
+                source,
+            })?;
+            for (id, pricing) in file.models {
+                table.insert(id, pricing);
+            }
+        }
+
+        Ok(table)
     }
 
     // __APPEND_MARKER__
@@ -322,6 +364,14 @@ fn read_optional(path: &Path) -> Result<Option<String>> {
             source,
         }),
     }
+}
+
+/// The on-disk shape of `.omini/config/pricing.toml`: a `[models."<id>"]` table
+/// per model. Used only by [`ConfigStore::load_pricing`] (`doc/monitor.md` §6.2).
+#[derive(Debug, Default, serde::Deserialize)]
+struct PricingFile {
+    #[serde(default)]
+    models: HashMap<String, Pricing>,
 }
 
 /// The user's home directory from `HOME`, if set.
@@ -559,5 +609,72 @@ temperature = 0.7
         let providers = store.load_providers().unwrap();
         assert_eq!(providers.providers.len(), 1);
         assert_eq!(providers.providers[0].base_url, "https://project");
+    }
+
+    /// `load_pricing` seeds from inline `providers.toml` pricing, then lets an
+    /// explicit `pricing.toml` override a model's price — the monitor's cost
+    /// source (`doc/monitor.md` §6.2).
+    #[test]
+    fn load_pricing_merges_inline_then_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join(".omini").join(CONFIG_SUBDIR);
+        std::fs::create_dir_all(&cfg).unwrap();
+        // providers.toml: gpt-4o has inline pricing; gpt-4o-mini does not.
+        std::fs::write(
+            cfg.join(PROVIDERS_FILE),
+            r#"
+[[providers]]
+name = "openai-main"
+type = "openai-chat"
+base_url = "https://api.openai.com/v1"
+api_key_env = "HOME"
+
+[[providers.models]]
+id = "gpt-4o"
+context_window = 128000
+max_output_tokens = 16384
+pricing = { input_per_million = 2.50, output_per_million = 10.00 }
+
+[[providers.models]]
+id = "gpt-4o-mini"
+context_window = 128000
+max_output_tokens = 16384
+"#,
+        )
+        .unwrap();
+        // pricing.toml overrides gpt-4o and adds gpt-4o-mini.
+        std::fs::write(
+            cfg.join(PRICING_FILE),
+            r#"
+[models."gpt-4o"]
+input_per_million = 3.00
+output_per_million = 12.00
+
+[models."gpt-4o-mini"]
+input_per_million = 0.15
+output_per_million = 0.60
+"#,
+        )
+        .unwrap();
+
+        let store = ConfigStore::from_roots(vec![dir.path().join(".omini")]);
+        let providers = store.load_providers().unwrap();
+        let pricing = store.load_pricing(&providers).unwrap();
+
+        // gpt-4o: pricing.toml wins over the inline 2.50.
+        assert_eq!(pricing["gpt-4o"].input_per_million, 3.00);
+        // gpt-4o-mini: only in pricing.toml.
+        assert_eq!(pricing["gpt-4o-mini"].output_per_million, 0.60);
+    }
+
+    /// A missing `pricing.toml` is not an error: the table is just the inline
+    /// pricing from `providers.toml`.
+    #[test]
+    fn load_pricing_without_pricing_toml_uses_inline_only() {
+        let (_d, store) = store_with(PROVIDERS, &[]);
+        let providers = store.load_providers().unwrap();
+        // PROVIDERS has no inline pricing → empty table, not an error.
+        let pricing = store.load_pricing(&providers).unwrap();
+        assert!(pricing.is_empty());
     }
 }

@@ -15,11 +15,13 @@
 //! compaction — which require a context snapshot — land with the `context`
 //! module.
 
+mod bus;
 mod error;
 mod event_log;
 mod id;
 mod meta;
 
+pub use bus::EventBus;
 pub use error::{Result, SessionError};
 pub use event_log::EventLog;
 pub use meta::{Origin, OriginKind, SessionMeta};
@@ -100,6 +102,7 @@ impl SessionStore {
             session_id,
             log,
             next_seq: 0,
+            bus: None,
         };
 
         let created = EventPayload::Session(SessionEvent::Created {
@@ -135,6 +138,7 @@ impl SessionStore {
             session_id: session_id.clone(),
             log,
             next_seq,
+            bus: None,
         })
     }
 
@@ -248,6 +252,7 @@ impl SessionStore {
             session_id,
             log,
             next_seq: 0,
+            bus: None,
         };
 
         let created = EventPayload::Session(SessionEvent::Created {
@@ -293,6 +298,9 @@ pub struct SessionWriter {
     session_id: SessionId,
     log: EventLog,
     next_seq: u64,
+    /// Optional bus to publish each appended event to live subscribers
+    /// (monitor, TUI). Set via [`SessionWriter::with_bus`]; `None` is headless.
+    bus: Option<EventBus>,
 }
 
 impl SessionWriter {
@@ -308,7 +316,20 @@ impl SessionWriter {
         self.next_seq
     }
 
+    /// Attach an [`EventBus`] so each appended event is also published to live
+    /// subscribers (e.g. the monitor, the TUI) after it is persisted. Persisting
+    /// to the log stays the source of truth; the broadcast is best-effort
+    /// (`doc/monitor.md` §9).
+    #[must_use]
+    pub fn with_bus(mut self, bus: EventBus) -> Self {
+        self.bus = Some(bus);
+        self
+    }
+
     /// Append an event, filling in the envelope. Returns the assigned seq.
+    ///
+    /// The event is durably written to the log first, then published to the bus
+    /// (if any) so a subscriber only ever observes committed events.
     ///
     /// # Errors
     /// Serialization or filesystem failures surface as [`SessionError`].
@@ -332,6 +353,9 @@ impl SessionWriter {
         };
         self.log.append(&event)?;
         self.next_seq += 1;
+        if let Some(bus) = &self.bus {
+            bus.publish(&event);
+        }
         Ok(seq)
     }
 }
