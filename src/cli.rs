@@ -198,7 +198,7 @@ fn prepare(
     register_profile_tools(&mut tools, &profile, workspace.clone());
     let tool_names = tools.descriptors().into_iter().map(|d| d.name).collect();
 
-    let agent = Agent::new(
+    let mut agent = Agent::new(
         provider,
         tools,
         AgentConfig {
@@ -214,6 +214,18 @@ fn prepare(
             ..AgentConfig::default()
         },
     );
+
+    // Optional dedicated compaction model (`doc/phase2-plan.md` decision B). It
+    // may name a different provider, so resolve and build it independently; a bad
+    // reference is fatal (the user asked for it explicitly).
+    if let Some(model_ref) = profile.context.compaction_model.as_deref() {
+        let resolved_compaction = store
+            .resolve(&providers, &profile, Some(model_ref), None)
+            .with_context(|| format!("failed to resolve compaction_model `{model_ref}`"))?;
+        let compaction_provider = crate::provider::build(&resolved_compaction)
+            .context("compaction_model provider type has no adapter")?;
+        agent = agent.with_compaction_model(compaction_provider, resolved_compaction.model_id);
+    }
 
     Ok(Prepared {
         agent,

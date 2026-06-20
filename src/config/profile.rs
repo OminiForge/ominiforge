@@ -111,6 +111,11 @@ impl ToolsSection {
 pub struct ContextSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_threshold: Option<f32>,
+    /// Model reference (`provider/model` or short `model`) used to generate
+    /// compaction summaries. `None` reuses the session's current model
+    /// (`doc/phase2-plan.md` decision B).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub injection_max_tokens: Option<u32>,
 }
@@ -245,6 +250,10 @@ fn overlay_tools(child: ToolsSection, parent: ToolsSection) -> ToolsSection {
 fn overlay_context(child: &ContextSection, parent: &ContextSection) -> ContextSection {
     ContextSection {
         compaction_threshold: child.compaction_threshold.or(parent.compaction_threshold),
+        compaction_model: child
+            .compaction_model
+            .clone()
+            .or_else(|| parent.compaction_model.clone()),
         injection_max_tokens: child.injection_max_tokens.or(parent.injection_max_tokens),
     }
 }
@@ -307,6 +316,7 @@ max_output_tokens = 16384
 [context]
 compaction_threshold = 0.8
 injection_max_tokens = 4096
+compaction_model = "openai-main/gpt-4o-mini"
 
 [tools]
 builtin = ["read", "write", "shell"]
@@ -337,6 +347,10 @@ before_tool = ["security-guard"]
             ["read", "write", "shell"]
         );
         assert_eq!(p.budget.session_max_usd, Some(10.00));
+        assert_eq!(
+            p.context.compaction_model.as_deref(),
+            Some("openai-main/gpt-4o-mini")
+        );
     }
 
     #[test]
