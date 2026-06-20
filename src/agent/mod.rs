@@ -885,7 +885,7 @@ impl TurnState<'_> {
             EventPayload::Tool(ToolEvent::Started {
                 tool_call_event_id: parent.clone(),
                 tool_name: call.name.clone(),
-                source: ToolSource::Builtin,
+                source: self.agent.tools.source_of(&call.name),
                 input: args.clone(),
                 working_dir: None,
             }),

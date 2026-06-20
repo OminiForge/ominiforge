@@ -166,6 +166,9 @@ struct Prepared {
     tool_names: Vec<String>,
     workspace: PathBuf,
     resolved: crate::config::ResolvedModel,
+    /// Live MCP server clients. Held for the session's lifetime: dropping a
+    /// client kills its subprocess, so these must outlive the agent loop.
+    _mcp_clients: Vec<std::sync::Arc<crate::mcp::McpClient>>,
 }
 
 /// The model/provider/tool selection shared by `run` and `chat`: discover config
@@ -173,7 +176,7 @@ struct Prepared {
 /// session store. The only difference between the two commands is what they do
 /// with the result (one turn vs. an interactive loop), so all the setup lives
 /// here.
-fn prepare(
+async fn prepare(
     workspace: Option<PathBuf>,
     profile_name: &str,
     model: Option<&str>,
@@ -214,6 +217,16 @@ fn prepare(
 
     let mut tools = ToolRegistry::new();
     register_profile_tools(&mut tools, &profile, workspace.clone());
+
+    // Connect configured MCP servers and register their tools alongside the
+    // built-ins (`doc/tool-protocol.md` §5). A broken server is logged and
+    // skipped, never fatal. Clients are returned to keep their subprocesses
+    // alive for the session.
+    let mcp_config = crate::mcp::McpConfig::load(store.roots())
+        .context("failed to load mcp.toml")?;
+    let mcp_clients =
+        crate::mcp::connect_all(&mcp_config, &mut tools, |msg| eprintln!("{msg}")).await;
+
     let tool_names = tools.descriptors().into_iter().map(|d| d.name).collect();
 
     let mut agent = Agent::new(
@@ -253,6 +266,7 @@ fn prepare(
         tool_names,
         workspace,
         resolved,
+        _mcp_clients: mcp_clients,
     })
 }
 
@@ -263,7 +277,8 @@ async fn run_turn(args: RunArgs) -> Result<()> {
         args.model.as_deref(),
         args.temperature,
         args.no_dotenv,
-    )?;
+    )
+    .await?;
 
     let mut writer = prep
         .session_store
@@ -367,7 +382,8 @@ async fn chat(args: ChatArgs) -> Result<()> {
         args.model.as_deref(),
         args.temperature,
         args.no_dotenv,
-    )?;
+    )
+    .await?;
 
     let system = vec![Message::System {
         content: prep.system_prompt.clone(),

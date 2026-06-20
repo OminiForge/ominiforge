@@ -22,18 +22,25 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::core::payload::ToolOutput;
+use crate::core::payload::{ToolOutput, ToolSource};
 
 /// The outcome of a tool invocation: either a [`ToolOutput`] (possibly a
 /// business-level error) or a protocol-level [`ToolError`].
 pub type ToolResult = Result<ToolOutput, ToolError>;
 
 /// A callable tool. Built-in tools implement this directly; the MCP adapter
-/// implements it over a JSON-RPC server (Phase 2).
+/// implements it over a JSON-RPC server.
 #[async_trait::async_trait]
 pub trait Tool: Send + Sync {
     /// The schema advertised to the model.
     fn descriptor(&self) -> ToolDescriptor;
+
+    /// Where the tool comes from, for source-aware monitoring. Defaults to
+    /// [`ToolSource::Builtin`]; the MCP adapter overrides it with the server
+    /// name (`doc/tool-protocol.md` §9).
+    fn source(&self) -> ToolSource {
+        ToolSource::Builtin
+    }
 
     /// Execute the tool to completion.
     async fn invoke(&self, input: ToolInput) -> ToolResult;
@@ -87,6 +94,16 @@ impl ToolRegistry {
     #[must_use]
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.get(name).cloned()
+    }
+
+    /// The [`ToolSource`] of a registered tool, or [`ToolSource::Builtin`] if
+    /// the name is unknown (the loop reports the started event before confirming
+    /// the tool exists; an unknown name is treated as builtin for that event).
+    #[must_use]
+    pub fn source_of(&self, name: &str) -> ToolSource {
+        self.tools
+            .get(name)
+            .map_or(ToolSource::Builtin, |t| t.source())
     }
 
     /// Whether the registry holds no tools.

@@ -115,7 +115,7 @@
 - [x] Step 2 — token 计数与用量追踪 ✅（2026-06-20）
 - [x] Step 3 — compaction ✅（2026-06-20）
 - [x] Step 4 — EventBus + monitor ✅（2026-06-20）
-- [ ] Step 5 — MCP client
+- [x] Step 5 — MCP client ✅（2026-06-20）
 - [ ] Step 6 — TUI
 
 ### Step 1 完成记录（2026-06-19）
@@ -251,3 +251,42 @@ pedantic+nursery 干净。Live（mimo）：单轮 `run` 后 `inspect` 报 1 turn
 
 注：EventBus 在线订阅路径已接线 + 单测（`with_bus` + broadcast 投递），实际在线消费者
 （TUI 实时渲染）在 Step 6 接入；本步可验证产出是离线 `inspect`。
+
+### Step 5 完成记录（2026-06-20）
+
+实现 MCP client：stdio 子进程生命周期 + JSON-RPC 2.0 framing + 适配到统一 `Tool` trait。
+
+`src/mcp/config.rs`：`McpConfig`/`McpServerConfig`（`.omini/config/mcp.toml`）。`load(roots)`
+按 root 优先级合并，同名 server 高优先 root 遮蔽低优先；缺文件不报错。`is_stdio`（有 `command`
+即 stdio；`url` 字段解析但 SSE 暂不支持）。
+
+`src/mcp/protocol.rs`：JSON-RPC wire 类型（`Request`/`Notification`/`Response`/`RpcError`）+ MCP
+子集（`ToolDef`/`ToolsListResult`/`ToolCallResult`/`ContentBlock`）。protocol version `2025-11-25`
+（最新 spec；server 在握手回包里回声其自身支持的版本，我们发最新并容忍更旧的回复——只用
+`tools/list` + `tools/call` 这层跨版本稳定的接口）。
+`Response.id` optional，使日志行/通知行能解码不报错（client 跳过非匹配行）。
+
+`src/mcp/client.rs`：`McpClient` 持有子进程（`kill_on_drop`）+ mutex 串行化 stdio（单条有序
+字节流，一次只允许一个 request/response 在途）。`connect` = spawn → `initialize` 握手 →
+`notifications/initialized` → `tools/list`。`request` 用单调 id，读行直到 id 匹配（跳过通知/异 id）。
+`McpTool` 适配器实现 `Tool`：`source()` 返回 `ToolSource::Mcp{server_name}`；`invoke` 用
+`input.timeout` 包住 round-trip（挂起=协议 Timeout，server 关闭=ServerCrashed，均非业务错误）；
+`isError:true` → 业务级 `ToolOutput{is_error,error_code="mcp_tool_error"}`（`tool-protocol.md` §7.1）。
+
+`src/mcp/mod.rs`：`connect_all(config, &mut registry, on_warn)`——逐 server 连接并注册其 tool 到
+统一 registry；单个 server 失败仅 warn + skip，不中断 agent（§12）。返回 live clients 供 caller
+持有（drop client 即杀子进程）。
+
+`src/cli.rs`：`prepare` 改 `async`（spawn 子进程需 await），加载 `mcp.toml` → `connect_all` 把
+MCP tool 与 built-in 并排注册；`Prepared._mcp_clients` 持有 client 保活整个 session。
+`src/agent/mod.rs`：ToolEvent 的 source 由 `registry.source_of(name)` 决定（不再硬编码 Builtin）。
+`src/tool/mod.rs`：`Tool::source()` 默认方法（默认 Builtin，MCP 适配器覆盖）+ `ToolRegistry::source_of`。
+
+验证：120 测试通过（112→+8：config 3 [doc 示例解析/同名遮蔽/缺省空] + client 3 [connect+list 标
+MCP source / invoke 经 stdio 回环 / isError→业务错误] + mod 2 [connect_all 端到端注册 + 坏 server
+跳过不致命]）。用 Python mock stdio server 跑真实 JSON-RPC 握手+调用回环，不依赖外部 binary。
+clippy pedantic+nursery 干净（request 持锁跨写读为有意，带 `allow(significant_drop_tightening)`
++ 注释说明）。
+
+注：在线 agent 调用 MCP 工具的实际 live 验证（mimo 模型实跑）可在 Step 6 TUI 或单独 e2e 中做；
+本步用 mock server 覆盖了协议层全回环 + 统一 Tool trait 适配 + source 归属。
