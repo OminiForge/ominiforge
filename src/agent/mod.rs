@@ -41,9 +41,11 @@ use crate::core::payload::{
     StopReason, ToolEvent, ToolOutput, ToolSource, TurnEvent, TurnFailureReason, Usage,
 };
 use crate::core::{EventId, EventPayload, EventSource, SourceKind, TurnId};
-use crate::llm::{LlmError, Message, ModelRequest, Provider, ToolCall, ToolSchema};
+use crate::llm::{LlmError, Message, ModelRequest, Provider, StreamEvent, ToolCall, ToolSchema};
 use crate::session::SessionWriter;
 use crate::tool::{ToolError, ToolInput, ToolRegistry};
+
+use futures_util::StreamExt;
 
 use plan::{PLAN_TOOL_NAME, PlanError, PlanOp, apply_plan_op};
 
@@ -259,6 +261,59 @@ impl Agent {
             kind: SourceKind::Model,
             id: format!("{}/{}", self.provider.name(), self.config.model),
         }
+    }
+
+    /// Generate a compaction summary of the current context. Calls the model with
+    /// a summarization prompt, collects the response, and returns a new snapshot:
+    /// system messages + summary + optionally the last `keep_last` user turns.
+    ///
+    /// Returns `None` if there's nothing to summarize (context is too short).
+    ///
+    /// # Errors
+    /// [`AgentError::Model`] on provider failure.
+    pub async fn compact(
+        &self,
+        runtime: &SessionRuntime,
+        keep_last: Option<usize>,
+    ) -> Result<Option<Vec<Message>>, AgentError> {
+        let (system, to_summarize, tail) = split_for_compaction(&runtime.context, keep_last);
+
+        if to_summarize.is_empty() {
+            return Ok(None);
+        }
+
+        let mut messages = system.clone();
+        messages.extend(to_summarize.iter().cloned());
+        messages.push(Message::User {
+            content: "<instruction>Summarize the above conversation concisely, preserving \
+                      key facts, decisions, and context needed to continue the conversation. \
+                      Keep it under 500 tokens.</instruction>".to_owned(),
+        });
+
+        let request = ModelRequest {
+            model: self.config.model.clone(),
+            messages,
+            tools: Vec::new(),
+            temperature: 0.3,
+            max_tokens: Some(1000),
+        };
+
+        let mut stream = self.provider.stream(request).await?;
+        let mut summary = String::new();
+
+        while let Some(event) = stream.next().await {
+            if let StreamEvent::TextDelta { text, .. } = event? {
+                summary.push_str(&text);
+            }
+        }
+
+        let mut snapshot = system;
+        snapshot.push(Message::User {
+            content: format!("<conversation_summary>\n{summary}\n</conversation_summary>"),
+        });
+        snapshot.extend(tail.iter().cloned());
+
+        Ok(Some(snapshot))
     }
 }
 
@@ -916,6 +971,48 @@ fn runtime_source() -> EventSource {
         kind: SourceKind::Runtime,
         id: "ominiforge".to_owned(),
     }
+}
+
+/// Split the context view into three parts for compaction: leading system
+/// message(s), the middle to summarize, and a tail of `keep_last` user turns to
+/// preserve verbatim (`doc/context-management.md` §4.4).
+///
+/// "System" is the leading run of `System` messages (the stable prefix). The
+/// tail begins at the `keep_last`-th-from-last `User` message in the remainder,
+/// so that many recent turns survive uncompressed; with `keep_last = None` (or
+/// `0`) the whole remainder is summarized. If there are fewer than `keep_last`
+/// user turns, nothing is summarized (the tail swallows everything).
+fn split_for_compaction(
+    context: &[Message],
+    keep_last: Option<usize>,
+) -> (Vec<Message>, Vec<Message>, Vec<Message>) {
+    let system_end = context
+        .iter()
+        .position(|m| !matches!(m, Message::System { .. }))
+        .unwrap_or(context.len());
+    let (system, rest) = context.split_at(system_end);
+
+    let keep = keep_last.unwrap_or(0);
+    let tail_start = if keep == 0 {
+        rest.len()
+    } else {
+        // Index of the keep-th-from-last User message in `rest`, or 0 if there
+        // are fewer than `keep` user turns (keep everything).
+        let user_positions: Vec<usize> = rest
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| matches!(m, Message::User { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        user_positions
+            .len()
+            .checked_sub(keep)
+            .and_then(|idx| user_positions.get(idx).copied())
+            .unwrap_or(0)
+    };
+    let (to_summarize, tail) = rest.split_at(tail_start);
+
+    (system.to_vec(), to_summarize.to_vec(), tail.to_vec())
 }
 
 /// The assistant's free-text content, or empty if it only made tool calls.
@@ -1806,6 +1903,104 @@ mod tests {
         let expected = (system.len() + user.len() + "ok".len()) / 4;
         assert_eq!(outcome.context_tokens as usize, expected);
         assert_eq!(runtime.ledger.running() as usize, expected);
+    }
+
+    /// `split_for_compaction` separates the leading system run, the middle to
+    /// summarize, and a verbatim tail. With `keep_last = None` everything after
+    /// the system prefix is summarized.
+    #[test]
+    fn split_compaction_no_keep_summarizes_everything_after_system() {
+        let ctx = vec![
+            Message::System { content: "sys".to_owned() },
+            Message::User { content: "u1".to_owned() },
+            Message::Assistant { content: Some("a1".to_owned()), tool_calls: vec![] },
+            Message::User { content: "u2".to_owned() },
+        ];
+        let (system, mid, tail) = split_for_compaction(&ctx, None);
+        assert_eq!(system, vec![Message::System { content: "sys".to_owned() }]);
+        assert_eq!(mid.len(), 3);
+        assert!(tail.is_empty());
+    }
+
+    /// With `keep_last = 1`, the last user turn (and anything after it) is kept
+    /// verbatim while everything before it is summarized.
+    #[test]
+    fn split_compaction_keeps_last_user_turn_verbatim() {
+        let ctx = vec![
+            Message::System { content: "sys".to_owned() },
+            Message::User { content: "u1".to_owned() },
+            Message::Assistant { content: Some("a1".to_owned()), tool_calls: vec![] },
+            Message::User { content: "u2".to_owned() },
+            Message::Assistant { content: Some("a2".to_owned()), tool_calls: vec![] },
+        ];
+        let (system, mid, tail) = split_for_compaction(&ctx, Some(1));
+        assert_eq!(system.len(), 1);
+        // u1, a1 get summarized.
+        assert_eq!(mid, vec![
+            Message::User { content: "u1".to_owned() },
+            Message::Assistant { content: Some("a1".to_owned()), tool_calls: vec![] },
+        ]);
+        // u2 onward kept verbatim.
+        assert_eq!(tail, vec![
+            Message::User { content: "u2".to_owned() },
+            Message::Assistant { content: Some("a2".to_owned()), tool_calls: vec![] },
+        ]);
+    }
+
+    /// When `keep_last` exceeds the available user turns, nothing is summarized:
+    /// the tail swallows the whole remainder (compaction is a no-op).
+    #[test]
+    fn split_compaction_keep_more_than_available_summarizes_nothing() {
+        let ctx = vec![
+            Message::System { content: "sys".to_owned() },
+            Message::User { content: "u1".to_owned() },
+        ];
+        let (_system, mid, tail) = split_for_compaction(&ctx, Some(5));
+        assert!(mid.is_empty());
+        assert_eq!(tail.len(), 1);
+    }
+
+    /// `Agent::compact` calls the model, wraps its reply in a summary message,
+    /// and returns a snapshot of system + summary (+ verbatim tail). The middle
+    /// of the conversation is replaced by the summary — that's the compression.
+    #[tokio::test]
+    async fn compact_produces_snapshot_with_summary() {
+        let provider = Arc::new(ScriptedProvider::new(vec![text_round("CONDENSED SUMMARY")]));
+        let agent = planning_agent(provider);
+
+        let mut runtime = SessionRuntime::new(vec![Message::System {
+            content: "be helpful".to_owned(),
+        }]);
+        runtime.context.push(Message::User { content: "old turn 1".to_owned() });
+        runtime.context.push(Message::Assistant {
+            content: Some("old reply 1".to_owned()),
+            tool_calls: vec![],
+        });
+
+        let snapshot = agent.compact(&runtime, None).await.unwrap().unwrap();
+
+        // system preserved at front.
+        assert_eq!(snapshot[0], Message::System { content: "be helpful".to_owned() });
+        // the model's reply is wrapped in a summary marker.
+        assert!(matches!(
+            &snapshot[1],
+            Message::User { content } if content.contains("CONDENSED SUMMARY")
+                && content.contains("conversation_summary")
+        ));
+        // the original turns are gone — replaced by the summary.
+        assert_eq!(snapshot.len(), 2);
+    }
+
+    /// Compacting a context with nothing past the system prefix is a no-op
+    /// (`None`): there is nothing to summarize.
+    #[tokio::test]
+    async fn compact_with_only_system_is_noop() {
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let agent = planning_agent(provider);
+        let runtime = SessionRuntime::new(vec![Message::System {
+            content: "be helpful".to_owned(),
+        }]);
+        assert!(agent.compact(&runtime, None).await.unwrap().is_none());
     }
 
     fn starts_with_created(events: &[CoreEvent]) -> bool {
