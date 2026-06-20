@@ -32,10 +32,12 @@ use crate::core::{CoreEvent, SessionId};
 use crate::llm::Message;
 use crate::session::{EventBus, SessionStore, SessionWriter};
 
-/// Run the TUI: session selector, then a multi-turn conversation loop.
+/// Run the TUI: optionally a session selector, then a multi-turn conversation loop.
 ///
-/// Streams live. `mcp_clients` is held for the whole session — dropping a
-/// client kills its subprocess, so the binding must outlive the loop.
+/// With `resume` false a fresh session starts immediately; with `resume` true a
+/// full-screen picker lists existing sessions first. Streams live. `mcp_clients`
+/// is held for the whole session — dropping a client kills its subprocess, so
+/// the binding must outlive the loop.
 ///
 /// # Errors
 /// Returns errors from terminal setup, session I/O, or agent turn failures.
@@ -51,6 +53,7 @@ pub async fn run(
     workspace: std::path::PathBuf,
     resolved: crate::config::ResolvedModel,
     mcp_clients: Vec<Arc<crate::mcp::McpClient>>,
+    resume: bool,
 ) -> Result<()> {
     // Keep the MCP subprocesses alive for the whole session (named, not `_`, so
     // it is not dropped immediately).
@@ -70,6 +73,7 @@ pub async fn run(
         tool_names,
         workspace,
         resolved,
+        resume,
     )
     .await;
 
@@ -88,22 +92,36 @@ async fn run_app(
     tool_names: Vec<String>,
     workspace: std::path::PathBuf,
     resolved: crate::config::ResolvedModel,
+    resume: bool,
 ) -> Result<()> {
-    // Session selector (synchronous full-screen picker before the live loop).
-    let (writer, runtime) = select_or_create_session(
+    // Choose the starting session. `--resume` opens the picker (cancellable →
+    // clean exit); otherwise start fresh. `history` is the resumed conversation
+    // to render (empty for a fresh session).
+    let Some((writer, runtime, history)) = start_session(
         terminal,
         &store,
-        system,
-        profile_name,
-        tool_names,
-        workspace,
-    )?;
+        &system,
+        &profile_name,
+        &workspace,
+        &tool_names,
+        resume,
+    )?
+    else {
+        return Ok(()); // user cancelled the picker — clean exit
+    };
 
     let agent = Arc::new(agent);
     let bus = EventBus::new();
     let mut bus_rx = bus.subscribe();
 
-    let mut state = AppState::new(writer.session_id().clone(), &resolved);
+    let mut state = AppState::new(
+        writer.session_id().clone(),
+        &resolved.provider_name,
+        &resolved.model_id,
+    );
+    // Seed the conversation pane with the resumed history so the user sees what
+    // this session was about (issue: a resumed session looked empty).
+    state.seed_history(&history);
 
     // The session writer + runtime live here between turns; during a turn they
     // are moved into the background task and returned over the oneshot. Each
@@ -297,74 +315,95 @@ async fn do_compact(
     Ok((new_writer, new_runtime))
 }
 
-/// Show the session picker and return the chosen session (resumed or new). With
-/// no existing sessions, a fresh one is created without prompting.
-#[allow(clippy::needless_pass_by_value)]
-fn select_or_create_session(
+/// What `start_session` hands back: the writer, runtime, and the rebuilt
+/// conversation history to render (empty for a fresh session).
+type StartedSession = (SessionWriter, SessionRuntime, Vec<Message>);
+
+/// Pick the starting session: with `resume`, show the picker (returns `None` if
+/// the user cancels or there are no sessions); otherwise create a fresh one.
+#[allow(clippy::too_many_arguments)]
+fn start_session(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     store: &SessionStore,
-    system: Vec<Message>,
-    profile_name: String,
-    tool_names: Vec<String>,
-    workspace: std::path::PathBuf,
-) -> Result<(SessionWriter, SessionRuntime)> {
-    let create_new = |store: &SessionStore| -> Result<(SessionWriter, SessionRuntime)> {
-        let writer = store
-            .create_new(
-                Some(profile_name.clone()),
-                Some(workspace.clone()),
-                tool_names.clone(),
-            )
-            .context("failed to create session")?;
-        let runtime = SessionRuntime::new(system.clone());
-        Ok((writer, runtime))
-    };
-
-    let sessions = store.list().context("failed to list sessions")?;
-    if sessions.is_empty() {
-        return create_new(store);
-    }
-
-    let mut selected = 0; // sessions.len() == the "[New session]" row
-    loop {
-        terminal.draw(|f| render_selector(f, &sessions, selected, store))?;
-
-        if let Event::Key(key) = event::read()? {
-            match key.code {
-                KeyCode::Up if selected > 0 => selected -= 1,
-                KeyCode::Down if selected < sessions.len() => selected += 1,
-                KeyCode::Enter => {
-                    if selected == sessions.len() {
-                        return create_new(store);
-                    }
-                    let sid = &sessions[selected];
-                    let events = store
-                        .read_events(sid)
-                        .with_context(|| format!("failed to read session {sid}"))?;
-                    let writer = store
-                        .open(sid)
-                        .with_context(|| format!("failed to open session {sid}"))?;
-                    let runtime = crate::agent::rebuild_runtime(&events, system);
-                    return Ok((writer, runtime));
-                }
-                KeyCode::Char('q') | KeyCode::Esc => anyhow::bail!("cancelled"),
-                _ => {}
-            }
-        }
+    system: &[Message],
+    profile_name: &str,
+    workspace: &std::path::Path,
+    tool_names: &[String],
+    resume: bool,
+) -> Result<Option<StartedSession>> {
+    if resume {
+        select_session(terminal, store)?
+            .map(|sid| open_session(store, &sid, system.to_vec()))
+            .transpose()
+    } else {
+        let (w, r) = create_session(store, profile_name, workspace, tool_names, system)?;
+        Ok(Some((w, r, Vec::new())))
     }
 }
 
-fn render_selector(f: &mut Frame, sessions: &[SessionId], selected: usize, store: &SessionStore) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("Select a session  (↑/↓ to move, Enter to open, q to quit)");
+/// Create a brand-new session seeded with the system prompt.
+fn create_session(
+    store: &SessionStore,
+    profile_name: &str,
+    workspace: &std::path::Path,
+    tool_names: &[String],
+    system: &[Message],
+) -> Result<(SessionWriter, SessionRuntime)> {
+    let writer = store
+        .create_new(
+            Some(profile_name.to_owned()),
+            Some(workspace.to_path_buf()),
+            tool_names.to_vec(),
+        )
+        .context("failed to create session")?;
+    Ok((writer, SessionRuntime::new(system.to_vec())))
+}
 
-    let mut lines: Vec<Line> = sessions
-        .iter()
-        .enumerate()
-        .map(|(i, sid)| {
-            let turns = store.read_events(sid).map_or(0, |events| {
-                events
+/// Reopen `sid` for appending and rebuild its runtime + conversation history
+/// from the event log. The returned `Vec<Message>` is the full rebuilt context
+/// (system seed included) so the caller can render what the session was about.
+fn open_session(
+    store: &SessionStore,
+    sid: &SessionId,
+    system: Vec<Message>,
+) -> Result<(SessionWriter, SessionRuntime, Vec<Message>)> {
+    let events = store
+        .read_events(sid)
+        .with_context(|| format!("failed to read session {sid}"))?;
+    let writer = store
+        .open(sid)
+        .with_context(|| format!("failed to open session {sid}"))?;
+    let runtime = crate::agent::rebuild_runtime(&events, system);
+    let history = runtime.context.clone();
+    Ok((writer, runtime, history))
+}
+
+/// A row in the session picker: id plus a human summary of what it holds.
+struct SessionRow {
+    id: SessionId,
+    created: String,
+    turns: usize,
+    preview: String,
+}
+
+/// Build the picker rows from the store: each session's creation time (local),
+/// user-turn count, and a preview of its first user prompt — so the list is
+/// meaningful instead of opaque ids. Unreadable sessions are skipped.
+fn session_rows(store: &SessionStore) -> Vec<SessionRow> {
+    let ids = store.list().unwrap_or_default();
+    ids.into_iter()
+        .map(|id| {
+            let created = store.read_meta(&id).map_or_else(
+                |_| "?".to_owned(),
+                |m| {
+                    m.created_at
+                        .with_timezone(&chrono::Local)
+                        .format("%Y-%m-%d %H:%M")
+                        .to_string()
+                },
+            );
+            let (turns, preview) = store.read_events(&id).map_or((0, String::new()), |events| {
+                let turns = events
                     .iter()
                     .filter(|e| {
                         matches!(
@@ -372,15 +411,74 @@ fn render_selector(f: &mut Frame, sessions: &[SessionId], selected: usize, store
                             EventPayload::Turn(crate::core::payload::TurnEvent::Started { .. })
                         )
                     })
-                    .count()
+                    .count();
+                let preview = events
+                    .iter()
+                    .find_map(|e| match &e.payload {
+                        EventPayload::Turn(crate::core::payload::TurnEvent::Started {
+                            input: Some(input),
+                            ..
+                        }) => Some(first_line(input, 60)),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                (turns, preview)
             });
-            selectable_line(&format!("{}  ({turns} turn(s))", sid.0), i == selected)
+            SessionRow {
+                id,
+                created,
+                turns,
+                preview,
+            }
+        })
+        .collect()
+}
+
+/// Show the session picker. Returns the chosen session id, or `None` if the user
+/// cancelled (q/Esc) or there are no sessions — both are clean, non-error exits.
+fn select_session(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    store: &SessionStore,
+) -> Result<Option<SessionId>> {
+    let rows = session_rows(store);
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    let mut selected = 0;
+    loop {
+        terminal.draw(|f| render_selector(f, &rows, selected))?;
+
+        if let Event::Key(key) = event::read()? {
+            match key.code {
+                KeyCode::Up if selected > 0 => selected -= 1,
+                KeyCode::Down if selected + 1 < rows.len() => selected += 1,
+                KeyCode::Enter => return Ok(Some(rows[selected].id.clone())),
+                KeyCode::Char('q') | KeyCode::Esc => return Ok(None),
+                _ => {}
+            }
+        }
+    }
+}
+
+fn render_selector(f: &mut Frame, rows: &[SessionRow], selected: usize) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Resume a session  (↑/↓ to move, Enter to open, q/Esc to cancel)");
+
+    let lines: Vec<Line> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let preview = if row.preview.is_empty() {
+                "(no messages yet)".to_owned()
+            } else {
+                row.preview.clone()
+            };
+            let label = format!("{}  ·  {} turn(s)  ·  {}", row.created, row.turns, preview);
+            selectable_line(&label, i == selected)
         })
         .collect();
-    lines.push(selectable_line(
-        "[ New session ]",
-        selected == sessions.len(),
-    ));
 
     f.render_widget(
         Paragraph::new(lines)
@@ -474,11 +572,11 @@ struct AppState {
 }
 
 impl AppState {
-    fn new(sid: SessionId, resolved: &crate::config::ResolvedModel) -> Self {
+    fn new(sid: SessionId, provider: &str, model: &str) -> Self {
         Self {
             session_id: sid.0,
-            provider: resolved.provider_name.clone(),
-            model: resolved.model_id.clone(),
+            provider: provider.to_owned(),
+            model: model.to_owned(),
             lines: Vec::new(),
             open: Open::None,
         }
@@ -487,6 +585,46 @@ impl AppState {
     fn push_user(&mut self, prompt: &str) {
         self.lines.push(String::new());
         self.lines.push(format!("> {prompt}"));
+        self.open = Open::None;
+    }
+
+    /// Render a resumed session's rebuilt context into the conversation pane so
+    /// the user sees what the session was about (the system seed is skipped — it
+    /// is identity, not conversation). Tool results are rebuilt as `Tool`
+    /// messages; their content is shown indented under the call.
+    fn seed_history(&mut self, history: &[Message]) {
+        let mut shown = false;
+        for msg in history {
+            match msg {
+                Message::System { .. } => {} // identity, not conversation
+                Message::User { content } => {
+                    self.lines.push(String::new());
+                    self.lines.push(format!("> {content}"));
+                    shown = true;
+                }
+                Message::Assistant {
+                    content,
+                    tool_calls,
+                } => {
+                    if let Some(text) = content {
+                        self.lines.push(text.clone());
+                    }
+                    for call in tool_calls {
+                        self.lines
+                            .push(format!("[tool: {}] {}", call.name, call.arguments));
+                    }
+                    shown = true;
+                }
+                Message::Tool { content, .. } => {
+                    self.lines.push(format!("  ↳ {}", first_line(content, 200)));
+                    shown = true;
+                }
+            }
+        }
+        if shown {
+            self.lines.push(String::new());
+            self.lines.push("── resumed; continue below ──".to_owned());
+        }
         self.open = Open::None;
     }
 
@@ -597,6 +735,22 @@ fn first_text_line(output: &ToolOutput) -> Option<String> {
     })
 }
 
+/// First line of `s`, trimmed and truncated to `max` chars with an ellipsis.
+/// Used for compact one-line previews in the picker and resumed history.
+fn first_line(s: &str, max: usize) -> String {
+    let line = s
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    if line.chars().count() > max {
+        let truncated: String = line.chars().take(max).collect();
+        format!("{truncated}…")
+    } else {
+        line.to_owned()
+    }
+}
+
 /// A [`StreamSink`] that forwards every live delta to the UI loop over a channel.
 /// Cheap and non-blocking (unbounded send), as the hot-path contract requires.
 struct ChannelSink {
@@ -623,5 +777,86 @@ impl StreamSink for ChannelSink {
 
     fn on_tool_call_delta(&mut self, _index: u32, json_delta: &str) {
         let _ = self.tx.send(UiDelta::ToolArgs(json_delta.to_owned()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::SessionId;
+    use crate::llm::{Message, ToolCall};
+
+    fn state() -> AppState {
+        AppState::new(SessionId("01TEST".to_owned()), "prov", "model")
+    }
+
+    /// A resumed session's rebuilt context must be rendered into the pane so the
+    /// user sees what it was about: the system seed is hidden, user turns show as
+    /// `> ...`, assistant text/tool-calls show, tool results show indented, and a
+    /// separator marks where the live continuation begins. This is the fix for
+    /// "a resumed session looked empty".
+    #[test]
+    fn seed_history_renders_prior_conversation_not_system() {
+        let mut s = state();
+        s.seed_history(&[
+            Message::System {
+                content: "you are an agent".to_owned(),
+            },
+            Message::User {
+                content: "remember 42".to_owned(),
+            },
+            Message::Assistant {
+                content: Some("noted 42".to_owned()),
+                tool_calls: vec![ToolCall {
+                    id: "c1".to_owned(),
+                    name: "shell".to_owned(),
+                    arguments: r#"{"command":"echo hi"}"#.to_owned(),
+                }],
+            },
+            Message::Tool {
+                tool_call_id: "c1".to_owned(),
+                content: "hi".to_owned(),
+            },
+        ]);
+        let view = s.lines.join("\n");
+
+        // System identity is NOT shown as conversation.
+        assert!(
+            !view.contains("you are an agent"),
+            "system seed must be hidden"
+        );
+        // The prior user turn and assistant reply ARE shown.
+        assert!(
+            view.contains("> remember 42"),
+            "user turn missing: {view:?}"
+        );
+        assert!(view.contains("noted 42"), "assistant text missing");
+        // The tool call and its result are shown.
+        assert!(view.contains("[tool: shell]"), "tool call missing");
+        assert!(view.contains("↳ hi"), "tool result missing");
+        // A separator marks where the live continuation starts.
+        assert!(
+            view.contains("resumed; continue below"),
+            "resume separator missing"
+        );
+    }
+
+    /// Seeding an empty history (a fresh session) adds nothing — no spurious
+    /// separator, so a new session starts with a clean pane.
+    #[test]
+    fn seed_history_empty_is_noop() {
+        let mut s = state();
+        s.seed_history(&[]);
+        assert!(s.lines.is_empty(), "empty history must not render anything");
+    }
+
+    /// `first_line` collapses to the first non-empty line and truncates with an
+    /// ellipsis, so picker rows and previews stay one line.
+    #[test]
+    fn first_line_truncates_and_trims() {
+        assert_eq!(first_line("  hello  \nworld", 80), "hello");
+        assert_eq!(first_line("\n\nfirst real", 80), "first real");
+        assert_eq!(first_line(&"x".repeat(100), 5), "xxxxx…");
+        assert_eq!(first_line("", 10), "");
     }
 }
