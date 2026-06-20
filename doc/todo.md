@@ -180,10 +180,25 @@ Hook protocol 当前决策：
 ### 11. MCP / ACP / A2A 适配优先级 — 部分决策
 
 已决策：
-- **MCP client**：Day 1，已确定为核心扩展机制。
+- **MCP client（stdio transport）**：Day 1，已实现（Phase 2 Step 5）。本地 server 全走 stdio
+  子进程，零网络/零认证，覆盖当前全部场景。
+- **MCP client 远程 transport（Streamable HTTP + OAuth）**：延后。理由如下。
 - **MCP server 对外暴露**：延后，暂不暴露，等有明确对外能力需求时再设计。
 - **A2A**：延后。当前无跨系统 agent 协作需求。内部多 agent 协作用 subagent/task system 解决。
 - **ACP**：延后。编辑器集成初期通过 gateway HTTP/WS 顶替。
+
+**MCP 远程 transport 延后记录（2026-06-20）：**
+- 现状：`src/mcp/client.rs` 只实现 stdio；`config.rs` 的 `url` 字段解析但不连接，非 stdio server
+  在 `connect` 处被 `McpError::NotStdio` 拒绝。
+- 传输代际：MCP 远程传输有两代。**SSE**（2024-11-05 引入，双端点 `GET /sse` + `POST /messages`，
+  已于 2025-03-26 标记废弃，不再单独实现）；**Streamable HTTP**（2025-03-26 起现行，单端点 `/mcp`，
+  SSE 降级为其一种响应流模式，支持无状态部署 + `Last-Event-ID` 断线重连）。要做远程，直接上
+  Streamable HTTP，跳过 SSE。
+- 为何延后：远程 server 拖入一坨独立工程——OAuth 2.1 授权 flow（2025 spec 已写进规范）、token
+  刷新、TLS、SSE 流解析、断线重连。每条都与 stdio 路径正交，且当前无远程 server 需求。Phase 2
+  "可用" 目标（agent 能调外部 tool）已由 stdio 达成。
+- 接入成本：`url` 字段占位已留，接 Streamable HTTP 时数据模型不动，只加一个 transport 实现 +
+  OAuth client。属独立任务，需求出现时立项。
 
 协议 adapter 位置：`src/mcp/`（已有）、`src/a2a/`、`src/acp/`（后续按需添加）。
 
