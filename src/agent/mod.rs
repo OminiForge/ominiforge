@@ -169,6 +169,9 @@ pub struct Agent {
     provider: Arc<dyn Provider>,
     tools: ToolRegistry,
     config: AgentConfig,
+    /// Optional dedicated provider + model id for compaction summaries
+    /// (`doc/phase2-plan.md` decision B). `None` reuses the main provider/model.
+    compaction: Option<(Arc<dyn Provider>, String)>,
 }
 
 impl Agent {
@@ -179,7 +182,16 @@ impl Agent {
             provider,
             tools,
             config,
+            compaction: None,
         }
+    }
+
+    /// Use a dedicated provider + model for compaction summaries instead of the
+    /// session's current model (`doc/phase2-plan.md` decision B).
+    #[must_use]
+    pub fn with_compaction_model(mut self, provider: Arc<dyn Provider>, model: String) -> Self {
+        self.compaction = Some((provider, model));
+        self
     }
 
     /// Run one turn: append `input` to the runtime context, drive model rounds
@@ -290,15 +302,22 @@ impl Agent {
                       Keep it under 500 tokens.</instruction>".to_owned(),
         });
 
+        // Use the dedicated compaction provider/model if configured, else the
+        // session's current one (`doc/phase2-plan.md` decision B).
+        let (provider, model) = self.compaction.as_ref().map_or_else(
+            || (&self.provider, self.config.model.clone()),
+            |(p, m)| (p, m.clone()),
+        );
+
         let request = ModelRequest {
-            model: self.config.model.clone(),
+            model,
             messages,
             tools: Vec::new(),
             temperature: 0.3,
             max_tokens: Some(1000),
         };
 
-        let mut stream = self.provider.stream(request).await?;
+        let mut stream = provider.stream(request).await?;
         let mut summary = String::new();
 
         while let Some(event) = stream.next().await {
@@ -2001,6 +2020,29 @@ mod tests {
             content: "be helpful".to_owned(),
         }]);
         assert!(agent.compact(&runtime, None).await.unwrap().is_none());
+    }
+
+    /// With a dedicated compaction model set, the summary is produced by *that*
+    /// provider, not the main one. The main provider here would panic if called
+    /// (empty script), proving compaction routed to the dedicated provider.
+    #[tokio::test]
+    async fn compact_uses_dedicated_compaction_provider() {
+        // Main provider is never expected to stream during compaction.
+        let main = Arc::new(ScriptedProvider::new(vec![]));
+        // Dedicated compaction provider yields a recognizable summary.
+        let compaction = Arc::new(ScriptedProvider::new(vec![text_round("DEDICATED SUMMARY")]));
+        let agent = planning_agent(main).with_compaction_model(compaction, "cheap".to_owned());
+
+        let mut runtime = SessionRuntime::new(vec![Message::System {
+            content: "be helpful".to_owned(),
+        }]);
+        runtime.context.push(Message::User { content: "old".to_owned() });
+
+        let snapshot = agent.compact(&runtime, None).await.unwrap().unwrap();
+        assert!(matches!(
+            &snapshot[1],
+            Message::User { content } if content.contains("DEDICATED SUMMARY")
+        ));
     }
 
     fn starts_with_created(events: &[CoreEvent]) -> bool {
