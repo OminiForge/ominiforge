@@ -116,7 +116,7 @@
 - [x] Step 3 — compaction ✅（2026-06-20）
 - [x] Step 4 — EventBus + monitor ✅（2026-06-20）
 - [x] Step 5 — MCP client ✅（2026-06-20）
-- [ ] Step 6 — TUI
+- [x] Step 6 — TUI ✅（2026-06-20）
 
 ### Step 1 完成记录（2026-06-19）
 
@@ -290,3 +290,41 @@ clippy pedantic+nursery 干净（request 持锁跨写读为有意，带 `allow(s
 
 注：在线 agent 调用 MCP 工具的实际 live 验证（mimo 模型实跑）可在 Step 6 TUI 或单独 e2e 中做；
 本步用 mock server 覆盖了协议层全回环 + 统一 Tool trait 适配 + source 归属。
+
+### Step 6 完成记录（2026-06-20）
+
+实现 TUI（`ratatui` 0.29 + `crossterm` 0.28）：裸命令 `ominiforge` 进全屏交互界面，订阅
+EventBus 实时渲染对话/思考/工具/token 用量；多轮输入；移植 Step 1 的 resume（交互式 session
+选择器）；移除临时 `chat` 子命令。
+
+`src/tui.rs`（全新实现，渲染循环永不阻塞模型）：
+- **并发模型**：一个 turn 在 `tokio::spawn` 后台任务里跑（`Agent` 包 `Arc`，`writer`/`runtime`
+  move 进任务、连同 `TurnOutcome` 经 `oneshot` move 回）；渲染循环每 50ms `draw` + 轮询键盘 +
+  排空两条 channel，所以输出边产生边显示（满足"实时看到流式输出"）。turn 运行时锁键盘输入
+  （仅 Ctrl-C 例外）。`run`/`run_app` 保持 `async`（`spawn` 需运行时上下文，带 `allow`）。
+- **两路事件源**：①`ChannelSink`（实现 `StreamSink`，unbounded send 非阻塞）把 token 级 delta
+  （text/reasoning/tool-args + block_start）推给 UI——这是真·流式来源，因 EventBus 只在 block
+  收尾投递整块；②`EventBus`（Step 4 为在线消费建的，本步首个在线消费者）投递 ToolEvent
+  Completed/Failed——sink 看不到工具*结果*。两路都 fold 进 `AppState.lines`，`Open` 枚举追踪
+  当前 channel 决定 delta 追加到末行还是开新行（镜像 CLI sink 的 channel 跟踪）。
+- **session 选择器**：`select_or_create_session` 全屏列出本 workspace sessions（每行 id + turn
+  数）+ `[ New session ]` 行，↑↓ 移动、Enter 选中、q/Esc 取消；选已存在的走 `read_events` +
+  `open` + `rebuild_runtime`（Step 1 的 UI 无关库函数，迁移只换调用方）。无 session 时直接建新。
+- **auto-compaction**：turn 收尾若 `context_tokens >= context_limit`，调 `do_compact`（= 旧 CLI
+  `do_compact` 同结构：`Agent::compact` → `create_compaction` → 新 writer 接 bus + 新 runtime）
+  原地换 session，header 更新 id。失败非致命（打 note 保留原 session）。补回了移除 `chat` 丢掉
+  的能力。
+- **渲染**：上对话区（按行数算 scroll 让末尾可见）+ 下输入区（busy 时 title 显示 "working…"）。
+
+`src/cli.rs`：`Command` 改 `Option`（裸命令 → `tui_main`）；删 `chat`/`ChatArgs`/`ChatSession`/
+`open_or_create_session`/`list_sessions`/`swap_to_compaction`/`do_compact`（resume + compaction
+能力迁入 TUI）。`run`/`inspect`/`init` 不变。`report_turn` 文案改为单轮 `run` 专用。
+`Cargo.toml`：加 `ratatui = "0.29"` + `crossterm = "0.28"`。
+
+验证：120 测试通过（无回归；TUI 是 IO/终端层，逻辑复用既测过的 agent/session/context）。clippy
+pedantic+nursery 干净。Live（mimo/mimo-v2.5-pro，PTY harness 设 40×120 winsize 驱动真终端）：
+①新建 session → 输入"run echo STEP6_OK"→ 实时看到 `[thinking]`/`[tool: shell]`/工具结果
+`STEP6_OK`/流式答案/footer（rounds + `ctx ~`），Ctrl-C 干净退出；on-disk 验 session `kind=new`、
+2 model round + shell tool + `Turn Completed`、seq 0..12 连续。②**独立新进程** resume 该 session
+（选择器 Enter 选首行）问"echo 输出过什么"→ 答出 `STEP6_OK`（证 `rebuild_runtime` 从磁盘重建
+上下文），新 turn 追加后 seq 0..18 连续无空洞。事后清理两个 throwaway session。
