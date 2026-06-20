@@ -35,6 +35,11 @@ const DEFAULT_PROFILE: &str = "default";
 pub struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+
+    /// Open the interactive session picker on startup instead of starting a
+    /// fresh session. Only meaningful for the bare `ominiforge` (TUI) command.
+    #[arg(long, global = true)]
+    resume: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -108,14 +113,14 @@ struct InspectArgs {
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        None => tui_main().await,
+        None => tui_main(cli.resume).await,
         Some(Command::Run(args)) => run_turn(args).await,
         Some(Command::Inspect(args)) => inspect(&args),
         Some(Command::Init(args)) => init(&args),
     }
 }
 
-async fn tui_main() -> Result<()> {
+async fn tui_main(resume: bool) -> Result<()> {
     let prep = prepare(None, DEFAULT_PROFILE, None, None, false).await?;
     let system = vec![Message::System {
         content: prep.system_prompt.clone(),
@@ -129,6 +134,7 @@ async fn tui_main() -> Result<()> {
         prep.workspace,
         prep.resolved,
         prep.mcp_clients,
+        resume,
     )
     .await
 }

@@ -328,3 +328,25 @@ pedantic+nursery 干净。Live（mimo/mimo-v2.5-pro，PTY harness 设 40×120 wi
 2 model round + shell tool + `Turn Completed`、seq 0..12 连续。②**独立新进程** resume 该 session
 （选择器 Enter 选首行）问"echo 输出过什么"→ 答出 `STEP6_OK`（证 `rebuild_runtime` 从磁盘重建
 上下文），新 turn 追加后 seq 0..18 连续无空洞。事后清理两个 throwaway session。
+
+#### Step 6 UX 修订（2026-06-20，按用户反馈）
+
+首版三个交互问题，已修：
+- **裸命令应直接进新 session，而非弹选择器**。`Cli` 加全局 `--resume` flag；裸 `ominiforge` →
+  新 session 直接进对话，`ominiforge --resume` → 才弹选择器。`tui::run` 加 `resume: bool` 参数。
+- **resume 后看不到历史**。原先只 `rebuild_runtime` 重建了 `runtime.context` 但从不渲染。新增
+  `AppState::seed_history`：把重建的 `Vec<Message>` 铺进对话区（System 跳过=身份非对话；User→
+  `> ...`；Assistant 文本/tool_calls；Tool 结果缩进 `↳`），末尾加 `── resumed; continue below ──`
+  分隔线。选择器行也从裸 id 改为 `时间 · N turn(s) · 首条 prompt 预览`（`session_rows` +
+  `first_line` 截断）。空 session 显示 `(no messages yet)`。
+- **选择器按 q/Esc 崩溃**。原 `anyhow::bail!("cancelled")` 当错误冒泡（带 backtrace）。改：
+  `select_session` 返回 `Result<Option<SessionId>>`，q/Esc/无 session → `Ok(None)` → 干净退出。
+
+重构：`select_or_create_session` 拆为 `create_session` / `open_session`（后者额外返回重建的
+history 供渲染）/ `select_session`（纯选择器）+ `Chosen` enum；`AppState::new` 改收 `&str`
+provider/model（不再依赖 `ResolvedModel`，可单测）。
+
+验证：123 测试通过（+3：`seed_history` 渲染历史/跳过 System、空历史 no-op、`first_line` 截断）。
+clippy pedantic+nursery 干净。Live（mimo，PTY 40×120）：①裸命令直接进对话（无选择器）；
+②`--resume` 选择器显示富信息行，Esc 退出码 0 无 panic/backtrace；③裸命令记住 codeword BANANA77
+→ `--resume` 选该 session → 历史区渲染出 BANANA77 + 分隔线。事后清理 3 个 throwaway session。
