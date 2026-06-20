@@ -114,7 +114,7 @@
 - [x] Step 1 — 多轮循环 + resume ✅（2026-06-19）
 - [x] Step 2 — token 计数与用量追踪 ✅（2026-06-20）
 - [x] Step 3 — compaction ✅（2026-06-20）
-- [ ] Step 4 — EventBus + monitor
+- [x] Step 4 — EventBus + monitor ✅（2026-06-20）
 - [ ] Step 5 — MCP client
 - [ ] Step 6 — TUI
 
@@ -218,3 +218,36 @@ Live（mimo/mimo-v2.5-pro）：单轮 `1068in` 真实 usage，context `~1071 / 6
 throwaway profile）：记住 42 → 自动压缩切到 compaction session → 新进程般续聊仍答出 42；
 on-disk 验证 compaction session `kind=compaction`+`parent_id`、snapshot = system+summary、
 首条 `Session::Created`、原 session 完整保留（`kind=new`/25 events）；事后清理 profile + sessions。
+
+### Step 4 完成记录（2026-06-20）
+
+实现 EventBus（tokio broadcast）+ Monitor（事件流派生指标），含离线 `inspect <session>`。
+
+`src/session/bus.rs`：`EventBus`（`broadcast::Sender<CoreEvent>` 封装，clone 共享通道）。
+`publish` best-effort（无 subscriber 不报错，丢弃即可）；`subscribe` 给 receiver；容量 1024，
+落后 subscriber 收 `Lagged` 后从 log 重同步。事件先落 jsonl 再 publish（log 仍是真相，广播只为
+liveness）。`SessionWriter` 加 `bus: Option<EventBus>` + `with_bus` builder，`append` 写完发布。
+
+`src/monitor.rs`：`Monitor`（纯 fold）+ `SessionSummary` + `summarize(events, pricing)` 离线入口。
+- 聚合 turns / model requests / tool calls(+failures) / input+output+cache_read tokens /
+  cache_hit_rate（read/input）/ tools_used / errors（按 code 计数）。
+- 成本：`RequestStarted` 记 `request_id→model`，`RequestCompleted` 按该 model 的 pricing 折算
+  累加；无任何 priced model → `cost_usd=None`（不报误导性 $0.00）。`cost_of` 用 input/output/
+  cache_read(缺省回退 input rate)/cache_write(缺省 0) 四项 per-million 求和。
+- 决策符合 `monitor.md`：成本不写回 event，读时用最新 pricing 重算。
+
+`src/config/mod.rs`：`load_pricing(&providers) -> HashMap<String,Pricing>`：先铺 `providers.toml`
+内联 pricing 作基线，再用 `.omini/config/pricing.toml`（`[models."<id>"]` 表）覆盖；缺文件不报错。
+`PricingFile` 私有结构 + `PRICING_FILE` 常量。
+
+`src/cli.rs`：`inspect <session_id>` 子命令——读 jsonl → `summarize` → `print_summary`
+（turns/requests/tools/tokens/cache/cost/tools_used/errors，tools 与 errors 按计数降序）。
+pricing best-effort（加载失败则 unpriced）。
+
+验证：112 测试通过（106→+6：bus 2 + monitor 4，另 config 2 pricing 合并/缺省）。clippy
+pedantic+nursery 干净。Live（mimo）：单轮 `run` 后 `inspect` 报 1 turn / 1 request /
+1075in/7out / cost $0.0033，与 turn footer 完全一致；手算 1075×$3/M + 7×$6/M = $0.003267
+→ $0.0033 ✓（用 providers.toml 内联 pricing，无 pricing.toml 走回退层）；事后清理 session。
+
+注：EventBus 在线订阅路径已接线 + 单测（`with_bus` + broadcast 投递），实际在线消费者
+（TUI 实时渲染）在 Step 6 接入；本步可验证产出是离线 `inspect`。

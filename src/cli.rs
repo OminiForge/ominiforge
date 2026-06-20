@@ -43,6 +43,8 @@ enum Command {
     Run(RunArgs),
     /// Start a multi-turn interactive conversation (stdio REPL).
     Chat(ChatArgs),
+    /// Print a derived metrics summary for a session (offline, from its log).
+    Inspect(InspectArgs),
     /// Scaffold `.omini/` config files (providers + a default profile).
     Init(InitArgs),
 }
@@ -122,6 +124,21 @@ struct InitArgs {
     force: bool,
 }
 
+/// Arguments for `ominiforge inspect`.
+#[derive(Debug, Parser)]
+struct InspectArgs {
+    /// The session id to inspect (a directory under `.omini/sessions`).
+    session_id: String,
+
+    /// Workspace whose sessions to read (default: current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+
+    /// Do not auto-load a `.env` file; use only the existing environment.
+    #[arg(long)]
+    no_dotenv: bool,
+}
+
 /// Parse arguments and dispatch. The binary entry point calls this.
 ///
 /// # Errors
@@ -131,6 +148,7 @@ pub async fn run() -> Result<()> {
     match cli.command {
         Command::Run(args) => run_turn(args).await,
         Command::Chat(args) => chat(args).await,
+        Command::Inspect(args) => inspect(&args),
         Command::Init(args) => init(&args),
     }
 }
@@ -796,6 +814,70 @@ async fn do_compact(
 }
 
 // __APPEND_MARKER2__
+
+/// Print a derived metrics summary for a session, computed offline by replaying
+/// its `events.jsonl` through the monitor (`doc/monitor.md` §8). Pricing comes
+/// from `providers.toml` + `pricing.toml`, so cost reflects current prices, not
+/// whatever was in effect when the session ran.
+fn inspect(args: &InspectArgs) -> Result<()> {
+    let workspace = resolve_workspace(args.workspace.clone())?;
+    let config = ConfigStore::discover(&workspace);
+    if !args.no_dotenv {
+        load_dotenv(config.roots(), &workspace);
+    }
+
+    // Pricing is best-effort: a missing/empty table just means cost is unpriced.
+    let pricing = config
+        .load_providers()
+        .and_then(|providers| config.load_pricing(&providers))
+        .unwrap_or_default();
+
+    let store = SessionStore::new(workspace.join(SESSIONS_SUBDIR));
+    let sid = crate::core::SessionId(args.session_id.clone());
+    let events = store
+        .read_events(&sid)
+        .with_context(|| format!("failed to read session `{}`", args.session_id))?;
+
+    let summary = crate::monitor::summarize(&events, pricing);
+    print_summary(&args.session_id, &summary);
+    Ok(())
+}
+
+/// Render a [`SessionSummary`](crate::monitor::SessionSummary) to stdout.
+fn print_summary(session_id: &str, s: &crate::monitor::SessionSummary) {
+    println!("session {session_id}");
+    println!("  turns:          {}", s.total_turns);
+    println!("  model requests: {}", s.total_model_requests);
+    println!(
+        "  tool calls:     {} ({} failed)",
+        s.total_tool_calls, s.total_tool_failures
+    );
+    println!(
+        "  tokens:         {} in / {} out",
+        s.total_input_tokens, s.total_output_tokens
+    );
+    println!(
+        "  cache hit rate: {:.1}% ({} read tokens)",
+        s.cache_hit_rate * 100.0,
+        s.total_cache_read_tokens
+    );
+    match s.cost_usd {
+        Some(cost) => println!("  cost:           ${cost:.4}"),
+        None => println!("  cost:           (unpriced — no pricing for the model(s) used)"),
+    }
+    if !s.tools_used.is_empty() {
+        let mut tools: Vec<_> = s.tools_used.iter().collect();
+        tools.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        let rendered: Vec<String> = tools.iter().map(|(n, c)| format!("{n}×{c}")).collect();
+        println!("  tools used:     {}", rendered.join(", "));
+    }
+    if !s.errors.is_empty() {
+        let mut errors: Vec<_> = s.errors.iter().collect();
+        errors.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        let rendered: Vec<String> = errors.iter().map(|(c, n)| format!("{c}×{n}")).collect();
+        println!("  errors:         {}", rendered.join(", "));
+    }
+}
 
 /// Scaffold `.omini/config/providers.toml` and `.omini/profiles/default.toml`.
 fn init(args: &InitArgs) -> Result<()> {
