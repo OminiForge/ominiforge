@@ -128,22 +128,9 @@ Hook（`model:request:before`）也可间接 modify 注入内容。
 
 ### 5.2 持久化
 
-注入内容同时写入 events.jsonl 和保留在 context view 中：
-
-```rust
-enum EventPayload {
-    // ... existing ...
-    Injection(InjectionEvent),
-}
-
-enum InjectionEvent {
-    ContextInjected {
-        source: InjectionSource,  // Memory | RAG | ACP | Hook
-        content: String,
-        token_count: u32,
-    },
-}
-```
+注入内容同时写入 events.jsonl（`InjectionEvent::ContextInjected`，含 source / content /
+token_count）并保留在 context view 中。`EventPayload::Injection` 与 `InjectionSource` 定义见
+[`src/core/payload.rs`](../src/core/payload.rs)，schema 说明见 [`event-schema.md`](./event-schema.md) §3.6。
 
 - Context view 中历史 injection 不移除，保障 cache 命中。
 - Events.jsonl 完整记录，保障 replay 和分析。

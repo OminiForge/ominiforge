@@ -30,60 +30,19 @@ Tool
 
 ## 3. 统一 Tool Interface
 
-Agent loop 看到的 tool 接口：
+Agent loop 通过单一 `Tool` trait 看待所有 tool：`descriptor()` 给出 name + description +
+input schema，`invoke(input) -> ToolResult` 执行。Built-in tool 直接 impl `Tool`；MCP tool
+通过 MCP client adapter impl `Tool`。两者对 agent loop 无差别。
 
-```rust
-#[async_trait]
-pub trait Tool: Send + Sync {
-    fn descriptor(&self) -> ToolDescriptor;
-    async fn invoke(&self, input: ToolInput) -> ToolResult;
-}
-
-pub struct ToolDescriptor {
-    pub name: String,
-    pub description: String,
-    pub input_schema: serde_json::Value,
-}
-
-pub struct ToolInput {
-    pub call_id: String,
-    pub input: serde_json::Value,
-    pub timeout: Duration,
-}
-
-pub struct ToolOutput {
-    pub content: Vec<Content>,
-    pub is_error: bool,
-    pub error_code: Option<String>,
-}
-
-pub type ToolResult = Result<ToolOutput, ToolError>;
-```
-
-Built-in tool 直接 impl `Tool` trait。MCP tool 通过 MCP client adapter impl `Tool` trait。
+trait、`ToolDescriptor` / `ToolInput` / `ToolOutput` / `ToolRegistry` 定义见
+[`src/tool/mod.rs`](../src/tool/mod.rs)；`ToolOutput` / `Content` / `ToolSource` 等事件侧类型
+见 [`src/core/payload.rs`](../src/core/payload.rs)。
 
 ## 4. Built-in Tool
 
-### 4.1 注册
-
-Built-in tool 在 agent 启动时静态注册：
-
-```rust
-pub fn register_builtin_tools(registry: &mut ToolRegistry) {
-    registry.register(ShellTool::new(config));
-    registry.register(ReadTool::new());
-    registry.register(WriteTool::new());
-    registry.register(SearchTool::new());
-    // ...
-}
-```
-
-### 4.2 特点
-
-- 直接访问 OS 能力（文件系统、进程、网络）。
-- 无沙箱限制（信任自身代码）。
-- 最低延迟（无 IPC 开销）。
-- 随 ominiforge 版本发布更新。
+Built-in tool 在 agent 启动时静态注册（`register_builtin` 见
+[`src/tool/mod.rs`](../src/tool/mod.rs)）。特点：直接访问 OS 能力（文件系统、进程、网络）、
+无沙箱限制（信任自身代码）、最低延迟（无 IPC 开销）、随 ominiforge 版本发布更新。
 
 ## 5. MCP Tool
 
@@ -258,15 +217,9 @@ Err(ToolError::ServerCrashed(reason))
 
 ## 8. Content 类型
 
-```rust
-pub enum Content {
-    Text(String),
-    Image { media_type: String, data: Vec<u8> },
-    ArtifactRef { artifact_id: String, media_type: String },
-}
-```
-
-超过 64KB 时，runtime 自动存入 artifact store，替换为 ArtifactRef。Tool 本身不感知。
+Tool 输出内容为 `Content`（Text / Image / ArtifactRef），定义见
+[`src/core/payload.rs`](../src/core/payload.rs)。超过 64KB 时 runtime 自动存入 artifact store，
+替换为 `ArtifactRef`，tool 本身不感知。
 
 ## 9. 与 Event Schema 的关系
 
