@@ -1,5 +1,8 @@
 # Monitor Trace Model
 
+代码：`Monitor`、`SessionSummary`、`summarize`、`cost_of` 见 [`src/monitor.rs`](../src/monitor.rs)。
+本文讲设计意图与配置契约，聚合字段细节以代码为准。
+
 ## 1. 设计原则
 
 - Trace = event stream 本身，不引入独立 trace ID 或 span 体系。
@@ -70,20 +73,9 @@ ToolEvent::Failed {
 
 ### 4.2 聚合指标（monitor 内存维护）
 
-```rust
-pub struct ToolMetrics {
-    pub tool_name: String,
-    pub source: ToolSource,         // Builtin | Mcp { server_name }
-    pub total_calls: u64,
-    pub total_failures: u64,
-    pub avg_duration_ms: f64,
-    pub p95_duration_ms: u64,
-    pub total_output_bytes: u64,
-    pub failure_reasons: HashMap<String, u64>,
-}
-```
-
-聚合在内存中维护，按需持久化（session 结束时写入、定期快照、或由 evolution 请求）。
+按 tool 聚合 `total_calls` / `total_failures` / `avg`+`p95` duration / `total_output_bytes` /
+`failure_reasons`（按 source = Builtin/Mcp 区分）。聚合在内存中维护，按需持久化（session 结束
+写入、定期快照、或由 evolution 请求）。结构见 `src/monitor.rs`。
 
 ## 5. Trace 结构
 
@@ -108,21 +100,10 @@ Turn N (turn_id)
 
 ### 6.1 实时估算
 
-每次 ModelEvent::RequestCompleted 后立即计算（不写回 event，仅 monitor 内存 + 聚合）：
-
-```rust
-pub struct CostEstimate {
-    pub input_cost: f64,        // USD
-    pub output_cost: f64,
-    pub cache_read_cost: f64,
-    pub cache_write_cost: f64,
-    pub total_cost: f64,
-}
-```
-
-- 输入为 `RequestCompleted.usage` + pricing table。
-- 用于 cost limiter hook（before hook 检查累计 cost 是否超预算）。
-- **不写入 event**。历史成本可用最新 pricing 从 `usage` 重算。
+每次 `ModelEvent::RequestCompleted` 后立即计算（不写回 event，仅 monitor 内存 + 聚合）：输入为
+`usage` + pricing table，按 input / output / cache_read / cache_write 四项分别折算。用于 cost
+limiter hook（检查累计 cost 是否超预算）。**不写入 event**——历史成本可用最新 pricing 从
+`usage` 重算。`cost_of` 见 `src/monitor.rs`。
 
 ### 6.2 Pricing Table
 
@@ -179,27 +160,9 @@ MCP server 作为子进程，额外追踪：
 
 ## 8. Session 级汇总
 
-Session 结束时生成汇总（写入 events.jsonl 最后一条或独立文件）：
-
-```rust
-pub struct SessionSummary {
-    pub total_turns: u32,
-    pub total_model_requests: u32,
-    pub total_tool_calls: u32,
-    pub total_input_tokens: u64,
-    pub total_output_tokens: u64,
-    pub total_cost_usd: f64,
-    pub cache_hit_rate: f64,
-    pub duration_seconds: u64,
-    pub tools_used: HashMap<String, u32>,  // tool_name → call_count
-    pub errors: Vec<ErrorSummary>,
-}
-```
-
-用于：
-- CLI/TUI session 结束时展示
-- Evolution worker 分析
-- Web dashboard 报告
+Session 结束时生成 `SessionSummary`（turns / model requests / tool calls / input+output
+tokens / cost / cache_hit_rate / duration / tools_used / errors），用于 CLI/TUI 结束展示、
+evolution 分析、Web dashboard 报告。结构与离线入口 `summarize` 见 `src/monitor.rs`。
 
 ## 9. Monitor 实现架构
 

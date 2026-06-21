@@ -1,343 +1,118 @@
 # Ominiforge Core Event Schema
 
-本文档定义 Ominiforge 内部统一事件协议。所有 UI、gateway、session log、monitor 和 replay 都依赖该协议。
+定义内部统一事件协议。所有 UI、gateway、session log、monitor、replay 依赖该协议。
+
+**精确类型定义在代码**：envelope 见 [`src/core/envelope.rs`](../src/core/envelope.rs)（`CoreEvent`、
+`EventSource`、`SourceKind`）；payload 见 [`src/core/payload.rs`](../src/core/payload.rs)
+（`EventPayload` 及各分域 enum、`Usage`、`ErrorDetail` 等）。本文只讲设计意图与不可变契约，
+字段级细节以代码及其注释为准。
 
 ## 1. 设计原则
 
 - 统一 envelope + 分域 payload enum。不做扁平大 enum，不做完全互不关联的事件体系。
-- Event schema 不引入显式 span 概念。Monitor 层从 start/stop 配对事件自行派生 span 树。
+- 不引入显式 span 概念。Monitor 层从 start/stop 配对事件自行派生 span 树。
 - 事件一旦持久化即不可变。
 - Schema 演进以追加兼容为主（只加字段、只加新 event type），极少情况做 breaking change 并升全局版本号。
 
-## 2. Envelope 结构
+## 2. Envelope
 
-每个事件共享以下信封字段：
+每个事件共享信封字段：`schema_version`、`seq`（session 内递增，严格排序）、`session_id`、
+`timestamp`、`source`、可选 `parent_event_id`（因果上游）、可选 `turn_id`、`payload`。
 
-```rust
-struct CoreEvent {
-    /// 协议版本，如 "ominiforge.event.v1"
-    schema_version: String,
-
-    /// Session 内递增序号，保证严格排序
-    seq: u64,
-
-    /// 所属 session
-    session_id: SessionId,
-
-    /// UTC 时间戳
-    timestamp: DateTime<Utc>,
-
-    /// 事件来源
-    source: EventSource,
-
-    /// 因果关联：指向触发本事件的上游事件（可选）
-    parent_event_id: Option<EventId>,
-
-    /// 所属 turn（可选，turn 启动后填充）
-    turn_id: Option<TurnId>,
-
-    /// 实际负载
-    payload: EventPayload,
-}
-```
-
-### 2.1 Event ID
-
-```rust
-struct EventId {
-    session_id: SessionId,
-    seq: u64,
-}
-```
-
-- Session 内操作只用 `seq`。
-- 跨 session 引用序列化为 `"{session_id}:{seq}"`。
-- 全局唯一性靠 session_id + seq 复合保证。
-
-### 2.2 Event Source
-
-```rust
-struct EventSource {
-    kind: SourceKind,
-    id: String,
-}
-
-enum SourceKind {
-    Model,      // LLM provider
-    Tool,       // tool 执行
-    Runtime,    // ominiforge 内部运行时
-    User,       // 用户操作
-    System,     // scheduler、evolution 等系统级
-    External,   // MCP server、A2A 远程 agent
-}
-```
-
-- `kind` 用于快速过滤和路由。
-- `id` 标识具体实例，如 `"shell"`、`"openai-compatible/deepseek-r1"`、`"mcp://github-server"`。
-- 无 `Plugin` variant：WASM plugin 方案已废弃，外部扩展统一走 MCP（`External`）。
+- **Event ID** = `session_id` + `seq` 复合。Session 内只用 `seq`；跨 session 引用序列化为
+  `"{session_id}:{seq}"`。
+- **Event Source** = `kind`（Model / Tool / Runtime / User / System / External）+ `id`
+  实例标识（如 `"shell"`、`"mcp://github-server"`）。`kind` 用于快速过滤路由。无 `Plugin`
+  variant——WASM 已废弃，外部扩展统一走 MCP（`External`）。
 
 ## 3. Payload 分域
 
-```rust
-enum EventPayload {
-    Turn(TurnEvent),
-    Model(ModelEvent),
-    Tool(ToolEvent),
-    Session(SessionEvent),
-    Artifact(ArtifactEvent),
-    Injection(InjectionEvent),
-    Error(ErrorEvent),
-}
-```
+按 Turn / Model / Tool / Session / Artifact / Injection / Error 分域。MonitorEvent **不在**
+核心 payload 中——monitor 是观测层，从核心事件派生 trace/span/cost，不污染 replay 必需语义。
 
-MonitorEvent 不在核心 payload 中。Monitor 是观测层，从核心事件派生 trace/span/cost，不污染 replay 必需语义。
+### 3.1 Turn
 
-## 4. Turn 事件
+Turn 是 agent loop 一次迭代的容器，显式状态机：`pending → running → completed | failed |
+interrupted`。设计要点：
 
-Turn 是 agent loop 一次迭代的容器，有显式状态机：
+- `Started.input` 记录开场用户输入；无用户输入的 turn（scheduler、自动续跑）为 `None`，
+  replay 据此重建开场 user message。
+- **Failed ≠ 进程崩溃**。撞 `max_rounds` 或 plan 卡死是*优雅停止*：副作用（已写文件）依然
+  成立，loop 写 `Failed` 后把部分结果交还调用方（`TurnOutcome.incomplete` 带同一 `reason`）。
+- **硬错误**（provider / 持久化故障）以 `Result::Err` 冒泡，不作为 `TurnOutcome`；但抛出前
+  loop 尽力先写一条 `ErrorEvent::Raised` 再写 `TurnEvent::Failed{reason:None}`。故 `reason:
+  None` + 配对 `ErrorEvent` = 硬错误；有 `reason`、无配对 `ErrorEvent` = 优雅停止。持久化
+  故障下补写可能再失败，此时静默放弃、原样抛首个错误，绝不掩盖或递归重试。
+- Resume 不开新 turn，同 `turn_id` 从断点续跑，用户无需重新输入。
 
-```
-pending → running → completed | failed | interrupted
-```
+### 3.2 Model
 
-```rust
-enum TurnEvent {
-    Started { turn_id: TurnId, input: Option<String> },
-    Completed { turn_id: TurnId },
-    Failed {
-        turn_id: TurnId,
-        failed_at_event_id: EventId,
-        retryable: bool,
-        reason: Option<TurnFailureReason>,   // 追加字段，旧日志为 None
-    },
-    Interrupted { turn_id: TurnId, interrupted_at_event_id: EventId },
-    Resumed { turn_id: TurnId, resume_from_event_id: EventId },
-}
+流式与持久化分离：
 
-enum TurnFailureReason {
-    MaxRoundsExceeded { max_rounds: u32 },   // 撞绝对安全网（兜底），非 crash
-    PlanStalled { incomplete_steps: u32 },   // 完成度门放弃（doc/plan.md §6）
-}
-```
+- **流式传输**（provider 边界，`llm::StreamEvent`）用 start/delta/stop 三段逐 token 推送，
+  供前端实时渲染。传输层概念，**不落盘**。
+- **持久化**（`ModelEvent`）按 content block 合并：一个块的所有 delta 累积，块结束写一条
+  `ContentBlock`。一条文本/推理/工具调用 = 一行，而非每 token 一行。
 
-- Turn started 记录开启它的用户输入 `input`（无用户输入的 turn——scheduler、自动续跑——为 `None`）。Replay 从此字段重建开场 user message。
+要点：
 
-- Turn failed 时记录断点位置 `failed_at_event_id`，并用 `reason` 说明为什么没干净收尾——replay/monitor 无需猜测。`reason` 是追加字段（append-compatible），早于该字段的日志解析为 `None`。
-- **Failed 不等于进程崩溃**：撞 `max_rounds` 或 plan 卡死是一种*优雅停止*——turn 的副作用（已写文件等）依然成立，loop 写下 `Failed` 事件后把**部分结果**交还调用方（`TurnOutcome.incomplete` 携带同一 `reason`）。
-- **硬错误（provider / 持久化故障）也留痕**：这类故障仍以 `Result::Err`（`AgentError`）冒泡给调用方，不作为 `TurnOutcome` 返回；但在抛出前，loop 会**尽力**先写一条 `ErrorEvent::Raised(ErrorDetail)` 承载真实错误，再写 `TurnEvent::Failed { reason: None, failed_at_event_id → 那条 ErrorEvent }`。所以每个 turn 终止都在事件流里留下尾巴；`reason: None` + 配对的 `ErrorEvent` 把硬错误与优雅停止区分开（优雅停止有 `reason`、无配对 `ErrorEvent`）。持久化故障下补写本身可能再失败，此时静默放弃补写、原样抛出首个错误（绝不掩盖或递归重试）。
-- Interrupted 时记录中断位置 `interrupted_at_event_id`。
-- Resume 不开新 turn，同一 turn_id 继续，从断点续跑。
-- 用户无需重新输入即可恢复。
+- model 产生 tool call 是 ModelEvent（`ContentBlock` 内含 `BlockContent::ToolCall`），tool
+  实际执行是 ToolEvent，二者分离。`ToolEvent::Started.tool_call_event_id` 指向该 `ContentBlock`。
+- 空文本/推理块（开了块没产出）不落盘——零信息量。tool call 块始终记录。
+- **`cost` 不存入 event**：由 monitor 从 `usage` + 可配 pricing 实时派生（见
+  [`monitor.md`](./monitor.md)）。存 usage（不可变事实）而非 cost（pricing 会变），历史可用
+  最新 pricing 重算。`cache_*` token 的 provider 字段映射见 [`monitor.md`](./monitor.md) §3。
 
-## 5. Model 事件
+### 3.3 Tool
 
-Streaming 与持久化分离：
+`source` 区分 Builtin / MCP（按 server 聚合监控）。`file_changes`（pre/post diff）为 Phase 2
+能力，初期不记录，见 [`sandbox.md`](./sandbox.md) §2.2。单次 tool 指标随 event 落盘；聚合指标
+（p95、失败率）由 monitor 内存维护。
 
-- **流式传输**（provider 边界，`llm::StreamEvent`）用 start/delta/stop 三段表达，逐 token 推送，供前端实时渲染。这是传输层概念，**不落盘**。
-- **持久化**（`ModelEvent`）按 content block 合并：collector 累积一个块的所有 delta，块结束时只写一条 `ContentBlock` 事件。一条文本/推理/工具调用 = 一行，而非每 token 一行。日志保持紧凑可读，replay 直接拿到完整块。
+### 3.4 Session
 
-```rust
-enum ModelEvent {
-    RequestStarted {
-        request_id: String,
-        provider: String,            // "openai", "anthropic", "xiaomi"
-        model: String,               // "gpt-4o", "mimo-7b"
-        temperature: f32,
-        max_tokens: Option<u32>,
-        tool_schemas_count: u32,     // 本次请求携带多少 tool schema
-        input_tokens_estimate: u32,  // 发送前估算（实际值在 RequestCompleted.usage）
-    },
-    // 一个完整 content block（流式 delta 合并后的结果）。
-    ContentBlock {
-        request_id: String,
-        index: u32,
-        content: BlockContent,
-    },
-    RequestCompleted {
-        request_id: String,
-        stop_reason: StopReason,
-        usage: Usage,
-        duration_ms: u64,                 // first byte → last byte
-        time_to_first_token_ms: Option<u64>,
-        provider_request_id: Option<String>, // provider 返回的 request id（调试用）
-    },
-    RequestFailed {
-        request_id: String,
-        duration_ms: u64,
-        error: ErrorDetail,
-    },
-}
+首条事件 `Created` 记录初始 config 快照（profile、tool list、workspace），使 replay 自包含；
+快照内容随实现以追加字段扩展。另有 `Forked` / `Paused` / `Resumed` / `Ended`。详见
+[`session-storage.md`](./session-storage.md) §3。
 
-// 持久化的完整块。与流式 ContentBlockType + delta 一一对应，但内容已组装完整。
-enum BlockContent {
-    Text { text: String },                              // 拼接所有 text delta
-    Reasoning { text: String },                         // 拼接所有 reasoning delta
-    ToolCall { id: String, name: String, arguments: String }, // arguments JSON 已拼全
-}
+### 3.5 Artifact
 
-struct Usage {
-    input_tokens: u32,
-    output_tokens: u32,
-    cache_read_tokens: u32,   // 命中 prefix cache 读取的 tokens
-    cache_write_tokens: u32,  // 本次写入 cache 的 tokens
-}
+只记录引用（id / kind / media_type / uri / size / sha256 / source_event_id），内容存 artifact store。
 
-enum StopReason {
-    EndTurn,
-    MaxTokens,
-    ToolUse,
-    StopSequence,
-}
-```
+### 3.6 Injection
 
-注意：
+记录动态注入，用于 replay 还原每轮 model 实际所见的 context。来源：Memory / RAG / ACP / Hook /
+**Runtime**。`Runtime` 用于 agent loop 自身注入的提醒（完成度门、卡死警告），见
+[`plan.md`](./plan.md) §6–§8，文本用 `<reminder>...</reminder>` 包裹，作为真实消息永久留在
+context 历史中（保 prefix cache）。Compaction 时历史 injection 被摘要浓缩。
 
-- model 产生 tool call 是 ModelEvent（`ContentBlock` 内含 `BlockContent::ToolCall`）。tool 实际执行是 ToolEvent。二者分离。`ToolEvent::Started.tool_call_event_id` 指向承载该 tool call 的 `ContentBlock` 事件。
-- 空文本/推理块（provider 开了块但没产出内容）不落盘——零信息量，避免噪声。tool call 块始终记录。
-- 逐 token 的实时输出由 collector 转发给 `StreamSink`（presentation 层，CLI/TUI/Web 各自渲染），不进 events.jsonl。Phase 2 的 gateway 通过 EventBus 向 Web 前端广播实时 delta，与落盘的合并块并行存在、互不影响。
-- **`cost` 不存入 event**。Cost 由 monitor 层从 `usage` + 可配置 pricing table 实时派生（见 [`monitor.md`](./monitor.md)）。存 usage（不可变事实）而非 cost（依赖会变的 pricing），保证历史可用最新 pricing 重算。
-- `cache_*` token 的 provider 字段映射见 [`monitor.md`](./monitor.md) §3。
+### 3.7 Error
 
-## 6. Tool 事件
+结构化（非纯 string）：`code` / `message` / `severity`（Fatal/Error/Warning）/ `retryable` /
+`source_event_id` / `provider_raw`。
 
-```rust
-enum ToolEvent {
-    Started {
-        tool_call_event_id: EventId, // 指向 ModelEvent 中的 tool call
-        tool_name: String,
-        source: ToolSource,          // Builtin | Mcp { server_name }
-        input: serde_json::Value,
-        working_dir: Option<PathBuf>,
-    },
-    Completed {
-        tool_call_event_id: EventId,
-        result: ToolOutput,          // 内联内容或 artifact 引用（由 runtime 决定）
-        duration_ms: u64,
-        output_bytes: usize,
-        artifacts_created: Vec<ArtifactId>,
-    },
-    Failed {
-        tool_call_event_id: EventId,
-        duration_ms: u64,
-        error: ErrorDetail,
-    },
-}
+## 4. Payload 大小限制
 
-enum ToolSource {
-    Builtin,
-    Mcp { server_name: String },
-}
-```
+单个 event payload 不超过 64KB。超限内容存 artifact store，event 中只留引用——信息零损失。
+传给 model 时的摘要/截断属 context management 层，不在 event schema 层处理。
 
-- `source` 区分内置 tool 与 MCP tool（按 server 聚合监控）。
-- `file_changes`（pre/post diff）为 Phase 2 能力，初期不记录，见 [`sandbox.md`](./sandbox.md) §2.2。
-- 单次 tool 指标随 event 落盘；聚合指标（p95、失败率等）由 monitor 内存维护。
-
-## 7. Session 事件
-
-```rust
-enum SessionEvent {
-    // 首条事件，记录初始 config 快照，使 replay 自包含
-    Created {
-        profile_id: Option<String>,
-        tools: Vec<String>,        // 启动时可用 tool 名列表
-        workspace: Option<PathBuf>,
-    },
-    Forked { parent_session_id: SessionId, fork_at_seq: u64 },
-    Paused,
-    Resumed,
-    Ended { reason: SessionEndReason },
-}
-```
-
-`Created` 的 config 快照内容随实现演进（model、context policy 等）以追加字段方式扩展。详见 [`session-storage.md`](./session-storage.md) §3。
-
-## 8. Artifact 事件
-
-Artifact 只记录引用，内容存 artifact store：
-
-```rust
-enum ArtifactEvent {
-    Created {
-        artifact_id: ArtifactId,
-        kind: String,        // "file", "image", "code_block", ...
-        media_type: String,
-        uri: String,         // artifact store 路径或 URI
-        size: u64,
-        sha256: Option<String>,
-        source_event_id: Option<EventId>,
-    },
-}
-```
-
-## 9. Injection 事件
-
-动态注入内容记录，用于 replay 和分析时还原每轮 model 实际看到的 context：
-
-```rust
-enum InjectionEvent {
-    ContextInjected {
-        source: InjectionSource,
-        content: String,
-        token_count: u32,
-    },
-}
-
-enum InjectionSource {
-    Memory,
-    RAG,
-    ACP,
-    Hook,
-    Runtime,   // agent loop self-injection (completion-gate / stuck-step reminders)
-}
-```
-
-- 每轮 model request 前，Context Manager 执行注入并记录此事件。
-- `Runtime` 来源用于 agent loop 自身注入的提醒（完成度门、卡死警告），见 `doc/plan.md` §6–§8。文本用 `<reminder>...</reminder>` 包裹，作为真实消息永久留在 context 历史中（保 prefix cache）。
-- 注入内容保留在 context view 历史中（保 cache），同时持久化到 events.jsonl（保可审计）。
-- Compaction 时历史 injection 被摘要浓缩。
-
-## 10. Error 事件
-
-独立结构化，不只 string：
-
-```rust
-struct ErrorDetail {
-    code: String,
-    message: String,
-    severity: ErrorSeverity,     // Fatal | Error | Warning
-    retryable: bool,
-    source_event_id: Option<EventId>,
-    provider_raw: Option<serde_json::Value>,
-}
-```
-
-## 11. Payload 大小限制
-
-- 设定阈值：单个 event payload 不超过 64KB。
-- 超过阈值时，内容存入 artifact store，event 中只保留引用。
-- 信息零损失——原始完整数据通过 artifact 可查。
-- 传给 model 时的摘要/截断属于 context management 层，不在 event schema 层处理。
-
-## 12. Schema 演进策略
-
-采用追加兼容策略：
+## 5. Schema 演进策略
 
 1. 只加新字段，不删不改已有字段语义。Consumer 用 `#[serde(default)]` 忽略不认识的字段。
 2. 新事件类型随时可加。Consumer 遇到不认识的 event type 跳过，不 crash。
-3. 极少情况需要不兼容变更时，升 `schema_version`（如 v1 → v2），写 migration guide。
+3. 极少情况需不兼容变更时升 `schema_version`（v1 → v2），写 migration guide。
 4. 旧 event log 永远以原版本保留，不做回写迁移。
 
-## 13. 因果关系表达
+## 6. 因果关系表达
 
 - 不引入显式 span 树作为一等概念。
-- 用 `parent_event_id` 表达直接因果（如 tool.started → 对应 model tool_call event）。
-- 用 start/stop 配对表达时间范围（如 model.request_started + model.request_completed）。
-- Monitor 层从 event stream 构建 span 树用于 trace 可视化，这是派生视图。
+- `parent_event_id` 表达直接因果（tool.started → 对应 model tool_call event）。
+- start/stop 配对表达时间范围（request_started + request_completed）。
+- Monitor 层从 event stream 构建 span 树用于 trace 可视化，派生视图。
 
-## 14. 与外部 JSON Wire Protocol 的关系
+## 7. 与外部 JSON Wire Protocol 的关系
 
-- 内部 Rust enum 和外部 JSON 不要求完全一一绑定。
-- 初期用同一套 struct + `#[serde(rename)]` 即可。
-- 当内部需要优化（arena 分配、zero-copy）时再引入转换层。
-- 外部 JSON 格式是稳定承诺；内部 Rust 类型可自由重构，只要转换层保持正确。
+- 内部 Rust enum 与外部 JSON 不要求完全一一绑定。
+- 初期用同一套 struct + `#[serde(rename)]`。内部需优化（arena、zero-copy）时再引入转换层。
+- **外部 JSON 格式是稳定承诺**；内部 Rust 类型可自由重构，只要转换层保持正确。
+</content>
