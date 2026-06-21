@@ -214,13 +214,8 @@ Host EventBus 是 runtime 内部机制（tokio broadcast channel），用于 mon
 
 ## 12. 与旧方案对比
 
-| | 旧方案（已废弃） | 新方案 |
-|--|---|---|
-| 运行时 | WASM Component + wasmtime | Rust trait + shell command |
-| 通信 | WIT 类型直传 | 内存直调 / stdin JSON |
-| 开发门槛 | Rust + wasm32-wasip3 | Rust（内置） / 任意语言（shell） |
-| 沙箱 | WASM 隔离 | 无（信任用户 hook） |
-| 能力 | 受 WASI 限制 | 完整 OS 能力 |
+旧 WASM Component hook 方案已废弃，改用 Rust trait（内置）+ shell command（用户扩展，
+stdin JSON 通信，完整 OS 能力）。废弃理由见 [`architecture.md`](./architecture.md) §2.3。
 
 ## 13. 待后续完善
 

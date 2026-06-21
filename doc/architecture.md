@@ -133,9 +133,13 @@ Infrastructure Layer
 
 ## 5. Workspace 拆分方案
 
-详见 [`doc/workspace-plan.md`](./workspace-plan.md)。
+拆分原则：只在满足以下条件时拆为独立 crate：
 
-拆分原则：初期只有一个 crate，用 module 分层。
+1. **不同编译目标** — 当前无此需求（WASM 已废弃）。
+2. **其余情况** — 用 module 分层，不拆 crate。
+
+"架构整洁"不是拆 crate 的理由，module boundary 已够；编译时间未成瓶颈前不做物理拆分。
+因此初期只有一个 crate：
 
 ```text
 crates/
@@ -178,6 +182,21 @@ monitor/ → core/ (EventBus subscriber, 不侵入 core)
 provider/ → llm/
 core → 不依赖任何上层 module
 ```
+
+### 5.1 Feature flags
+
+| Feature   | 控制范围              | 默认 |
+|-----------|----------------------|------|
+| `gateway` | gateway/ module 编译 | on   |
+| `tui`     | tui/ 相关依赖(ratatui 等) | on   |
+| `provider-openai`  | OpenAI provider | on   |
+| `provider-xiaomi`  | Xiaomi MiMo provider | on   |
+
+### 5.2 何时再拆
+
+满足任一条件时考虑物理拆分：增量编译时间超过可接受阈值；某 module 需被外部项目独立引用
+（如 event schema 被其他工具消费）；provider 数量增多且各自依赖树庞大。Module boundary
+已画好，物理拆分是机械操作。
 
 ## 6. Session 管理
 
