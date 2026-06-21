@@ -87,41 +87,63 @@ pub fn register_builtin_tools(registry: &mut ToolRegistry) {
 
 ## 5. MCP Tool
 
+MCP 是唯一的外部扩展机制（Plugin 概念已废弃，见 §11）。一个 MCP server 是普通进程，
+拥有完整 OS 能力，可暴露多个 tool（等价于旧方案的 plugin 容器）。安全性靠用户信任
+（安装行为即授权），见 §5.7。
+
 ### 5.1 MCP Server 配置
 
 ```toml
 # .omini/config/mcp.toml
 
 [[servers]]
-name = "filesystem-extra"
-command = "npx"
-args = ["-y", "@anthropic/mcp-filesystem"]
-env = { ROOT = "/home/user/projects" }
-
-[[servers]]
 name = "github"
-command = "gh-mcp-server"
+description = "GitHub integration"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+env = { GITHUB_TOKEN = "$GITHUB_TOKEN" }
 transport = "stdio"
+auto_start = true
 
 [[servers]]
-name = "remote-rag"
-url = "https://my-rag.example.com/sse"
+name = "remote-search"
+description = "Semantic search service"
+url = "https://search.example.com/mcp"
 transport = "sse"
+auto_start = true
 ```
+
+配置字段：
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| name | ✓ | 唯一标识，用于路由和日志 |
+| description | ✗ | 人类可读说明 |
+| command | stdio 时必填 | 可执行文件路径 |
+| args | ✗ | 命令行参数，支持变量替换 |
+| env | ✗ | 环境变量，支持变量替换 |
+| url | sse 时必填 | 远程 MCP server URL |
+| transport | ✓ | stdio / sse |
+| auto_start | ✗ | 默认 true，agent 启动时自动启动 |
+
+变量替换：`$WORKSPACE`（当前 session workspace）、`$SESSION_ID`、`$OMINI_HOME`
+（`.omini/` 目录）、`$HOME`。环境变量引用（如 `$GITHUB_TOKEN`）从进程环境继承。
 
 ### 5.2 生命周期
 
 ```text
 Agent 启动
   → 读取 mcp.toml
-  → 启动配置的 MCP server 子进程（或连接远程）
-  → MCP initialize handshake
-  → tools/list → 注册到 ToolRegistry
+  → 对 auto_start = true 的 server：spawn 子进程 / 连接远程
+    → MCP initialize handshake
+    → tools/list → 注册到 ToolRegistry
   → 正常服务
 
+Session 进行中
+  → MCP server 持续运行，tool 调用通过 JSON-RPC 路由
+
 Agent 关闭
-  → 通知 MCP server shutdown
-  → 终止子进程
+  → 通知 MCP server shutdown → 等待 graceful shutdown（超时 kill）
 ```
 
 ### 5.3 调用流程
@@ -142,6 +164,49 @@ Agent loop 选择 MCP tool
 - 管理 MCP server 子进程生命周期
 - 处理 MCP server 崩溃和重连
 - 超时控制
+
+### 5.5 健壮性
+
+| 场景 | 处理 |
+|------|------|
+| Server 启动失败 | 记录错误，该 server 的 tools 不可用，不阻塞 agent 启动 |
+| Server 运行中崩溃 | 自动重启（最多 3 次），连续失败则标记为不可用 |
+| 调用超时 | 返回 `ToolError::Timeout`，记录到 monitor |
+| Server 返回错误 | 转为 `ToolOutput.is_error = true`，传给 model |
+
+### 5.6 文件系统布局
+
+```text
+.omini/
+├── config/
+│   └── mcp.toml          # MCP server 配置
+├── mcp/
+│   ├── code-sandbox/     # 本地安装的 MCP server
+│   │   ├── server        # 可执行文件
+│   │   └── manifest.toml # 元数据（可选）
+│   └── custom-tool/
+│       └── server.py     # 脚本形式的 MCP server
+└── sessions/{id}/
+    └── mcp_data/
+        └── {server_name}/ # MCP server 的 session 级数据（可选）
+```
+
+### 5.7 安全模型
+
+当前（Phase 1）：MCP server 由用户主动安装/配置，安装行为 = 信任；server 拥有与用户相同
+的 OS 权限（类比 VS Code extension、npm package）。未来 marketplace 可通过签名校验、
+权限声明、可选容器隔离、社区审核增强。
+
+### 5.8 开发自定义 MCP Server
+
+无需 ominiforge SDK，使用各语言标准 MCP SDK，开发完成后在 mcp.toml 添加配置即可：
+
+```text
+Python:  pip install mcp
+Node.js: npm install @modelcontextprotocol/sdk
+Rust:    cargo add mcp-sdk
+Go:      go get github.com/mark3labs/mcp-go
+```
 
 ## 6. 调用流程（统一）
 
@@ -231,14 +296,9 @@ Tool schemas 按 name 字母序排列（保障 prefix cache 命中率）。
 
 ## 11. 与之前 WASM 方案的对比
 
-| | 旧方案（已废弃） | 新方案 |
-|--|---|---|
-| 扩展机制 | WASM Component + WIT | MCP server（任意语言） |
-| 沙箱 | wasmtime 内存隔离 | 无（信任用户安装的 MCP server） |
-| 通信 | WIT 类型直传 | JSON-RPC over stdio/SSE |
-| 开发门槛 | Rust + wasm32-wasip3 编译 | 任意语言，实现 MCP 协议即可 |
-| OS 能力 | 受限，需 host 代理 | 完整（MCP server 是普通进程） |
-| SDK | ominiforge-sdk (wasm) | 不需要，用 MCP SDK（各语言已有） |
+WASM Component + WIT 扩展方案已废弃，统一改用 MCP（任意语言进程，JSON-RPC over
+stdio/SSE，完整 OS 能力，无需 ominiforge-sdk）。废弃理由见
+[`architecture.md`](./architecture.md) §2.3。
 
 ## 12. 待后续完善
 

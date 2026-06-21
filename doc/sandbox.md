@@ -106,17 +106,9 @@ Tool 执行流程（写操作）：
 
 ## 5. MCP Server 监控
 
-MCP server 作为子进程，额外监控：
-
-| 指标 | 来源 |
-|------|------|
-| 启动时间 | spawn → initialize 完成 |
-| 崩溃次数 | 进程非正常退出 |
-| 重启次数 | 自动重启计数 |
-| 调用延迟 | JSON-RPC request → response |
-| 错误率 | failed / total calls |
-
-这些指标由 monitor module 从 event stream 派生，不在 tool invoke 路径计算。
+MCP server 作为子进程的额外监控指标（启动耗时、崩溃/重启次数、调用延迟、错误率、可用
+状态）由 monitor module 从 event stream 派生，不在 tool invoke 路径计算。指标清单见
+[`monitor.md`](./monitor.md) §7。
 
 ## 6. 资源限制（Phase 1 只做超时）
 
@@ -130,11 +122,6 @@ MCP server 作为子进程，额外监控：
 
 ## 7. 废弃内容
 
-以下概念已废弃：
-
-- WASM 沙箱（wasmtime StoreLimits、preopens）
-- 路径变量系统（$WORKSPACE 等用于 WASM preopen）
-- Guest 可见文件系统映射（/workspace/、/data/ 等）
-- WASI capability-based 权限
-
-这些被替换为：全量 event 监控 + 可选 OS 级容器沙箱（Phase 2）。
+WASM 沙箱（wasmtime StoreLimits/preopens、路径变量系统、guest 文件系统映射、WASI
+capability 权限）已废弃，替换为全量 event 监控 + 可选 OS 级容器沙箱（Phase 2）。废弃
+理由见 [`architecture.md`](./architecture.md) §2.3。
