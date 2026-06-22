@@ -71,3 +71,10 @@ CI 会运行格式检查、cargo check、clippy、nextest、audit、deny、mache
 ## License
 
 MIT OR Apache-2.0
+
+## 致谢
+
+Ominiforge 的 TUI 设计参考了以下项目，特此感谢：
+
+- [oh-my-pi](https://github.com/can1357/oh-my-pi)（[omp.sh](https://omp.sh)）—— 卡片式工具渲染、状态栏与整体交互风格。
+- [Pi](https://github.com/badlogic/pi-mono) by [@mariozechner](https://github.com/mariozechner) —— oh-my-pi 的上游，简洁的 agent 终端界面范式。
