@@ -361,7 +361,10 @@ mod tests {
         let store = SkillStore::new(dir.path().to_path_buf());
         let tool = LoadSkillTool::new(store, dir.path().to_path_buf(), "default".to_owned());
         let out = tool.invoke(make_input("bad")).await.unwrap();
-        assert!(!out.is_error, "partial template failure is not a tool error");
+        assert!(
+            !out.is_error,
+            "partial template failure is not a tool error"
+        );
         let Content::Text(text) = &out.content[0] else {
             panic!("expected text");
         };
