@@ -23,6 +23,7 @@ use crate::session::SessionStore;
 use crate::tool::{ReadTool, ShellTool, ToolRegistry, WriteTool};
 
 const SESSIONS_SUBDIR: &str = ".omini/sessions";
+const SKILLS_SUBDIR: &str = ".omini/skills";
 const DEFAULT_PROFILE: &str = "default";
 
 /// Ominiforge command-line interface.
@@ -213,6 +214,20 @@ async fn prepare(
     let mcp_clients =
         crate::mcp::connect_all(&mcp_config, &mut tools, |msg| eprintln!("{msg}")).await;
 
+    // Skills: list those enabled by the profile (empty = all) and inject their
+    // index into the system prompt. The `load_skill` tool is registered only
+    // when at least one skill is available (`doc/skill.md` §2).
+    let skills_dir = workspace.join(SKILLS_SUBDIR);
+    let skills = crate::skill::SkillStore::new(skills_dir.clone()).list(&profile.skills.enabled);
+    let skill_index = crate::skill::skill_index_block(&skills);
+    if !skills.is_empty() {
+        tools.register(std::sync::Arc::new(crate::skill::LoadSkillTool::new(
+            crate::skill::SkillStore::new(skills_dir),
+            workspace.clone(),
+            profile.profile.name.clone(),
+        )));
+    }
+
     let tool_names = tools.descriptors().into_iter().map(|d| d.name).collect();
 
     let mut agent = Agent::new(
@@ -247,7 +262,7 @@ async fn prepare(
     Ok(Prepared {
         agent,
         session_store: SessionStore::new(workspace.join(SESSIONS_SUBDIR)),
-        system_prompt: ConfigStore::system_prompt(&profile),
+        system_prompt: ConfigStore::system_prompt(&profile) + &skill_index,
         profile_name: profile.profile.name.clone(),
         tool_names,
         workspace,
