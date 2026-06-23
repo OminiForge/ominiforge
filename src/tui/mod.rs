@@ -29,9 +29,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::ExecutableCommand;
-use crossterm::event::{
-    self, Event, KeyCode, KeyEventKind, KeyModifiers,
-};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -373,9 +371,7 @@ fn drain_input(state: &mut AppState, input: &mut Input, busy: bool) -> Result<In
     loop {
         match event::read()? {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && key.code == KeyCode::Char('c')
-                {
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                     return Ok(InputAction::Quit);
                 }
                 if let Some(s) = handle_key(key, state, input, busy) {
@@ -1194,7 +1190,11 @@ impl AppState {
 
     fn last_running_tool(&mut self) -> Option<&mut ToolStatus> {
         self.blocks.iter_mut().rev().find_map(|b| {
-            if let Block::Tool { status: s @ ToolStatus::Running, .. } = b {
+            if let Block::Tool {
+                status: s @ ToolStatus::Running,
+                ..
+            } = b
+            {
                 Some(s)
             } else {
                 None
@@ -1204,7 +1204,10 @@ impl AppState {
 
     fn set_last_tool_result(&mut self, error: bool, summary: &str) {
         if let Some(status) = self.last_running_tool() {
-            *status = ToolStatus::Done { error, summary: summary.to_owned() };
+            *status = ToolStatus::Done {
+                error,
+                summary: summary.to_owned(),
+            };
         }
     }
 

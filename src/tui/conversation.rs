@@ -500,7 +500,11 @@ mod tests {
         // A committed heading paragraph, then an in-progress line.
         let text = "# Done\n\nstill **typ";
         let commit = stable_boundary(text);
-        assert_eq!(&text[..commit], "# Done\n\n", "blank line commits the heading");
+        assert_eq!(
+            &text[..commit],
+            "# Done\n\n",
+            "blank line commits the heading"
+        );
 
         // An unterminated code fence must NOT commit (it is still open).
         let open_fence = "intro\n\n```rust\nlet x = 1;";
