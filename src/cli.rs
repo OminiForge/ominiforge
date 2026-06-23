@@ -259,6 +259,16 @@ async fn prepare(
         agent = agent.with_compaction_model(compaction_provider, resolved_compaction.model_id);
     }
 
+    // User shell hooks from `.omini/config/hooks.toml` (`doc/hook-protocol.md`
+    // §6). A hook at an unknown / not-yet-wired point is logged and skipped,
+    // never fatal — same posture as a broken MCP server.
+    let hooks = crate::hook::HookConfig::load(store.roots())
+        .context("failed to load hooks.toml")?
+        .into_registry(|msg| eprintln!("{msg}"));
+    if !hooks.is_empty() {
+        agent = agent.with_hooks(hooks);
+    }
+
     Ok(Prepared {
         agent,
         session_store: SessionStore::new(workspace.join(SESSIONS_SUBDIR)),
@@ -368,6 +378,9 @@ fn report_turn(outcome: &crate::agent::TurnOutcome) {
                 "stopped with {incomplete_steps} plan step(s) unfinished after \
                  repeated nudges. Check the plan in the session log."
             ),
+            TurnFailureReason::BlockedByHook { by, reason } => {
+                format!("blocked by the `{by}` hook before any model round ran: {reason}")
+            }
         };
         eprintln!("warning: turn did not complete cleanly — {detail}");
     }

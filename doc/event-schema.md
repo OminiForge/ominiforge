@@ -27,7 +27,7 @@
 
 ## 3. Payload 分域
 
-按 Turn / Model / Tool / Session / Artifact / Injection / Error 分域。MonitorEvent **不在**
+按 Turn / Model / Tool / Session / Artifact / Injection / Hook / Error 分域。MonitorEvent **不在**
 核心 payload 中——monitor 是观测层，从核心事件派生 trace/span/cost，不污染 replay 必需语义。
 
 ### 3.1 Turn
@@ -86,7 +86,15 @@ interrupted`。设计要点：
 [`plan.md`](./plan.md) §6–§8，文本用 `<reminder>...</reminder>` 包裹，作为真实消息永久留在
 context 历史中（保 prefix cache）。Compaction 时历史 injection 被摘要浓缩。
 
-### 3.7 Error
+### 3.7 Hook
+
+记录 hook 在 pipeline point 的执行：`hook_name` / `hook_point`（如 `tool:invoke:before`）/
+`outcome`（Pass / Modified / Blocked{reason} / Observed / Failed{error}）/ `duration_ms`。
+协议要求所有 hook 执行写 event log，用于 replay、监控和审计，见
+[`hook-protocol.md`](./hook-protocol.md) §1、§11。block 同时产生 point 专属失败事件（如
+`tool:invoke:before` block → `ToolEvent::Failed { code: blocked_by_hook }`，§8）。
+
+### 3.8 Error
 
 结构化（非纯 string）：`code` / `message` / `severity`（Fatal/Error/Warning）/ `retryable` /
 `source_event_id` / `provider_raw`。

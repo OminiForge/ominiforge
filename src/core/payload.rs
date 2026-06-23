@@ -19,6 +19,7 @@ pub enum EventPayload {
     Session(SessionEvent),
     Artifact(ArtifactEvent),
     Injection(InjectionEvent),
+    Hook(HookEvent),
     Error(ErrorEvent),
 }
 
@@ -79,6 +80,9 @@ pub enum TurnFailureReason {
     /// The completion gate gave up: the model kept stopping with this many
     /// non-terminal plan steps after repeated nudges (`doc/plan.md` §6).
     PlanStalled { incomplete_steps: u32 },
+    /// A `turn:start` before hook blocked the turn before any model round ran
+    /// (`doc/hook-protocol.md` §7). `by` names the blocking hook.
+    BlockedByHook { by: String, reason: String },
 }
 
 /// Model interaction.
@@ -320,6 +324,48 @@ pub enum InjectionSource {
     Runtime,
 }
 
+/// Hook execution at a pipeline point.
+///
+/// Recorded so replay and monitoring can see every hook that ran, what it
+/// decided, and how long it took: the protocol requires all hook executions to
+/// be logged (`doc/hook-protocol.md` §1, §11).
+///
+/// A hook that *blocks* additionally produces the point-specific failure event
+/// (e.g. a `tool:invoke:before` block emits a paired [`ToolEvent::Failed`] with
+/// code `blocked_by_hook`, `doc/hook-protocol.md` §8); this event records the
+/// hook's own execution regardless of outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HookEvent {
+    Executed {
+        /// The hook's configured name.
+        hook_name: String,
+        /// The pipeline point it fired at, e.g. `"tool:invoke:before"`.
+        hook_point: String,
+        outcome: HookOutcome,
+        duration_ms: u64,
+    },
+}
+
+/// What a hook decided when it ran.
+///
+/// Before hooks can `Pass`/`Modified`/`Blocked`; after hooks only `Observed`.
+/// `Failed` covers a hook that errored, timed out, or returned invalid output —
+/// the pipeline's response to it is governed by the hook's failure mode
+/// (`doc/hook-protocol.md` §9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HookOutcome {
+    /// Before hook let the pipeline continue unchanged.
+    Pass,
+    /// Before hook rewrote the payload.
+    Modified,
+    /// Before hook stopped the pipeline.
+    Blocked { reason: String },
+    /// After hook observed the point (no control).
+    Observed,
+    /// The hook itself failed (non-zero exit, timeout, bad output).
+    Failed { error: String },
+}
+
 /// A structured error surfaced as its own event. See `doc/event-schema.md` §10.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorEvent {
@@ -401,5 +447,38 @@ mod tests {
         assert_eq!(value["input_tokens"], 100);
         assert_eq!(value["cache_read_tokens"], 80);
         assert!(value.get("cost").is_none());
+    }
+
+    /// A blocking hook execution round-trips and pins the externally-tagged wire
+    /// shape (`{"Hook":{"Executed":{...,"outcome":{"Blocked":{...}}}}}`) so
+    /// replay and monitoring can route on it.
+    #[test]
+    fn hook_blocked_event_round_trips() {
+        let event = CoreEvent {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            seq: 7,
+            session_id: SessionId("01J5M3HKEA7V2X3P1YKRN9C4WG".to_owned()),
+            timestamp: Utc.with_ymd_and_hms(2026, 6, 23, 10, 0, 0).unwrap(),
+            source: EventSource {
+                kind: SourceKind::Runtime,
+                id: "ominiforge".to_owned(),
+            },
+            parent_event_id: None,
+            turn_id: None,
+            payload: EventPayload::Hook(HookEvent::Executed {
+                hook_name: "security-guard".to_owned(),
+                hook_point: "tool:invoke:before".to_owned(),
+                outcome: HookOutcome::Blocked {
+                    reason: "Dangerous command pattern detected: rm -rf".to_owned(),
+                },
+                duration_ms: 12,
+            }),
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""Hook":{"Executed""#));
+        assert!(json.contains(r#""outcome":{"Blocked""#));
+        let decoded: CoreEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, decoded);
     }
 }

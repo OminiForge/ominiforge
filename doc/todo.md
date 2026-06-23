@@ -71,20 +71,34 @@
 - `{{session_id}}` 模板（需 per-invocation context，当前展开为空）。
 - 显式 `/skill` 命令（list/edit/disable）、skill 间组合、参数化。
 
-### Phase 4 — Hook 系统（下一步）
+### Phase 4 — Hook 系统 ✅（核心完成）
 
-**目标**：在固定 pipeline 位置拦截/观察事件。协议已定，见 [`hook-protocol.md`](./hook-protocol.md)。
+**目标**：在固定 pipeline 位置拦截/观察事件。协议见 [`hook-protocol.md`](./hook-protocol.md)。
 
-已决策：
-- Hook point 为固定预定义集合，不允许订阅任意 event。
-- Before hook 同步，可 pass/modify/block；After hook 异步，仅 observe。
-- 实现为 host 侧 Rust trait（内置）或 shell command（用户）。
-- 全量 event 订阅需求由 EventBus 满足，不属 hook 系统。
-- 所有 hook 执行写入 event log。
+已实现（`src/hook.rs` + `src/agent/mod.rs` + `src/core/payload.rs`）：
+- 4 个 hook point：`turn:start`、`turn:end`、`tool:invoke:before`、`tool:invoke:after`
+  （`HookPoint` enum，`is_before()` 区分同步/观察）。
+- `BeforeHook` / `AfterHook` trait；`HookRegistry` 按 priority 升序链式执行，before
+  链 modify 结果传给下一个、首个 block 短路。
+- `FailureMode`（open/closed）：closed 模式下 hook 失败转为 block。
+- User shell hook（`ShellHook`）：`sh -c` + stdin/stdout JSON 协议，超时（before 5s /
+  after 30s）、`match_tool` 过滤、非零退出/超时/非法 JSON → failure_mode 处理。
+- `HookConfig`（`.omini/config/hooks.toml`，多 root 合并，mirror mcp.toml）→
+  `into_registry`，未知 point 跳过并告警。
+- Agent 接入：`with_hooks`；turn:start block → `TurnFailureReason::BlockedByHook`（不发
+  model 请求）；tool:invoke:before block → `ToolEvent::Failed { code: blocked_by_hook }`
+  （§8），modify 改写 tool 入参；turn:end / tool:invoke:after observe。
+- 所有 hook 执行写 `HookEvent::Executed`（新增 core payload variant）到 event log（§11）。
+- CLI `prepare()`：加载 hooks.toml，非空时注册，损坏 server 式容错。
 
-产出模块：`src/hook.rs`（当前 stub），agent loop 接入 hook point，profile `[hooks]` section wire。
+延后：
+- 内置 hook（permission-guard / cost-limiter 等 Rust trait impl）—— 依赖 permission /
+  cost 子系统。profile `[hooks].before_tool/after_tool` 字段已解析，待内置 hook 出现后
+  按 name 绑定。
+- 其余 6 个 hook point（model:request:*、artifact:create:*、session:*）—— 当前 pipeline
+  无对应暂停语义挂载点，按需新增（需发版）。
+- Hook 热更新、hook 与 profile 绑定、hook 执行 monitor metrics（待 monitor 扩展）。
 
-验证：注册一个 before hook 在 `turn:start` block 某输入，turn 被拦截；一个 after hook 在 `turn:end` observe，event log 有记录。
 
 ### Phase 5 — Gateway（网络访问层）
 
