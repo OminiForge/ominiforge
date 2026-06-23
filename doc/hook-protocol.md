@@ -217,10 +217,19 @@ Host EventBus 是 runtime 内部机制（tokio broadcast channel），用于 mon
 旧 WASM Component hook 方案已废弃，改用 Rust trait（内置）+ shell command（用户扩展，
 stdin JSON 通信，完整 OS 能力）。废弃理由见 [`architecture.md`](./architecture.md) §2.3。
 
-## 13. 待后续完善
+## 13. 实现状态与待后续完善
 
-- 各 hook point 的 payload 详细 schema。
+Phase 4 已实现：4 个 hook point（`turn:start`、`turn:end`、`tool:invoke:before`、
+`tool:invoke:after`）、Rust trait（`BeforeHook`/`AfterHook`）+ shell hook runner、
+`HookRegistry`（priority 链式 + block 短路 + failure_mode）、`hooks.toml` 加载、agent
+接入、`HookEvent::Executed` 写 event log。详见 [`todo.md`](./todo.md) Phase 4。
+
+待后续完善：
+- 其余 6 个 hook point（`model:request:*`、`artifact:create:*`、`session:*`）的挂载点与
+  payload 详细 schema。
+- 内置 hook（permission-guard / cost-limiter）—— 依赖 permission / cost 子系统；profile
+  `[hooks]` 字段已解析，待内置 hook 按 name 绑定。
 - Hook 热更新：是否支持运行中替换 hook。
 - Hook 与 profile 的关系：是否可以绑定到特定 profile。
-- Hook 执行的 monitor metrics。
-- match 条件扩展（按 tool name、input pattern 等过滤触发）。
+- Hook 执行的 monitor metrics（待 monitor 扩展消费 `HookEvent`）。
+- match 条件扩展（当前仅 `match_tool`；后续按 input pattern 等过滤）。

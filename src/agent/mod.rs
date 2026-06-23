@@ -39,10 +39,11 @@ use crate::context::{
     ContextLedger, DEFAULT_COMPACTION_THRESHOLD, effective_limit, estimate_tokens,
 };
 use crate::core::payload::{
-    Content, ErrorDetail, ErrorEvent, ErrorSeverity, InjectionEvent, InjectionSource, ModelEvent,
-    StopReason, ToolEvent, ToolOutput, ToolSource, TurnEvent, TurnFailureReason, Usage,
+    Content, ErrorDetail, ErrorEvent, ErrorSeverity, HookEvent, InjectionEvent, InjectionSource,
+    ModelEvent, StopReason, ToolEvent, ToolOutput, ToolSource, TurnEvent, TurnFailureReason, Usage,
 };
 use crate::core::{EventId, EventPayload, EventSource, SourceKind, TurnId};
+use crate::hook::{BeforeEffect, HookExecution, HookPoint, HookRegistry};
 use crate::llm::{LlmError, Message, ModelRequest, Provider, StreamEvent, ToolCall, ToolSchema};
 use crate::session::SessionWriter;
 use crate::tool::{ToolError, ToolInput, ToolRegistry};
@@ -174,6 +175,9 @@ pub struct Agent {
     /// Optional dedicated provider + model id for compaction summaries
     /// (`doc/phase2-plan.md` decision B). `None` reuses the main provider/model.
     compaction: Option<(Arc<dyn Provider>, String)>,
+    /// Hooks fired at fixed pipeline points (`doc/hook-protocol.md`). Empty by
+    /// default — a no-op until the caller attaches a registry.
+    hooks: HookRegistry,
 }
 
 impl Agent {
@@ -185,6 +189,7 @@ impl Agent {
             tools,
             config,
             compaction: None,
+            hooks: HookRegistry::new(),
         }
     }
 
@@ -193,6 +198,14 @@ impl Agent {
     #[must_use]
     pub fn with_compaction_model(mut self, provider: Arc<dyn Provider>, model: String) -> Self {
         self.compaction = Some((provider, model));
+        self
+    }
+
+    /// Attach a hook registry. Hooks fire at `turn:start`, `turn:end`,
+    /// `tool:invoke:before`, and `tool:invoke:after` (`doc/hook-protocol.md`).
+    #[must_use]
+    pub fn with_hooks(mut self, hooks: HookRegistry) -> Self {
+        self.hooks = hooks;
         self
     }
 
@@ -412,15 +425,49 @@ impl TurnState<'_> {
             None,
             Some(self.turn_id.clone()),
         )?;
+
+        // `turn:start` before hooks may block the turn before any model round
+        // runs (`doc/hook-protocol.md` §3, §7). A block is a graceful stop: the
+        // turn records `Failed { BlockedByHook }` and returns, no model call.
+        if let BeforeEffect::Block { reason, by } = self
+            .fire_before(
+                HookPoint::TurnStart,
+                serde_json::json!({ "input": input }),
+                None,
+            )
+            .await?
+        {
+            self.runtime.push_message(Message::User { content: input });
+            let outcome = self.fail(TurnFailureReason::BlockedByHook { by, reason }, false)?;
+            self.fire_turn_end().await?;
+            return Ok(outcome);
+        }
+
         self.runtime.push_message(Message::User { content: input });
 
         match self.drive().await {
-            Ok(outcome) => Ok(outcome),
+            Ok(outcome) => {
+                // `turn:end` after hooks observe a settled turn (clean finish or
+                // graceful stop). A hard error skips this — the turn did not
+                // settle (`doc/hook-protocol.md` §3).
+                self.fire_turn_end().await?;
+                Ok(outcome)
+            }
             Err(err) => {
                 self.record_hard_failure(&err);
                 Err(err)
             }
         }
+    }
+
+    /// Fire the `turn:end` after chain (observe only).
+    async fn fire_turn_end(&mut self) -> Result<(), AgentError> {
+        self.fire_after(
+            HookPoint::TurnEnd,
+            serde_json::json!({ "answer": self.answer }),
+            None,
+        )
+        .await
     }
 
     /// The round loop. Returns `Ok` for every *graceful* outcome (clean finish,
@@ -670,6 +717,60 @@ impl TurnState<'_> {
         Ok(())
     }
 
+    /// Persist a `HookEvent` for every hook execution at a point. Hook records
+    /// carry no parent and are attributed to a `hook`-named source so monitoring
+    /// can route on them (`doc/hook-protocol.md` §11).
+    fn record_hook_executions(&mut self, execs: &[HookExecution]) -> Result<(), AgentError> {
+        for exec in execs {
+            self.writer.append(
+                EventSource {
+                    kind: SourceKind::Runtime,
+                    id: format!("hook:{}", exec.hook_name),
+                },
+                EventPayload::Hook(HookEvent::Executed {
+                    hook_name: exec.hook_name.clone(),
+                    hook_point: exec.hook_point.as_str().to_owned(),
+                    outcome: exec.outcome.clone(),
+                    duration_ms: exec.duration_ms,
+                }),
+                None,
+                Some(self.turn_id.clone()),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Run the before chain at `point`, persist its executions, and return the
+    /// effect (proceed with possibly-modified payload, or block).
+    async fn fire_before(
+        &mut self,
+        point: HookPoint,
+        payload: serde_json::Value,
+        tool_name: Option<String>,
+    ) -> Result<BeforeEffect, AgentError> {
+        if self.agent.hooks.is_empty() {
+            return Ok(BeforeEffect::Proceed(payload));
+        }
+        let outcome = self.agent.hooks.run_before(point, payload, tool_name).await;
+        self.record_hook_executions(&outcome.executions)?;
+        Ok(outcome.effect)
+    }
+
+    /// Run the after chain at `point` and persist its executions. After hooks
+    /// cannot affect the pipeline.
+    async fn fire_after(
+        &mut self,
+        point: HookPoint,
+        payload: serde_json::Value,
+        tool_name: Option<String>,
+    ) -> Result<(), AgentError> {
+        if self.agent.hooks.is_empty() {
+            return Ok(());
+        }
+        let execs = self.agent.hooks.run_after(point, payload, tool_name).await;
+        self.record_hook_executions(&execs)
+    }
+
     // __APPEND_MARKER__
 
     /// Run one model round: send the current context, persist the streamed
@@ -852,6 +953,7 @@ impl TurnState<'_> {
     /// Execute one leaf tool call, persisting `ToolEvent`s and returning the
     /// `Tool` message to feed back to the model, paired with whether it made
     /// progress (a non-error result; see [`dispatch`](Self::dispatch)).
+    #[allow(clippy::too_many_lines)] // before/after hook brackets around one dispatch
     async fn dispatch_tool(
         &mut self,
         call: &ToolCall,
@@ -896,17 +998,44 @@ impl TurnState<'_> {
             Some(self.turn_id.clone()),
         )?;
 
-        let Some(tool) = self.agent.tools.get(&call.name) else {
-            return self
-                .fail_tool(
+        // `tool:invoke:before` hooks may rewrite the input or block the call
+        // (`doc/hook-protocol.md` §7). A block becomes the point-specific failure
+        // event: a `ToolEvent::Failed` with code `blocked_by_hook`, which the
+        // model sees as a tool result and can react to (§8).
+        let args = match self
+            .fire_before(HookPoint::ToolInvokeBefore, args, Some(call.name.clone()))
+            .await?
+        {
+            BeforeEffect::Proceed(payload) => payload,
+            BeforeEffect::Block { reason, by } => {
+                let msg = self.fail_tool(
                     &source,
                     &parent,
                     call,
                     0,
-                    "unknown_tool",
-                    &format!("no such tool: {}", call.name),
+                    "blocked_by_hook",
+                    &format!("Blocked by hook [{by}]: {reason}"),
+                )?;
+                self.fire_after(
+                    HookPoint::ToolInvokeAfter,
+                    serde_json::json!({ "tool_name": call.name, "blocked": true }),
+                    Some(call.name.clone()),
                 )
-                .map(|m| (m, false));
+                .await?;
+                return Ok((msg, false));
+            }
+        };
+
+        let Some(tool) = self.agent.tools.get(&call.name) else {
+            let msg = self.fail_tool(
+                &source,
+                &parent,
+                call,
+                0,
+                "unknown_tool",
+                &format!("no such tool: {}", call.name),
+            )?;
+            return Ok((msg, false));
         };
 
         let started = Instant::now();
@@ -917,7 +1046,7 @@ impl TurnState<'_> {
         };
         let elapsed = |start: Instant| duration_ms(start.elapsed());
 
-        match tool.invoke(input).await {
+        let (message, made_progress) = match tool.invoke(input).await {
             Ok(output) => {
                 // A successful invocation that reports a business-level error
                 // (`is_error`) is not progress — the step is still spinning.
@@ -936,20 +1065,31 @@ impl TurnState<'_> {
                     Some(parent),
                     Some(self.turn_id.clone()),
                 )?;
-                Ok((
+                (
                     Message::Tool {
                         tool_call_id: call.id.clone(),
                         content: text,
                     },
                     made_progress,
-                ))
+                )
             }
             Err(err) => {
                 let (code, message) = tool_error_parts(&err);
-                self.fail_tool(&source, &parent, call, elapsed(started), code, &message)
-                    .map(|m| (m, false))
+                let msg =
+                    self.fail_tool(&source, &parent, call, elapsed(started), code, &message)?;
+                (msg, false)
             }
-        }
+        };
+
+        // `tool:invoke:after` hooks observe the settled call (`doc/hook-protocol.md`
+        // §3). They cannot change the result already fed back to the model.
+        self.fire_after(
+            HookPoint::ToolInvokeAfter,
+            serde_json::json!({ "tool_name": call.name }),
+            Some(call.name.clone()),
+        )
+        .await?;
+        Ok((message, made_progress))
     }
 
     /// Persist a `ToolEvent::Failed` and return the error as a `Tool` message so
@@ -2133,5 +2273,271 @@ mod tests {
 
     fn seqs_are_contiguous(events: &[CoreEvent]) -> bool {
         events.iter().enumerate().all(|(i, e)| e.seq == i as u64)
+    }
+
+    // ── Hook wiring ───────────────────────────────────────────────────────
+
+    use crate::core::payload::{HookEvent, HookOutcome};
+    use crate::hook::{
+        AfterHook, BeforeDecision, BeforeHook, HookPoint, HookRegistry, HookRequest,
+    };
+
+    /// A before hook that always returns the same decision, for asserting the
+    /// agent's response to block/modify/pass.
+    struct FixedBefore {
+        name: &'static str,
+        decision: BeforeDecision,
+    }
+
+    #[async_trait::async_trait]
+    impl BeforeHook for FixedBefore {
+        fn name(&self) -> &str {
+            self.name
+        }
+        async fn intercept(&self, _req: &HookRequest) -> BeforeDecision {
+            self.decision.clone()
+        }
+    }
+
+    /// An after hook that always observes successfully.
+    struct NoopAfter {
+        name: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl AfterHook for NoopAfter {
+        fn name(&self) -> &str {
+            self.name
+        }
+        async fn observe(&self, _req: &HookRequest) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn hook_events(events: &[CoreEvent]) -> Vec<(&str, &HookOutcome)> {
+        events
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Hook(HookEvent::Executed {
+                    hook_point,
+                    outcome,
+                    ..
+                }) => Some((hook_point.as_str(), outcome)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A `turn:start` before hook that blocks stops the turn before any model
+    /// round runs: no `ModelEvent`, a `Failed { BlockedByHook }`, and a logged
+    /// `HookEvent` with a `Blocked` outcome (`doc/hook-protocol.md` §3, §7, §11).
+    #[tokio::test]
+    async fn turn_start_block_stops_turn_before_model_call() {
+        let dir = tempfile::tempdir().unwrap();
+        // Scripted with zero rounds: if the loop calls the provider, the test
+        // panics ("called more times than scripted"), proving no model round ran.
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let mut hooks = HookRegistry::new();
+        hooks.register_before(
+            HookPoint::TurnStart,
+            Arc::new(FixedBefore {
+                name: "gate",
+                decision: BeforeDecision::Block {
+                    reason: "no".to_owned(),
+                },
+            }),
+        );
+        let agent = planning_agent(provider).with_hooks(hooks);
+
+        let store = SessionStore::new(dir.path().join("sessions"));
+        let mut writer = store.create_new(None, None, vec![]).unwrap();
+        let sid = writer.session_id().clone();
+        let mut runtime = SessionRuntime::default();
+
+        let outcome = agent
+            .run_turn(&mut writer, &mut runtime, "blocked input".to_owned())
+            .await
+            .unwrap();
+        drop(writer);
+
+        assert!(matches!(
+            outcome.incomplete,
+            Some(TurnFailureReason::BlockedByHook { .. })
+        ));
+        assert_eq!(outcome.rounds, 0, "no model round ran");
+
+        let events = store.read_events(&sid).unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.payload, EventPayload::Model(_))),
+            "blocked turn made no model request"
+        );
+        let hooks = hook_events(&events);
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].0, "turn:start");
+        assert!(matches!(hooks[0].1, HookOutcome::Blocked { .. }));
+        assert!(seqs_are_contiguous(&events));
+    }
+
+    /// A clean turn fires `turn:end` after hooks, recorded as an observed
+    /// `HookEvent` (the `doc/todo.md` Phase 4 acceptance check).
+    #[tokio::test]
+    async fn turn_end_after_hook_is_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ScriptedProvider::new(vec![text_round("done")]));
+        let mut hooks = HookRegistry::new();
+        hooks.register_after(HookPoint::TurnEnd, Arc::new(NoopAfter { name: "notify" }));
+        let agent = planning_agent(provider).with_hooks(hooks);
+
+        let store = SessionStore::new(dir.path().join("sessions"));
+        let mut writer = store.create_new(None, None, vec![]).unwrap();
+        let sid = writer.session_id().clone();
+        let mut runtime = SessionRuntime::default();
+
+        agent
+            .run_turn(&mut writer, &mut runtime, "hi".to_owned())
+            .await
+            .unwrap();
+        drop(writer);
+
+        let events = store.read_events(&sid).unwrap();
+        let hooks = hook_events(&events);
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].0, "turn:end");
+        assert_eq!(hooks[0].1, &HookOutcome::Observed);
+        assert!(seqs_are_contiguous(&events));
+    }
+
+    /// A `tool:invoke:before` block turns into a `ToolEvent::Failed` with code
+    /// `blocked_by_hook`, the tool never runs, and both the before block and the
+    /// after observe are logged (`doc/hook-protocol.md` §8).
+    #[tokio::test]
+    async fn tool_invoke_before_block_becomes_tool_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().to_path_buf();
+        // The model asks to write a file; the hook blocks it; then it gives up.
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            tool_call_round("c1", "write", r#"{"path":"x.txt","content":"hi"}"#),
+            text_round("ok, blocked"),
+        ]));
+        let mut tools = ToolRegistry::new();
+        crate::tool::register_builtin(&mut tools, workspace);
+        let mut hooks = HookRegistry::new();
+        hooks.register_before(
+            HookPoint::ToolInvokeBefore,
+            Arc::new(FixedBefore {
+                name: "deny-write",
+                decision: BeforeDecision::Block {
+                    reason: "writes disabled".to_owned(),
+                },
+            }),
+        );
+        hooks.register_after(
+            HookPoint::ToolInvokeAfter,
+            Arc::new(NoopAfter { name: "audit" }),
+        );
+        let agent = Agent::new(
+            provider,
+            tools,
+            AgentConfig {
+                model: "mock".to_owned(),
+                ..AgentConfig::default()
+            },
+        )
+        .with_hooks(hooks);
+
+        let store = SessionStore::new(dir.path().join("sessions"));
+        let mut writer = store
+            .create_new(None, None, vec!["write".to_owned()])
+            .unwrap();
+        let sid = writer.session_id().clone();
+        let mut runtime = SessionRuntime::default();
+
+        agent
+            .run_turn(&mut writer, &mut runtime, "write a file".to_owned())
+            .await
+            .unwrap();
+        drop(writer);
+
+        let events = store.read_events(&sid).unwrap();
+        // The tool call failed with the hook-block code; the file was never written.
+        let blocked = events.iter().any(|e| matches!(
+            &e.payload,
+            EventPayload::Tool(ToolEvent::Failed { error, .. }) if error.code == "blocked_by_hook"
+        ));
+        assert!(blocked, "blocked tool surfaces as blocked_by_hook failure");
+        assert!(
+            !dir.path().join("x.txt").exists(),
+            "blocked write never touched the filesystem"
+        );
+        // Both the before block and the after observe were logged.
+        let hooks = hook_events(&events);
+        assert!(
+            hooks.iter().any(
+                |(p, o)| *p == "tool:invoke:before" && matches!(o, HookOutcome::Blocked { .. })
+            )
+        );
+        assert!(
+            hooks
+                .iter()
+                .any(|(p, o)| *p == "tool:invoke:after" && matches!(o, HookOutcome::Observed))
+        );
+        assert!(seqs_are_contiguous(&events));
+    }
+
+    /// A `tool:invoke:before` modify rewrites the tool input the tool actually
+    /// receives (`doc/hook-protocol.md` §7).
+    #[tokio::test]
+    async fn tool_invoke_before_modify_rewrites_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().to_path_buf();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            tool_call_round("c1", "write", r#"{"path":"orig.txt","content":"a"}"#),
+            text_round("written"),
+        ]));
+        let mut tools = ToolRegistry::new();
+        crate::tool::register_builtin(&mut tools, workspace);
+        let mut hooks = HookRegistry::new();
+        hooks.register_before(
+            HookPoint::ToolInvokeBefore,
+            Arc::new(FixedBefore {
+                name: "redirect",
+                decision: BeforeDecision::Modify(serde_json::json!({
+                    "path": "redirected.txt",
+                    "content": "a"
+                })),
+            }),
+        );
+        let agent = Agent::new(
+            provider,
+            tools,
+            AgentConfig {
+                model: "mock".to_owned(),
+                ..AgentConfig::default()
+            },
+        )
+        .with_hooks(hooks);
+
+        let store = SessionStore::new(dir.path().join("sessions"));
+        let mut writer = store
+            .create_new(None, None, vec!["write".to_owned()])
+            .unwrap();
+        let mut runtime = SessionRuntime::default();
+
+        agent
+            .run_turn(&mut writer, &mut runtime, "write something".to_owned())
+            .await
+            .unwrap();
+        drop(writer);
+
+        assert!(
+            dir.path().join("redirected.txt").exists(),
+            "the hook's modified path is what the tool wrote"
+        );
+        assert!(
+            !dir.path().join("orig.txt").exists(),
+            "the original path was overridden by the hook"
+        );
     }
 }
