@@ -264,6 +264,69 @@ impl SessionStore {
         Ok(writer)
     }
 
+    /// Create a fork: branch a new session from `parent_id` at `fork_at_seq`,
+    /// seeded with the conversation as it stood at that point
+    /// (`doc/architecture.md` §6.1). The fork is self-contained — it carries its
+    /// own context snapshot — so the parent can later be deleted without
+    /// affecting it (`doc/session-storage.md` §6.2).
+    ///
+    /// `snapshot` is the rebuilt context view (system + messages) up to the fork
+    /// point; the caller produces it from the parent's events (e.g. via
+    /// [`crate::agent::rebuild_runtime`] truncated at `fork_at_seq`).
+    ///
+    /// Returns a locked [`SessionWriter`] positioned after the `Created` event.
+    ///
+    /// # Errors
+    /// Filesystem or serialization failures surface as [`SessionError`].
+    pub fn create_fork(
+        &self,
+        parent_id: SessionId,
+        fork_at_seq: u64,
+        profile_id: Option<String>,
+        workspace: Option<PathBuf>,
+        tools: Vec<String>,
+        snapshot: &[crate::llm::Message],
+    ) -> Result<SessionWriter> {
+        let session_id = id::generate();
+        let dir = self.session_dir(&session_id);
+        std::fs::create_dir_all(&dir).map_err(|source| SessionError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+
+        let meta = SessionMeta {
+            id: session_id.clone(),
+            profile_id: profile_id.clone(),
+            created_at: Utc::now(),
+            workspace: workspace.clone(),
+            origin: Origin::fork(parent_id, fork_at_seq),
+        };
+        self.write_meta(&meta)?;
+
+        let snapshot_path = dir.join(SNAPSHOT_FILE);
+        let snapshot_json = serde_json::to_string_pretty(snapshot)?;
+        std::fs::write(&snapshot_path, snapshot_json).map_err(|source| SessionError::Io {
+            path: snapshot_path,
+            source,
+        })?;
+
+        let log = EventLog::open(&self.events_path(&session_id))?;
+        let mut writer = SessionWriter {
+            session_id,
+            log,
+            next_seq: 0,
+            bus: None,
+        };
+
+        let created = EventPayload::Session(SessionEvent::Created {
+            profile_id,
+            tools,
+            workspace,
+        });
+        writer.append(runtime_source(), created, None, None)?;
+        Ok(writer)
+    }
+
     /// Read the context snapshot for a non-new session (fork/compaction/reconfiguration).
     ///
     /// # Errors

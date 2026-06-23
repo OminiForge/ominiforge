@@ -9,22 +9,16 @@
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use crate::agent::{Agent, AgentConfig, BlockKind, SessionRuntime, StreamSink};
+use crate::agent::{BlockKind, SessionRuntime, StreamSink};
+use crate::app::{self, DEFAULT_PROFILE, SESSIONS_SUBDIR};
 use crate::config::ConfigStore;
-use crate::context::DEFAULT_COMPACTION_THRESHOLD;
 use crate::core::payload::TurnFailureReason;
 use crate::llm::Message;
 use crate::session::SessionStore;
-use crate::tool::{ReadTool, ShellTool, ToolRegistry, WriteTool};
-
-const SESSIONS_SUBDIR: &str = ".omini/sessions";
-const SKILLS_SUBDIR: &str = ".omini/skills";
-const DEFAULT_PROFILE: &str = "default";
 
 /// Ominiforge command-line interface.
 #[derive(Debug, Parser)]
@@ -51,6 +45,30 @@ enum Command {
     Inspect(InspectArgs),
     /// Scaffold `.omini/` config files (providers + a default profile).
     Init(InitArgs),
+    /// Run the gateway server (HTTP/SSE/WebSocket) in the foreground.
+    #[cfg(feature = "gateway")]
+    Serve(ServeArgs),
+}
+
+/// Arguments for `ominiforge serve`.
+#[cfg(feature = "gateway")]
+#[derive(Debug, Parser)]
+struct ServeArgs {
+    /// Workspace the gateway's sessions operate in (default: current directory).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+
+    /// Profile new sessions are created with.
+    #[arg(long, default_value = DEFAULT_PROFILE)]
+    profile: String,
+
+    /// Bind address, overriding `gateway.toml` (host:port).
+    #[arg(long)]
+    bind: Option<String>,
+
+    /// Do not auto-load a `.env` file; use only the existing environment.
+    #[arg(long)]
+    no_dotenv: bool,
 }
 
 /// Arguments for `ominiforge run`.
@@ -118,7 +136,56 @@ pub async fn run() -> Result<()> {
         Some(Command::Run(args)) => run_turn(args).await,
         Some(Command::Inspect(args)) => inspect(&args),
         Some(Command::Init(args)) => init(&args),
+        #[cfg(feature = "gateway")]
+        Some(Command::Serve(args)) => serve_cmd(args).await,
     }
+}
+
+/// Run the gateway server in the foreground (`doc/architecture.md` §18.1). A
+/// systemd user service wraps this; for development it runs directly.
+#[cfg(feature = "gateway")]
+async fn serve_cmd(args: ServeArgs) -> Result<()> {
+    use crate::gateway::{GatewayConfig, SessionDefaults, SessionRegistry, serve};
+
+    let workspace = match args.workspace {
+        Some(path) => path,
+        None => std::env::current_dir().context("cannot determine current directory")?,
+    };
+    let workspace = app::resolve_workspace(&workspace)?;
+
+    // Load `.env` up front so `api_key_env` and provider keys resolve, unless
+    // disabled. The registry assembles agents with `no_dotenv = true` afterward
+    // so it does not reload per session.
+    let config_store = ConfigStore::discover(&workspace);
+    if !args.no_dotenv {
+        app::load_dotenv(config_store.roots(), &workspace, &|msg| eprintln!("{msg}"));
+    }
+
+    let mut gateway_config =
+        GatewayConfig::load(config_store.roots()).context("failed to load gateway.toml")?;
+    if let Some(bind) = args.bind {
+        gateway_config.bind = bind;
+    }
+
+    let authenticated = gateway_config.resolve_api_key().is_some();
+    eprintln!("ominiforge gateway listening on {}", gateway_config.bind);
+    if authenticated {
+        eprintln!("auth: bearer token required (from ${})",
+            gateway_config.api_key_env.as_deref().unwrap_or("?"));
+    } else {
+        eprintln!(
+            "auth: DISABLED — no api_key_env configured. Only safe behind \
+             loopback + a trusted reverse proxy (doc/architecture.md §18.1)."
+        );
+    }
+
+    let defaults = SessionDefaults {
+        workspace,
+        profile: args.profile,
+        no_dotenv: true,
+    };
+    let registry = SessionRegistry::new(defaults, &gateway_config);
+    serve(registry, &gateway_config).await
 }
 
 async fn tui_main(resume: bool) -> Result<()> {
@@ -142,27 +209,14 @@ async fn tui_main(resume: bool) -> Result<()> {
 
 // __APPEND_MARKER__
 
-/// Everything `run` and the TUI need once config is loaded and resolved: the
-/// agent, the session store for the workspace, the system prompt to seed a fresh
-/// runtime, and the bits of identity to echo and to stamp on a new session.
-struct Prepared {
-    agent: Agent,
-    session_store: SessionStore,
-    system_prompt: String,
-    profile_name: String,
-    tool_names: Vec<String>,
-    workspace: PathBuf,
-    resolved: crate::config::ResolvedModel,
-    /// Live MCP server clients. Held for the session's lifetime: dropping a
-    /// client kills its subprocess, so these must outlive the agent loop.
-    mcp_clients: Vec<std::sync::Arc<crate::mcp::McpClient>>,
-}
+/// Everything `run` and the TUI need once config is resolved. This is just
+/// [`app::Assembled`] — the model/provider/tool selection lives in the
+/// UI-agnostic [`crate::app`] layer so the gateway and scheduler reuse it.
+type Prepared = app::Assembled;
 
-/// The model/provider/tool selection shared by `run` and the TUI: discover config
-/// under the workspace, load `.env`, resolve the model, build the agent and the
-/// session store. The only difference between the entry points is what they do
-/// with the result (one turn vs. an interactive loop), so all the setup lives
-/// here.
+/// Resolve config and build the agent for an entry point, routing non-fatal
+/// diagnostics to stderr (the CLI's log). `workspace = None` means the current
+/// directory. Thin wrapper over [`app::assemble`].
 async fn prepare(
     workspace: Option<PathBuf>,
     profile_name: &str,
@@ -170,115 +224,19 @@ async fn prepare(
     temperature: Option<f32>,
     no_dotenv: bool,
 ) -> Result<Prepared> {
-    let workspace = resolve_workspace(workspace)?;
-
-    // Config is discovered relative to the workspace (project `.omini` first,
-    // then `~/.omini`).
-    let store = ConfigStore::discover(&workspace);
-
-    // Load secrets from a `.env` file before anything reads `api_key_env`,
-    // unless disabled. Real environment variables are never overwritten.
-    if !no_dotenv {
-        load_dotenv(store.roots(), &workspace);
-    }
-
-    let providers = store
-        .load_providers()
-        .context("failed to load providers.toml")?;
-    if providers.providers.is_empty() {
-        bail!(
-            "no providers configured. Run `ominiforge init` to scaffold \
-             .omini/config/providers.toml, then set the model's api_key_env."
-        );
-    }
-    let profile = store
-        .load_profile(profile_name)
-        .with_context(|| format!("failed to load profile `{profile_name}`"))?;
-
-    let resolved = store
-        .resolve(&providers, &profile, model, temperature)
-        .context("failed to resolve model selection")?;
-
-    let provider = crate::provider::build(&resolved)
-        .context("provider type has no adapter (only openai-chat is wired)")?;
-
-    let mut tools = ToolRegistry::new();
-    register_profile_tools(&mut tools, &profile, workspace.clone());
-
-    // Connect configured MCP servers and register their tools alongside the
-    // built-ins (`doc/tool-protocol.md` §5). A broken server is logged and
-    // skipped, never fatal. Clients are returned to keep their subprocesses
-    // alive for the session.
-    let mcp_config =
-        crate::mcp::McpConfig::load(store.roots()).context("failed to load mcp.toml")?;
-    let mcp_clients =
-        crate::mcp::connect_all(&mcp_config, &mut tools, |msg| eprintln!("{msg}")).await;
-
-    // Skills: list those enabled by the profile (empty = all) and inject their
-    // index into the system prompt. The `load_skill` tool is registered only
-    // when at least one skill is available (`doc/skill.md` §2).
-    let skills_dir = workspace.join(SKILLS_SUBDIR);
-    let skills = crate::skill::SkillStore::new(skills_dir.clone()).list(&profile.skills.enabled);
-    let skill_index = crate::skill::skill_index_block(&skills);
-    if !skills.is_empty() {
-        tools.register(std::sync::Arc::new(crate::skill::LoadSkillTool::new(
-            crate::skill::SkillStore::new(skills_dir),
-            workspace.clone(),
-            profile.profile.name.clone(),
-        )));
-    }
-
-    let tool_names = tools.descriptors().into_iter().map(|d| d.name).collect();
-
-    let mut agent = Agent::new(
-        provider,
-        tools,
-        AgentConfig {
-            model: resolved.model_id.clone(),
-            temperature: resolved.temperature,
-            max_tokens: Some(resolved.max_output_tokens),
-            tool_timeout: Duration::from_secs(120),
-            context_window: resolved.context_window,
-            compaction_threshold: profile
-                .context
-                .compaction_threshold
-                .unwrap_or(DEFAULT_COMPACTION_THRESHOLD),
-            ..AgentConfig::default()
-        },
-    );
-
-    // Optional dedicated compaction model (`doc/phase2-plan.md` decision B). It
-    // may name a different provider, so resolve and build it independently; a bad
-    // reference is fatal (the user asked for it explicitly).
-    if let Some(model_ref) = profile.context.compaction_model.as_deref() {
-        let resolved_compaction = store
-            .resolve(&providers, &profile, Some(model_ref), None)
-            .with_context(|| format!("failed to resolve compaction_model `{model_ref}`"))?;
-        let compaction_provider = crate::provider::build(&resolved_compaction)
-            .context("compaction_model provider type has no adapter")?;
-        agent = agent.with_compaction_model(compaction_provider, resolved_compaction.model_id);
-    }
-
-    // User shell hooks from `.omini/config/hooks.toml` (`doc/hook-protocol.md`
-    // §6). A hook at an unknown / not-yet-wired point is logged and skipped,
-    // never fatal — same posture as a broken MCP server.
-    let hooks = crate::hook::HookConfig::load(store.roots())
-        .context("failed to load hooks.toml")?
-        .into_registry(|msg| eprintln!("{msg}"));
-    if !hooks.is_empty() {
-        agent = agent.with_hooks(hooks);
-    }
-
-    Ok(Prepared {
-        agent,
-        session_store: SessionStore::new(workspace.join(SESSIONS_SUBDIR)),
-        system_prompt: ConfigStore::system_prompt(&profile) + &skill_index,
-        profile_name: profile.profile.name.clone(),
-        tool_names,
+    let workspace = match workspace {
+        Some(path) => path,
+        None => std::env::current_dir().context("cannot determine current directory")?,
+    };
+    app::assemble(
         workspace,
-        resolved,
-        mcp_clients,
-    })
+        profile_name,
+        model,
+        temperature,
+        no_dotenv,
+        &|msg| eprintln!("{msg}"),
+    )
+    .await
 }
 
 async fn run_turn(args: RunArgs) -> Result<()> {
@@ -535,66 +493,6 @@ impl<O: Write + Send, E: Write + Send> StreamSink for CliSink<O, E> {
     }
 }
 
-/// Register the built-in tools the profile enables (all three by default),
-/// honoring `[tools].builtin` / `[tools].disabled`.
-fn register_profile_tools(
-    registry: &mut ToolRegistry,
-    profile: &crate::config::Profile,
-    workspace: PathBuf,
-) {
-    use std::sync::Arc;
-    if profile.tools.allows("read") {
-        registry.register(Arc::new(ReadTool::new(workspace.clone())));
-    }
-    if profile.tools.allows("write") {
-        registry.register(Arc::new(WriteTool::new(workspace.clone())));
-    }
-    if profile.tools.allows("shell") {
-        registry.register(Arc::new(ShellTool::new(workspace)));
-    }
-}
-
-/// Resolve and validate the workspace directory, canonicalizing to an absolute
-/// path (the tool layer's escape checks compare against it).
-fn resolve_workspace(requested: Option<PathBuf>) -> Result<PathBuf> {
-    let dir = match requested {
-        Some(path) => path,
-        None => std::env::current_dir().context("cannot determine current directory")?,
-    };
-    dir.canonicalize()
-        .with_context(|| format!("workspace does not exist: {}", dir.display()))
-}
-
-/// Load a single `.env` file into the environment, if one is found.
-///
-/// Search order: each config root's `.env` (project `.omini` before user
-/// `.omini`), then `<workspace>/.env` as a fallback. The first file found is
-/// loaded and the search stops. `dotenvy` never overwrites variables already
-/// present in the environment, so real env vars / direnv / CI always win.
-fn load_dotenv(roots: &[PathBuf], workspace: &Path) {
-    let Some(path) = pick_dotenv_path(roots, workspace) else {
-        return;
-    };
-    match dotenvy::from_path(&path) {
-        Ok(()) => eprintln!("loaded env from {}", path.display()),
-        Err(e) => eprintln!("warning: failed to load {}: {e}", path.display()),
-    }
-}
-
-/// Choose which `.env` to load: the first existing `<root>/.env` (config roots
-/// in priority order), else `<workspace>/.env`, else none. Pure (filesystem
-/// reads only) so it is unit-testable without mutating the environment.
-fn pick_dotenv_path(roots: &[PathBuf], workspace: &Path) -> Option<PathBuf> {
-    roots
-        .iter()
-        .map(|root| root.join(".env"))
-        .find(|p| p.is_file())
-        .or_else(|| {
-            let ws = workspace.join(".env");
-            ws.is_file().then_some(ws)
-        })
-}
-
 // __APPEND_MARKER2__
 
 /// Print a derived metrics summary for a session, computed offline by replaying
@@ -602,10 +500,14 @@ fn pick_dotenv_path(roots: &[PathBuf], workspace: &Path) -> Option<PathBuf> {
 /// from `providers.toml` + `pricing.toml`, so cost reflects current prices, not
 /// whatever was in effect when the session ran.
 fn inspect(args: &InspectArgs) -> Result<()> {
-    let workspace = resolve_workspace(args.workspace.clone())?;
+    let requested = match args.workspace.clone() {
+        Some(path) => path,
+        None => std::env::current_dir().context("cannot determine current directory")?,
+    };
+    let workspace = app::resolve_workspace(&requested)?;
     let config = ConfigStore::discover(&workspace);
     if !args.no_dotenv {
-        load_dotenv(config.roots(), &workspace);
+        app::load_dotenv(config.roots(), &workspace, &|msg| eprintln!("{msg}"));
     }
 
     // Pricing is best-effort: a missing/empty table just means cost is unpriced.
@@ -686,6 +588,13 @@ fn init(args: &InitArgs) -> Result<()> {
         args.force,
     )?;
 
+    #[cfg(feature = "gateway")]
+    write_scaffold(
+        &config_dir.join("gateway.toml"),
+        GATEWAY_TEMPLATE,
+        args.force,
+    )?;
+
     eprintln!(
         "scaffolded {}\n  edit config/providers.toml, set the api_key_env vars, then:\n  ominiforge run \"your prompt\"",
         omini.display()
@@ -759,71 +668,26 @@ default = "openai-main/gpt-4o"        # provider_name/model_id
 builtin = ["read", "write", "shell"]
 "#;
 
+/// Starter `gateway.toml`. Auth is off until you uncomment `api_key_env` and set
+/// the named env var; the gateway binds loopback so it is only reachable behind a
+/// reverse proxy. See doc/gateway.md.
+#[cfg(feature = "gateway")]
+const GATEWAY_TEMPLATE: &str = r#"# Gateway server config. See doc/gateway.md.
+# The gateway is the backend for Web/desktop/mobile; the TUI/CLI bypass it.
+
+bind = "127.0.0.1:7878"            # loopback; a reverse proxy terminates TLS
+
+# Bearer-token auth. Uncomment and set the named env var to require a token on
+# every route except /healthz. Left unset, the gateway is UNAUTHENTICATED —
+# only safe behind loopback + a trusted reverse proxy.
+# api_key_env = "OMINI_GATEWAY_KEY"
+
+idle_timeout_secs = 1800           # evict an idle session actor after 30 min
+"#;
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
-
-    use super::pick_dotenv_path;
-    use std::path::PathBuf;
-
-    /// A config root's `.env` is preferred over the workspace's, and config
-    /// roots are tried in priority order (first one with a `.env` wins).
-    #[test]
-    fn config_root_env_beats_workspace_and_respects_order() {
-        let tmp = tempfile::tempdir().unwrap();
-        let project = tmp.path().join("project/.omini");
-        let user = tmp.path().join("home/.omini");
-        let workspace = tmp.path().join("project");
-        std::fs::create_dir_all(&project).unwrap();
-        std::fs::create_dir_all(&user).unwrap();
-        std::fs::create_dir_all(&workspace).unwrap();
-
-        // Only the user root and the workspace have a `.env`.
-        std::fs::write(user.join(".env"), "K=user").unwrap();
-        std::fs::write(workspace.join(".env"), "K=ws").unwrap();
-
-        let roots = vec![project.clone(), user.clone()];
-        // Project root has no `.env`, so the user root's wins over workspace.
-        assert_eq!(
-            pick_dotenv_path(&roots, &workspace),
-            Some(user.join(".env"))
-        );
-
-        // Add a project-root `.env`: highest priority now.
-        std::fs::write(project.join(".env"), "K=project").unwrap();
-        assert_eq!(
-            pick_dotenv_path(&roots, &workspace),
-            Some(project.join(".env"))
-        );
-    }
-
-    /// With no config-root `.env`, the workspace `.env` is the fallback.
-    #[test]
-    fn falls_back_to_workspace_env() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join(".omini");
-        let workspace = tmp.path().join("ws");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::write(workspace.join(".env"), "K=ws").unwrap();
-
-        assert_eq!(
-            pick_dotenv_path(&[root], &workspace),
-            Some(workspace.join(".env"))
-        );
-    }
-
-    /// No `.env` anywhere → nothing to load.
-    #[test]
-    fn none_when_no_env_files() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join(".omini");
-        let workspace = tmp.path().join("ws");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::create_dir_all(&workspace).unwrap();
-
-        assert_eq!(pick_dotenv_path(&[root], &workspace), None::<PathBuf>);
-    }
 
     use super::{BlockKind, Channel, CliSink, StreamSink};
 

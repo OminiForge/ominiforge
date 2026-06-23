@@ -100,23 +100,27 @@
 - Hook 热更新、hook 与 profile 绑定、hook 执行 monitor metrics（待 monitor 扩展）。
 
 
-### Phase 5 — Gateway（网络访问层）
+### Phase 5 — Gateway（网络访问层）✅（核心完成）
 
-**目标**：让 Web/桌面/手机通过网络访问 agent。TUI 本地使用不经过 Gateway。
+**目标**：让 Web/桌面/手机通过网络访问 agent。TUI 本地使用不经过 Gateway。设计与契约见
+[`gateway.md`](./gateway.md)。
 
-已决策：
-- axum HTTP server，feature-gated（`gateway`）。
-- REST API 覆盖完整工作流：session CRUD/fork/message/cancel、profiles、tools、skills、monitor、evolution。
-- WebSocket / SSE：`/sessions/:id/events` 实时 event stream。
-- 认证：**单用户 API key**（静态 token，配置在 profile 或单独配置文件）。GitHub OAuth 延后，等多用户需求出现时再加。
-- 部署：`ominiforge serve`，用户级 systemd service。
-- HTTPS 强制（公网暴露时）。
+已实现（`src/gateway/` + `src/app.rs`）：
+- axum HTTP/SSE/WS server，feature-gated（`gateway`，默认 on；`--no-default-features` 去掉整套 axum 栈）。
+- **session-actor 模型**：单写者 flock 逼出——一个 session 同时只在一处可写，多客户端 fan-in
+  串行经 `SessionActor`（`actor.rs`，轮间持有 writer+runtime，inbox 串行化，turn 永不交错）。
+- `SessionRegistry`（`registry.rs`）：`session_id → actor`，冷查找即时 spawn，idle 自我逐出
+  释放锁，锁冲突 → HTTP 409。per-session 隔离 agent + MCP（已决策）。
+- REST：`/sessions` list/create、`/sessions/{id}` get/fork/message/cancel/compact；
+  SSE `/sessions/{id}/events`（`Last-Event-ID` = seq，从 log 重放后挂 live 流）；
+  WS `/sessions/{id}/ws`（events 出 + send/cancel 入）。
+- 单用户静态 bearer token（`gateway.toml` 的 `api_key_env`），`/healthz` 不鉴权。
+- 部署：`ominiforge serve` 前台，用户级 systemd（§18.1）；TLS 由反代终结（bind loopback）。
+- `src/app.rs`：从 cli `prepare()` 抽出的 UI 无关 assemble 层，CLI / Gateway 共用。
 
-待后续深入（实施前拆分）：
-- REST 路由完整列表与请求/响应 schema。
-- WebSocket / SSE 协议细节。
-- API key 存储与轮换机制。
-- Rate limiting 策略。
+延后（见 [`gateway.md`](./gateway.md) §9）：
+- profiles/tools/skills/monitor/evolution 的 REST 端点（当前覆盖 session 工作流主线）。
+- API key 存储与轮换、rate limiting、共享 agent/MCP 池、GitHub OAuth + 多用户隔离。
 
 ### Phase 6 — Web 前端
 
@@ -210,20 +214,11 @@
 
 协议 adapter 位置：`src/mcp/`（已有）、`src/a2a/`、`src/acp/`（后续按需添加）。
 
-### 12. Gateway API — 已决策，待 Phase 5 实施拆分
+### 12. Gateway API — ✅ 核心实现完成
 
-已决策：
-- Gateway 是所有非 TUI 入口（Web/桌面/手机）的唯一后端；TUI 本地使用直接调 Rust core，不经 Gateway。
-- HTTP API 覆盖完整工作流：session CRUD/fork/message/cancel、profiles、tools、skills、monitor、evolution。
-- WebSocket / SSE：`/sessions/:id/events` 实时 event stream。
-- 认证模型：**单用户 API key**（静态 token）。GitHub OAuth + 多用户隔离延后，等多用户需求出现时再立项。
-- 部署模型：用户级 systemd service，`ominiforge serve`，HTTPS 强制（公网时）。
-- 框架：axum，feature-gated（`gateway`）。
-
-待 Phase 5 实施拆分时深入：
-- REST 路由完整列表与请求/响应 schema。
-- API key 存储与轮换机制。
-- Rate limiting 策略。
+实现见 Phase 5 与 [`gateway.md`](./gateway.md)；`src/gateway/`。本条不再保留正文细节，
+设计与契约以 `gateway.md` 和代码为准。剩余开放项（profiles/tools/skills/monitor/evolution
+端点、API key 轮换、rate limiting、共享池、OAuth/多用户）见 `gateway.md` §9。
 
 ### 13. Scheduler 与任务工作区 — 部分决策
 

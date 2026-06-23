@@ -82,6 +82,17 @@ impl Origin {
             fork_at_seq: None,
         }
     }
+
+    /// Origin for a fork: branched from `parent_id` at `fork_at_seq`
+    /// (`doc/session-storage.md` §5, `doc/architecture.md` §6.1).
+    #[must_use]
+    pub const fn fork(parent_id: SessionId, fork_at_seq: u64) -> Self {
+        Self {
+            kind: OriginKind::Fork,
+            parent_id: Some(parent_id),
+            fork_at_seq: Some(fork_at_seq),
+        }
+    }
 }
 
 impl Default for Origin {
