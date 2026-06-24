@@ -124,17 +124,24 @@
 
 ### Phase 6 — Web 前端
 
-**目标**：浏览器端完整 agent 工作流（对话、session 管理、监控、任务、进化审批）。
+**目标**：浏览器端完整 agent 工作流（对话、session 管理、监控、任务、进化审批）。设计见
+[`doc/frontend.md`](./frontend.md)。
 
 已决策：
 - 通过 Gateway API 操作，不直接调 Rust core。
 - 主要面向跨机器随时访问场景。
-- 前端框架待选型（Phase 5 完成后决策）。
+- **框架：SvelteKit + TypeScript**（adapter-static → SPA）。
+- **仓库：polyglot monorepo**，`frontend/` 与 Rust `src/` 平级，Rust 侧仍单 crate。
+- **类型一致性链路**：Rust event/DTO enum `#[derive(TS)]` → ts-rs 生成 `frontend/src/lib/types/*.ts`，CI `git diff` gate 拦漂移。
+- **Transport 抽象**：`client-core` 定义 `SessionClient` 接口，`GatewayTransport` (fetch+SSE) 供 Web；`TauriTransport` (invoke+channel) 供 Desktop 本地模式（Phase 9 复用）。
+- **环境**：Node/pnpm 进 `flake.nix` devShell，不依赖宿主机全局安装。
+- Web 与 Desktop 共享同一套 UI 代码（见 [`frontend.md`](./frontend.md) §1–§3）。
 
-待后续深入：
-- 框架选型（SvelteKit / Next.js / Leptos）。
-- UI 信息架构与页面拆分。
-- 交互设计。
+待后续深入（实施前）：
+- client-core 接口精确签名 + 两 transport 实现细节。
+- 图表库选型（layerchart / echarts）。
+- UI 信息架构与页面拆分（对话 / session 管理 / 监控 / 进化审批）。
+- 交互设计（uipro skill，developer-console 风格）。
 
 ### Phase 7 — Scheduler（任务管理系统）
 
@@ -157,9 +164,11 @@
 
 ### Phase 9 — 桌面端（Tauri）
 
-**目标**：本地原生应用，最佳本地体验，同时支持连接远程 server。
+**目标**：本地原生应用，最佳本地体验，同时支持连接远程 server。设计见
+[`doc/frontend.md`](./frontend.md)（Web 与 Desktop 共享 UI，差异只在 transport）。
 
 已决策：
+- **复用 Web 前端 UI 代码** + 额外 `TauriTransport`（invoke+channel）+ Rust 侧 `#[tauri::command]` 包装 `src/app.rs`。
 - 本地模式：Tauri shell + Rust core 直接调用，读本地配置启动，无需 `serve`。
 - 远程模式：通过 Gateway API 连接注册的远程 server（URL + token）。
 - 客户端维护 server 注册列表，支持切换。当前阶段各 server 完全独立。

@@ -146,6 +146,10 @@ crates/
   ominiforge/              # library + binary（唯一 crate）
 ```
 
+> **Polyglot monorepo**：自 Phase 6 起仓库新增 `frontend/`（SvelteKit + TS，Node 项目，
+> 不进 Cargo workspace），与 Rust `src/` 物理隔离，唯一接触点是 ts-rs 生成的类型文件。
+> Rust 侧仍维持**单 crate**，本节原则不破。详见 [`frontend.md`](./frontend.md) §5。
+
 主 crate 内部 module 布局：
 
 ```text
