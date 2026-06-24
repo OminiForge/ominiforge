@@ -10,9 +10,13 @@ const gateway = process.env.GATEWAY_URL ?? 'http://127.0.0.1:7878';
 export default defineConfig({
 	plugins: [sveltekit()],
 	server: {
-		// Bind IPv4 loopback explicitly. Vite otherwise binds IPv6-only ([::1]),
-		// so a browser hitting 127.0.0.1 gets connection-refused.
-		host: '127.0.0.1',
+		// Dual-stack bind: '::' makes Node listen on IPv6 and (on Linux with the
+		// default bindv6only=0) also accept IPv4-mapped connections, so an SSH
+		// tunnel forwarding to either 127.0.0.1 or [::1] reaches the dev server.
+		// allowedHosts disables vite's host-header check (needed when reached via
+		// a tunnel / non-localhost host). Dev only.
+		host: '::',
+		allowedHosts: true,
 		proxy: {
 			'/api': {
 				target: gateway,
