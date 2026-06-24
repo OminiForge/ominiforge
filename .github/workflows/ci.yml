@@ -57,6 +57,12 @@ jobs:
       - name: Typecheck
         run: nix develop --command pnpm check
         working-directory: frontend
+      - name: Lint
+        run: nix develop --command pnpm lint
+        working-directory: frontend
+      - name: Test
+        run: nix develop --command pnpm test
+        working-directory: frontend
       - name: Build
         run: nix develop --command pnpm build
         working-directory: frontend

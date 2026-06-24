@@ -37,7 +37,9 @@ export class GatewayTransport implements SessionClient {
 		const res = await fetch(this.#baseUrl + path, {
 			...init,
 			headers: this.#headers(
-				init?.body ? { 'Content-Type': 'application/json', ...headerObj(init.headers) } : headerObj(init?.headers)
+				init?.body
+					? { 'Content-Type': 'application/json', ...headerObj(init.headers) }
+					: headerObj(init?.headers)
 			)
 		});
 		if (!res.ok) throw await gatewayError(res);
@@ -47,9 +49,7 @@ export class GatewayTransport implements SessionClient {
 	async #send(path: string, init?: RequestInit): Promise<void> {
 		const res = await fetch(this.#baseUrl + path, {
 			...init,
-			headers: this.#headers(
-				init?.body ? { 'Content-Type': 'application/json' } : undefined
-			)
+			headers: this.#headers(init?.body ? { 'Content-Type': 'application/json' } : undefined)
 		});
 		if (!res.ok) throw await gatewayError(res);
 	}
