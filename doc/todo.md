@@ -125,7 +125,7 @@
 ### Phase 6 — Web 前端
 
 **目标**：浏览器端完整 agent 工作流（对话、session 管理、监控、任务、进化审批）。设计见
-[`doc/frontend.md`](./frontend.md)。
+[`doc/frontend.md`](./frontend.md)，实施计划与 §11 决策见 [`doc/phase6-plan.md`](./phase6-plan.md)。
 
 已决策：
 - 通过 Gateway API 操作，不直接调 Rust core。
