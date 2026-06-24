@@ -1,0 +1,48 @@
+/* Global base: reset + body defaults. All values reference tokens.css —
+   no raw color/spacing here (doc/frontend.md §6 design-drift guard). */
+
+*,
+*::before,
+*::after {
+	box-sizing: border-box;
+	margin: 0;
+	padding: 0;
+}
+
+html {
+	color-scheme: dark;
+}
+
+body {
+	background: var(--bg-primary);
+	color: var(--text-primary);
+	font-family: var(--font-sans);
+	font-size: 14px;
+	line-height: 1.5;
+	-webkit-font-smoothing: antialiased;
+}
+
+a {
+	color: var(--accent);
+	text-decoration: none;
+}
+
+a:hover {
+	text-decoration: underline;
+}
+
+button {
+	font: inherit;
+	color: inherit;
+	cursor: pointer;
+}
+
+code,
+pre {
+	font-family: var(--font-mono);
+}
+
+:focus-visible {
+	outline: 2px solid var(--ring);
+	outline-offset: 1px;
+}
