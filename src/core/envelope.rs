@@ -12,6 +12,7 @@ use super::payload::EventPayload;
 /// `session_id` is held in memory but omitted on disk (it is the session
 /// directory name); see `doc/session-storage.md` §3.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct CoreEvent {
     /// Protocol version, e.g. `"ominiforge.event.v1"`.
     pub schema_version: String,
@@ -43,6 +44,7 @@ pub struct CoreEvent {
 /// Where an event came from. `kind` enables fast routing/filtering; `id`
 /// names the concrete instance (e.g. `"shell"`, `"mcp://github-server"`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct EventSource {
     pub kind: SourceKind,
     pub id: String,
@@ -53,6 +55,7 @@ pub struct EventSource {
 /// No `Plugin` variant: the WASM plugin model was dropped; external extensions
 /// are MCP servers, classified as [`SourceKind::External`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub enum SourceKind {
     /// An LLM provider.
     Model,

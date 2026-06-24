@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 /// Identifies a session. ULID format in practice (time-sortable + random).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 #[serde(transparent)]
 pub struct SessionId(pub String);
 
@@ -20,11 +21,13 @@ impl std::fmt::Display for SessionId {
 
 /// Identifies a turn — one iteration of the agent loop — within a session.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 #[serde(transparent)]
 pub struct TurnId(pub String);
 
 /// Identifies a stored artifact (tool output, intermediate product, ...).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 #[serde(transparent)]
 pub struct ArtifactId(pub String);
 
@@ -34,6 +37,7 @@ pub struct ArtifactId(pub String);
 /// pair. Persisted events omit `session_id` per line (it is the directory
 /// name), so `EventId` here is the in-memory/cross-session form.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct EventId {
     pub session_id: SessionId,
     pub seq: u64,

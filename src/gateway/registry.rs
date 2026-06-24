@@ -176,7 +176,11 @@ impl SessionRegistry {
             self.inner.idle_timeout,
             assembled.mcp_clients,
         );
-        self.inner.actors.lock().await.insert(id.clone(), handle.clone());
+        self.inner
+            .actors
+            .lock()
+            .await
+            .insert(id.clone(), handle.clone());
         Ok((id, handle))
     }
 
@@ -199,7 +203,10 @@ impl SessionRegistry {
             .with_context(|| format!("failed to read parent session `{}`", parent.0))?;
         let upto: Vec<_> = all.into_iter().filter(|e| e.seq <= at_seq).collect();
         if upto.is_empty() {
-            return Err(anyhow!("parent session `{}` has no event at or before seq {at_seq}", parent.0));
+            return Err(anyhow!(
+                "parent session `{}` has no event at or before seq {at_seq}",
+                parent.0
+            ));
         }
         let parent_runtime = crate::agent::rebuild_runtime(&upto, system.clone());
         let snapshot = parent_runtime.context;
@@ -227,7 +234,11 @@ impl SessionRegistry {
             self.inner.idle_timeout,
             assembled.mcp_clients,
         );
-        self.inner.actors.lock().await.insert(id.clone(), handle.clone());
+        self.inner
+            .actors
+            .lock()
+            .await
+            .insert(id.clone(), handle.clone());
         Ok((id, handle))
     }
 

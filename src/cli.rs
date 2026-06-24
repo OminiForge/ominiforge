@@ -170,8 +170,10 @@ async fn serve_cmd(args: ServeArgs) -> Result<()> {
     let authenticated = gateway_config.resolve_api_key().is_some();
     eprintln!("ominiforge gateway listening on {}", gateway_config.bind);
     if authenticated {
-        eprintln!("auth: bearer token required (from ${})",
-            gateway_config.api_key_env.as_deref().unwrap_or("?"));
+        eprintln!(
+            "auth: bearer token required (from ${})",
+            gateway_config.api_key_env.as_deref().unwrap_or("?")
+        );
     } else {
         eprintln!(
             "auth: DISABLED — no api_key_env configured. Only safe behind \

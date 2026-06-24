@@ -12,6 +12,7 @@ use super::ids::{ArtifactId, EventId, SessionId, TurnId};
 
 /// Domain-tagged payload of a [`super::CoreEvent`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub enum EventPayload {
     Turn(TurnEvent),
     Model(ModelEvent),
@@ -30,6 +31,7 @@ pub enum EventPayload {
 /// interrupted turn records its break point so it can resume without the user
 /// re-entering input. See `doc/event-schema.md` §4.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub enum TurnEvent {
     Started {
         turn_id: TurnId,
@@ -73,6 +75,7 @@ pub enum TurnEvent {
 /// `reason.is_some()` distinguishes a graceful stop from a hard abort. See
 /// `doc/event-schema.md` §4 and `doc/plan.md` §6–§7.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub enum TurnFailureReason {
     /// The absolute max-rounds safety net tripped: the tool loop ran this many
     /// model rounds without the model giving a final answer.
@@ -95,6 +98,7 @@ pub enum TurnFailureReason {
 /// A model emitting a tool call is a `ModelEvent`; the tool actually running is
 /// a [`ToolEvent`] — the two are kept separate. See `doc/event-schema.md` §5.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub enum ModelEvent {
     RequestStarted {
         request_id: String,
@@ -138,6 +142,7 @@ pub enum ModelEvent {
 /// subsequent deltas. Persisted history uses [`BlockContent`] instead, which
 /// carries the fully-assembled block.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub enum ContentBlockType {
     Text,
     Reasoning,
@@ -150,6 +155,7 @@ pub enum ContentBlockType {
 /// [`ContentBlockType`] + deltas: instead of one event per token, the collector
 /// accumulates a block and records it once, here, with its complete content.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub enum BlockContent {
     /// Assistant free-text, concatenated from all text deltas.
     Text { text: String },
@@ -165,6 +171,7 @@ pub enum BlockContent {
 
 /// Why the model stopped generating.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub enum StopReason {
     EndTurn,
     MaxTokens,
@@ -178,6 +185,7 @@ pub enum StopReason {
 /// configurable pricing table, so history can be recomputed with current
 /// prices. See `doc/monitor.md` §3, §6.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,
@@ -189,6 +197,7 @@ pub struct Usage {
 /// triggered it; `Completed`/`Failed` carry timing and output metadata. See
 /// `doc/event-schema.md` §6.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub enum ToolEvent {
     Started {
         tool_call_event_id: EventId,
@@ -214,6 +223,7 @@ pub enum ToolEvent {
 /// Where a tool came from. The agent loop treats both uniformly; this only
 /// drives source-aware monitoring (which MCP server is slow/failing/etc.).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub enum ToolSource {
     Builtin,
     Mcp { server_name: String },
@@ -226,6 +236,7 @@ pub enum ToolSource {
 /// `ToolResult` alias is `Result<ToolOutput, ToolError>`. See
 /// `doc/tool-protocol.md` §7.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct ToolOutput {
     pub content: Vec<Content>,
     pub is_error: bool,
@@ -236,6 +247,7 @@ pub struct ToolOutput {
 /// A unit of tool output. Payloads over 64KB are spilled to the artifact store
 /// by the runtime and referenced via [`Content::ArtifactRef`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub enum Content {
     Text(String),
     Image {
@@ -252,6 +264,7 @@ pub enum Content {
 /// initial config so replay is self-contained. See `doc/event-schema.md` §7
 /// and `doc/session-storage.md` §3.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub enum SessionEvent {
     Created {
         profile_id: Option<String>,
@@ -271,6 +284,7 @@ pub enum SessionEvent {
 
 /// Why a session ended.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub enum SessionEndReason {
     Completed,
     Cancelled,
@@ -280,6 +294,7 @@ pub enum SessionEndReason {
 /// Artifact lifecycle. The event records only a reference; content lives in the
 /// artifact store. See `doc/event-schema.md` §8.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub enum ArtifactEvent {
     Created {
         artifact_id: ArtifactId,
@@ -300,6 +315,7 @@ pub enum ArtifactEvent {
 /// the model saw each turn. See `doc/event-schema.md` §9 and
 /// `doc/context-management.md` §5.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub enum InjectionEvent {
     ContextInjected {
         source: InjectionSource,
@@ -311,6 +327,7 @@ pub enum InjectionEvent {
 /// What produced an injection. Ordering is kept stable (Memory → Rag → Acp →
 /// Hook → Runtime) to avoid needless prefix-cache churn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub enum InjectionSource {
     Memory,
     #[serde(rename = "RAG")]
@@ -335,6 +352,7 @@ pub enum InjectionSource {
 /// code `blocked_by_hook`, `doc/hook-protocol.md` §8); this event records the
 /// hook's own execution regardless of outcome.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub enum HookEvent {
     Executed {
         /// The hook's configured name.
@@ -353,6 +371,7 @@ pub enum HookEvent {
 /// the pipeline's response to it is governed by the hook's failure mode
 /// (`doc/hook-protocol.md` §9).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub enum HookOutcome {
     /// Before hook let the pipeline continue unchanged.
     Pass,
@@ -368,6 +387,7 @@ pub enum HookOutcome {
 
 /// A structured error surfaced as its own event. See `doc/event-schema.md` §10.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub enum ErrorEvent {
     Raised(ErrorDetail),
 }
@@ -377,6 +397,7 @@ pub enum ErrorEvent {
 /// Carries more than a string so consumers can route on `code`, `severity`,
 /// and `retryable`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct ErrorDetail {
     pub code: String,
     pub message: String,
@@ -390,6 +411,7 @@ pub struct ErrorDetail {
 
 /// Severity of an [`ErrorDetail`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub enum ErrorSeverity {
     Fatal,
     Error,

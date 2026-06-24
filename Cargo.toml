@@ -52,11 +52,25 @@ git2 = "0.21.0"
 axum = { version = "0.8", optional = true, features = ["ws"] }
 tokio-stream = { version = "0.1", optional = true, features = ["sync"] }
 
+# ts-rs (feature `ts-export`): generate the TS type bindings the frontend
+# consumes from the Rust wire types (events, gateway frames, session meta). Dev
+# tooling only — not compiled into any shipping binary. Generation runs through
+# `#[cfg(test)]` export tests; see doc/frontend.md §4.
+ts-rs = { version = "12", optional = true, features = [
+  "chrono-impl",
+  "serde-json-impl",
+  "no-serde-warnings",
+] }
+
 [features]
 # Gateway on by default (doc/architecture.md §5.1); build without it via
 # `--no-default-features`.
 default = ["gateway"]
 gateway = ["dep:axum", "dep:tokio-stream"]
+# Enables ts-rs derives on the wire types so `cargo test --features ts-export`
+# regenerates frontend/src/lib/types/*.ts. Off by default; CI runs it to gate
+# type drift (doc/frontend.md §6).
+ts-export = ["dep:ts-rs"]
 
 [dev-dependencies]
 tempfile = "3"

@@ -136,11 +136,9 @@ async fn get_session(State(state): State<AppState>, Path(id): Path<String>) -> R
 /// `POST /sessions` — create a new session; returns its id.
 async fn create_session(State(state): State<AppState>) -> Response {
     match state.registry.create().await {
-        Ok((id, _handle)) => (
-            StatusCode::CREATED,
-            Json(json!({ "session_id": id.0 })),
-        )
-            .into_response(),
+        Ok((id, _handle)) => {
+            (StatusCode::CREATED, Json(json!({ "session_id": id.0 }))).into_response()
+        }
         Err(e) => internal_error(&e),
     }
 }
@@ -160,11 +158,9 @@ async fn fork_session(
 ) -> Response {
     let parent = SessionId(id);
     match state.registry.fork(&parent, body.at_seq).await {
-        Ok((new_id, _handle)) => (
-            StatusCode::CREATED,
-            Json(json!({ "session_id": new_id.0 })),
-        )
-            .into_response(),
+        Ok((new_id, _handle)) => {
+            (StatusCode::CREATED, Json(json!({ "session_id": new_id.0 }))).into_response()
+        }
         Err(e) => internal_error(&e),
     }
 }
@@ -275,7 +271,6 @@ fn replay_events(
         .filter(|e| last_seen.is_none_or(|seen| e.seq > seen))
         .map(|event| {
             let gw = GatewayEvent::Event {
-                seq: event.seq,
                 event: Box::new(event),
             };
             Ok(sse_from_gateway(&gw))
@@ -296,8 +291,8 @@ fn live_event_stream(
 fn sse_from_gateway(gw: &GatewayEvent) -> SseEvent {
     let data = serde_json::to_string(gw).unwrap_or_else(|_| "{}".to_owned());
     let event = SseEvent::default().data(data);
-    if let GatewayEvent::Event { seq, .. } = gw {
-        event.id(seq.to_string())
+    if let GatewayEvent::Event { event: core } = gw {
+        event.id(core.seq.to_string())
     } else {
         event
     }
@@ -377,11 +372,7 @@ async fn ws_loop(socket: WebSocket, handle: ActorHandle) {
 fn conflict_or_not_found(e: &anyhow::Error) -> Response {
     let msg = e.to_string();
     if msg.contains("locked") {
-        (
-            StatusCode::CONFLICT,
-            Json(json!({ "error": msg })),
-        )
-            .into_response()
+        (StatusCode::CONFLICT, Json(json!({ "error": msg }))).into_response()
     } else {
         not_found(e)
     }
@@ -523,9 +514,7 @@ mod tests {
                         kind: crate::core::SourceKind::Runtime,
                         id: "test".to_owned(),
                     },
-                    crate::core::EventPayload::Session(
-                        crate::core::payload::SessionEvent::Paused,
-                    ),
+                    crate::core::EventPayload::Session(crate::core::payload::SessionEvent::Paused),
                     None,
                     None,
                 )
