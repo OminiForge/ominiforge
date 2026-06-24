@@ -43,12 +43,12 @@ const INBOX_CAPACITY: usize = 64;
 /// What a front-end sees on the wire for one session. Tagged JSON so a client
 /// can switch on `type`.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GatewayEvent {
-    /// A committed, persisted event. `seq` is its session sequence number — the
-    /// SSE `Last-Event-ID` for resume.
+    /// A committed, persisted event. The flattened event's `seq` is its session
+    /// sequence number — the SSE `Last-Event-ID` for resume.
     Event {
-        seq: u64,
         #[serde(flatten)]
         event: Box<CoreEvent>,
     },
@@ -67,6 +67,7 @@ pub enum GatewayEvent {
 
 /// A live streaming delta, mirroring [`StreamSink`] callbacks.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 #[serde(tag = "delta", rename_all = "snake_case")]
 pub enum Delta {
     /// A new content block opened.
@@ -316,9 +317,7 @@ impl SessionActor {
         match res {
             Ok(Ok((writer, runtime, outcome))) => {
                 let incomplete = outcome.incomplete.as_ref().map(|r| format!("{r:?}"));
-                let _ = self
-                    .outbound
-                    .send(GatewayEvent::TurnSettled { incomplete });
+                let _ = self.outbound.send(GatewayEvent::TurnSettled { incomplete });
 
                 let over = outcome
                     .context_limit
@@ -401,10 +400,13 @@ impl SessionActor {
                 return (writer, runtime);
             }
         };
-        match self
-            .store
-            .create_compaction(old_sid, meta.profile_id, meta.workspace, Vec::new(), &snapshot)
-        {
+        match self.store.create_compaction(
+            old_sid,
+            meta.profile_id,
+            meta.workspace,
+            Vec::new(),
+            &snapshot,
+        ) {
             Ok(new_writer) => {
                 let new_writer = new_writer.with_bus(self.bus.clone());
                 self.session_id = new_writer.session_id().clone();
@@ -433,7 +435,6 @@ fn spawn_event_forwarder(bus: &EventBus, outbound: broadcast::Sender<GatewayEven
             match rx.recv().await {
                 Ok(event) => {
                     let _ = outbound.send(GatewayEvent::Event {
-                        seq: event.seq,
                         event: Box::new(event),
                     });
                 }
@@ -475,30 +476,24 @@ impl StreamSink for BroadcastSink {
     }
 
     fn on_text(&mut self, index: u32, text: &str) {
-        let _ = self
-            .tx
-            .send(GatewayEvent::Delta(Delta::Text {
-                index,
-                text: text.to_owned(),
-            }));
+        let _ = self.tx.send(GatewayEvent::Delta(Delta::Text {
+            index,
+            text: text.to_owned(),
+        }));
     }
 
     fn on_reasoning(&mut self, index: u32, text: &str) {
-        let _ = self
-            .tx
-            .send(GatewayEvent::Delta(Delta::Reasoning {
-                index,
-                text: text.to_owned(),
-            }));
+        let _ = self.tx.send(GatewayEvent::Delta(Delta::Reasoning {
+            index,
+            text: text.to_owned(),
+        }));
     }
 
     fn on_tool_call_delta(&mut self, index: u32, json_delta: &str) {
-        let _ = self
-            .tx
-            .send(GatewayEvent::Delta(Delta::ToolArgs {
-                index,
-                json: json_delta.to_owned(),
-            }));
+        let _ = self.tx.send(GatewayEvent::Delta(Delta::ToolArgs {
+            index,
+            json: json_delta.to_owned(),
+        }));
     }
 }
 

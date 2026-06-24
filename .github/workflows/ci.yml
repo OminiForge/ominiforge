@@ -40,3 +40,5 @@ jobs:
         run: nix develop --command just deny
       - name: Machete
         run: nix develop --command just machete
+      - name: TS bindings drift
+        run: nix develop --command just ts-check
