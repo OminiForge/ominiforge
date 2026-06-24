@@ -30,14 +30,14 @@
 	--font-mono: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
 
 	/* ---------- spacing (4px grid) -------------------------------- */
-	--gap-xs: 0.25rem;  /* 4px */
-	--gap-sm: 0.5rem;   /* 8px */
-	--gap-md: 0.75rem;  /* 12px */
-	--gap-lg: 1rem;     /* 16px */
-	--gap-xl: 1.25rem;  /* 20px */
-	--gap-2xl: 1.5rem;  /* 24px */
-	--gap-3xl: 2rem;    /* 32px */
-	--gap-4xl: 2.5rem;  /* 40px */
+	--gap-xs: 0.25rem; /* 4px */
+	--gap-sm: 0.5rem; /* 8px */
+	--gap-md: 0.75rem; /* 12px */
+	--gap-lg: 1rem; /* 16px */
+	--gap-xl: 1.25rem; /* 20px */
+	--gap-2xl: 1.5rem; /* 24px */
+	--gap-3xl: 2rem; /* 32px */
+	--gap-4xl: 2.5rem; /* 40px */
 
 	/* ---------- radii ------------------------------------------ */
 	--radius-sm: 4px;
@@ -46,6 +46,5 @@
 	--radius-xl: 10px;
 
 	/* ---------- shadow (subtle elevation) -------------------------- */
-	--shadow-popover: 0 1px 4px rgba(0, 0, 0, 0.3),
-				0 0 1px rgba(0, 0, 0, 0.5);
+	--shadow-popover: 0 1px 4px rgba(0, 0, 0, 0.3), 0 0 1px rgba(0, 0, 0, 0.5);
 }
