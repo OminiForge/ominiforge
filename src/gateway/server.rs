@@ -72,6 +72,10 @@ pub async fn serve(registry: SessionRegistry, config: &GatewayConfig) -> Result<
 }
 
 /// Build the router with auth applied to everything but `/healthz`.
+///
+/// The session API is nested under `/api/*` so it never collides with the
+/// SPA's own client-side routes (which share names like `/sessions`) when the
+/// gateway serves the static frontend from the same origin (`doc/gateway.md`).
 fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/sessions", get(list_sessions).post(create_session))
@@ -87,7 +91,7 @@ fn router(state: AppState) -> Router {
 
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        .merge(protected)
+        .nest("/api", protected)
 }
 
 /// Bearer-token auth. A no-op when no key is configured; otherwise rejects any
@@ -454,12 +458,12 @@ mod tests {
         let client = reqwest::Client::new();
 
         // No token → 401.
-        let resp = client.get(format!("{base}/sessions")).send().await.unwrap();
+        let resp = client.get(format!("{base}/api/sessions")).send().await.unwrap();
         assert_eq!(resp.status(), 401);
 
         // Wrong token → 401.
         let resp = client
-            .get(format!("{base}/sessions"))
+            .get(format!("{base}/api/sessions"))
             .bearer_auth("wrong")
             .send()
             .await
@@ -468,7 +472,7 @@ mod tests {
 
         // Correct token → 200 (empty session list).
         let resp = client
-            .get(format!("{base}/sessions"))
+            .get(format!("{base}/api/sessions"))
             .bearer_auth("s3cret")
             .send()
             .await
@@ -486,7 +490,7 @@ mod tests {
             api_key: None,
         };
         let base = serve_test(state).await;
-        let resp = reqwest::get(format!("{base}/sessions")).await.unwrap();
+        let resp = reqwest::get(format!("{base}/api/sessions")).await.unwrap();
         assert_eq!(resp.status(), 200);
     }
 
