@@ -74,18 +74,21 @@ spawn MCP）、进程多。换来完全隔离。共享池（按 profile 复用 a
 
 完整路由与请求/响应以 [`src/gateway/server.rs`](../src/gateway/server.rs) 为准。
 
+session API 统一挂在 `/api/*` 下，避免与前端 SPA 自身的 client-side 路由（同名
+`/sessions` 等）在同源托管时撞车（见 §10）。`/healthz` 留在根，不鉴权。
+
 | Method | Path | 说明 |
 |--------|------|------|
-| GET  | `/healthz` | 健康检查，**不鉴权** |
-| GET  | `/sessions` | 列出 session id（最新优先） |
-| POST | `/sessions` | 新建 session → `201 {session_id}` |
-| GET  | `/sessions/{id}` | session 元数据 |
-| POST | `/sessions/{id}/fork` | body `{at_seq}` → 在该 seq 分叉，`201 {session_id}` |
-| POST | `/sessions/{id}/message` | body `{text}` → 入队一个 turn，`202 Accepted`（不阻塞） |
-| POST | `/sessions/{id}/cancel` | abort 正在跑的 turn |
-| POST | `/sessions/{id}/compact` | body 可选 `{keep_last}` → 摘要并切换 compaction session |
-| GET  | `/sessions/{id}/events` | SSE event 流（见 §4） |
-| GET  | `/sessions/{id}/ws` | WebSocket：events 出 + `{type:"send",text}` / `{type:"cancel"}` 入 |
+| GET  | `/healthz` | 健康检查，**不鉴权**，**不在 `/api` 下** |
+| GET  | `/api/sessions` | 列出 session id（最新优先） |
+| POST | `/api/sessions` | 新建 session → `201 {session_id}` |
+| GET  | `/api/sessions/{id}` | session 元数据 |
+| POST | `/api/sessions/{id}/fork` | body `{at_seq}` → 在该 seq 分叉，`201 {session_id}` |
+| POST | `/api/sessions/{id}/message` | body `{text}` → 入队一个 turn，`202 Accepted`（不阻塞） |
+| POST | `/api/sessions/{id}/cancel` | abort 正在跑的 turn |
+| POST | `/api/sessions/{id}/compact` | body 可选 `{keep_last}` → 摘要并切换 compaction session |
+| GET  | `/api/sessions/{id}/events` | SSE event 流（见 §4） |
+| GET  | `/api/sessions/{id}/ws` | WebSocket：events 出 + `{type:"send",text}` / `{type:"cancel"}` 入 |
 
 `message` 立即返回 202；turn 在 actor 内跑，输出走 event 流。这把“提交”与“观察”解耦，
 和 TUI（spawn turn + 订阅 bus）同构。
