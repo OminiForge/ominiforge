@@ -189,7 +189,9 @@
 	}
 
 	.msg.user {
-		background: var(--accent-weak);
+		background: var(--bg-secondary);
+		border: 1px solid var(--border);
+		border-left: 2px solid var(--accent);
 		align-self: flex-end;
 		max-width: 80%;
 	}
