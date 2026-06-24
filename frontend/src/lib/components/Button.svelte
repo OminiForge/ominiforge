@@ -48,6 +48,8 @@
 	.btn.accent {
 		background: var(--accent-weak);
 		border-color: var(--accent-weak);
+		color: var(--accent-fg);
+		font-weight: 600;
 	}
 
 	.btn.accent:hover:not(:disabled) {

@@ -1,35 +1,44 @@
-/* Ominiforge design tokens — developer tool console baseline (§9 of
-   doc/frontend.md). All color/spacing/typography values flow through
-   these. Components built with these variables. */
+/* Ominiforge design tokens — developer tool console (doc/frontend.md §9).
+   Generated from ui-ux-pro-max: style = Minimalism/Swiss + Dark Mode (OLED),
+   palette = "Developer Tool / IDE" (Slate dark + run-green CTA). All
+   color/spacing/typography values flow through these; components reference the
+   token names, never raw values (frontend.md §6 drift guard). */
 :root {
-	/* ---------- dark palette (Aura gray) ---------------------------- */
-	--bg-primary: #0e0e10;
-	--bg-secondary: #16161a;
-	--bg-tertiary: #1f1f23;
+	color-scheme: dark;
 
-	--text-primary: #ebebeb;
-	--text-secondary: #a1a1aa;
-	--text-muted: #71717a;
+	/* ---------- palette: Slate dark, "code dark + run green" ---------- */
+	/* Background ladder (deepest → raised surface). */
+	--bg-primary: #0f172a; /* slate-900 — app background */
+	--bg-secondary: #1e293b; /* slate-800 — sidebar / rails */
+	--bg-tertiary: #283449; /* between 800/700 — raised panels */
 
-	--accent: #00a0db;
-	--accent-weak: #1c6fc2;
-	--accent-visit: #e1f0fa;
-	--error: #f87171;
-	--error-bg: rgba(248, 113, 113, 0.08);
-	--warning: #fbbf24;
+	--text-primary: #f8fafc; /* slate-50 */
+	--text-secondary: #cbd5e1; /* slate-300 */
+	--text-muted: #94a3b8; /* slate-400 — meets 4.5:1 on bg-primary */
 
-	/* ---------- input / layout -------------------------------------- */
+	/* Accent = run green (action/success), the IDE "run" signal. */
+	--accent: #22c55e; /* green-500 */
+	--accent-weak: #15803d; /* green-700 — filled button base */
+	--accent-fg: #04140a; /* text on a green fill */
+
+	/* Status. */
+	--error: #f87171; /* red-400 */
+	--error-bg: rgba(248, 113, 113, 0.1);
+	--warning: #fbbf24; /* amber-400 */
+	--info: #38bdf8; /* sky-400 — chart/series primary */
+
+	/* ---------- surfaces / borders / focus -------------------------- */
 	--surface: var(--bg-tertiary);
-	--surface-hover: #28282d;
-	--border: #27272a;
-	--border-strong: var(--bg-secondary);
+	--surface-hover: #334155; /* slate-700 */
+	--border: #334155; /* slate-700 */
+	--border-strong: #475569; /* slate-600 */
 	--ring: var(--accent);
 
-	/* ---------- font --------------------------------------------- */
-	--font-sans: 'Inter', 'Geist', system-ui, -apple-system, sans-serif;
+	/* ---------- typography (Inter / JetBrains Mono) ----------------- */
+	--font-sans: 'Inter', system-ui, -apple-system, sans-serif;
 	--font-mono: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
 
-	/* ---------- spacing (4px grid) -------------------------------- */
+	/* ---------- spacing (4px grid) ---------------------------------- */
 	--gap-xs: 0.25rem; /* 4px */
 	--gap-sm: 0.5rem; /* 8px */
 	--gap-md: 0.75rem; /* 12px */
@@ -39,12 +48,29 @@
 	--gap-3xl: 2rem; /* 32px */
 	--gap-4xl: 2.5rem; /* 40px */
 
-	/* ---------- radii ------------------------------------------ */
-	--radius-sm: 4px;
-	--radius-md: 6px;
-	--radius-lg: 8px;
-	--radius-xl: 10px;
+	/* ---------- radii (Swiss: tight, near-square) ------------------- */
+	--radius-sm: 2px;
+	--radius-md: 4px;
+	--radius-lg: 6px;
+	--radius-xl: 8px;
 
-	/* ---------- shadow (subtle elevation) -------------------------- */
-	--shadow-popover: 0 1px 4px rgba(0, 0, 0, 0.3), 0 0 1px rgba(0, 0, 0, 0.5);
+	/* ---------- elevation (flat: hairline borders over shadows) ----- */
+	--shadow-popover: 0 2px 8px rgba(0, 0, 0, 0.4);
+
+	/* ---------- motion (micro-interactions 150-300ms) --------------- */
+	--motion-fast: 0.15s ease;
+	--motion-base: 0.2s ease;
+
+	/* ---------- z-index scale --------------------------------------- */
+	--z-nav: 10;
+	--z-sticky: 20;
+	--z-popover: 30;
+	--z-modal: 50;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	:root {
+		--motion-fast: 0s;
+		--motion-base: 0s;
+	}
 }
