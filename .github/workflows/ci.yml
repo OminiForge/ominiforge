@@ -42,3 +42,21 @@ jobs:
         run: nix develop --command just machete
       - name: TS bindings drift
         run: nix develop --command just ts-check
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v16
+      - name: Install frontend deps
+        run: nix develop --command pnpm install
+        working-directory: frontend
+      - name: Typecheck
+        run: nix develop --command pnpm check
+        working-directory: frontend
+      - name: Build
+        run: nix develop --command pnpm build
+        working-directory: frontend

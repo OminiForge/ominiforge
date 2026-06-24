@@ -1,0 +1,51 @@
+/* Ominiforge design tokens — developer tool console baseline (§9 of
+   doc/frontend.md). All color/spacing/typography values flow through
+   these. Components built with these variables. */
+:root {
+	/* ---------- dark palette (Aura gray) ---------------------------- */
+	--bg-primary: #0e0e10;
+	--bg-secondary: #16161a;
+	--bg-tertiary: #1f1f23;
+
+	--text-primary: #ebebeb;
+	--text-secondary: #a1a1aa;
+	--text-muted: #71717a;
+
+	--accent: #00a0db;
+	--accent-weak: #1c6fc2;
+	--accent-visit: #e1f0fa;
+	--error: #f87171;
+	--error-bg: rgba(248, 113, 113, 0.08);
+	--warning: #fbbf24;
+
+	/* ---------- input / layout -------------------------------------- */
+	--surface: var(--bg-tertiary);
+	--surface-hover: #28282d;
+	--border: #27272a;
+	--border-strong: var(--bg-secondary);
+	--ring: var(--accent);
+
+	/* ---------- font --------------------------------------------- */
+	--font-sans: 'Inter', 'Geist', system-ui, -apple-system, sans-serif;
+	--font-mono: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+
+	/* ---------- spacing (4px grid) -------------------------------- */
+	--gap-xs: 0.25rem;  /* 4px */
+	--gap-sm: 0.5rem;   /* 8px */
+	--gap-md: 0.75rem;  /* 12px */
+	--gap-lg: 1rem;     /* 16px */
+	--gap-xl: 1.25rem;  /* 20px */
+	--gap-2xl: 1.5rem;  /* 24px */
+	--gap-3xl: 2rem;    /* 32px */
+	--gap-4xl: 2.5rem;  /* 40px */
+
+	/* ---------- radii ------------------------------------------ */
+	--radius-sm: 4px;
+	--radius-md: 6px;
+	--radius-lg: 8px;
+	--radius-xl: 10px;
+
+	/* ---------- shadow (subtle elevation) -------------------------- */
+	--shadow-popover: 0 1px 4px rgba(0, 0, 0, 0.3),
+				0 0 1px rgba(0, 0, 0, 0.5);
+}
