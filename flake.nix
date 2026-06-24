@@ -50,6 +50,14 @@
         statix
       ];
 
+      # Frontend toolchain (doc/frontend.md §7). pnpm-in-nix sandboxed builds
+      # are a known hard point; initially we just provide the tools in the
+      # devShell and run the frontend build inside the shell (non-sandboxed).
+      nodeTools = with pkgs; [
+        nodejs_22
+        pnpm
+      ];
+
       miscTools = with pkgs; [
         openssl
         python3
@@ -57,7 +65,7 @@
       ];
     in {
       devShells.default = pkgs.mkShell {
-        packages = rustTools ++ nixTools ++ miscTools;
+        packages = rustTools ++ nixTools ++ nodeTools ++ miscTools;
 
         RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
         PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig";
