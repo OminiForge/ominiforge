@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v16
       - name: Nix flake check
@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v16
       - name: Format
@@ -48,7 +48,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v16
       - name: Install frontend deps
