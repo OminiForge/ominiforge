@@ -215,6 +215,70 @@ describe('conversation fold', () => {
 		expect(reasoningIdx).toBeLessThan(textIdx);
 	});
 
+	// ── Race condition: deltas before RequestStarted ───────────────────
+
+	it('no duplication when deltas arrive before RequestStarted', () => {
+		// Simulates the race condition: streaming deltas arrive first,
+		// then RequestStarted arrives late, then committed ContentBlocks.
+		// Before the fix, this produced [reasoning, text, reasoning, text].
+		const events: GatewayEvent[] = [
+			// Deltas arrive first (RequestStarted hasn't been forwarded yet)
+			{ type: 'delta', delta: 'block_start', index: 0, kind: 'reasoning', tool: null },
+			{ type: 'delta', delta: 'reasoning', index: 0, text: 'think...' },
+			{ type: 'delta', delta: 'block_start', index: 1, kind: 'text', tool: null },
+			{ type: 'delta', delta: 'text', index: 1, text: 'answer' },
+			// RequestStarted arrives late (forwarder task was slow)
+			reqStarted(1),
+			// Committed ContentBlocks (collector finished)
+			contentBlock(2, { Reasoning: { text: 'think...' } }),
+			contentBlock(3, { Text: { text: 'answer' } })
+		];
+
+		const items = fold(events).items;
+		const reasoning = items.filter((i) => i.kind === 'reasoning');
+		const text = items.filter((i) => i.kind === 'text');
+
+		// Must not duplicate: exactly one reasoning and one text item
+		expect(reasoning).toHaveLength(1);
+		expect(text).toHaveLength(1);
+		expect(reasoning[0].kind === 'reasoning' && reasoning[0].text).toBe('think...');
+		expect(text[0].kind === 'text' && text[0].text).toBe('answer');
+		// Reasoning before text
+		expect(items.findIndex((i) => i.kind === 'reasoning')).toBeLessThan(
+			items.findIndex((i) => i.kind === 'text')
+		);
+	});
+
+	it('no duplication across multiple rounds', () => {
+		// Round 1: tool call
+		// Round 2: reasoning + text (deltas before RequestStarted)
+		const events: GatewayEvent[] = [
+			reqStarted(1),
+			{ type: 'delta', delta: 'block_start', index: 0, kind: 'tool_call', tool: 'read' },
+			{ type: 'delta', delta: 'tool_args', index: 0, json: '{"path":"f.txt"}' },
+			contentBlock(2, { ToolCall: { id: 'c1', name: 'read', arguments: '{"path":"f.txt"}' } }),
+
+			// Round 2: deltas arrive before RequestStarted
+			{ type: 'delta', delta: 'block_start', index: 0, kind: 'reasoning', tool: null },
+			{ type: 'delta', delta: 'reasoning', index: 0, text: 'hmm' },
+			{ type: 'delta', delta: 'block_start', index: 1, kind: 'text', tool: null },
+			{ type: 'delta', delta: 'text', index: 1, text: 'result' },
+			reqStarted(3),
+			contentBlock(4, { Reasoning: { text: 'hmm' } }),
+			contentBlock(5, { Text: { text: 'result' } })
+		];
+
+		const items = fold(events).items;
+		const reasoning = items.filter((i) => i.kind === 'reasoning');
+		const text = items.filter((i) => i.kind === 'text');
+		expect(reasoning).toHaveLength(1);
+		expect(text).toHaveLength(1);
+		// Tool from round 1, then reasoning, then text
+		expect(items[0].kind).toBe('tool');
+		expect(items[1].kind).toBe('reasoning');
+		expect(items[2].kind).toBe('text');
+	});
+
 	// ── Request lifecycle ──────────────────────────────────────────────
 
 	it('a new model request resets block indices', () => {

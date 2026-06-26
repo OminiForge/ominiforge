@@ -34,6 +34,10 @@ export interface ConversationState {
 	/** Insertion point for reasoning items during commit. Ensures reasoning
 	 *  is always placed before text, regardless of the collector's block order. */
 	commitBase?: number;
+	/** End position of committed items from all previous requests.  Used as the
+	 *  truncation point on RequestStarted so that streaming items created *before*
+	 *  the late-arriving RequestStarted are also removed. */
+	committedEnd?: number;
 	/** committed tool_call seq → items position, for pairing Tool::Completed */
 	toolSeqs: Map<number, number>;
 }
@@ -79,7 +83,9 @@ function applyCommitted(
 			return {
 				...next,
 				open: {},
-				requestStart: next.items.length,
+				// Use committedEnd (not items.length) so streaming items created
+				// before this late-arriving event are also truncated away.
+				requestStart: next.committedEnd ?? 0,
 				requestCommitted: false,
 				commitBase: undefined
 			};
@@ -132,11 +138,11 @@ function commitBlock(
 
 	let item: Item;
 	if ('Text' in content) {
-		if (!content.Text.text.trim()) return { ...state, requestCommitted: true, commitBase };
+		if (!content.Text.text.trim()) return { ...state, requestCommitted: true, commitBase, committedEnd: items.length };
 		item = { kind: 'text', text: content.Text.text, streaming: false };
 		items.push(item);
 	} else if ('Reasoning' in content) {
-		if (!content.Reasoning.text.trim()) return { ...state, requestCommitted: true, commitBase };
+		if (!content.Reasoning.text.trim()) return { ...state, requestCommitted: true, commitBase, committedEnd: items.length };
 		item = { kind: 'reasoning', text: content.Reasoning.text, streaming: false };
 		// Insert reasoning at commitBase so it appears before any text items
 		// that the collector emitted earlier (providers may open text@0 before reasoning@1).
@@ -148,10 +154,10 @@ function commitBlock(
 		toolSeqs.set(seq, items.length);
 		item = { kind: 'tool', seq, name: content.ToolCall.name, args: content.ToolCall.arguments, status: 'running' };
 		items.push(item);
-		return { ...state, items, toolSeqs, requestCommitted: true, commitBase };
+		return { ...state, items, toolSeqs, requestCommitted: true, commitBase, committedEnd: items.length };
 	}
 
-	return { ...state, items, requestCommitted: true, commitBase };
+	return { ...state, items, requestCommitted: true, commitBase, committedEnd: items.length };
 }
 
 function pairResult(
