@@ -4,6 +4,7 @@
 
 import type { SessionMeta } from '$lib/types/SessionMeta';
 import type { GatewayEvent } from '$lib/types/GatewayEvent';
+import type { SessionSummary } from '$lib/types/SessionSummary';
 
 /** Handle to a live event subscription; call `close()` to detach. */
 export interface EventSubscription {
@@ -33,6 +34,8 @@ export interface SessionClient {
 	cancel(id: string): Promise<void>;
 	/** Summarize and switch to a compaction session; `keepLast` keeps recent turns. */
 	compact(id: string, keepLast?: number): Promise<void>;
+	/** Derived monitor metrics for one session (folded from its committed event log). */
+	getSummary(id: string): Promise<SessionSummary>;
 	/**
 	 * Subscribe to a session's events. The transport replays committed events
 	 * after `lastSeq` from the durable log, then attaches the live stream

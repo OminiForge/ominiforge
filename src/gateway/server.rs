@@ -38,6 +38,7 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::core::SessionId;
+use crate::monitor::{self, PricingTable};
 
 use super::actor::{ActorHandle, Command, GatewayEvent};
 use super::config::GatewayConfig;
@@ -49,6 +50,9 @@ struct AppState {
     registry: SessionRegistry,
     /// Resolved bearer token; `None` means the gateway runs unauthenticated.
     api_key: Option<Arc<str>>,
+    /// Pricing table for deriving session cost on the summary endpoint. Empty
+    /// means cost is reported as unpriced.
+    pricing: Arc<PricingTable>,
 }
 
 /// Run the gateway server until the process is signalled. Binds the configured
@@ -56,9 +60,17 @@ struct AppState {
 ///
 /// # Errors
 /// Binding the listener or a fatal serve error.
-pub async fn serve(registry: SessionRegistry, config: &GatewayConfig) -> Result<()> {
+pub async fn serve(
+    registry: SessionRegistry,
+    config: &GatewayConfig,
+    pricing: PricingTable,
+) -> Result<()> {
     let api_key = config.resolve_api_key().map(Arc::from);
-    let state = AppState { registry, api_key };
+    let state = AppState {
+        registry,
+        api_key,
+        pricing: Arc::new(pricing),
+    };
 
     let app = router(state);
 
@@ -84,6 +96,7 @@ fn router(state: AppState) -> Router {
         .route("/sessions/{id}/message", post(post_message))
         .route("/sessions/{id}/cancel", post(cancel_turn))
         .route("/sessions/{id}/compact", post(compact_session))
+        .route("/sessions/{id}/summary", get(session_summary))
         .route("/sessions/{id}/events", get(sse_events))
         .route("/sessions/{id}/ws", get(ws_events))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
@@ -229,6 +242,26 @@ async fn compact_session(
             Err(_) => internal_error(&anyhow::anyhow!("session actor is unavailable")),
         },
         Err(e) => conflict_or_not_found(&e),
+    }
+}
+
+/// `GET /sessions/{id}/summary` — derived monitor metrics for one session,
+/// computed by replaying its committed `events.jsonl` through the monitor fold
+/// (`doc/monitor.md` §8). Cost is priced with the gateway's pricing table at
+/// read time, so it reflects current prices.
+async fn session_summary(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let sid = SessionId(id);
+    let events = state
+        .registry
+        .store()
+        .read_events(&sid)
+        .with_context(|| format!("failed to read session `{}`", sid.0));
+    match events {
+        Ok(events) => {
+            let summary = monitor::summarize(&events, (*state.pricing).clone());
+            Json(summary).into_response()
+        }
+        Err(e) => not_found(&e),
     }
 }
 
@@ -439,6 +472,7 @@ mod tests {
         let state = AppState {
             registry,
             api_key: Some(Arc::from("secret")),
+            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
         let resp = reqwest::get(format!("{base}/healthz")).await.unwrap();
@@ -453,6 +487,7 @@ mod tests {
         let state = AppState {
             registry,
             api_key: Some(Arc::from("s3cret")),
+            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
         let client = reqwest::Client::new();
@@ -488,6 +523,7 @@ mod tests {
         let state = AppState {
             registry,
             api_key: None,
+            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
         let resp = reqwest::get(format!("{base}/api/sessions")).await.unwrap();
@@ -533,5 +569,54 @@ mod tests {
         // No Last-Event-ID → replay everything (4 events: seqs 0..=3).
         let all = replay_events(&registry, &sid, None);
         assert_eq!(all.len(), 4);
+    }
+
+    /// `GET /sessions/{id}/summary` returns a derived `SessionSummary` as typed
+    /// JSON for an existing session. A fresh session with no model/tool activity
+    /// folds to all-zero counts and an unpriced (`null`) cost — proving the
+    /// endpoint replays the log through the monitor rather than 404ing.
+    #[tokio::test]
+    async fn summary_endpoint_returns_typed_json() {
+        let (registry, _dir) = test_registry();
+        let store = registry.store();
+        let writer = store.create_new(None, None, vec![]).unwrap();
+        let sid = writer.session_id().clone();
+        drop(writer); // release the lock before the handler reads the log
+
+        let state = AppState {
+            registry,
+            api_key: None,
+            pricing: Arc::new(PricingTable::default()),
+        };
+        let base = serve_test(state).await;
+
+        let resp = reqwest::get(format!("{base}/api/sessions/{}/summary", sid.0))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["total_turns"], 0);
+        assert_eq!(body["total_tool_calls"], 0);
+        assert!(body["cost_usd"].is_null(), "no priced model ran");
+        assert!(body["tools_used"].is_object());
+    }
+
+    /// An unknown session id yields 404 from the summary endpoint, not a 500 or
+    /// an empty summary.
+    #[tokio::test]
+    async fn summary_endpoint_unknown_session_is_404() {
+        let (registry, _dir) = test_registry();
+        let state = AppState {
+            registry,
+            api_key: None,
+            pricing: Arc::new(PricingTable::default()),
+        };
+        let base = serve_test(state).await;
+
+        let resp = reqwest::get(format!("{base}/api/sessions/does-not-exist/summary"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
     }
 }

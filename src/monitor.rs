@@ -10,6 +10,8 @@
 
 use std::collections::HashMap;
 
+use serde::Serialize;
+
 use crate::config::Pricing;
 use crate::core::CoreEvent;
 use crate::core::payload::{ErrorEvent, EventPayload, ModelEvent, ToolEvent, TurnEvent, Usage};
@@ -25,7 +27,8 @@ pub type PricingTable = HashMap<String, Pricing>;
 ///
 /// All counts are saturating; `cost_usd` is `None` when no priced model ran
 /// (so the UI can say "unpriced" rather than print a misleading `$0.00`).
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct SessionSummary {
     pub total_turns: u32,
     pub total_model_requests: u32,

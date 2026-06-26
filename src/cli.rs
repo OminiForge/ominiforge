@@ -181,13 +181,19 @@ async fn serve_cmd(args: ServeArgs) -> Result<()> {
         );
     }
 
+    // Pricing for the monitor summary endpoint; best-effort (empty = unpriced).
+    let pricing = config_store
+        .load_providers()
+        .and_then(|providers| config_store.load_pricing(&providers))
+        .unwrap_or_default();
+
     let defaults = SessionDefaults {
         workspace,
         profile: args.profile,
         no_dotenv: true,
     };
     let registry = SessionRegistry::new(defaults, &gateway_config);
-    serve(registry, &gateway_config).await
+    serve(registry, &gateway_config, pricing).await
 }
 
 async fn tui_main(resume: bool) -> Result<()> {

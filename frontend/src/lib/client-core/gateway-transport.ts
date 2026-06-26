@@ -8,6 +8,7 @@
 
 import type { SessionMeta } from '$lib/types/SessionMeta';
 import type { GatewayEvent } from '$lib/types/GatewayEvent';
+import type { SessionSummary } from '$lib/types/SessionSummary';
 import { endpoints } from './endpoints';
 import type { EventHandlers, EventSubscription, SessionClient } from './types';
 
@@ -94,6 +95,10 @@ export class GatewayTransport implements SessionClient {
 			method: 'POST',
 			body: JSON.stringify(keepLast === undefined ? {} : { keep_last: keepLast })
 		});
+	}
+
+	getSummary(id: string): Promise<SessionSummary> {
+		return this.#json<SessionSummary>(endpoints.summary(id));
 	}
 
 	subscribeEvents(id: string, handlers: EventHandlers, lastSeq?: number): EventSubscription {
