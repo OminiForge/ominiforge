@@ -1,71 +1,103 @@
-/* Ominiforge design tokens — developer tool console (doc/frontend.md §9).
-   Generated from ui-ux-pro-max: style = Minimalism/Swiss + Dark Mode (OLED),
-   palette = "Developer Tool / IDE" (Slate dark + run-green CTA). All
-   color/spacing/typography values flow through these; components reference the
-   token names, never raw values (frontend.md §6 drift guard). */
+/* Elegant dual-theme system with LXGW WenKai for Chinese */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
+@import url('https://cdn.jsdelivr.net/npm/lxgw-wenkai-webfont@1.1.0/style.css');
+
 :root {
+	/* Fonts: LXGW WenKai for Chinese, Inter for Latin */
+	--font-sans: 'Inter', 'LXGW WenKai', system-ui, sans-serif;
+	--font-mono: 'JetBrains Mono', 'LXGW WenKai Mono', 'Consolas', monospace;
+
+	/* Spacing: generous but purposeful */
+	--gap-xs: 0.25rem;
+	--gap-sm: 0.5rem;
+	--gap-md: 1rem;
+	--gap-lg: 1.5rem;
+	--gap-xl: 2rem;
+	--gap-2xl: 3rem;
+
+	/* Radii: soft elegance */
+	--radius-sm: 4px;
+	--radius-md: 8px;
+	--radius-lg: 12px;
+	--radius-xl: 16px;
+
+	/* Motion: smooth and intentional */
+	--motion-fast: 0.15s cubic-bezier(0.4, 0, 0.2, 1);
+	--motion-base: 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+
+	/* Z-index scale */
+	--z-base: 1;
+	--z-sticky: 10;
+	--z-popover: 20;
+	--z-modal: 30;
+	--z-toast: 40;
+}
+
+/* Dark theme (default) */
+:root,
+:root[data-theme='dark'] {
 	color-scheme: dark;
 
-	/* ---------- palette: Slate dark, "code dark + run green" ---------- */
-	/* Background ladder (deepest → raised surface). */
-	--bg-primary: #0f172a; /* slate-900 — app background */
-	--bg-secondary: #1e293b; /* slate-800 — sidebar / rails */
-	--bg-tertiary: #283449; /* between 800/700 — raised panels */
+	--bg-primary: #0d0d0d;
+	--bg-secondary: #1a1a1a;
+	--bg-tertiary: #262626;
 
-	--text-primary: #f8fafc; /* slate-50 */
-	--text-secondary: #cbd5e1; /* slate-300 */
-	--text-muted: #94a3b8; /* slate-400 — meets 4.5:1 on bg-primary */
+	--text-primary: #f5f5f5;
+	--text-secondary: #a3a3a3;
+	--text-muted: #737373;
 
-	/* Accent = run green (action/success), the IDE "run" signal. */
-	--accent: #22c55e; /* green-500 */
-	--accent-weak: #15803d; /* green-700 — filled button base */
-	--accent-fg: #04140a; /* text on a green fill */
+	--accent: #3b82f6;
+	--accent-hover: #2563eb;
+	--accent-fg: #ffffff;
 
-	/* Status. */
-	--error: #f87171; /* red-400 */
-	--error-bg: rgba(248, 113, 113, 0.1);
-	--warning: #fbbf24; /* amber-400 */
-	--info: #38bdf8; /* sky-400 — chart/series primary */
+	--surface: #171717;
+	--surface-hover: #262626;
 
-	/* ---------- surfaces / borders / focus -------------------------- */
-	--surface: var(--bg-tertiary);
-	--surface-hover: #334155; /* slate-700 */
-	--border: #334155; /* slate-700 */
-	--border-strong: #475569; /* slate-600 */
-	--ring: var(--accent);
+	--border: #333333;
+	--border-hover: #525252;
 
-	/* ---------- typography (Inter / JetBrains Mono) ----------------- */
-	--font-sans: 'Inter', system-ui, -apple-system, sans-serif;
-	--font-mono: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+	--error: #ef4444;
+	--error-bg: rgba(239, 68, 68, 0.1);
+	--warning: #f59e0b;
+	--success: #10b981;
+	--info: #6366f1;
 
-	/* ---------- spacing (4px grid) ---------------------------------- */
-	--gap-xs: 0.25rem; /* 4px */
-	--gap-sm: 0.5rem; /* 8px */
-	--gap-md: 0.75rem; /* 12px */
-	--gap-lg: 1rem; /* 16px */
-	--gap-xl: 1.25rem; /* 20px */
-	--gap-2xl: 1.5rem; /* 24px */
-	--gap-3xl: 2rem; /* 32px */
-	--gap-4xl: 2.5rem; /* 40px */
+	--shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.3);
+	--shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4);
+	--shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
 
-	/* ---------- radii (Swiss: tight, near-square) ------------------- */
-	--radius-sm: 2px;
-	--radius-md: 4px;
-	--radius-lg: 6px;
-	--radius-xl: 8px;
+/* Light theme */
+:root[data-theme='light'] {
+	color-scheme: light;
 
-	/* ---------- elevation (flat: hairline borders over shadows) ----- */
-	--shadow-popover: 0 2px 8px rgba(0, 0, 0, 0.4);
+	--bg-primary: #ffffff;
+	--bg-secondary: #fafafa;
+	--bg-tertiary: #f5f5f5;
 
-	/* ---------- motion (micro-interactions 150-300ms) --------------- */
-	--motion-fast: 0.15s ease;
-	--motion-base: 0.2s ease;
+	--text-primary: #171717;
+	--text-secondary: #525252;
+	--text-muted: #737373;
 
-	/* ---------- z-index scale --------------------------------------- */
-	--z-nav: 10;
-	--z-sticky: 20;
-	--z-popover: 30;
-	--z-modal: 50;
+	--accent: #2563eb;
+	--accent-hover: #1d4ed8;
+	--accent-fg: #ffffff;
+
+	--surface: #ffffff;
+	--surface-hover: #f5f5f5;
+
+	--border: #e5e5e5;
+	--border-hover: #d4d4d4;
+
+	--error: #dc2626;
+	--error-bg: rgba(220, 38, 38, 0.1);
+	--warning: #d97706;
+	--success: #059669;
+	--info: #4f46e5;
+
+	--shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.08);
+	--shadow-md: 0 4px 12px rgba(0, 0, 0, 0.1);
+	--shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.12);
 }
 
 @media (prefers-reduced-motion: reduce) {
