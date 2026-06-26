@@ -334,4 +334,111 @@ describe('conversation fold', () => {
 		expect(state.requestCommitted).toBeUndefined();
 		expect(state.commitBase).toBeUndefined();
 	});
+
+	// ── Race condition: turn_settled before ContentBlock events ────────
+	//
+	// This reproduces the duplication bug: the backend's event-forwarder task
+	// runs on a separate tokio task. After a turn completes, TurnSettled is
+	// sent from the turn task (synchronous) while ContentBlock events are
+	// forwarded by the separate forwarder task. If the turn task doesn't yield
+	// between collect_round.finish() and on_turn_done(), TurnSettled reaches
+	// the frontend before ContentBlock events, clearing requestStart and
+	// preventing commitBlock from truncating streaming previews.
+
+	it('no duplication when turn_settled arrives before ContentBlock (normal order)', () => {
+		const events: GatewayEvent[] = [
+			turnStarted(1, 'hello'),
+			reqStarted(2),
+			// Streaming phase
+			{ type: 'delta', delta: 'block_start', index: 0, kind: 'reasoning', tool: null },
+			{ type: 'delta', delta: 'reasoning', index: 0, text: 'think...' },
+			{ type: 'delta', delta: 'block_start', index: 1, kind: 'text', tool: null },
+			{ type: 'delta', delta: 'text', index: 1, text: 'answer' },
+			// turn_settled arrives BEFORE committed events (the race)
+			{ type: 'turn_settled', incomplete: null },
+			// Committed events arrive late
+			contentBlock(3, { Reasoning: { text: 'think...' } }),
+			contentBlock(4, { Text: { text: 'answer' } })
+		];
+
+		const items = fold(events).items;
+		const reasoning = items.filter((i) => i.kind === 'reasoning');
+		const text = items.filter((i) => i.kind === 'text');
+
+		expect(reasoning).toHaveLength(1);
+		expect(text).toHaveLength(1);
+		expect(reasoning[0].kind === 'reasoning' && reasoning[0].text).toBe('think...');
+		expect(text[0].kind === 'text' && text[0].text).toBe('answer');
+		// Reasoning must come before text
+		expect(items.findIndex((i) => i.kind === 'reasoning')).toBeLessThan(
+			items.findIndex((i) => i.kind === 'text')
+		);
+		// User message preserved
+		expect(items[0].kind).toBe('user');
+	});
+
+	it('no duplication when turn_settled arrives before ContentBlock (reversed commit order)', () => {
+		// The collector may emit ContentBlock events in either order (text
+		// first, or reasoning first). Both must work.
+		const events: GatewayEvent[] = [
+			turnStarted(1, 'hi'),
+			reqStarted(2),
+			{ type: 'delta', delta: 'block_start', index: 0, kind: 'reasoning', tool: null },
+			{ type: 'delta', delta: 'reasoning', index: 0, text: 'hmm' },
+			{ type: 'delta', delta: 'block_start', index: 1, kind: 'text', tool: null },
+			{ type: 'delta', delta: 'text', index: 1, text: 'hello' },
+			{ type: 'turn_settled', incomplete: null },
+			// Text committed before reasoning
+			contentBlock(3, { Text: { text: 'hello' } }),
+			contentBlock(4, { Reasoning: { text: 'hmm' } })
+		];
+
+		const items = fold(events).items;
+		const reasoning = items.filter((i) => i.kind === 'reasoning');
+		const text = items.filter((i) => i.kind === 'text');
+
+		expect(reasoning).toHaveLength(1);
+		expect(text).toHaveLength(1);
+		// Reasoning should still come before text (commitBase reorders)
+		expect(items.findIndex((i) => i.kind === 'reasoning')).toBeLessThan(
+			items.findIndex((i) => i.kind === 'text')
+		);
+	});
+
+	it('no duplication when turn_settled arrives before ContentBlock across multi-round turn', () => {
+		// Multi-round: round 1 (tool call) commits normally, then round 2
+		// has the race condition.
+		const events: GatewayEvent[] = [
+			turnStarted(1, 'do something'),
+			reqStarted(2),
+			// Round 1: tool call (committed normally before turn_settled)
+			{ type: 'delta', delta: 'block_start', index: 0, kind: 'tool_call', tool: 'read' },
+			{ type: 'delta', delta: 'tool_args', index: 0, json: '{"path":"f.txt"}' },
+			contentBlock(3, { ToolCall: { id: 'c1', name: 'read', arguments: '{"path":"f.txt"}' } }),
+			// Round 2: reasoning + text with the race
+			reqStarted(4),
+			{ type: 'delta', delta: 'block_start', index: 0, kind: 'reasoning', tool: null },
+			{ type: 'delta', delta: 'reasoning', index: 0, text: 'analyzing...' },
+			{ type: 'delta', delta: 'block_start', index: 1, kind: 'text', tool: null },
+			{ type: 'delta', delta: 'text', index: 1, text: 'here is the result' },
+			// turn_settled arrives before round 2's committed events
+			{ type: 'turn_settled', incomplete: null },
+			contentBlock(5, { Reasoning: { text: 'analyzing...' } }),
+			contentBlock(6, { Text: { text: 'here is the result' } })
+		];
+
+		const items = fold(events).items;
+		const reasoning = items.filter((i) => i.kind === 'reasoning');
+		const text = items.filter((i) => i.kind === 'text');
+
+		expect(reasoning).toHaveLength(1);
+		expect(text).toHaveLength(1);
+		expect(reasoning[0].kind === 'reasoning' && reasoning[0].text).toBe('analyzing...');
+		expect(text[0].kind === 'text' && text[0].text).toBe('here is the result');
+		// Tool call from round 1 preserved
+		expect(items[0].kind).toBe('user');
+		expect(items[1].kind).toBe('tool');
+		expect(items[2].kind).toBe('reasoning');
+		expect(items[3].kind).toBe('text');
+	});
 });

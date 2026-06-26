@@ -122,6 +122,10 @@ function applyCommitted(
 /// Reasoning-before-text ordering is critical because some providers open a text
 /// block first (index 0) then reasoning (index 1); the collector preserves that
 /// order in committed events, but the user expects reasoning above text.
+///
+/// When `requestStart` has been cleared (by `turn_settled` arriving before
+/// committed events — an async event-forwarding race in the backend), we
+/// detect and remove any lingering streaming items to prevent duplication.
 function commitBlock(
 	state: ConversationState,
 	seq: number,
@@ -134,6 +138,20 @@ function commitBlock(
 		// First commit: replace all streaming previews with authoritative committed stream.
 		items = state.items.slice(0, state.requestStart);
 		commitBase = state.requestStart;
+	} else if (state.requestStart === undefined) {
+		// requestStart was cleared (e.g. by turn_settled arriving before the
+		// ContentBlock events — a backend event-forwarding race).  Strip any
+		// trailing streaming items so committed content replaces them rather
+		// than duplicating.
+		const firstStreaming = state.items.findIndex(
+			(i) => 'streaming' in i && i.streaming
+		);
+		if (firstStreaming >= 0) {
+			items = state.items.slice(0, firstStreaming);
+			commitBase = firstStreaming;
+		} else {
+			items = [...state.items];
+		}
 	} else {
 		items = [...state.items];
 	}

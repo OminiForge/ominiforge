@@ -9,6 +9,12 @@
 	import { apply, emptyState, type ConversationState, type Item } from '$lib/conversation';
 	import Button from '$lib/components/Button.svelte';
 
+	/** When the user is within this many pixels from the bottom we consider
+	 *  them "at the bottom" and auto-scroll on new content. This tolerance
+	 *  avoids missing the trigger due to sub-pixel rounding or small
+	 *  layout shifts. */
+	const SCROLL_BOTTOM_THRESHOLD = 80;
+
 	let convo = $state<ConversationState>(emptyState());
 	let input = $state('');
 	let sending = $state(false);
@@ -16,13 +22,31 @@
 	let sessionId = $state(page.params.id!);
 	let sub: EventSubscription | undefined;
 	let streamEl = $state<HTMLElement | null>(null);
+	// Whether the user is scrolled to (or near) the bottom – controls auto-scroll.
+	let shouldAutoScroll = $state(true);
 	// Track collapsed state for reasoning items separately (index → collapsed)
 	let collapsed = $state<Record<number, boolean>>({});
+
+	/** Returns `true` when the element is scrolled close enough to the bottom. */
+	function isNearBottom(el: HTMLElement): boolean {
+		return el.scrollHeight - el.scrollTop - el.clientHeight < SCROLL_BOTTOM_THRESHOLD;
+	}
+
+	/** Called whenever the user scrolls inside the stream container.
+	 *  Updates `shouldAutoScroll` so that we only auto-scroll when the
+	 *  user hasn't deliberately scrolled up to read history. */
+	function onStreamScroll() {
+		if (streamEl) {
+			shouldAutoScroll = isNearBottom(streamEl);
+		}
+	}
 
 	function subscribe(id: string) {
 		sub?.close();
 		convo = emptyState();
 		collapsed = {};
+		// A new subscription means fresh content – start auto-scrolling.
+		shouldAutoScroll = true;
 		sub = client.subscribeEvents(id, {
 			onEvent: (ev) => {
 				convo = apply(convo, ev);
@@ -30,10 +54,14 @@
 					sessionId = ev.new_session_id;
 					subscribe(ev.new_session_id);
 				}
-				// Auto-scroll on new content
-				requestAnimationFrame(() => {
-					streamEl?.scrollTo({ top: streamEl.scrollHeight, behavior: 'smooth' });
-				});
+				// Only auto-scroll when the user is already at (or near) the
+				// bottom of the stream. This prevents yanking them back to the
+				// latest message while they're reading history.
+				if (shouldAutoScroll) {
+					requestAnimationFrame(() => {
+						streamEl?.scrollTo({ top: streamEl.scrollHeight, behavior: 'smooth' });
+					});
+				}
 			},
 			onError: (e) => {
 				error = e instanceof Error ? e.message : String(e);
@@ -156,7 +184,7 @@
 		<div class="error-bar">{error}</div>
 	{/if}
 
-	<div class="stream" bind:this={streamEl}>
+	<div class="stream" bind:this={streamEl} onscroll={onStreamScroll}>
 		{#each convo.items as item, i (i)}
 			{#if item.kind === 'user'}
 				<div class="msg user">{item.text}</div>
