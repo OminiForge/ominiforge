@@ -1,18 +1,3 @@
-// Folds a session's GatewayEvent stream into a flat, render-ready list of
-// conversation items. The gateway sends two interleaved kinds (gateway.md §4):
-//
-//   - committed `event` frames (persisted CoreEvent) — the authoritative record
-//   - live `delta` frames — token-level streaming, ephemeral, not replayed
-//
-// Streaming blocks are keyed by their content-block `index` within the current
-// model request — NOT by list position — because the provider interleaves
-// blocks (e.g. a text block and a reasoning block grow concurrently). The
-// committed ModelEvent::ContentBlock for an index is the final authoritative
-// version and replaces the streaming preview at that index. Indices reset each
-// model request, so we clear the index→position map on RequestStarted. On
-// reconnect only committed events replay, so the committed copy is always the
-// source of truth and deltas are pure UX sugar.
-
 import type { GatewayEvent } from '$lib/types/GatewayEvent';
 import type { CoreEvent } from '$lib/types/CoreEvent';
 import type { BlockContent } from '$lib/types/BlockContent';
@@ -21,132 +6,181 @@ export type Item =
 	| { kind: 'user'; text: string }
 	| { kind: 'text'; text: string; streaming: boolean }
 	| { kind: 'reasoning'; text: string; streaming: boolean }
-	| { kind: 'tool_call'; name: string; args: string; streaming: boolean }
-	| { kind: 'tool_result'; name: string; ok: boolean; text: string }
+	| {
+			kind: 'tool';
+			seq: number;
+			name: string;
+			args: string;
+			status: 'running' | 'done' | 'error';
+			result?: string;
+	  }
 	| { kind: 'error'; message: string }
 	| { kind: 'notice'; message: string };
 
 export interface ConversationState {
 	items: Item[];
-	/** Latest seq seen from a committed event, for reconnect resume. */
 	lastSeq?: number;
-	/** Set when the stream reports a turn settled; carries any incomplete reason. */
 	lastSettle?: string | null;
-	/** Block index → items position, for the current model request only. */
+	/** block index → items position, current request streaming. Only used for tool_call tracking;
+	 *  text/reasoning use temporal (append-at-end) ordering to match TUI behavior. */
 	open: Record<number, number>;
+	/** Position in items[] where current request's blocks start (set on RequestStarted).
+	 *  Used once by commitBlock to truncate streaming previews, then stays defined
+	 *  until the next RequestStarted or turn_settled clears it. */
+	requestStart?: number;
+	/** True after the first committed ContentBlock has truncated streaming previews.
+	 *  Prevents re-truncation on subsequent ContentBlocks in the same request. */
+	requestCommitted?: boolean;
+	/** Insertion point for reasoning items during commit. Ensures reasoning
+	 *  is always placed before text, regardless of the collector's block order. */
+	commitBase?: number;
+	/** committed tool_call seq → items position, for pairing Tool::Completed */
+	toolSeqs: Map<number, number>;
 }
 
 export function emptyState(): ConversationState {
-	return { items: [], open: {} };
+	return { items: [], open: {}, toolSeqs: new Map() };
 }
 
-/**
- * Apply one GatewayEvent to the state, returning a new state (immutable so
- * Svelte re-renders on assignment). Exhaustive over the GatewayEvent union;
- * an unhandled variant is a compile error (the `never` arm).
- */
 export function apply(state: ConversationState, ev: GatewayEvent): ConversationState {
 	switch (ev.type) {
-		case 'event':
-			return applyCommitted(state, ev);
-		case 'delta':
-			return applyDelta(state, ev);
-		case 'turn_settled':
-			return { ...state, lastSettle: ev.incomplete };
-		case 'compacted':
-			// The caller resubscribes to ev.new_session_id; surface a marker.
-			return push(state, { kind: 'notice', message: `compacted → ${ev.new_session_id}` });
-		case 'notice':
-			return push(state, { kind: 'notice', message: ev.message });
-		default:
-			return assertNever(ev);
+		case 'event':    return applyCommitted(state, ev);
+		case 'delta':    return applyDelta(state, ev);
+		case 'turn_settled': return {
+			...state,
+			lastSettle: ev.incomplete,
+			requestStart: undefined,
+			requestCommitted: undefined,
+			commitBase: undefined
+		};
+		case 'compacted':    return push(state, { kind: 'notice', message: `compacted → ${ev.new_session_id}` });
+		case 'notice':       return push(state, { kind: 'notice', message: ev.message });
+		default: return assertNever(ev);
 	}
 }
 
-/** A committed CoreEvent: the durable, authoritative record. */
 function applyCommitted(
 	state: ConversationState,
 	ev: GatewayEvent & { type: 'event' }
 ): ConversationState {
-	// The flattened CoreEvent fields live alongside `type` on the same object.
 	const core = ev as unknown as CoreEvent & { seq: number };
-	const next: ConversationState = { ...state, lastSeq: core.seq };
-
+	const next: ConversationState = { ...state, lastSeq: Number(core.seq) };
 	const payload = core.payload;
+
 	if ('Turn' in payload) {
 		const t = payload.Turn;
-		if ('Started' in t && t.Started.input) {
+		if ('Started' in t && t.Started.input)
 			return push(next, { kind: 'user', text: t.Started.input });
-		}
 		return next;
 	}
 	if ('Model' in payload) {
 		const m = payload.Model;
-		// A new request resets block indices; clear the open-block map so the next
-		// round's index 0 does not collide with this round's.
-		if ('RequestStarted' in m) return { ...next, open: {} };
-		if ('ContentBlock' in m) {
-			return commitBlock(next, m.ContentBlock.index, m.ContentBlock.content);
-		}
+		if ('RequestStarted' in m)
+			return {
+				...next,
+				open: {},
+				requestStart: next.items.length,
+				requestCommitted: false,
+				commitBase: undefined
+			};
+		if ('ContentBlock' in m)
+			return commitBlock(next, Number(core.seq), m.ContentBlock.content);
 		return next;
 	}
 	if ('Tool' in payload) {
 		const tool = payload.Tool;
-		if ('Completed' in tool) {
-			const out = tool.Completed.result;
-			const text = out.content
-				.map((c) => ('Text' in c ? c.Text : `[${'Image' in c ? 'image' : 'artifact'}]`))
-				.join('');
-			return push(next, { kind: 'tool_result', name: '', ok: !out.is_error, text });
-		}
-		if ('Failed' in tool) {
-			return push(next, {
-				kind: 'tool_result',
-				name: '',
-				ok: false,
-				text: tool.Failed.error.message
-			});
-		}
+		if ('Completed' in tool)
+			return pairResult(next, Number(tool.Completed.tool_call_event_id.seq), tool.Completed.result, false);
+		if ('Failed' in tool)
+			return pairResult(
+				next,
+				Number(tool.Failed.tool_call_event_id.seq),
+				{ content: [{ Text: tool.Failed.error.message }], is_error: true, error_code: null },
+				true
+			);
 		return next;
 	}
-	if ('Error' in payload) {
+	if ('Error' in payload)
 		return push(next, { kind: 'error', message: payload.Error.Raised.message });
-	}
-	// Session / Artifact / Injection / Hook events are not rendered in the
-	// conversation transcript (they show up in the monitor view instead).
 	return next;
 }
 
-/** Finalize the streaming block at `index` with its committed content. */
+/// Finalize streaming previews with authoritative committed content.
+///
+/// Strategy: on the FIRST committed ContentBlock for a request, truncate all
+/// streaming previews and rebuild from committed blocks only. Subsequent
+/// committed blocks append (with reasoning inserted before text via commitBase).
+///
+/// Reasoning-before-text ordering is critical because some providers open a text
+/// block first (index 0) then reasoning (index 1); the collector preserves that
+/// order in committed events, but the user expects reasoning above text.
 function commitBlock(
 	state: ConversationState,
-	index: number,
+	seq: number,
 	content: BlockContent
 ): ConversationState {
-	let item: Item;
-	if ('Text' in content) item = { kind: 'text', text: content.Text.text, streaming: false };
-	else if ('Reasoning' in content)
-		item = { kind: 'reasoning', text: content.Reasoning.text, streaming: false };
-	else
-		item = {
-			kind: 'tool_call',
-			name: content.ToolCall.name,
-			args: content.ToolCall.arguments,
-			streaming: false
-		};
+	let items: Item[];
+	let commitBase = state.commitBase;
 
-	const pos = state.open[index];
-	const items = [...state.items];
-	if (pos !== undefined) {
-		items[pos] = item; // replace the streaming preview in place
-		return { ...state, items };
+	if (state.requestStart !== undefined && !state.requestCommitted) {
+		// First commit: replace all streaming previews with authoritative committed stream.
+		items = state.items.slice(0, state.requestStart);
+		commitBase = state.requestStart;
+	} else {
+		items = [...state.items];
 	}
-	// No preview seen (e.g. replay without deltas): append the committed block.
-	items.push(item);
+
+	let item: Item;
+	if ('Text' in content) {
+		if (!content.Text.text.trim()) return { ...state, requestCommitted: true, commitBase };
+		item = { kind: 'text', text: content.Text.text, streaming: false };
+		items.push(item);
+	} else if ('Reasoning' in content) {
+		if (!content.Reasoning.text.trim()) return { ...state, requestCommitted: true, commitBase };
+		item = { kind: 'reasoning', text: content.Reasoning.text, streaming: false };
+		// Insert reasoning at commitBase so it appears before any text items
+		// that the collector emitted earlier (providers may open text@0 before reasoning@1).
+		const insertAt = commitBase ?? items.length;
+		items.splice(insertAt, 0, item);
+		commitBase = insertAt + 1;
+	} else {
+		const toolSeqs = new Map(state.toolSeqs);
+		toolSeqs.set(seq, items.length);
+		item = { kind: 'tool', seq, name: content.ToolCall.name, args: content.ToolCall.arguments, status: 'running' };
+		items.push(item);
+		return { ...state, items, toolSeqs, requestCommitted: true, commitBase };
+	}
+
+	return { ...state, items, requestCommitted: true, commitBase };
+}
+
+function pairResult(
+	state: ConversationState,
+	callSeq: number,
+	output: { content: Array<{ Text: string } | unknown>; is_error: boolean; error_code: string | null },
+	failed: boolean
+): ConversationState {
+	const pos = state.toolSeqs.get(callSeq);
+	if (pos === undefined) return state;
+	const items = [...state.items];
+	const call = items[pos];
+	if (call?.kind !== 'tool') return state;
+	const text = output.content
+		.map((c) => ('Text' in (c as object) ? (c as { Text: string }).Text : '[binary]'))
+		.join('');
+	items[pos] = { ...call, status: failed || output.is_error ? 'error' : 'done', result: text };
 	return { ...state, items };
 }
 
-/** A live token-level delta: open or extend the streaming block at its index. */
+/// Fold one live streaming delta into the conversation state.
+///
+/// Text and reasoning blocks use **temporal (append-at-end) ordering** to match
+/// the TUI: when the model opens a text block at index 0 but fills it after a
+/// reasoning block at index 1, the text content still appears after reasoning —
+/// matching the user's expected reading order.
+///
+/// Tool-call blocks keep index-based tracking (via `open`) because tool argument
+/// deltas must be matched to the correct tool call.
 function applyDelta(
 	state: ConversationState,
 	ev: GatewayEvent & { type: 'delta' }
@@ -154,52 +188,72 @@ function applyDelta(
 	const items = [...state.items];
 	const open = { ...state.open };
 
-	const openBlock = (item: Item): ConversationState => {
-		open[ev.index] = items.length;
-		items.push(item);
-		return { ...state, items, open };
-	};
-	const extend = (next: Item): ConversationState => {
-		const pos = open[ev.index];
-		if (pos === undefined) {
-			items.push(next);
-			open[ev.index] = items.length - 1;
-		} else {
-			items[pos] = next;
-		}
-		return { ...state, items, open };
-	};
-	const at = (): Item | undefined => {
-		const pos = open[ev.index];
-		return pos === undefined ? undefined : items[pos];
-	};
-
 	switch (ev.delta) {
 		case 'block_start': {
-			const kind =
-				ev.kind === 'reasoning' ? 'reasoning' : ev.kind === 'tool_call' ? 'tool_call' : 'text';
-			if (kind === 'tool_call')
-				return openBlock({ kind: 'tool_call', name: ev.tool ?? '', args: '', streaming: true });
-			if (kind === 'reasoning') return openBlock({ kind: 'reasoning', text: '', streaming: true });
-			return openBlock({ kind: 'text', text: '', streaming: true });
+			const kind = ev.kind === 'reasoning' ? 'reasoning' : ev.kind === 'tool_call' ? 'tool_call' : 'text';
+			if (kind === 'tool_call') {
+				// Tool calls: immediate creation, index-based tracking
+				open[ev.index] = items.length;
+				items.push({ kind: 'tool', seq: -1, name: ev.tool ?? '', args: '', status: 'running' });
+			} else {
+				// Text/reasoning: close the previous streaming item of the same kind
+				// (so new content for the same kind starts a fresh item at the end),
+				// but do NOT create an empty item — defer until content arrives.
+				// This avoids premature positioning before the user can see anything.
+				for (let i = items.length - 1; i >= 0; i--) {
+					const it = items[i];
+					if (it.kind === kind && it.streaming) {
+						items[i] = { ...it, streaming: false } as Item;
+						break;
+					}
+				}
+				// Do not set open[ev.index] — the first content delta will
+				// create the item and record its position.
+			}
+			return { ...state, items, open };
 		}
 		case 'text': {
-			const cur = at();
-			if (cur && cur.kind === 'text') return extend({ ...cur, text: cur.text + ev.text });
-			return extend({ kind: 'text', text: ev.text, streaming: true });
+			// Extend the existing streaming text item at this index, or create one at the end.
+			const pos = open[ev.index];
+			const cur = pos !== undefined ? items[pos] : undefined;
+			if (cur?.kind === 'text' && cur.streaming) {
+				items[pos] = { ...cur, text: cur.text + ev.text };
+				return { ...state, items, open };
+			}
+			// No streaming text at this index. Only create if non-empty
+			// (empty deltas are common when a provider opens then abandons a block;
+			//  deferring lets a later reasoning block take an earlier visual position).
+			if (ev.text) {
+				open[ev.index] = items.length;
+				items.push({ kind: 'text', text: ev.text, streaming: true });
+			}
+			return { ...state, items, open };
 		}
 		case 'reasoning': {
-			const cur = at();
-			if (cur && cur.kind === 'reasoning') return extend({ ...cur, text: cur.text + ev.text });
-			return extend({ kind: 'reasoning', text: ev.text, streaming: true });
+			const pos = open[ev.index];
+			const cur = pos !== undefined ? items[pos] : undefined;
+			if (cur?.kind === 'reasoning' && cur.streaming) {
+				items[pos] = { ...cur, text: cur.text + ev.text };
+				return { ...state, items, open };
+			}
+			if (ev.text) {
+				open[ev.index] = items.length;
+				items.push({ kind: 'reasoning', text: ev.text, streaming: true });
+			}
+			return { ...state, items, open };
 		}
 		case 'tool_args': {
-			const cur = at();
-			if (cur && cur.kind === 'tool_call') return extend({ ...cur, args: cur.args + ev.json });
-			return extend({ kind: 'tool_call', name: '', args: ev.json, streaming: true });
+			const pos = open[ev.index];
+			const cur = pos !== undefined ? items[pos] : undefined;
+			if (cur?.kind === 'tool') {
+				items[pos] = { ...cur, args: cur.args + ev.json };
+				return { ...state, items, open };
+			}
+			open[ev.index] = items.length;
+			items.push({ kind: 'tool', seq: -1, name: '', args: ev.json, status: 'running' });
+			return { ...state, items, open };
 		}
-		default:
-			return assertNever(ev);
+		default: return assertNever(ev);
 	}
 }
 
