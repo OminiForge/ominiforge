@@ -354,6 +354,13 @@ impl ChunkAssembler {
     }
 
     fn push_text(&mut self, text: &str, out: &mut Vec<StreamEvent>) {
+        // Skip empty deltas: providers often send a leading empty `content` chunk
+        // (e.g. the role-only chunk) before reasoning starts. Opening a text block
+        // on it would claim a block index ahead of the reasoning block, so the
+        // real text would render *before* the thinking. Open lazily on real text.
+        if text.is_empty() {
+            return;
+        }
         let index = Self::ensure_block(
             &mut self.text_index,
             &mut self.next_index,
@@ -367,6 +374,9 @@ impl ChunkAssembler {
     }
 
     fn push_reasoning(&mut self, text: &str, out: &mut Vec<StreamEvent>) {
+        if text.is_empty() {
+            return;
+        }
         let index = Self::ensure_block(
             &mut self.reasoning_index,
             &mut self.next_index,
@@ -610,6 +620,51 @@ mod tests {
         };
         assert_eq!(usage.cache_read_tokens, 80);
         assert_eq!(usage.input_tokens, 100);
+    }
+
+    /// A leading empty `content` chunk (the role-only delta many providers emit)
+    /// must NOT open a text block. Otherwise text claims index 0 ahead of the
+    /// reasoning block, and the answer renders before the thinking. Reasoning
+    /// must own the first block, text the second.
+    #[test]
+    fn empty_content_before_reasoning_does_not_steal_first_block() {
+        let mut asm = ChunkAssembler::default();
+        let mut events = Vec::new();
+        // Role-only opening chunk: empty content, no reasoning yet.
+        events.extend(asm.accept(chunk(r#"{"choices":[{"delta":{"content":""}}]}"#)));
+        events.extend(asm.accept(chunk(
+            r#"{"choices":[{"delta":{"reasoning_content":"think"}}]}"#,
+        )));
+        events.extend(asm.accept(chunk(r#"{"choices":[{"delta":{"content":"answer"}}]}"#)));
+        events.extend(asm.finish());
+
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::BlockStart {
+                    index: 0,
+                    block_type: ContentBlockType::Reasoning
+                },
+                StreamEvent::ReasoningDelta {
+                    index: 0,
+                    text: "think".to_owned()
+                },
+                StreamEvent::BlockStart {
+                    index: 1,
+                    block_type: ContentBlockType::Text
+                },
+                StreamEvent::TextDelta {
+                    index: 1,
+                    text: "answer".to_owned()
+                },
+                StreamEvent::BlockStop { index: 0 },
+                StreamEvent::BlockStop { index: 1 },
+                StreamEvent::Completed {
+                    stop_reason: StopReason::EndTurn,
+                    usage: Usage::default(),
+                },
+            ]
+        );
     }
 
     #[test]
