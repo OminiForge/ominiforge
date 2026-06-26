@@ -55,12 +55,28 @@ function contentBlock(
 	} as unknown as GatewayEvent;
 }
 
+function turnStarted(seq: number, input: string): GatewayEvent {
+	return {
+		type: 'event',
+		schema_version: 'ominiforge.event.v1',
+		seq,
+		session_id: 's',
+		timestamp: '2026-06-24T00:00:00Z',
+		source: { kind: 'Runtime', id: 'ominiforge' },
+		parent_event_id: null,
+		turn_id: null,
+		payload: {
+			Turn: {
+				Started: { turn_id: 't1', input }
+			}
+		}
+	} as unknown as GatewayEvent;
+}
+
 describe('conversation fold', () => {
 	// ── Streaming: temporal ordering ───────────────────────────────────
 
 	it('streaming: reasoning appears before text when provider opens text block first', () => {
-		// Provider opens text@0 (empty), then reasoning@1, then fills text@0.
-		// With temporal ordering, reasoning should appear before text.
 		const events: GatewayEvent[] = [
 			{ type: 'delta', delta: 'block_start', index: 0, kind: 'text', tool: null },
 			{ type: 'delta', delta: 'text', index: 0, text: '' },
@@ -82,7 +98,6 @@ describe('conversation fold', () => {
 			'The user wants me to say hi'
 		);
 
-		// Key assertion: reasoning appears BEFORE text in the items array
 		const reasoningIdx = items.findIndex((i) => i.kind === 'reasoning');
 		const textIdx = items.findIndex((i) => i.kind === 'text');
 		expect(reasoningIdx).toBeLessThan(textIdx);
@@ -176,8 +191,6 @@ describe('conversation fold', () => {
 	});
 
 	it('committed events put reasoning before text even when collector emits text first', () => {
-		// Provider opens text@0 then reasoning@1; collector emits in that order.
-		// commitBlock must reorder so reasoning appears before text.
 		const events: GatewayEvent[] = [
 			reqStarted(1),
 			{ type: 'delta', delta: 'block_start', index: 0, kind: 'text', tool: null },
@@ -185,7 +198,6 @@ describe('conversation fold', () => {
 			{ type: 'delta', delta: 'block_start', index: 1, kind: 'reasoning', tool: null },
 			{ type: 'delta', delta: 'reasoning', index: 1, text: 'thinking...' },
 			{ type: 'delta', delta: 'text', index: 0, text: 'answer' },
-			// Collector committed order: text first, reasoning second
 			contentBlock(10, { Text: { text: 'answer' } }),
 			contentBlock(11, { Reasoning: { text: 'thinking...' } })
 		];
@@ -215,21 +227,39 @@ describe('conversation fold', () => {
 		expect(reasoningIdx).toBeLessThan(textIdx);
 	});
 
-	// ── Race condition: deltas before RequestStarted ───────────────────
+	// ── User message visibility ────────────────────────────────────────
 
-	it('no duplication when deltas arrive before RequestStarted', () => {
-		// Simulates the race condition: streaming deltas arrive first,
-		// then RequestStarted arrives late, then committed ContentBlocks.
-		// Before the fix, this produced [reasoning, text, reasoning, text].
+	it('user message survives committed event truncation', () => {
+		// Normal flow: Turn.Started → RequestStarted → deltas → ContentBlocks.
+		// The user message must survive the commitBlock truncation.
 		const events: GatewayEvent[] = [
-			// Deltas arrive first (RequestStarted hasn't been forwarded yet)
+			turnStarted(1, 'hello'),
+			reqStarted(2),
 			{ type: 'delta', delta: 'block_start', index: 0, kind: 'reasoning', tool: null },
 			{ type: 'delta', delta: 'reasoning', index: 0, text: 'think...' },
 			{ type: 'delta', delta: 'block_start', index: 1, kind: 'text', tool: null },
 			{ type: 'delta', delta: 'text', index: 1, text: 'answer' },
-			// RequestStarted arrives late (forwarder task was slow)
+			contentBlock(3, { Reasoning: { text: 'think...' } }),
+			contentBlock(4, { Text: { text: 'answer' } })
+		];
+
+		const items = fold(events).items;
+		const user = items.filter((i) => i.kind === 'user');
+		expect(user).toHaveLength(1);
+		expect(user[0].kind === 'user' && user[0].text).toBe('hello');
+		// User message should be first
+		expect(items[0].kind).toBe('user');
+	});
+
+	// ── Race condition: deltas before RequestStarted ───────────────────
+
+	it('no duplication when deltas arrive before RequestStarted', () => {
+		const events: GatewayEvent[] = [
+			{ type: 'delta', delta: 'block_start', index: 0, kind: 'reasoning', tool: null },
+			{ type: 'delta', delta: 'reasoning', index: 0, text: 'think...' },
+			{ type: 'delta', delta: 'block_start', index: 1, kind: 'text', tool: null },
+			{ type: 'delta', delta: 'text', index: 1, text: 'answer' },
 			reqStarted(1),
-			// Committed ContentBlocks (collector finished)
 			contentBlock(2, { Reasoning: { text: 'think...' } }),
 			contentBlock(3, { Text: { text: 'answer' } })
 		];
@@ -238,27 +268,22 @@ describe('conversation fold', () => {
 		const reasoning = items.filter((i) => i.kind === 'reasoning');
 		const text = items.filter((i) => i.kind === 'text');
 
-		// Must not duplicate: exactly one reasoning and one text item
 		expect(reasoning).toHaveLength(1);
 		expect(text).toHaveLength(1);
 		expect(reasoning[0].kind === 'reasoning' && reasoning[0].text).toBe('think...');
 		expect(text[0].kind === 'text' && text[0].text).toBe('answer');
-		// Reasoning before text
 		expect(items.findIndex((i) => i.kind === 'reasoning')).toBeLessThan(
 			items.findIndex((i) => i.kind === 'text')
 		);
 	});
 
 	it('no duplication across multiple rounds', () => {
-		// Round 1: tool call
-		// Round 2: reasoning + text (deltas before RequestStarted)
 		const events: GatewayEvent[] = [
 			reqStarted(1),
 			{ type: 'delta', delta: 'block_start', index: 0, kind: 'tool_call', tool: 'read' },
 			{ type: 'delta', delta: 'tool_args', index: 0, json: '{"path":"f.txt"}' },
 			contentBlock(2, { ToolCall: { id: 'c1', name: 'read', arguments: '{"path":"f.txt"}' } }),
 
-			// Round 2: deltas arrive before RequestStarted
 			{ type: 'delta', delta: 'block_start', index: 0, kind: 'reasoning', tool: null },
 			{ type: 'delta', delta: 'reasoning', index: 0, text: 'hmm' },
 			{ type: 'delta', delta: 'block_start', index: 1, kind: 'text', tool: null },
@@ -273,7 +298,6 @@ describe('conversation fold', () => {
 		const text = items.filter((i) => i.kind === 'text');
 		expect(reasoning).toHaveLength(1);
 		expect(text).toHaveLength(1);
-		// Tool from round 1, then reasoning, then text
 		expect(items[0].kind).toBe('tool');
 		expect(items[1].kind).toBe('reasoning');
 		expect(items[2].kind).toBe('text');
@@ -292,8 +316,6 @@ describe('conversation fold', () => {
 		];
 
 		const text = fold(events).items.filter((i) => i.kind === 'text');
-		// Two separate blocks despite both being index 0 — the reset prevents the
-		// second round from extending the first round's block.
 		expect(text).toHaveLength(2);
 		expect(text.map((t) => (t.kind === 'text' ? t.text : ''))).toEqual(['first', 'second']);
 	});

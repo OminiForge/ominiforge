@@ -34,9 +34,11 @@ export interface ConversationState {
 	/** Insertion point for reasoning items during commit. Ensures reasoning
 	 *  is always placed before text, regardless of the collector's block order. */
 	commitBase?: number;
-	/** End position of committed items from all previous requests.  Used as the
-	 *  truncation point on RequestStarted so that streaming items created *before*
-	 *  the late-arriving RequestStarted are also removed. */
+	/** End position of committed (non-streaming) items.  Used as the truncation
+	 *  point on RequestStarted so that streaming items created *before* the
+	 *  late-arriving RequestStarted are also removed.  Only advanced by push()
+	 *  when no streaming items are present, preventing a race from corrupting
+	 *  the boundary. */
 	committedEnd?: number;
 	/** committed tool_call seq → items position, for pairing Tool::Completed */
 	toolSeqs: Map<number, number>;
@@ -264,7 +266,17 @@ function applyDelta(
 }
 
 function push(state: ConversationState, item: Item): ConversationState {
-	return { ...state, items: [...state.items, item] };
+	const items = [...state.items, item];
+	// Advance committedEnd so the next RequestStarted truncates past this item.
+	// But only when no streaming items exist — if streaming items are present
+	// they were created by a race (deltas arrived before this committed event),
+	// and including them in committedEnd would prevent truncation from removing them.
+	const hasStreaming = items.some((i) => 'streaming' in i && i.streaming);
+	return {
+		...state,
+		items,
+		committedEnd: hasStreaming ? state.committedEnd : items.length
+	};
 }
 
 function assertNever(x: never): never {
