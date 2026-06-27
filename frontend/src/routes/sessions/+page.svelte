@@ -64,99 +64,107 @@
 	onMount(refresh);
 </script>
 
-<header>
-	<h1>Sessions</h1>
-	<Button variant="accent" disabled={creating} onclick={create}>
-		{creating ? 'Creating…' : 'New session'}
-	</Button>
-</header>
+<div class="page">
+	<header>
+		<h1>Sessions</h1>
+		<Button variant="accent" disabled={creating} onclick={create}>
+			{creating ? 'Creating…' : 'New session'}
+		</Button>
+	</header>
 
-{#if error}
-	<p class="error">{error}</p>
-{/if}
+	{#if error}
+		<p class="error">{error}</p>
+	{/if}
 
-{#if loading}
-	<p class="muted">加载中…</p>
-{:else if sessions.length === 0}
-	<p class="muted">还没有会话，创建一个开始吧。</p>
-{:else}
-	<ul class="list">
-		{#each sessions as meta (meta.id)}
-			<li>
-				<a href={`/sessions/${meta.id}`}>
-					<span class="label">{label(meta)}</span>
-					<span class="time">{formatTime(meta.created_at)}</span>
-				</a>
-			</li>
-		{/each}
-	</ul>
-{/if}
+	{#if loading}
+		<p class="muted">加载中…</p>
+	{:else if sessions.length === 0}
+		<p class="muted">还没有会话，创建一个开始吧。</p>
+	{:else}
+		<ul class="list">
+			{#each sessions as meta (meta.id)}
+				<li>
+					<a href={`/sessions/${meta.id}`}>
+						<span class="label">{label(meta)}</span>
+						<span class="time">{formatTime(meta.created_at)}</span>
+					</a>
+				</li>
+			{/each}
+		</ul>
+	{/if}
+</div>
 
 <style>
+	.page {
+		height: 100%;
+		overflow-y: auto;
+		padding: var(--space-8) var(--space-10);
+		max-width: 880px;
+	}
+
 	header {
 		display: flex;
 		align-items: center;
 		justify-content: space-between;
-		margin-bottom: var(--gap-xl);
-		padding-bottom: var(--gap-lg);
-		border-bottom: 1px solid var(--border);
+		margin-bottom: var(--space-6);
+		padding-bottom: var(--space-4);
+		border-bottom: 1px solid var(--border-subtle);
 	}
 
 	h1 {
-		font-size: 24px;
+		font-size: 22px;
 		font-weight: 600;
 		letter-spacing: -0.01em;
 	}
 
 	.error {
-		color: var(--error);
-		background: var(--error-bg);
-		padding: var(--gap-md) var(--gap-lg);
+		color: var(--state-error-text);
+		background: var(--state-error-bg);
+		padding: var(--space-3) var(--space-4);
 		border-radius: var(--radius-md);
-		border-left: 3px solid var(--error);
-		margin-bottom: var(--gap-lg);
-		font-size: 14px;
+		border: 1px solid color-mix(in srgb, var(--state-error) 25%, transparent);
+		margin-bottom: var(--space-4);
+		font-size: 13px;
 	}
 
 	.muted {
-		color: var(--text-muted);
-		font-size: 14px;
+		color: var(--text-tertiary);
+		font-size: 13px;
 		text-align: center;
-		padding: var(--gap-2xl);
+		padding: var(--space-12);
 	}
 
 	.list {
 		list-style: none;
 		display: grid;
-		gap: var(--gap-md);
+		gap: var(--space-2);
 	}
 
 	.list li a {
 		display: flex;
 		justify-content: space-between;
 		align-items: center;
-		padding: var(--gap-lg);
-		border: 1px solid var(--border);
+		padding: var(--space-3) var(--space-4);
+		border: 1px solid var(--border-subtle);
 		border-radius: var(--radius-md);
-		background: var(--surface);
-		transition: all var(--motion-fast);
+		background: var(--canvas-raised);
+		transition: all var(--dur-fast) var(--ease-out);
 	}
 
 	.label {
 		color: var(--text-primary);
-		font-weight: 500;
+		font-weight: 450;
+		font-size: 13px;
 	}
 
 	.time {
-		color: var(--text-muted);
-		font-size: 13px;
+		color: var(--text-tertiary);
+		font-size: 11.5px;
+		font-variant-numeric: tabular-nums;
 	}
 
 	.list li a:hover {
 		background: var(--surface-hover);
-		border-color: var(--border-hover);
-		color: var(--text-primary);
-		transform: translateY(-1px);
-		box-shadow: var(--shadow-sm);
+		border-color: var(--border-default);
 	}
 </style>

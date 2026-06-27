@@ -25,3 +25,6 @@
 .claude
 
 .omini
+
+# UI design exploration scratch (HTML mockups, screenshots, node_modules symlink)
+design-demos/

@@ -6,8 +6,9 @@
 	import DOMPurify from 'dompurify';
 	import { client } from '$lib/client';
 	import type { EventSubscription } from '$lib/client-core';
+	import type { SessionMeta } from '$lib/types/SessionMeta';
 	import { apply, emptyState, type ConversationState, type Item } from '$lib/conversation';
-	import Button from '$lib/components/Button.svelte';
+	import { currentSession } from '$lib/stores/currentSession';
 
 	/** When the user is within this many pixels from the bottom we consider
 	 *  them "at the bottom" and auto-scroll on new content. This tolerance
@@ -20,6 +21,7 @@
 	let sending = $state(false);
 	let error = $state<string | null>(null);
 	let sessionId = $state(page.params.id!);
+	let meta = $state<SessionMeta | null>(null);
 	let sub: EventSubscription | undefined;
 	let streamEl = $state<HTMLElement | null>(null);
 	// Whether the user is scrolled to (or near) the bottom – controls auto-scroll.
@@ -41,6 +43,17 @@
 		}
 	}
 
+	/** Load session meta for the RUNTIME sidebar panel. Best-effort: a failure
+	 *  here must not break the conversation view, so errors are swallowed. */
+	async function loadMeta(id: string) {
+		try {
+			meta = await client.getSession(id);
+			currentSession.set(meta);
+		} catch {
+			/* RUNTIME panel just stays empty; conversation still works. */
+		}
+	}
+
 	function subscribe(id: string) {
 		sub?.close();
 		convo = emptyState();
@@ -53,6 +66,7 @@
 				if (ev.type === 'compacted') {
 					sessionId = ev.new_session_id;
 					subscribe(ev.new_session_id);
+					void loadMeta(ev.new_session_id);
 				}
 				// Only auto-scroll when the user is already at (or near) the
 				// bottom of the stream. This prevents yanking them back to the
@@ -72,9 +86,15 @@
 	$effect(() => {
 		const id = sessionId;
 		subscribe(id);
+		void loadMeta(id);
 	});
 
-	onDestroy(() => sub?.close());
+	onDestroy(() => {
+		sub?.close();
+		// Clear so the sidebar RUNTIME panel doesn't leak this session's context
+		// onto the list / monitor / evolution pages.
+		currentSession.set(null);
+	});
 
 	async function send() {
 		const text = input.trim();
@@ -92,13 +112,23 @@
 	}
 
 	async function cancel() {
-		try { await client.cancel(sessionId); }
-		catch (e) { error = e instanceof Error ? e.message : String(e); }
+		try {
+			await client.cancel(sessionId);
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
+		}
 	}
 
+	// Compaction stays available programmatically; the button was removed in
+	// favour of a future `/` command (see redesign plan). Keep the function so
+	// the slash-command wiring can call it later.
+	// eslint-disable-next-line @typescript-eslint/no-unused-vars
 	async function compact() {
-		try { await client.compact(sessionId); }
-		catch (e) { error = e instanceof Error ? e.message : String(e); }
+		try {
+			await client.compact(sessionId);
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
+		}
 	}
 
 	function onKeydown(e: KeyboardEvent) {
@@ -168,330 +198,705 @@
 		const line = s.split('\n')[0];
 		return line.length > n ? line.slice(0, n) + '…' : line;
 	}
+
+	/** Pretty-print + syntax-highlight tool-call JSON args into safe HTML.
+	 *  Falls back to escaped raw text when args aren't valid JSON. Highlight
+	 *  classes mirror the design tokens (--syntax-key/str/num). */
+	function renderArgs(args: string): string {
+		let pretty = args;
+		try {
+			pretty = JSON.stringify(JSON.parse(args), null, 2);
+		} catch {
+			return escapeHtml(args);
+		}
+		const esc = escapeHtml(pretty);
+		// Keys: "foo": → highlight the key; strings / numbers as values.
+		return esc
+			.replace(/&quot;([^&]*?)&quot;(\s*:)/g, '<span class="syn-key">&quot;$1&quot;</span>$2')
+			.replace(/:\s*&quot;([^&]*?)&quot;/g, ': <span class="syn-str">&quot;$1&quot;</span>')
+			.replace(/:\s*(-?\d+(?:\.\d+)?)/g, ': <span class="syn-num">$1</span>');
+	}
+
+	/** Short session label for the topbar: prefer the latest user message would
+	 *  be ideal, but we don't track titles yet — show a workspace-derived label
+	 *  or the session id. */
+	function topbarTitle(): string {
+		if (meta?.workspace) {
+			const parts = meta.workspace.split('/').filter(Boolean);
+			return parts[parts.length - 1] ?? sessionId;
+		}
+		return shortId(sessionId);
+	}
+
+	function shortId(id: string): string {
+		return id.length > 14 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id;
+	}
+
+	const incomplete = $derived(convo.lastSettle != null);
 </script>
 
-<div class="page">
-	<header>
-		<a href="/sessions" class="back">← 返回</a>
-		<span class="sid">{sessionId}</span>
-		<div class="actions">
-			<Button variant="ghost" onclick={cancel}>中断</Button>
-			<Button variant="ghost" onclick={compact}>压缩</Button>
+<div class="conv-page">
+	<!-- TOPBAR -->
+	<div class="topbar">
+		<a href="/sessions" class="topbar-back" title="返回会话列表" aria-label="Back to sessions">
+			<svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+				<polyline points="8.5,2.5 4,7 8.5,11.5" />
+			</svg>
+		</a>
+		<span class="topbar-title">{topbarTitle()}</span>
+		<div class="topbar-sep"></div>
+		<div class="topbar-meta">
+			<span class="mono">{shortId(sessionId)}</span>
+			{#if incomplete}
+				<span class="topbar-badge badge-running">incomplete</span>
+			{/if}
 		</div>
-	</header>
+		<div class="topbar-actions">
+			<button class="topbar-btn" onclick={cancel}>Cancel</button>
+		</div>
+	</div>
 
 	{#if error}
 		<div class="error-bar">{error}</div>
 	{/if}
 
-	<div class="stream" bind:this={streamEl} onscroll={onStreamScroll}>
-		{#each convo.items as item, i (i)}
-			{#if item.kind === 'user'}
-				<div class="msg user">{item.text}</div>
-
-			{:else if item.kind === 'text'}
-				{#if item.text.trim()}
-					<div class="msg text" class:streaming={item.streaming}>
-						{#if browser}
-							<!-- eslint-disable-next-line svelte/no-at-html-tags -->
-							{@html renderMarkdown(item.text)}
-						{:else}
-							{item.text}
-						{/if}
+	<!-- CONVERSATION SCROLL -->
+	<div class="conv-scroll" bind:this={streamEl} onscroll={onStreamScroll}>
+		<div class="conv-inner">
+			{#each convo.items as item, i (i)}
+				{#if item.kind === 'user'}
+					<div class="item item-user">
+						<div class="user-bubble">{item.text}</div>
 					</div>
-				{/if}
 
-			{:else if item.kind === 'reasoning'}
-				{#if item.text.trim()}
-					<div class="msg reasoning" class:collapsed={isCollapsed(item, i)}>
-						<button class="reasoning-header" onclick={() => toggleCollapse(item, i)}>
-							<span class="reasoning-icon">{isCollapsed(item, i) ? '▸' : '▾'}</span>
-							<span class="reasoning-label">思考过程</span>
-							{#if isCollapsed(item, i)}
-								<span class="reasoning-preview">{shortPreview(item.text)}</span>
+				{:else if item.kind === 'text'}
+					{#if item.text.trim()}
+						<div class="item item-text" class:streaming={item.streaming}>
+							{#if browser}
+								<!-- eslint-disable-next-line svelte/no-at-html-tags -->
+								{@html renderMarkdown(item.text)}
+							{:else}
+								{item.text}
 							{/if}
-							{#if item.streaming}
-								<span class="streaming-dot"></span>
-							{/if}
-						</button>
-						{#if !isCollapsed(item, i)}
-							<div class="reasoning-body">
-								{#if browser}
-									<!-- eslint-disable-next-line svelte/no-at-html-tags -->
-									{@html renderMarkdown(item.text)}
-								{:else}
-									{item.text}
-								{/if}
-							</div>
-						{/if}
-					</div>
-				{/if}
-
-			{:else if item.kind === 'tool'}
-				<div class="msg tool" class:done={item.status === 'done'} class:err={item.status === 'error'}>
-					<button class="tool-header" onclick={() => toggleCollapse(item, i)}>
-						<span class="tool-icon">
-							{#if item.status === 'running'}⋯{:else if item.status === 'done'}✓{:else}✗{/if}
-						</span>
-						<span class="tool-name">{item.name}</span>
-						{#if isCollapsed(item, i) && toolPreview(item.args)}
-							<span class="tool-preview">{toolPreview(item.args)}</span>
-						{/if}
-						{#if item.status === 'running'}
-							<span class="streaming-dot"></span>
-						{:else}
-							<span class="tool-toggle">{isCollapsed(item, i) ? '▸' : '▾'}</span>
-						{/if}
-					</button>
-					{#if !isCollapsed(item, i)}
-						{#if item.args && item.args !== '{}'}
-							<pre class="tool-args">{item.args}</pre>
-						{/if}
-						{#if item.result}
-							<div class="tool-result">{item.result}</div>
-						{/if}
+						</div>
 					{/if}
-				</div>
 
-			{:else if item.kind === 'error'}
-				<div class="msg error-item">{item.message}</div>
+				{:else if item.kind === 'reasoning'}
+					{#if item.text.trim()}
+						<div class="item item-reasoning" class:expanded={!isCollapsed(item, i)}>
+							<button class="reasoning-toggle" onclick={() => toggleCollapse(item, i)} aria-expanded={!isCollapsed(item, i)}>
+								<svg class="reasoning-toggle-icon" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+									<polyline points="5,3 9,7 5,11" />
+								</svg>
+								<span class="reasoning-label">Thinking</span>
+								{#if isCollapsed(item, i)}
+									<span class="reasoning-preview">{shortPreview(item.text)}</span>
+								{/if}
+								{#if item.streaming}
+									<span class="streaming-dot"></span>
+								{/if}
+							</button>
+							{#if !isCollapsed(item, i)}
+								<div class="reasoning-body">
+									{#if browser}
+										<!-- eslint-disable-next-line svelte/no-at-html-tags -->
+										{@html renderMarkdown(item.text)}
+									{:else}
+										{item.text}
+									{/if}
+								</div>
+							{/if}
+						</div>
+					{/if}
 
-			{:else if item.kind === 'notice'}
-				<div class="msg notice">{item.message}</div>
+				{:else if item.kind === 'tool'}
+					<div class="item">
+						<div
+							class="tool-block"
+							class:done={item.status === 'done'}
+							class:running={item.status === 'running'}
+							class:error={item.status === 'error'}
+							class:expanded={!isCollapsed(item, i)}
+						>
+							<button class="tool-header" onclick={() => toggleCollapse(item, i)} aria-expanded={!isCollapsed(item, i)}>
+								<span class="tool-pip"></span>
+								{#if item.status === 'running'}
+									<span class="tool-spinner"></span>
+								{/if}
+								<span class="tool-name">{item.name}</span>
+								<span class="tool-status-badge">{item.status}</span>
+								{#if isCollapsed(item, i) && toolPreview(item.args)}
+									<span class="tool-preview">{toolPreview(item.args)}</span>
+								{/if}
+								<svg class="tool-chevron" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+									<polyline points="4,2 8,6 4,10" />
+								</svg>
+							</button>
+							{#if !isCollapsed(item, i)}
+								<div class="tool-detail">
+									{#if item.args && item.args !== '{}'}
+										<div class="tool-detail-section">
+											<div class="tool-detail-label">params</div>
+											<!-- eslint-disable-next-line svelte/no-at-html-tags -->
+											<div class="tool-params">{@html renderArgs(item.args)}</div>
+										</div>
+									{/if}
+									{#if item.result}
+										<div class="tool-detail-section">
+											<div class="tool-detail-label">result</div>
+											<div class="tool-result">{item.result}</div>
+										</div>
+									{:else if item.status === 'running'}
+										<div class="running-placeholder">
+											<span class="tool-spinner"></span>
+											正在执行…
+										</div>
+									{/if}
+								</div>
+							{/if}
+						</div>
+					</div>
+
+				{:else if item.kind === 'error'}
+					<div class="item item-error">{item.message}</div>
+
+				{:else if item.kind === 'notice'}
+					<div class="item item-notice">{item.message}</div>
+				{/if}
+			{/each}
+
+			{#if convo.items.length === 0}
+				<p class="empty">发送消息开始对话</p>
 			{/if}
-		{/each}
-
-		{#if convo.items.length === 0}
-			<p class="empty">发送消息开始对话</p>
-		{/if}
+		</div>
 	</div>
 
-	<div class="composer">
-		<textarea
-			bind:value={input}
-			onkeydown={onKeydown}
-			placeholder="输入消息… (Enter 发送，Shift+Enter 换行)"
-			rows="2"
-		></textarea>
-		<Button variant="accent" disabled={sending} onclick={send}>
-			{sending ? '发送中…' : '发送'}
-		</Button>
+	<!-- INPUT AREA -->
+	<div class="input-area">
+		<div class="input-inner">
+			<div class="input-box">
+				<textarea
+					class="input-field"
+					bind:value={input}
+					onkeydown={onKeydown}
+					placeholder="输入消息… Enter 发送，Shift+Enter 换行"
+					rows="2"
+				></textarea>
+				<div class="input-actions">
+					<span class="input-status">
+						{#if incomplete}<span class="status-warn">Turn incomplete</span>{/if}
+					</span>
+					<button class="input-btn cancel" onclick={cancel}>
+						<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+							<line x1="1" y1="1" x2="9" y2="9" />
+							<line x1="9" y1="1" x2="1" y2="9" />
+						</svg>
+						Cancel
+					</button>
+					<button class="input-btn primary" disabled={sending} onclick={send}>
+						{sending ? 'Sending…' : 'Send'}
+						<kbd>↵</kbd>
+					</button>
+				</div>
+			</div>
+			<div class="input-hint">Type / for commands</div>
+		</div>
 	</div>
 </div>
 
 <style>
-	.page {
+	.conv-page {
 		display: flex;
 		flex-direction: column;
-		height: calc(100vh - var(--gap-2xl) * 2);
-		gap: var(--gap-lg);
+		height: 100%;
+		overflow: hidden;
 	}
 
-	header {
+	/* ---- TOPBAR ---- */
+	.topbar {
+		height: 44px;
+		min-height: 44px;
+		border-bottom: 1px solid var(--border-subtle);
 		display: flex;
 		align-items: center;
-		gap: var(--gap-lg);
-		padding-bottom: var(--gap-lg);
-		border-bottom: 1px solid var(--border);
+		padding: 0 var(--space-6);
+		gap: var(--space-3);
+		background: var(--canvas-raised);
 		flex-shrink: 0;
 	}
 
-	.back {
-		color: var(--text-secondary);
-		font-size: 14px;
-		font-weight: 500;
-		white-space: nowrap;
+	.topbar-back {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		width: 22px;
+		height: 22px;
+		border-radius: var(--radius-sm);
+		color: var(--text-tertiary);
+		flex-shrink: 0;
+		transition:
+			color var(--dur-fast) var(--ease-out),
+			background var(--dur-fast) var(--ease-out);
 	}
 
-	.back:hover { color: var(--accent); }
+	.topbar-back:hover {
+		color: var(--text-primary);
+		background: var(--surface-hover);
+	}
 
-	.sid {
-		font-family: var(--font-mono);
-		font-size: 12px;
-		color: var(--text-muted);
-		flex: 1;
+	.topbar-title {
+		font-size: 13px;
+		font-weight: 500;
+		color: var(--text-primary);
+		letter-spacing: -0.01em;
+		font-family: var(--font-chinese);
+		white-space: nowrap;
 		overflow: hidden;
 		text-overflow: ellipsis;
-		white-space: nowrap;
-		padding: 4px var(--gap-sm);
-		background: var(--bg-tertiary);
-		border-radius: var(--radius-sm);
+		max-width: 320px;
 	}
 
-	.actions { display: flex; gap: var(--gap-sm); }
-
-	.error-bar {
-		color: var(--error);
-		background: var(--error-bg);
-		padding: var(--gap-sm) var(--gap-md);
-		border-radius: var(--radius-md);
-		border-left: 3px solid var(--error);
-		font-size: 14px;
+	.topbar-sep {
+		width: 1px;
+		height: 14px;
+		background: var(--border-default);
 		flex-shrink: 0;
 	}
 
-	.stream {
+	.topbar-meta {
+		font-size: 11.5px;
+		color: var(--text-tertiary);
+		display: flex;
+		align-items: center;
+		gap: var(--space-3);
+	}
+
+	.mono {
+		font-family: var(--font-mono);
+		font-variant-numeric: tabular-nums;
+	}
+
+	.topbar-badge {
+		padding: 2px 6px;
+		border-radius: 3px;
+		font-size: 10.5px;
+		font-weight: 510;
+		letter-spacing: 0.03em;
+	}
+
+	.badge-running {
+		background: var(--state-running-bg);
+		color: var(--state-running-text);
+		border: 1px solid color-mix(in srgb, var(--state-running) 25%, transparent);
+	}
+
+	.topbar-actions {
+		margin-left: auto;
+		display: flex;
+		gap: var(--space-1);
+	}
+
+	.topbar-btn {
+		padding: 4px 10px;
+		border-radius: var(--radius-sm);
+		border: 1px solid var(--border-default);
+		background: transparent;
+		color: var(--text-secondary);
+		font-size: 11.5px;
+		font-weight: 450;
+		cursor: pointer;
+		transition: all var(--dur-fast) var(--ease-out);
+	}
+
+	.topbar-btn:hover {
+		background: var(--surface-hover);
+		color: var(--text-primary);
+		border-color: var(--border-strong);
+	}
+
+	.error-bar {
+		color: var(--state-error-text);
+		background: var(--state-error-bg);
+		padding: var(--space-2) var(--space-6);
+		border-bottom: 1px solid color-mix(in srgb, var(--state-error) 25%, transparent);
+		font-size: 12.5px;
+		flex-shrink: 0;
+	}
+
+	/* ---- CONVERSATION ---- */
+	.conv-scroll {
 		flex: 1;
 		overflow-y: auto;
-		display: flex;
-		flex-direction: column;
-		gap: var(--gap-md);
-		/* Custom scrollbar at edge */
-		scrollbar-gutter: stable;
+		padding: var(--space-5) var(--space-10) var(--space-6);
+		min-height: 0;
+	}
+
+	.conv-inner {
+		max-width: 740px;
+		margin: 0 auto;
+	}
+
+	.item {
+		margin-bottom: var(--space-4);
 	}
 
 	.empty {
-		color: var(--text-muted);
+		color: var(--text-tertiary);
 		text-align: center;
-		margin: auto;
-		font-size: 14px;
+		margin-top: 25vh;
+		font-size: 13px;
+		font-family: var(--font-chinese);
 	}
 
-	.msg {
-		padding: var(--gap-md) var(--gap-lg);
-		border-radius: var(--radius-md);
-		font-size: 15px;
-		line-height: 1.7;
+	/* ---- USER ---- */
+	.item-user {
+		display: flex;
+		justify-content: flex-end;
+	}
+
+	.user-bubble {
+		max-width: 560px;
+		background: var(--user-bg);
+		border: 1px solid var(--user-border);
+		border-radius: var(--radius-lg);
+		padding: var(--space-3) var(--space-4);
+		font-size: 13px;
+		color: var(--text-primary);
+		line-height: 1.6;
+		font-family: var(--font-chinese);
+		text-wrap: pretty;
 		word-break: break-word;
 	}
 
-	.msg.user {
-		background: var(--accent);
-		color: var(--accent-fg);
-		align-self: flex-end;
-		max-width: 80%;
-		border-radius: var(--radius-lg);
+	/* ---- AGENT TEXT ---- */
+	.item-text {
+		font-size: 13.5px;
+		line-height: 1.75;
+		color: var(--text-primary);
+		font-family: var(--font-chinese);
+		text-wrap: pretty;
+		word-break: break-word;
 	}
 
-	.msg.text {
-		background: var(--surface);
-		border: 1px solid var(--border);
+	.item-text :global(p) {
+		margin-bottom: var(--space-3);
 	}
-
-	/* Markdown content styling */
-	.msg.text :global(p) { margin-bottom: 0.75em; }
-	.msg.text :global(p:last-child) { margin-bottom: 0; }
-	.msg.text :global(h1),
-	.msg.text :global(h2),
-	.msg.text :global(h3) {
+	.item-text :global(p:last-child) {
+		margin-bottom: 0;
+	}
+	.item-text :global(h1),
+	.item-text :global(h2),
+	.item-text :global(h3) {
 		font-weight: 600;
 		margin: 1em 0 0.5em;
 		color: var(--text-primary);
+		line-height: 1.3;
 	}
-	.msg.text :global(code) {
+	.item-text :global(strong) {
+		font-weight: 600;
+		color: var(--text-primary);
+	}
+	.item-text :global(code) {
 		font-family: var(--font-mono);
-		font-size: 13px;
-		background: var(--bg-tertiary);
-		padding: 2px 5px;
+		font-size: 12px;
+		background: var(--canvas-float);
+		color: var(--syntax-str);
+		padding: 1px 5px;
 		border-radius: 3px;
+		border: 1px solid var(--border-subtle);
 	}
-	.msg.text :global(pre) {
-		background: var(--bg-tertiary);
-		padding: var(--gap-md);
+	.item-text :global(pre) {
+		background: var(--canvas-float);
+		padding: var(--space-3);
 		border-radius: var(--radius-md);
+		border: 1px solid var(--border-subtle);
 		overflow-x: auto;
-		margin: 0.75em 0;
+		margin: var(--space-3) 0;
 	}
-	.msg.text :global(pre code) {
+	.item-text :global(pre code) {
 		background: none;
+		border: none;
 		padding: 0;
-	}
-	.msg.text :global(ul), .msg.text :global(ol) {
-		padding-left: 1.5em;
-		margin: 0.5em 0;
-	}
-	.msg.text :global(blockquote) {
-		border-left: 3px solid var(--border-hover);
-		padding-left: var(--gap-md);
 		color: var(--text-secondary);
-		margin: 0.75em 0;
+	}
+	.item-text :global(ol),
+	.item-text :global(ul) {
+		padding-left: var(--space-5);
+		margin-bottom: var(--space-3);
+	}
+	.item-text :global(li) {
+		margin-bottom: var(--space-1);
+		padding-left: var(--space-1);
+	}
+	.item-text :global(li::marker) {
+		color: var(--text-tertiary);
+		font-variant-numeric: tabular-nums;
+	}
+	.item-text :global(a) {
+		color: var(--accent-ink);
+		text-decoration: none;
+		border-bottom: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+		transition: border-color var(--dur-fast);
+	}
+	.item-text :global(a:hover) {
+		border-color: var(--accent);
+	}
+	.item-text :global(blockquote) {
+		border-left: 2px solid var(--border-strong);
+		padding-left: var(--space-3);
+		color: var(--text-secondary);
+		margin: var(--space-3) 0;
 	}
 
-	.msg.reasoning {
-		background: transparent;
-		border: 1px dashed var(--border);
+	/* Streaming cursor on the live text item */
+	.item-text.streaming::after {
+		content: '';
+		display: inline-block;
+		width: 2px;
+		height: 1em;
+		background: var(--accent);
+		vertical-align: text-bottom;
+		margin-left: 2px;
+		border-radius: 1px;
+		animation: cursor-blink 1.1s step-end infinite;
 	}
 
-	.reasoning-header {
+	@keyframes cursor-blink {
+		0%,
+		100% {
+			opacity: 1;
+		}
+		50% {
+			opacity: 0;
+		}
+	}
+
+	/* ---- REASONING ---- */
+	.reasoning-toggle {
 		display: flex;
 		align-items: center;
-		gap: var(--gap-sm);
+		gap: var(--space-2);
+		padding: var(--space-2) var(--space-3);
+		border-radius: var(--radius-md);
+		border: 1px solid var(--reasoning-border);
+		background: var(--reasoning-bg);
+		cursor: pointer;
+		transition:
+			border-color var(--dur-fast) var(--ease-out),
+			background var(--dur-fast) var(--ease-out);
 		width: 100%;
 		text-align: left;
-		font-size: 13px;
-		color: var(--text-muted);
-		padding: 0;
-		cursor: pointer;
 	}
 
-	.reasoning-header:hover { color: var(--text-secondary); }
+	.reasoning-toggle:hover {
+		border-color: color-mix(in srgb, var(--reasoning-text) 40%, transparent);
+	}
 
-	.reasoning-icon { font-size: 11px; }
+	.reasoning-toggle-icon {
+		width: 14px;
+		height: 14px;
+		flex-shrink: 0;
+		color: var(--reasoning-text);
+		transition: transform var(--dur-std) var(--ease-out);
+	}
+
+	.item-reasoning.expanded .reasoning-toggle-icon {
+		transform: rotate(90deg);
+	}
 
 	.reasoning-label {
-		font-weight: 500;
-		color: var(--info);
-		font-size: 12px;
+		font-size: 10.5px;
+		font-weight: 510;
+		color: var(--reasoning-text);
 		text-transform: uppercase;
-		letter-spacing: 0.05em;
+		letter-spacing: 0.08em;
+		flex-shrink: 0;
 	}
 
 	.reasoning-preview {
-		flex: 1;
+		font-size: 12px;
+		color: var(--text-tertiary);
+		white-space: nowrap;
 		overflow: hidden;
 		text-overflow: ellipsis;
-		white-space: nowrap;
-		opacity: 0.7;
+		flex: 1;
+		font-family: var(--font-chinese);
 	}
 
 	.reasoning-body {
-		margin-top: var(--gap-sm);
-		font-size: 13px;
-		color: var(--text-muted);
-		white-space: pre-wrap;
-		line-height: 1.6;
+		padding: var(--space-3) var(--space-3) var(--space-2);
+		margin-top: 2px;
+		margin-left: var(--space-3);
+		border-left: 2px solid var(--reasoning-border);
+		font-size: 12.5px;
+		color: var(--text-tertiary);
+		line-height: 1.7;
+		font-family: var(--font-chinese);
+		text-wrap: pretty;
+	}
+	.reasoning-body :global(p) {
+		margin-bottom: var(--space-2);
+	}
+	.reasoning-body :global(p:last-child) {
+		margin-bottom: 0;
+	}
+	.reasoning-body :global(ol),
+	.reasoning-body :global(ul) {
+		padding-left: var(--space-5);
+		margin-bottom: var(--space-2);
+	}
+	.reasoning-body :global(li) {
+		margin-bottom: 2px;
+	}
+	.reasoning-body :global(li::marker) {
+		color: var(--text-disabled);
+		font-variant-numeric: tabular-nums;
+	}
+	.reasoning-body :global(code) {
+		font-family: var(--font-mono);
+		font-size: 11.5px;
+		background: var(--canvas-float);
+		padding: 1px 4px;
+		border-radius: 3px;
 	}
 
-	.msg.tool {
-		background: var(--bg-secondary);
-		border: 1px solid var(--border);
-		padding: var(--gap-md);
+	/* ---- TOOL (the 120% detail) ---- */
+	.tool-block {
+		border-radius: var(--radius-md);
+		overflow: hidden;
+		border: 1px solid var(--border-subtle);
+		transition: border-color var(--dur-std) var(--ease-out);
 	}
 
-	.msg.tool.done { border-color: var(--success); }
-	.msg.tool.err { border-color: var(--error); }
+	.tool-block.done {
+		border-color: color-mix(in srgb, var(--state-done) 22%, transparent);
+	}
+
+	.tool-block.running {
+		border-color: color-mix(in srgb, var(--state-running) 35%, transparent);
+		animation: tool-running-pulse 2s ease-in-out infinite;
+	}
+
+	@keyframes tool-running-pulse {
+		0%,
+		100% {
+			border-color: color-mix(in srgb, var(--state-running) 30%, transparent);
+			box-shadow: 0 0 0 0 transparent;
+		}
+		50% {
+			border-color: color-mix(in srgb, var(--state-running) 55%, transparent);
+			box-shadow: 0 0 0 3px color-mix(in srgb, var(--state-running) 6%, transparent);
+		}
+	}
+
+	.tool-block.error {
+		border-color: color-mix(in srgb, var(--state-error) 30%, transparent);
+	}
 
 	.tool-header {
 		display: flex;
 		align-items: center;
-		gap: var(--gap-sm);
-		font-size: 13px;
-		font-family: var(--font-mono);
+		gap: var(--space-2);
+		padding: 7px var(--space-3);
+		background: var(--canvas-overlay);
+		cursor: pointer;
+		user-select: none;
+		transition: background var(--dur-fast) var(--ease-out);
 		width: 100%;
 		text-align: left;
-		padding: 0;
-		cursor: pointer;
 	}
 
-	.tool-header:hover .tool-name { color: var(--accent); }
-
-	.tool-toggle {
-		margin-left: auto;
-		font-size: 11px;
-		color: var(--text-muted);
+	.tool-header:hover {
+		background: var(--canvas-float);
 	}
 
-	.tool-icon {
-		font-size: 12px;
-		.msg.tool.done & { color: var(--success); }
-		.msg.tool.err & { color: var(--error); }
-		.msg.tool:not(.done):not(.err) & { color: var(--text-muted); }
+	.tool-pip {
+		width: 6px;
+		height: 6px;
+		border-radius: 50%;
+		flex-shrink: 0;
+		position: relative;
+		background: var(--text-tertiary);
+	}
+	.done .tool-pip {
+		background: var(--state-done);
+	}
+	.running .tool-pip {
+		background: var(--state-running);
+	}
+	.error .tool-pip {
+		background: var(--state-error);
+	}
+
+	.running .tool-pip::after {
+		content: '';
+		position: absolute;
+		inset: -3px;
+		border-radius: 50%;
+		border: 1.5px solid var(--state-running);
+		opacity: 0;
+		animation: pip-ripple 1.8s ease-out infinite;
+	}
+
+	@keyframes pip-ripple {
+		0% {
+			opacity: 0.7;
+			transform: scale(0.5);
+		}
+		100% {
+			opacity: 0;
+			transform: scale(2.2);
+		}
+	}
+
+	.tool-spinner {
+		width: 11px;
+		height: 11px;
+		border: 1.5px solid color-mix(in srgb, var(--state-running) 25%, transparent);
+		border-top-color: var(--state-running);
+		border-radius: 50%;
+		animation: spin 700ms linear infinite;
+		flex-shrink: 0;
+	}
+
+	@keyframes spin {
+		to {
+			transform: rotate(360deg);
+		}
 	}
 
 	.tool-name {
-		font-weight: 600;
+		font-family: var(--font-mono);
+		font-size: 12px;
+		font-weight: 500;
 		color: var(--text-primary);
-		font-size: 13px;
+		letter-spacing: -0.01em;
+		flex-shrink: 0;
+	}
+
+	.tool-status-badge {
+		font-size: 10px;
+		font-weight: 510;
+		padding: 1px 5px;
+		border-radius: 3px;
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		flex-shrink: 0;
+	}
+	.done .tool-status-badge {
+		background: var(--state-done-bg);
+		color: var(--state-done-text);
+		border: 1px solid color-mix(in srgb, var(--state-done) 25%, transparent);
+	}
+	.running .tool-status-badge {
+		background: var(--state-running-bg);
+		color: var(--state-running-text);
+		border: 1px solid color-mix(in srgb, var(--state-running) 25%, transparent);
+	}
+	.error .tool-status-badge {
+		background: var(--state-error-bg);
+		color: var(--state-error-text);
+		border: 1px solid color-mix(in srgb, var(--state-error) 25%, transparent);
 	}
 
 	.tool-preview {
@@ -500,57 +905,107 @@
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
-		color: var(--text-muted);
-		font-size: 12px;
-		opacity: 0.8;
+		color: var(--text-tertiary);
+		font-family: var(--font-mono);
+		font-size: 11px;
 	}
 
-	.tool-args {
-		margin-top: var(--gap-sm);
+	.tool-chevron {
+		margin-left: auto;
+		width: 12px;
+		height: 12px;
+		color: var(--text-tertiary);
+		transition: transform var(--dur-std) var(--ease-out);
+		flex-shrink: 0;
+	}
+
+	.tool-block.expanded .tool-chevron {
+		transform: rotate(90deg);
+	}
+
+	.tool-detail {
+		background: var(--canvas-base);
+		border-top: 1px solid var(--border-subtle);
+	}
+
+	.tool-detail-section {
+		padding: var(--space-3) var(--space-4);
+		border-bottom: 1px solid var(--border-subtle);
+	}
+	.tool-detail-section:last-child {
+		border-bottom: none;
+	}
+
+	.tool-detail-label {
+		font-size: 10px;
+		font-weight: 510;
+		color: var(--text-tertiary);
+		text-transform: uppercase;
+		letter-spacing: 0.1em;
+		margin-bottom: var(--space-2);
+	}
+
+	.tool-params {
 		font-family: var(--font-mono);
-		font-size: 12px;
-		color: var(--text-muted);
-		white-space: pre-wrap;
-		word-break: break-all;
-		max-height: 120px;
-		overflow-y: auto;
+		font-size: 11.5px;
+		color: var(--text-secondary);
+		line-height: 1.6;
+		white-space: pre;
+		overflow-x: auto;
+		max-height: 200px;
+	}
+
+	.tool-params :global(.syn-key) {
+		color: var(--syntax-key);
+	}
+	.tool-params :global(.syn-str) {
+		color: var(--syntax-str);
+	}
+	.tool-params :global(.syn-num) {
+		color: var(--syntax-num);
 	}
 
 	.tool-result {
-		margin-top: var(--gap-sm);
-		padding-top: var(--gap-sm);
-		border-top: 1px solid var(--border);
-		font-size: 13px;
+		font-family: var(--font-mono);
+		font-size: 11.5px;
 		color: var(--text-secondary);
+		line-height: 1.6;
 		white-space: pre-wrap;
 		word-break: break-word;
-		max-height: 160px;
+		max-height: 220px;
 		overflow-y: auto;
 	}
 
-	.msg.error-item {
-		color: var(--error);
-		background: var(--error-bg);
-		border: 1px solid var(--error);
-		font-size: 14px;
+	.running-placeholder {
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+		font-size: 12px;
+		color: var(--text-tertiary);
+		font-family: var(--font-chinese);
+		padding: var(--space-3) var(--space-4);
 	}
 
-	.msg.notice {
-		color: var(--text-muted);
-		font-size: 13px;
+	/* ---- ERROR / NOTICE ---- */
+	.item-error {
+		color: var(--state-error-text);
+		background: var(--state-error-bg);
+		border: 1px solid color-mix(in srgb, var(--state-error) 30%, transparent);
+		border-radius: var(--radius-md);
+		padding: var(--space-3) var(--space-4);
+		font-size: 12.5px;
+	}
+
+	.item-notice {
+		color: var(--text-tertiary);
+		font-size: 12px;
 		font-style: italic;
-		border: none;
-		background: none;
-		padding: var(--gap-sm) var(--gap-md);
 		text-align: center;
+		padding: var(--space-2) var(--space-4);
+		font-family: var(--font-chinese);
 	}
 
-	.streaming::after {
-		content: '▋';
-		color: var(--accent);
-		animation: blink 0.8s step-start infinite;
-	}
-
+	/* Streaming dot (reasoning / tool live indicator) */
 	.streaming-dot {
 		display: inline-block;
 		width: 6px;
@@ -558,39 +1013,168 @@
 		border-radius: 50%;
 		background: var(--accent);
 		animation: pulse 1s ease-in-out infinite;
-	}
-
-	@keyframes blink { 50% { opacity: 0; } }
-	@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
-
-	.composer {
-		display: flex;
-		gap: var(--gap-md);
-		align-items: flex-end;
 		flex-shrink: 0;
-		padding-top: var(--gap-md);
-		border-top: 1px solid var(--border);
 	}
 
-	textarea {
-		flex: 1;
-		resize: none;
-		padding: var(--gap-md) var(--gap-lg);
-		border: 1px solid var(--border);
-		border-radius: var(--radius-md);
-		background: var(--surface);
-		color: var(--text-primary);
-		font-family: var(--font-sans);
-		font-size: 14px;
-		line-height: 1.5;
-		transition: border-color var(--motion-fast);
+	@keyframes pulse {
+		0%,
+		100% {
+			opacity: 1;
+		}
+		50% {
+			opacity: 0.3;
+		}
 	}
 
-	textarea:focus {
-		border-color: var(--accent);
+	/* ---- INPUT AREA ---- */
+	.input-area {
+		border-top: 1px solid var(--border-subtle);
+		padding: var(--space-4) var(--space-10);
+		background: var(--canvas-raised);
+		flex-shrink: 0;
+	}
+
+	.input-inner {
+		max-width: 740px;
+		margin: 0 auto;
+	}
+
+	.input-box {
+		background: var(--canvas-overlay);
+		border: 1px solid var(--border-default);
+		border-radius: var(--radius-lg);
+		overflow: hidden;
+		transition:
+			border-color var(--dur-std) var(--ease-out),
+			box-shadow var(--dur-std) var(--ease-out);
+	}
+
+	.input-box:focus-within {
+		border-color: var(--border-strong);
+		box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 8%, transparent);
+	}
+
+	.input-field {
+		width: 100%;
+		padding: var(--space-3) var(--space-4);
+		background: transparent;
+		border: none;
 		outline: none;
-		box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent);
+		color: var(--text-primary);
+		font-family: var(--font-chinese);
+		font-size: 13px;
+		line-height: 1.6;
+		resize: none;
+		min-height: 44px;
+		max-height: 120px;
 	}
 
-	textarea::placeholder { color: var(--text-muted); }
+	.input-field::placeholder {
+		color: var(--text-disabled);
+	}
+
+	.input-actions {
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+		padding: var(--space-2) var(--space-3);
+		border-top: 1px solid var(--border-subtle);
+	}
+
+	.input-status {
+		font-size: 11px;
+		color: var(--text-tertiary);
+		flex: 1;
+		font-family: var(--font-chinese);
+	}
+
+	.input-status .status-warn {
+		color: var(--state-running-text);
+	}
+
+	.input-btn {
+		display: flex;
+		align-items: center;
+		gap: 5px;
+		padding: 5px 10px;
+		border-radius: var(--radius-sm);
+		border: 1px solid var(--border-default);
+		background: transparent;
+		color: var(--text-secondary);
+		font-size: 11.5px;
+		font-weight: 450;
+		cursor: pointer;
+		font-family: var(--font-sans);
+		transition: all var(--dur-fast) var(--ease-out);
+	}
+
+	.input-btn:hover {
+		background: var(--surface-hover);
+		color: var(--text-primary);
+		border-color: var(--border-strong);
+	}
+
+	.input-btn.primary {
+		background: var(--accent);
+		color: var(--accent-fg);
+		border-color: transparent;
+		font-weight: 590;
+	}
+
+	.input-btn.primary:hover {
+		background: var(--accent-hover);
+		color: var(--accent-fg);
+	}
+
+	.input-btn.primary:disabled {
+		opacity: 0.55;
+		cursor: not-allowed;
+	}
+
+	.input-btn.cancel {
+		color: var(--state-error-text);
+		border-color: color-mix(in srgb, var(--state-error) 22%, transparent);
+	}
+
+	.input-btn.cancel:hover {
+		background: var(--state-error-bg);
+		border-color: color-mix(in srgb, var(--state-error) 40%, transparent);
+		color: var(--state-error-text);
+	}
+
+	kbd {
+		font-family: var(--font-mono);
+		font-size: 10px;
+		background: var(--canvas-float);
+		border: 1px solid var(--border-strong);
+		border-radius: 3px;
+		padding: 1px 4px;
+		color: var(--text-tertiary);
+	}
+
+	.input-hint {
+		font-size: 10.5px;
+		color: var(--text-disabled);
+		font-family: var(--font-mono);
+		margin-top: 5px;
+		padding-left: 2px;
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		.tool-block.running {
+			animation: none;
+		}
+		.tool-spinner {
+			animation: none;
+		}
+		.running .tool-pip::after {
+			animation: none;
+		}
+		.item-text.streaming::after {
+			animation: none;
+		}
+		.streaming-dot {
+			animation: none;
+		}
+	}
 </style>

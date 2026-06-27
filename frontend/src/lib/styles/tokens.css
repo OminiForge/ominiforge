@@ -1,13 +1,16 @@
-/* Elegant dual-theme system with LXGW WenKai for Chinese */
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
+/* Elegant dual-theme system with LXGW WenKai for Chinese.
+   Design language: Linear-derived near-black + single acid-lime accent.
+   Dark is the primary theme; light is a tuned counterpart. */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;450;500;510;590;600&display=swap');
 @import url('https://cdn.jsdelivr.net/npm/lxgw-wenkai-webfont@1.1.0/style.css');
 
 :root {
-	/* Fonts: LXGW WenKai for Chinese, Inter for Latin */
+	/* Fonts: LXGW WenKai for Chinese, Inter for Latin, mono for code/labels */
 	--font-sans: 'Inter', 'LXGW WenKai', system-ui, sans-serif;
-	--font-mono: 'JetBrains Mono', 'LXGW WenKai Mono', 'Consolas', monospace;
+	--font-mono: 'Berkeley Mono', 'JetBrains Mono', 'Fira Code', 'Cascadia Code', ui-monospace, 'LXGW WenKai Mono', monospace;
+	--font-chinese: 'LXGW WenKai', serif;
 
-	/* Spacing: generous but purposeful */
+	/* Spacing: rem rhythm (legacy gap-* names, kept for existing callers) */
 	--gap-xs: 0.25rem;
 	--gap-sm: 0.5rem;
 	--gap-md: 1rem;
@@ -15,15 +18,32 @@
 	--gap-xl: 2rem;
 	--gap-2xl: 3rem;
 
-	/* Radii: soft elegance */
-	--radius-sm: 4px;
-	--radius-md: 8px;
-	--radius-lg: 12px;
-	--radius-xl: 16px;
+	/* Spacing: 4px grid (px scale, used by ported components) */
+	--space-1: 4px;
+	--space-2: 8px;
+	--space-3: 12px;
+	--space-4: 16px;
+	--space-5: 20px;
+	--space-6: 24px;
+	--space-8: 32px;
+	--space-10: 40px;
+	--space-12: 48px;
 
-	/* Motion: smooth and intentional */
-	--motion-fast: 0.15s cubic-bezier(0.4, 0, 0.2, 1);
-	--motion-base: 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+	/* Radii */
+	--radius-sm: 4px;
+	--radius-md: 6px;
+	--radius-lg: 8px;
+	--radius-xl: 12px;
+
+	/* Layout */
+	--sidebar-width: 220px;
+
+	/* Motion */
+	--ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+	--dur-fast: 120ms;
+	--dur-std: 200ms;
+	--motion-fast: 120ms var(--ease-out);
+	--motion-base: 200ms var(--ease-out);
 
 	/* Z-index scale */
 	--z-base: 1;
@@ -33,67 +53,155 @@
 	--z-toast: 40;
 }
 
-/* Dark theme (default) */
+/* ============================================================
+   DARK THEME (default) — Linear DNA
+   ============================================================ */
 :root,
 :root[data-theme='dark'] {
 	color-scheme: dark;
 
-	--bg-primary: #0d0d0d;
-	--bg-secondary: #1a1a1a;
-	--bg-tertiary: #262626;
+	/* Canvas stack — near-black, 4-step range */
+	--canvas-base: #0e0e10;
+	--canvas-raised: #141416;
+	--canvas-overlay: #1a1a1e;
+	--canvas-float: #222228;
 
-	--text-primary: #f5f5f5;
-	--text-secondary: #a3a3a3;
-	--text-muted: #737373;
+	/* Legacy bg-* aliases (existing callers) → mapped onto canvas stack */
+	--bg-primary: #0e0e10;
+	--bg-secondary: #141416;
+	--bg-tertiary: #222228;
+	--surface: #1a1a1e;
+	--surface-hover: #222228;
 
-	--accent: #3b82f6;
-	--accent-hover: #2563eb;
-	--accent-fg: #ffffff;
+	/* Borders — inset white-alpha, 3 levels */
+	--border-subtle: rgba(255, 255, 255, 0.055);
+	--border-default: rgba(255, 255, 255, 0.09);
+	--border-strong: rgba(255, 255, 255, 0.16);
+	/* Legacy border aliases */
+	--border: rgba(255, 255, 255, 0.09);
+	--border-hover: rgba(255, 255, 255, 0.16);
 
-	--surface: #171717;
-	--surface-hover: #262626;
+	/* Text — 4 levels */
+	--text-primary: #f0f0f2;
+	--text-secondary: #8a8a9a;
+	--text-tertiary: #5c5c6e;
+	--text-disabled: #3a3a48;
+	--text-muted: #5c5c6e; /* legacy alias → tertiary */
 
-	--border: #333333;
-	--border-hover: #525252;
+	/* Accent — single acid-lime, rationed to ONE action per screen */
+	--accent: #c6f135;
+	--accent-dim: rgba(198, 241, 53, 0.12);
+	--accent-hover: #d4ff3d;
+	--accent-fg: #0e0e10; /* text/icon on top of accent fill */
+	--accent-ink: #c6f135; /* lime-on-canvas for text/links (dark: same) */
 
-	--error: #ef4444;
-	--error-bg: rgba(239, 68, 68, 0.1);
-	--warning: #f59e0b;
-	--success: #10b981;
-	--info: #6366f1;
+	/* Semantic states (base / bg / text triplets) */
+	--state-done: #3d9b5c;
+	--state-done-bg: rgba(61, 155, 92, 0.1);
+	--state-done-text: #6dbe8c;
+	--state-running: #e8a838;
+	--state-running-bg: rgba(232, 168, 56, 0.1);
+	--state-running-text: #f0bc5e;
+	--state-error: #e05252;
+	--state-error-bg: rgba(224, 82, 82, 0.1);
+	--state-error-text: #f07070;
+	/* Legacy single-color aliases */
+	--success: #3d9b5c;
+	--warning: #e8a838;
+	--error: #e05252;
+	--error-bg: rgba(224, 82, 82, 0.1);
+	--info: #7878b0;
+
+	/* Reasoning — muted indigo-tinted */
+	--reasoning-border: rgba(120, 120, 220, 0.18);
+	--reasoning-bg: rgba(100, 100, 200, 0.05);
+	--reasoning-text: #7878b0;
+
+	/* User message — acid-lime tinted bubble */
+	--user-bg: rgba(198, 241, 53, 0.06);
+	--user-border: rgba(198, 241, 53, 0.18);
+
+	/* Param syntax highlight (tool JSON) */
+	--syntax-key: #7b9bd8;
+	--syntax-str: #a8d68a;
+	--syntax-num: #e8a838;
 
 	--shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.3);
 	--shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4);
 	--shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.5);
 }
 
-/* Light theme */
+/* ============================================================
+   LIGHT THEME — acid-lime language tuned for a paper canvas.
+   Lime is darkened on light surfaces so it never floats.
+   ============================================================ */
 :root[data-theme='light'] {
 	color-scheme: light;
 
+	/* Canvas stack — white → light grey, 4-step range */
+	--canvas-base: #ffffff;
+	--canvas-raised: #f7f7f5;
+	--canvas-overlay: #f1f1ee;
+	--canvas-float: #e8e8e4;
+
 	--bg-primary: #ffffff;
-	--bg-secondary: #fafafa;
-	--bg-tertiary: #f5f5f5;
-
-	--text-primary: #171717;
-	--text-secondary: #525252;
-	--text-muted: #737373;
-
-	--accent: #2563eb;
-	--accent-hover: #1d4ed8;
-	--accent-fg: #ffffff;
-
+	--bg-secondary: #f7f7f5;
+	--bg-tertiary: #e8e8e4;
 	--surface: #ffffff;
-	--surface-hover: #f5f5f5;
+	--surface-hover: #f1f1ee;
 
-	--border: #e5e5e5;
-	--border-hover: #d4d4d4;
+	/* Borders — inset black-alpha, 3 levels */
+	--border-subtle: rgba(0, 0, 0, 0.06);
+	--border-default: rgba(0, 0, 0, 0.1);
+	--border-strong: rgba(0, 0, 0, 0.18);
+	--border: rgba(0, 0, 0, 0.1);
+	--border-hover: rgba(0, 0, 0, 0.18);
 
-	--error: #dc2626;
-	--error-bg: rgba(220, 38, 38, 0.1);
-	--warning: #d97706;
-	--success: #059669;
-	--info: #4f46e5;
+	/* Text — 4 levels */
+	--text-primary: #1a1a1e;
+	--text-secondary: #55555f;
+	--text-tertiary: #85858f;
+	--text-disabled: #b0b0b8;
+	--text-muted: #85858f;
+
+	/* Accent — darkened lime so text/borders read on light bg.
+	   --accent stays vivid for fills (button bg); --accent-ink is the
+	   darkened variant for text/links/icons on light surfaces. */
+	--accent: #a6cc1f;
+	--accent-dim: rgba(140, 175, 20, 0.14);
+	--accent-hover: #93b815;
+	--accent-fg: #1a1a1e; /* dark text on lime fill */
+	--accent-ink: #5f7a0f; /* lime-on-light for text/links */
+
+	/* Semantic states — deeper for light-bg contrast */
+	--state-done: #2f8a4d;
+	--state-done-bg: rgba(47, 138, 77, 0.1);
+	--state-done-text: #2f8a4d;
+	--state-running: #c0851a;
+	--state-running-bg: rgba(192, 133, 26, 0.12);
+	--state-running-text: #9c6a14;
+	--state-error: #cc3b3b;
+	--state-error-bg: rgba(204, 59, 59, 0.1);
+	--state-error-text: #cc3b3b;
+	--success: #2f8a4d;
+	--warning: #c0851a;
+	--error: #cc3b3b;
+	--error-bg: rgba(204, 59, 59, 0.1);
+	--info: #5b5bbf;
+
+	/* Reasoning */
+	--reasoning-border: rgba(90, 90, 190, 0.22);
+	--reasoning-bg: rgba(90, 90, 190, 0.05);
+	--reasoning-text: #5b5bbf;
+
+	/* User message */
+	--user-bg: rgba(140, 175, 20, 0.1);
+	--user-border: rgba(140, 175, 20, 0.28);
+
+	/* Param syntax highlight */
+	--syntax-key: #3a5fa8;
+	--syntax-str: #4d8a2f;
+	--syntax-num: #9c6a14;
 
 	--shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.08);
 	--shadow-md: 0 4px 12px rgba(0, 0, 0, 0.1);
@@ -104,5 +212,7 @@
 	:root {
 		--motion-fast: 0s;
 		--motion-base: 0s;
+		--dur-fast: 0s;
+		--dur-std: 0s;
 	}
 }

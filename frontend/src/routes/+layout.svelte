@@ -3,6 +3,7 @@
 	import '$lib/styles/global.css';
 	import { page } from '$app/state';
 	import { onMount } from 'svelte';
+	import { currentSession } from '$lib/stores/currentSession';
 
 	let { children } = $props();
 
@@ -30,128 +31,309 @@
 		theme = stored ?? (prefersDark ? 'dark' : 'light');
 		document.documentElement.setAttribute('data-theme', theme);
 	});
+
+	/** Short workspace label: last two path segments, full path on hover. */
+	function wsLabel(ws: string): string {
+		const parts = ws.split('/').filter(Boolean);
+		return parts.length > 2 ? '…/' + parts.slice(-2).join('/') : ws;
+	}
 </script>
 
 <div class="shell">
-	<nav class="sidebar">
-		<div class="brand">ominiforge</div>
-		<ul>
+	<aside class="sidebar">
+		<div class="sidebar-brand">
+			<div class="brand-mark">
+				<svg viewBox="0 0 12 12" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+					<rect x="1" y="7" width="10" height="2" rx="0.5" />
+					<path d="M3 7V3.5C3 2.7 3.7 2 5 2h2c1.3 0 2 .7 2 1.5V7" />
+					<rect x="5" y="4" width="2" height="3" />
+				</svg>
+			</div>
+			<span class="brand-name">ominiforge</span>
+		</div>
+
+		<nav class="sidebar-section">
+			<div class="sidebar-label">Nav</div>
 			{#each nav as item (item.href)}
-				<li>
-					<a href={item.href} class:active={active(item.href)}>{item.label}</a>
-				</li>
+				<a href={item.href} class="nav-item" class:active={active(item.href)}>
+					<span class="nav-dot"></span>
+					{item.label}
+				</a>
 			{/each}
-		</ul>
-		<button class="theme-toggle" onclick={toggleTheme} title="切换主题">
-			{#if theme === 'dark'}
-				<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-					<circle cx="12" cy="12" r="4"/>
-					<path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32l1.41 1.41M2 12h2m16 0h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/>
-				</svg>
-			{:else}
-				<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-					<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
-				</svg>
-			{/if}
-		</button>
-	</nav>
-	<main>
+		</nav>
+
+		<div class="sidebar-spacer"></div>
+
+		{#if $currentSession}
+			{@const s = $currentSession}
+			<div class="sidebar-runtime">
+				<div class="sidebar-label">Runtime</div>
+
+				{#if s.workspace}
+					<div class="rt-entry">
+						<div class="rt-label">Workspace</div>
+						<div class="rt-value" title={s.workspace}>{wsLabel(s.workspace)}</div>
+					</div>
+				{/if}
+
+				<!-- ENV: detected env tools (nix/cargo/…) — needs backend support (Phase B2); hidden until available -->
+				<!-- MODEL: resolved provider·model — needs backend support (Phase B1); hidden until available -->
+
+				{#if s.profile_id}
+					<div class="rt-entry">
+						<div class="rt-label">Profile</div>
+						<div class="rt-value">{s.profile_id}</div>
+					</div>
+				{/if}
+			</div>
+		{/if}
+
+		<div class="sidebar-bottom">
+			<button class="theme-btn" onclick={toggleTheme} title="切换主题">
+				{#if theme === 'dark'}
+					<svg width="11" height="11" viewBox="0 0 11 11" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">
+						<circle cx="5.5" cy="5.5" r="2.2" />
+						<line x1="5.5" y1="0.5" x2="5.5" y2="1.8" />
+						<line x1="5.5" y1="9.2" x2="5.5" y2="10.5" />
+						<line x1="0.5" y1="5.5" x2="1.8" y2="5.5" />
+						<line x1="9.2" y1="5.5" x2="10.5" y2="5.5" />
+						<line x1="2" y1="2" x2="2.9" y2="2.9" />
+						<line x1="8.1" y1="8.1" x2="9" y2="9" />
+						<line x1="2" y1="9" x2="2.9" y2="8.1" />
+						<line x1="8.1" y1="2.9" x2="9" y2="2" />
+					</svg>
+					Light
+				{:else}
+					<svg width="11" height="11" viewBox="0 0 11 11" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">
+						<path d="M9.5 6.2A4 4 0 1 1 4.8 1.5 3.1 3.1 0 0 0 9.5 6.2z" />
+					</svg>
+					Dark
+				{/if}
+			</button>
+		</div>
+	</aside>
+
+	<main class="main">
 		{@render children()}
 	</main>
 </div>
 
 <style>
 	.shell {
-		display: grid;
-		grid-template-columns: 220px 1fr;
+		display: flex;
+		width: 100vw;
 		height: 100vh;
+		overflow: hidden;
 	}
 
 	.sidebar {
-		background: var(--bg-secondary);
-		border-right: 1px solid var(--border);
-		padding: var(--gap-xl) var(--gap-md);
+		width: var(--sidebar-width);
+		min-width: var(--sidebar-width);
+		height: 100%;
+		background: var(--canvas-raised);
+		border-right: 1px solid var(--border-subtle);
 		display: flex;
 		flex-direction: column;
-		gap: var(--gap-xl);
+		padding: var(--space-4) 0;
 	}
 
-	.brand {
-		font-weight: 600;
-		font-size: 20px;
-		color: var(--text-primary);
-		padding: var(--gap-sm) var(--gap-md);
-		letter-spacing: -0.01em;
-	}
-
-	.sidebar ul {
-		list-style: none;
+	.sidebar-brand {
+		padding: var(--space-3) var(--space-4) var(--space-4);
 		display: flex;
-		flex-direction: column;
-		gap: var(--gap-xs);
-		flex: 1;
+		align-items: center;
+		gap: var(--space-2);
 	}
 
-	.sidebar a {
-		display: block;
-		padding: var(--gap-sm) var(--gap-md);
-		color: var(--text-secondary);
-		font-size: 14px;
-		font-weight: 500;
-		border-radius: var(--radius-md);
-		transition: all var(--motion-fast);
-	}
-
-	.sidebar a:hover {
-		background: var(--surface-hover);
-		color: var(--text-primary);
-	}
-
-	.sidebar a.active {
-		background: var(--surface);
-		color: var(--accent);
-		font-weight: 600;
-	}
-
-	.theme-toggle {
-		margin-top: auto;
-		padding: var(--gap-sm) var(--gap-md);
-		color: var(--text-secondary);
-		border-radius: var(--radius-md);
-		transition: all var(--motion-fast);
+	.brand-mark {
+		width: 22px;
+		height: 22px;
+		background: var(--accent);
+		border-radius: var(--radius-sm);
 		display: flex;
 		align-items: center;
 		justify-content: center;
+		flex-shrink: 0;
 	}
 
-	.theme-toggle:hover {
-		background: var(--surface-hover);
+	.brand-mark svg {
+		width: 12px;
+		height: 12px;
+		fill: var(--accent-fg);
+	}
+
+	.brand-name {
+		font-size: 13px;
+		font-weight: 590;
 		color: var(--text-primary);
+		letter-spacing: -0.02em;
 	}
 
-	main {
-		overflow-y: auto;
-		padding: var(--gap-2xl);
+	.sidebar-section {
+		padding: var(--space-3) var(--space-3) var(--space-1);
+	}
+
+	.sidebar-label {
+		font-size: 10.5px;
+		font-weight: 510;
+		color: var(--text-tertiary);
+		letter-spacing: 0.07em;
+		text-transform: uppercase;
+		padding: 0 var(--space-1);
+		margin-bottom: var(--space-2);
+	}
+
+	.nav-item {
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+		padding: 5px var(--space-2);
+		border-radius: var(--radius-sm);
+		color: var(--text-secondary);
+		font-size: 12.5px;
+		font-weight: 450;
+		transition:
+			color var(--dur-fast) var(--ease-out),
+			background var(--dur-fast) var(--ease-out);
+		margin-bottom: 1px;
+		text-decoration: none;
+	}
+
+	.nav-item:hover {
+		color: var(--text-primary);
+		background: var(--surface-hover);
+	}
+
+	.nav-item.active {
+		color: var(--text-primary);
+		background: var(--surface-hover);
+		font-weight: 510;
+	}
+
+	.nav-dot {
+		width: 5px;
+		height: 5px;
+		border-radius: 50%;
+		background: var(--text-disabled);
+		flex-shrink: 0;
+		transition: background var(--dur-fast) var(--ease-out);
+	}
+
+	.nav-item.active .nav-dot {
+		background: var(--accent);
+	}
+
+	.sidebar-spacer {
+		flex: 1;
+	}
+
+	/* RUNTIME — current session context, hidden when not on a session page */
+	.sidebar-runtime {
+		padding: var(--space-3) var(--space-3) var(--space-2);
+		border-top: 1px solid var(--border-subtle);
+	}
+
+	.rt-entry {
+		padding: 0 var(--space-1);
+		margin-bottom: var(--space-3);
+	}
+
+	.rt-entry:last-child {
+		margin-bottom: 0;
+	}
+
+	.rt-label {
+		font-family: var(--font-mono);
+		font-size: 9.5px;
+		font-weight: 510;
+		color: var(--text-tertiary);
+		letter-spacing: 0.09em;
+		text-transform: uppercase;
+		margin-bottom: 2px;
+		line-height: 1;
+	}
+
+	.rt-value {
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--text-secondary);
+		line-height: 1.4;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		max-width: 100%;
+	}
+
+	.sidebar-bottom {
+		padding: var(--space-3) var(--space-4) 0;
+		border-top: 1px solid var(--border-subtle);
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+		margin-top: var(--space-3);
+	}
+
+	.theme-btn {
+		display: flex;
+		align-items: center;
+		gap: var(--space-1);
+		padding: 4px var(--space-2);
+		border-radius: var(--radius-sm);
+		border: 1px solid var(--border-default);
+		background: transparent;
+		color: var(--text-tertiary);
+		font-size: 11px;
+		cursor: pointer;
+		transition: all var(--dur-fast) var(--ease-out);
+	}
+
+	.theme-btn:hover {
+		color: var(--text-secondary);
+		border-color: var(--border-strong);
+	}
+
+	.main {
+		flex: 1;
+		display: flex;
+		flex-direction: column;
+		height: 100%;
+		overflow: hidden;
+		min-width: 0;
 	}
 
 	@media (max-width: 768px) {
 		.shell {
-			grid-template-columns: 1fr;
-			grid-template-rows: auto 1fr;
+			flex-direction: column;
 		}
 		.sidebar {
+			width: 100%;
+			min-width: 0;
+			height: auto;
 			flex-direction: row;
 			align-items: center;
-			padding: var(--gap-md);
+			padding: var(--space-2) var(--space-3);
 			border-right: none;
-			border-bottom: 1px solid var(--border);
+			border-bottom: 1px solid var(--border-subtle);
 		}
-		.sidebar ul {
+		.sidebar-brand {
+			padding: 0 var(--space-3) 0 0;
+		}
+		.sidebar-section {
+			display: flex;
+			align-items: center;
+			gap: var(--space-1);
+			padding: 0;
 			flex-direction: row;
-			gap: var(--gap-sm);
 		}
-		main {
-			padding: var(--gap-lg);
+		.sidebar-section .sidebar-label {
+			display: none;
+		}
+		.sidebar-runtime {
+			display: none;
+		}
+		.sidebar-bottom {
+			border-top: none;
+			margin-top: 0;
+			padding: 0;
 		}
 	}
 </style>

@@ -73,6 +73,7 @@
 	onMount(loadSessions);
 </script>
 
+<div class="page">
 <header>
 	<h1>Monitor</h1>
 	{#if sessionIds.length > 0}
@@ -159,8 +160,15 @@
 		</section>
 	{/if}
 {/if}
+</div>
 
 <style>
+	.page {
+		height: 100%;
+		overflow-y: auto;
+		padding: var(--space-8) var(--space-10);
+	}
+
 	header {
 		display: flex;
 		align-items: center;
