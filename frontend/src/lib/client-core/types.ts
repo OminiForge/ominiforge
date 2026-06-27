@@ -5,6 +5,7 @@
 import type { SessionMeta } from '$lib/types/SessionMeta';
 import type { GatewayEvent } from '$lib/types/GatewayEvent';
 import type { SessionSummary } from '$lib/types/SessionSummary';
+import type { RuntimeInfo } from '$lib/types/RuntimeInfo';
 
 /** Handle to a live event subscription; call `close()` to detach. */
 export interface EventSubscription {
@@ -36,6 +37,8 @@ export interface SessionClient {
 	compact(id: string, keepLast?: number): Promise<void>;
 	/** Derived monitor metrics for one session (folded from its committed event log). */
 	getSummary(id: string): Promise<SessionSummary>;
+	/** Config-layer provider/model the gateway resolves for this session (RUNTIME panel). */
+	getRuntime(id: string): Promise<RuntimeInfo>;
 	/**
 	 * Subscribe to a session's events. The transport replays committed events
 	 * after `lastSeq` from the durable log, then attaches the live stream

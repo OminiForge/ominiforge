@@ -97,6 +97,7 @@ fn router(state: AppState) -> Router {
         .route("/sessions/{id}/cancel", post(cancel_turn))
         .route("/sessions/{id}/compact", post(compact_session))
         .route("/sessions/{id}/summary", get(session_summary))
+        .route("/sessions/{id}/runtime", get(session_runtime))
         .route("/sessions/{id}/events", get(sse_events))
         .route("/sessions/{id}/ws", get(ws_events))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
@@ -265,8 +266,24 @@ async fn session_summary(State(state): State<AppState>, Path(id): Path<String>) 
     }
 }
 
-/// `GET /sessions/{id}/events` — SSE stream. Replays committed events after
-/// `Last-Event-ID` from the log, then attaches the live stream.
+/// `GET /sessions/{id}/runtime` — the config-layer provider/model the gateway
+/// resolves for this session (the RUNTIME panel's display source). Derived from
+/// the session's profile via config, not from the live event stream, so it
+/// stays stable across subagent/fork model switches (`doc/frontend.md`, B1).
+async fn session_runtime(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let sid = SessionId(id);
+    // Establish the session exists (404 otherwise), then read its configured
+    // profile to resolve the model. A resolve failure is a server-side config
+    // problem (500), not a missing session.
+    let meta = match state.registry.meta(&sid) {
+        Ok(meta) => meta,
+        Err(e) => return not_found(&e),
+    };
+    match state.registry.runtime_info(meta.profile_id.as_deref()) {
+        Ok(info) => Json(info).into_response(),
+        Err(e) => internal_error(&e),
+    }
+}
 async fn sse_events(
     State(state): State<AppState>,
     Path(id): Path<String>,

@@ -9,7 +9,7 @@
 	import type { EventSubscription } from '$lib/client-core';
 	import type { SessionMeta } from '$lib/types/SessionMeta';
 	import { apply, emptyState, type ConversationState, type Item } from '$lib/conversation';
-	import { currentSession } from '$lib/stores/currentSession';
+	import { currentSession, currentRuntime } from '$lib/stores/currentSession';
 
 	/** Sentinel id for a not-yet-created (draft) session. Reaching `/sessions/new`
 	 *  shows an empty conversation; the real session is created lazily on the
@@ -61,6 +61,14 @@
 		} catch {
 			/* RUNTIME panel just stays empty; conversation still works. */
 		}
+		// Resolve the config-layer model independently: a runtime failure must not
+		// blank the meta we just loaded, and a stale value must not linger, so it
+		// owns its own try/clear.
+		try {
+			currentRuntime.set(await client.getRuntime(id));
+		} catch {
+			currentRuntime.set(null);
+		}
 	}
 
 	function subscribe(id: string) {
@@ -101,6 +109,7 @@
 			convo = emptyState();
 			collapsed = {};
 			currentSession.set(null);
+			currentRuntime.set(null);
 			return;
 		}
 		subscribe(id);
@@ -112,6 +121,7 @@
 		// Clear so the sidebar RUNTIME panel doesn't leak this session's context
 		// onto the list / monitor / evolution pages.
 		currentSession.set(null);
+		currentRuntime.set(null);
 	});
 
 	async function send() {

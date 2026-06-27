@@ -20,10 +20,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
+use serde::Serialize;
 use tokio::sync::Mutex;
 
 use crate::agent::SessionRuntime;
 use crate::app::{self, Assembled};
+use crate::config::ConfigStore;
 use crate::core::SessionId;
 use crate::llm::Message;
 use crate::session::{SessionMeta, SessionStore};
@@ -43,6 +45,20 @@ pub struct SessionDefaults {
     pub profile: String,
     /// Whether to skip `.env` autoloading (already loaded at server startup).
     pub no_dotenv: bool,
+}
+
+/// The config-layer model identity for a session: the provider and model the
+/// gateway resolves for it (`doc/frontend.md`, RUNTIME panel). This is the
+/// *configured* selection — stable for the session's lifetime — not whatever a
+/// given model request happened to use (subagents/forks may differ; that
+/// divergence is a runtime-validation concern, not this display source).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
+pub struct RuntimeInfo {
+    /// Provider name (e.g. `openai-main`).
+    pub provider: String,
+    /// Model id sent to the API (e.g. `gpt-4o`).
+    pub model: String,
 }
 
 /// Owns the live actors and the defaults used to spawn new ones.
@@ -97,6 +113,37 @@ impl SessionRegistry {
         self.store()
             .read_meta(id)
             .with_context(|| format!("failed to read session `{}`", id.0))
+    }
+
+    /// Resolve the config-layer provider/model for `profile_id` (the gateway's
+    /// default profile when `None`). This is the *configured* selection the
+    /// RUNTIME panel displays — read straight from config (providers + profile +
+    /// resolve), deliberately **not** through [`app::assemble`], which would also
+    /// spawn this profile's MCP subprocesses. Resolving is two small TOML reads;
+    /// a display GET must not pay the assembly cost.
+    ///
+    /// # Errors
+    /// [`anyhow::Error`] if config is unreadable or the profile/model cannot be
+    /// resolved (no model named, unknown provider, missing api key).
+    pub fn runtime_info(&self, profile_id: Option<&str>) -> Result<RuntimeInfo> {
+        let workspace = &self.inner.defaults.workspace;
+        let profile_name = profile_id.unwrap_or(&self.inner.defaults.profile);
+
+        let store = ConfigStore::discover(workspace);
+        let providers = store
+            .load_providers()
+            .context("failed to load providers.toml")?;
+        let profile = store
+            .load_profile(profile_name)
+            .with_context(|| format!("failed to load profile `{profile_name}`"))?;
+        let resolved = store
+            .resolve(&providers, &profile, None, None)
+            .context("failed to resolve model selection")?;
+
+        Ok(RuntimeInfo {
+            provider: resolved.provider_name,
+            model: resolved.model_id,
+        })
     }
 
     /// Get the live actor for `id`, spawning one if the session is cold. The

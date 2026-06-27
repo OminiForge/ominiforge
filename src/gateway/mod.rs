@@ -27,5 +27,5 @@ mod registry;
 mod server;
 
 pub use config::GatewayConfig;
-pub use registry::{SessionDefaults, SessionRegistry};
+pub use registry::{RuntimeInfo, SessionDefaults, SessionRegistry};
 pub use server::serve;

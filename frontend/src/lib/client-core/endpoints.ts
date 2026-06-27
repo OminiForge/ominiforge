@@ -13,6 +13,7 @@ export const endpoints = {
 	cancel: (id: string) => `${API}/sessions/${encodeURIComponent(id)}/cancel`,
 	compact: (id: string) => `${API}/sessions/${encodeURIComponent(id)}/compact`,
 	summary: (id: string) => `${API}/sessions/${encodeURIComponent(id)}/summary`,
+	runtime: (id: string) => `${API}/sessions/${encodeURIComponent(id)}/runtime`,
 	events: (id: string) => `${API}/sessions/${encodeURIComponent(id)}/events`,
 	ws: (id: string) => `${API}/sessions/${encodeURIComponent(id)}/ws`
 } as const;

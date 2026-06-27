@@ -9,6 +9,7 @@
 import type { SessionMeta } from '$lib/types/SessionMeta';
 import type { GatewayEvent } from '$lib/types/GatewayEvent';
 import type { SessionSummary } from '$lib/types/SessionSummary';
+import type { RuntimeInfo } from '$lib/types/RuntimeInfo';
 import { endpoints } from './endpoints';
 import type { EventHandlers, EventSubscription, SessionClient } from './types';
 
@@ -99,6 +100,10 @@ export class GatewayTransport implements SessionClient {
 
 	getSummary(id: string): Promise<SessionSummary> {
 		return this.#json<SessionSummary>(endpoints.summary(id));
+	}
+
+	getRuntime(id: string): Promise<RuntimeInfo> {
+		return this.#json<RuntimeInfo>(endpoints.runtime(id));
 	}
 
 	subscribeEvents(id: string, handlers: EventHandlers, lastSeq?: number): EventSubscription {

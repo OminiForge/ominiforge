@@ -3,7 +3,7 @@
 	import '$lib/styles/global.css';
 	import { page } from '$app/state';
 	import { onMount } from 'svelte';
-	import { currentSession } from '$lib/stores/currentSession';
+	import { currentSession, currentRuntime } from '$lib/stores/currentSession';
 
 	let { children } = $props();
 
@@ -77,7 +77,15 @@
 				{/if}
 
 				<!-- ENV: detected env tools (nix/cargo/…) — needs backend support (Phase B2); hidden until available -->
-				<!-- MODEL: resolved provider·model — needs backend support (Phase B1); hidden until available -->
+
+				{#if $currentRuntime}
+					<div class="rt-entry">
+						<div class="rt-label">Model</div>
+						<div class="rt-value" title={`${$currentRuntime.provider} · ${$currentRuntime.model}`}>
+							{$currentRuntime.model}
+						</div>
+					</div>
+				{/if}
 
 				{#if s.profile_id}
 					<div class="rt-entry">
