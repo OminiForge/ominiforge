@@ -8,7 +8,6 @@
 	let sessions = $state<SessionMeta[]>([]);
 	let loading = $state(true);
 	let error = $state<string | null>(null);
-	let creating = $state(false);
 
 	async function refresh() {
 		loading = true;
@@ -23,16 +22,11 @@
 		}
 	}
 
-	async function create() {
-		creating = true;
-		error = null;
-		try {
-			const id = await client.createSession();
-			await goto(`/sessions/${id}`);
-		} catch (e) {
-			error = e instanceof Error ? e.message : String(e);
-			creating = false;
-		}
+	function create() {
+		// Don't create the session yet — open a draft conversation. The real
+		// session is created lazily on the first send (see sessions/[id]), so
+		// merely clicking "New session" never leaves an empty session behind.
+		void goto('/sessions/new');
 	}
 
 	function formatTime(iso: string): string {
@@ -67,9 +61,7 @@
 <div class="page">
 	<header>
 		<h1>Sessions</h1>
-		<Button variant="accent" disabled={creating} onclick={create}>
-			{creating ? 'Creating…' : 'New session'}
-		</Button>
+		<Button variant="accent" onclick={create}>New session</Button>
 	</header>
 
 	{#if error}

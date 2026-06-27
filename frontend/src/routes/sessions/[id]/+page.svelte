@@ -2,6 +2,7 @@
 	import { onDestroy } from 'svelte';
 	import { browser } from '$app/environment';
 	import { page } from '$app/state';
+	import { goto, replaceState } from '$app/navigation';
 	import { marked } from 'marked';
 	import DOMPurify from 'dompurify';
 	import { client } from '$lib/client';
@@ -9,6 +10,12 @@
 	import type { SessionMeta } from '$lib/types/SessionMeta';
 	import { apply, emptyState, type ConversationState, type Item } from '$lib/conversation';
 	import { currentSession } from '$lib/stores/currentSession';
+
+	/** Sentinel id for a not-yet-created (draft) session. Reaching `/sessions/new`
+	 *  shows an empty conversation; the real session is created lazily on the
+	 *  first send, so merely opening a draft never litters the store with empty
+	 *  sessions. The backend never mints `new` as a real id, so it can't clash. */
+	const DRAFT_ID = 'new';
 
 	/** When the user is within this many pixels from the bottom we consider
 	 *  them "at the bottom" and auto-scroll on new content. This tolerance
@@ -28,6 +35,8 @@
 	let shouldAutoScroll = $state(true);
 	// Track collapsed state for reasoning items separately (index → collapsed)
 	let collapsed = $state<Record<number, boolean>>({});
+
+	const isDraft = $derived(sessionId === DRAFT_ID);
 
 	/** Returns `true` when the element is scrolled close enough to the bottom. */
 	function isNearBottom(el: HTMLElement): boolean {
@@ -85,6 +94,15 @@
 
 	$effect(() => {
 		const id = sessionId;
+		// Draft: show an empty conversation, don't subscribe or load meta. The
+		// real session doesn't exist yet — it's created on the first send().
+		if (id === DRAFT_ID) {
+			sub?.close();
+			convo = emptyState();
+			collapsed = {};
+			currentSession.set(null);
+			return;
+		}
 		subscribe(id);
 		void loadMeta(id);
 	});
@@ -102,7 +120,18 @@
 		sending = true;
 		error = null;
 		try {
-			await client.sendMessage(sessionId, text);
+			if (sessionId === DRAFT_ID) {
+				// Lazily create the real session on first send, then adopt its id.
+				// Setting sessionId drives the $effect to subscribe + load meta;
+				// replaceState swaps the URL without pushing a history entry (so
+				// Back doesn't return to the empty draft).
+				const realId = await client.createSession();
+				sessionId = realId;
+				replaceState(`/sessions/${realId}`, {});
+				await client.sendMessage(realId, text);
+			} else {
+				await client.sendMessage(sessionId, text);
+			}
 			input = '';
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
@@ -221,6 +250,7 @@
 	 *  be ideal, but we don't track titles yet — show a workspace-derived label
 	 *  or the session id. */
 	function topbarTitle(): string {
+		if (sessionId === DRAFT_ID) return 'New session';
 		if (meta?.workspace) {
 			const parts = meta.workspace.split('/').filter(Boolean);
 			return parts[parts.length - 1] ?? sessionId;
@@ -246,14 +276,20 @@
 		<span class="topbar-title">{topbarTitle()}</span>
 		<div class="topbar-sep"></div>
 		<div class="topbar-meta">
-			<span class="mono">{shortId(sessionId)}</span>
-			{#if incomplete}
-				<span class="topbar-badge badge-running">incomplete</span>
+			{#if isDraft}
+				<span class="mono draft-hint">draft · 发送后创建</span>
+			{:else}
+				<span class="mono">{shortId(sessionId)}</span>
+				{#if incomplete}
+					<span class="topbar-badge badge-running">incomplete</span>
+				{/if}
 			{/if}
 		</div>
-		<div class="topbar-actions">
-			<button class="topbar-btn" onclick={cancel}>Cancel</button>
-		</div>
+		{#if !isDraft}
+			<div class="topbar-actions">
+				<button class="topbar-btn" onclick={cancel}>Cancel</button>
+			</div>
+		{/if}
 	</div>
 
 	{#if error}
@@ -366,7 +402,7 @@
 			{/each}
 
 			{#if convo.items.length === 0}
-				<p class="empty">发送消息开始对话</p>
+				<p class="empty">{isDraft ? '输入消息，开始一段新对话' : '发送消息开始对话'}</p>
 			{/if}
 		</div>
 	</div>
@@ -386,13 +422,15 @@
 					<span class="input-status">
 						{#if incomplete}<span class="status-warn">Turn incomplete</span>{/if}
 					</span>
-					<button class="input-btn cancel" onclick={cancel}>
-						<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
-							<line x1="1" y1="1" x2="9" y2="9" />
-							<line x1="9" y1="1" x2="1" y2="9" />
-						</svg>
-						Cancel
-					</button>
+					{#if !isDraft}
+						<button class="input-btn cancel" onclick={cancel}>
+							<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+								<line x1="1" y1="1" x2="9" y2="9" />
+								<line x1="9" y1="1" x2="1" y2="9" />
+							</svg>
+							Cancel
+						</button>
+					{/if}
 					<button class="input-btn primary" disabled={sending} onclick={send}>
 						{sending ? 'Sending…' : 'Send'}
 						<kbd>↵</kbd>
@@ -474,6 +512,11 @@
 	.mono {
 		font-family: var(--font-mono);
 		font-variant-numeric: tabular-nums;
+	}
+
+	.draft-hint {
+		color: var(--text-tertiary);
+		font-family: var(--font-chinese);
 	}
 
 	.topbar-badge {
