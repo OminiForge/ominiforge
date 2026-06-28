@@ -9,7 +9,7 @@
 	import type { EventSubscription } from '$lib/client-core';
 	import type { SessionMeta } from '$lib/types/SessionMeta';
 	import { apply, emptyState, type ConversationState, type Item } from '$lib/conversation';
-	import { currentSession, currentRuntime } from '$lib/stores/currentSession';
+	import { currentSession, currentRuntime, currentRuntimeModels } from '$lib/stores/currentSession';
 
 	/** Sentinel id for a not-yet-created (draft) session. Reaching `/sessions/new`
 	 *  shows an empty conversation; the real session is created lazily on the
@@ -110,10 +110,18 @@
 			collapsed = {};
 			currentSession.set(null);
 			currentRuntime.set(null);
+			currentRuntimeModels.set([]);
 			return;
 		}
 		subscribe(id);
 		void loadMeta(id);
+	});
+
+	// Mirror the runtime-layer models the fold collected into the store the
+	// sidebar RUNTIME panel reads, so it can flag divergence from the configured
+	// model (B4). Reactive on convo so it tracks each new RequestStarted.
+	$effect(() => {
+		currentRuntimeModels.set([...convo.runtimeModels]);
 	});
 
 	onDestroy(() => {
@@ -122,6 +130,7 @@
 		// onto the list / monitor / evolution pages.
 		currentSession.set(null);
 		currentRuntime.set(null);
+		currentRuntimeModels.set([]);
 	});
 
 	async function send() {

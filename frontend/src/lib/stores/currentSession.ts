@@ -19,3 +19,15 @@ export const currentSession = writable<SessionMeta | null>(null);
  * [`currentSession`] so the two never disagree about which session is active.
  */
 export const currentRuntime = writable<RuntimeInfo | null>(null);
+
+/**
+ * Distinct models the current session's runtime layer actually used (from
+ * `RequestStarted` events, folded in `conversation.ts`). The RUNTIME panel
+ * compares these against the config-layer model ([`currentRuntime`]) and fails
+ * loud on divergence — a subagent/fork running a different model than the one
+ * configured (`doc/frontend.md` B4, CLAUDE.md #12). Empty off a session page.
+ *
+ * This is a *validation* source only; it never drives the displayed Model row,
+ * so that row stays stable while subagents switch models.
+ */
+export const currentRuntimeModels = writable<string[]>([]);

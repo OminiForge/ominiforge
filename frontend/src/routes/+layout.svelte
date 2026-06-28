@@ -3,7 +3,7 @@
 	import '$lib/styles/global.css';
 	import { page } from '$app/state';
 	import { onMount } from 'svelte';
-	import { currentSession, currentRuntime } from '$lib/stores/currentSession';
+	import { currentSession, currentRuntime, currentRuntimeModels } from '$lib/stores/currentSession';
 
 	let { children } = $props();
 
@@ -12,6 +12,17 @@
 		{ href: '/monitor', label: 'Monitor' },
 		{ href: '/evolution', label: 'Evolution' }
 	];
+
+	/** Runtime-layer models that diverge from the configured model: models a
+	 *  RequestStarted actually used that aren't the config-layer selection (a
+	 *  subagent/fork on a different model). Empty until the config model is known,
+	 *  so we never flag divergence we can't yet judge. Surfacing this is fail-loud
+	 *  (CLAUDE.md #12); the displayed Model row stays the stable config layer. */
+	const divergent = $derived(
+		$currentRuntime
+			? $currentRuntimeModels.filter((m) => m !== $currentRuntime!.model)
+			: []
+	);
 
 	let theme = $state<'light' | 'dark'>('dark');
 
@@ -90,6 +101,15 @@
 						<div class="rt-label">Model</div>
 						<div class="rt-value" title={`${$currentRuntime.provider} · ${$currentRuntime.model}`}>
 							{$currentRuntime.model}
+						</div>
+					</div>
+				{/if}
+
+				{#if divergent.length > 0}
+					<div class="rt-entry rt-warn">
+						<div class="rt-label rt-warn-label">⚠ Runtime</div>
+						<div class="rt-value rt-warn-value" title={`runtime used ${divergent.join(', ')}, configured ${$currentRuntime?.model}`}>
+							{divergent.join(' · ')} ≠ {$currentRuntime?.model}
 						</div>
 					</div>
 				{/if}
@@ -276,6 +296,16 @@
 		overflow: hidden;
 		text-overflow: ellipsis;
 		max-width: 100%;
+	}
+
+	/* Divergence marker: runtime model ≠ configured model (fail-loud, B4) */
+	.rt-warn-label {
+		color: var(--state-error-text);
+	}
+
+	.rt-warn-value {
+		color: var(--state-error-text);
+		white-space: normal;
 	}
 
 	.sidebar-bottom {

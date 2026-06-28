@@ -42,10 +42,18 @@ export interface ConversationState {
 	committedEnd?: number;
 	/** committed tool_call seq → items position, for pairing Tool::Completed */
 	toolSeqs: Map<number, number>;
+	/** Distinct models seen on the runtime layer: every model a `RequestStarted`
+	 *  actually used this session (deduplicated). The display source stays the
+	 *  config layer (`currentRuntime`); this is the *validation* source — a model
+	 *  here that isn't the configured one (a subagent/fork using something else)
+	 *  is surfaced as a fail-loud divergence, not silently shown (`doc/frontend.md`
+	 *  B4, CLAUDE.md #12). It deliberately does not drive the RUNTIME Model row,
+	 *  so that row never flickers as subagents switch models. */
+	runtimeModels: Set<string>;
 }
 
 export function emptyState(): ConversationState {
-	return { items: [], open: {}, toolSeqs: new Map() };
+	return { items: [], open: {}, toolSeqs: new Map(), runtimeModels: new Set() };
 }
 
 export function apply(state: ConversationState, ev: GatewayEvent): ConversationState {
@@ -81,9 +89,17 @@ function applyCommitted(
 	}
 	if ('Model' in payload) {
 		const m = payload.Model;
-		if ('RequestStarted' in m)
+		if ('RequestStarted' in m) {
+			// Record the runtime-layer model for divergence validation (B4). Clone
+			// the set only when this model is new, keeping the fold a pure reducer
+			// without churning allocations on every request.
+			const model = m.RequestStarted.model;
+			const runtimeModels = next.runtimeModels.has(model)
+				? next.runtimeModels
+				: new Set(next.runtimeModels).add(model);
 			return {
 				...next,
+				runtimeModels,
 				open: {},
 				// Use committedEnd (not items.length) so streaming items created
 				// before this late-arriving event are also truncated away.
@@ -91,6 +107,7 @@ function applyCommitted(
 				requestCommitted: false,
 				commitBase: undefined
 			};
+		}
 		if ('ContentBlock' in m)
 			return commitBlock(next, Number(core.seq), m.ContentBlock.content);
 		return next;

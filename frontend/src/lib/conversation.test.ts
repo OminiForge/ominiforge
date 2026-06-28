@@ -6,8 +6,8 @@ function fold(events: GatewayEvent[]): ConversationState {
 	return events.reduce(apply, emptyState());
 }
 
-/** Build a RequestStarted committed event. */
-function reqStarted(seq: number): GatewayEvent {
+/** Build a RequestStarted committed event. `model` defaults to 'm'. */
+function reqStarted(seq: number, model = 'm'): GatewayEvent {
 	return {
 		type: 'event',
 		schema_version: 'ominiforge.event.v1',
@@ -22,7 +22,7 @@ function reqStarted(seq: number): GatewayEvent {
 				RequestStarted: {
 					request_id: `r${seq}`,
 					provider: 'p',
-					model: 'm',
+					model,
 					temperature: 0,
 					max_tokens: null,
 					tool_schemas_count: 0,
@@ -440,5 +440,35 @@ describe('conversation fold', () => {
 		expect(items[1].kind).toBe('tool');
 		expect(items[2].kind).toBe('reasoning');
 		expect(items[3].kind).toBe('text');
+	});
+
+	// ── Runtime-layer model capture (B4) ───────────────────────────────
+	//
+	// The fold records every distinct model a RequestStarted used, so the UI can
+	// validate the runtime layer against the configured model and fail loud on
+	// divergence (a subagent/fork on a different model). The config layer remains
+	// the display source; this set is the validation source only.
+
+	it('runtime models: a single request records its model', () => {
+		const state = fold([reqStarted(1, 'sonnet')]);
+		expect([...state.runtimeModels]).toEqual(['sonnet']);
+	});
+
+	it('runtime models: repeated use of the same model is deduplicated', () => {
+		// Same model across rounds must not produce duplicates — the set is what
+		// the divergence check compares against, so duplicates would be noise.
+		const state = fold([reqStarted(1, 'sonnet'), reqStarted(2, 'sonnet'), reqStarted(3, 'sonnet')]);
+		expect([...state.runtimeModels]).toEqual(['sonnet']);
+	});
+
+	it('runtime models: distinct models are all captured (divergence is detectable)', () => {
+		// A subagent switching to haiku mid-session is exactly the case B4 must
+		// surface: both models present means the UI can flag haiku ≠ configured.
+		const state = fold([reqStarted(1, 'sonnet'), reqStarted(2, 'haiku'), reqStarted(3, 'sonnet')]);
+		expect([...state.runtimeModels].sort()).toEqual(['haiku', 'sonnet']);
+	});
+
+	it('runtime models: empty before any request', () => {
+		expect(emptyState().runtimeModels.size).toBe(0);
 	});
 });
