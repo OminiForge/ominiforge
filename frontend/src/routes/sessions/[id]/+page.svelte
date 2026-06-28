@@ -282,6 +282,9 @@
 	}
 
 	const incomplete = $derived(convo.lastSettle != null);
+	// Cancel only makes sense while a turn is running (the backend ignores Cancel
+	// when idle), so the button is shown only then — see ConversationState.turnRunning.
+	const turnRunning = $derived(convo.turnRunning === true);
 </script>
 
 <div class="conv-page">
@@ -304,11 +307,6 @@
 				{/if}
 			{/if}
 		</div>
-		{#if !isDraft}
-			<div class="topbar-actions">
-				<button class="topbar-btn" onclick={cancel}>Cancel</button>
-			</div>
-		{/if}
 	</div>
 
 	{#if error}
@@ -441,7 +439,7 @@
 					<span class="input-status">
 						{#if incomplete}<span class="status-warn">Turn incomplete</span>{/if}
 					</span>
-					{#if !isDraft}
+					{#if !isDraft && turnRunning}
 						<button class="input-btn cancel" onclick={cancel}>
 							<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
 								<line x1="1" y1="1" x2="9" y2="9" />
@@ -550,30 +548,6 @@
 		background: var(--state-running-bg);
 		color: var(--state-running-text);
 		border: 1px solid color-mix(in srgb, var(--state-running) 25%, transparent);
-	}
-
-	.topbar-actions {
-		margin-left: auto;
-		display: flex;
-		gap: var(--space-1);
-	}
-
-	.topbar-btn {
-		padding: 4px 10px;
-		border-radius: var(--radius-sm);
-		border: 1px solid var(--border-default);
-		background: transparent;
-		color: var(--text-secondary);
-		font-size: 11.5px;
-		font-weight: 450;
-		cursor: pointer;
-		transition: all var(--dur-fast) var(--ease-out);
-	}
-
-	.topbar-btn:hover {
-		background: var(--surface-hover);
-		color: var(--text-primary);
-		border-color: var(--border-strong);
 	}
 
 	.error-bar {

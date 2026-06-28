@@ -42,6 +42,18 @@ export interface ConversationState {
 	committedEnd?: number;
 	/** committed tool_call seq → items position, for pairing Tool::Completed */
 	toolSeqs: Map<number, number>;
+	/** Whether a turn is currently running. Driven last-write-wins by the turn
+	 *  lifecycle: committed `Turn::Started`/`Resumed` set it, committed
+	 *  `Completed`/`Failed`/`Interrupted` and live `turn_settled`/`notice`/
+	 *  `compacted` clear it. Folding committed turn events (not the live-only
+	 *  `TurnSettled`) is what lets it reconstruct correctly on history replay —
+	 *  a finished turn replays its committed `Completed`, so the flag lands
+	 *  `false`. Only the Cancel control reads it: cancel is meaningful solely
+	 *  while a turn runs (`src/gateway/actor.rs` ignores Cancel when idle), so
+	 *  the button hides otherwise. Known gap: a turn ended by Cancel aborts the
+	 *  task without persisting a terminator, so reloading such a session leaves
+	 *  this `true` (a stale Cancel that no-ops on click). */
+	turnRunning?: boolean;
 	/** Distinct models seen on the runtime layer: every model a `RequestStarted`
 	 *  actually used this session (deduplicated). The display source stays the
 	 *  config layer (`currentRuntime`); this is the *validation* source — a model
@@ -63,12 +75,13 @@ export function apply(state: ConversationState, ev: GatewayEvent): ConversationS
 		case 'turn_settled': return {
 			...state,
 			lastSettle: ev.incomplete,
+			turnRunning: false,
 			requestStart: undefined,
 			requestCommitted: undefined,
 			commitBase: undefined
 		};
-		case 'compacted':    return push(state, { kind: 'notice', message: `compacted → ${ev.new_session_id}` });
-		case 'notice':       return push(state, { kind: 'notice', message: ev.message });
+		case 'compacted':    return push({ ...state, turnRunning: false }, { kind: 'notice', message: `compacted → ${ev.new_session_id}` });
+		case 'notice':       return push({ ...state, turnRunning: false }, { kind: 'notice', message: ev.message });
 		default: return assertNever(ev);
 	}
 }
@@ -83,8 +96,15 @@ function applyCommitted(
 
 	if ('Turn' in payload) {
 		const t = payload.Turn;
-		if ('Started' in t && t.Started.input)
-			return push(next, { kind: 'user', text: t.Started.input });
+		if ('Started' in t) {
+			const started = { ...next, turnRunning: true };
+			return t.Started.input
+				? push(started, { kind: 'user', text: t.Started.input })
+				: started;
+		}
+		if ('Resumed' in t) return { ...next, turnRunning: true };
+		if ('Completed' in t || 'Failed' in t || 'Interrupted' in t)
+			return { ...next, turnRunning: false };
 		return next;
 	}
 	if ('Model' in payload) {

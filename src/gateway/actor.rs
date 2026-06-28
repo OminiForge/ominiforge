@@ -28,7 +28,8 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::agent::{Agent, BlockKind, SessionRuntime, StreamSink, TurnOutcome};
-use crate::core::{CoreEvent, SessionId};
+use crate::core::payload::TurnEvent;
+use crate::core::{CoreEvent, EventId, EventPayload, EventSource, SessionId, SourceKind, TurnId};
 use crate::llm::Message;
 use crate::session::{EventBus, SessionStore, SessionWriter};
 
@@ -348,13 +349,60 @@ impl SessionActor {
     /// task drops the writer (releasing the lock); awaiting the handle guarantees
     /// that drop has happened before we reopen. `None` means reopen failed and
     /// the actor stops.
+    ///
+    /// Before rebuilding, persist a `TurnEvent::Interrupted` for the open turn.
+    /// The abort tears the writer down without recording why the turn stopped, so
+    /// the log would otherwise end on a dangling `Turn::Started` — and a client
+    /// replaying that history (no live `TurnSettled` on reconnect) can't tell the
+    /// turn ended, leaving a turn-running UI (e.g. a stale Cancel button) stuck on.
+    /// Writing the committed terminator makes the stop durable. Reopening to append
+    /// is safe: the aborted task already released the lock.
     async fn cancel_turn(&self, handle: JoinHandle<TurnResult>) -> Option<Session> {
         handle.abort();
         let _ = handle.await;
         let _ = self.outbound.send(GatewayEvent::Notice {
             message: "turn cancelled".to_owned(),
         });
+        self.record_interrupted();
         self.reopen_after_abort()
+    }
+
+    /// Append a committed `TurnEvent::Interrupted` for the turn left open by an
+    /// abort.
+    ///
+    /// This makes the stop durable: history replay carries a turn terminator, so
+    /// a reconnecting client (which never re-sees the live `TurnSettled`) can tell
+    /// the turn ended. Best-effort — if the open turn can't be found or the write
+    /// fails, the session still reopens from the log; the worst case is the
+    /// pre-existing dangling-turn behavior, not a crash. The append publishes on
+    /// the bus, so live clients also receive the terminator (the forwarder turns
+    /// it into an outbound committed `Event`).
+    fn record_interrupted(&self) {
+        let events = self.store.read_events(&self.session_id).unwrap_or_default();
+        let Some(turn_id) = open_turn_id(&events) else {
+            return; // no turn open (already terminated) — nothing to record
+        };
+        let interrupted_at = EventId {
+            session_id: self.session_id.clone(),
+            seq: events.last().map_or(0, |e| e.seq),
+        };
+        // Reopen to append: the aborted task already released the writer lock.
+        if let Ok(writer) = self.store.open(&self.session_id) {
+            let mut writer = writer.with_bus(self.bus.clone());
+            let _ = writer.append(
+                EventSource {
+                    kind: SourceKind::Runtime,
+                    id: "ominiforge".to_owned(),
+                },
+                EventPayload::Turn(TurnEvent::Interrupted {
+                    turn_id: turn_id.clone(),
+                    interrupted_at_event_id: interrupted_at,
+                }),
+                None,
+                Some(turn_id),
+            );
+        }
+        // A reopen failure is surfaced by the reopen_after_abort that follows.
     }
 
     /// Reopen the current session and rebuild its runtime from the event log,
@@ -447,6 +495,24 @@ fn spawn_event_forwarder(bus: &EventBus, outbound: broadcast::Sender<GatewayEven
     });
 }
 
+/// The turn id left open at the tail of the log, if any. Turns never overlap, so
+/// the last turn-lifecycle event decides: a `Started`/`Resumed` with no following
+/// terminator means that turn is still open; a `Completed`/`Failed`/`Interrupted`
+/// means none is. Returns `None` when no turn is open (nothing to terminate).
+fn open_turn_id(events: &[CoreEvent]) -> Option<TurnId> {
+    events.iter().rev().find_map(|e| match &e.payload {
+        EventPayload::Turn(TurnEvent::Started { turn_id, .. } | TurnEvent::Resumed { turn_id, .. }) => {
+            Some(Some(turn_id.clone()))
+        }
+        EventPayload::Turn(
+            TurnEvent::Completed { .. }
+            | TurnEvent::Failed { .. }
+            | TurnEvent::Interrupted { .. },
+        ) => Some(None),
+        _ => None,
+    })?
+}
+
 /// A [`StreamSink`] that forwards each live delta onto the session's outbound
 /// broadcast as a [`GatewayEvent::Delta`].
 struct BroadcastSink {
@@ -507,6 +573,7 @@ mod tests {
     use crate::llm::{EventStream, LlmError, ModelRequest, Provider, StreamEvent};
     use crate::tool::ToolRegistry;
     use futures_util::stream;
+    use futures_util::StreamExt as _;
     use std::sync::Mutex;
 
     /// A provider that replays one scripted batch of stream events per `stream()`
@@ -651,5 +718,202 @@ mod tests {
             }
         }
         assert_eq!(settled, 2, "both queued turns should run and settle");
+    }
+
+    /// A provider whose stream never completes: it emits one text block then
+    /// parks forever, so the turn task is still running when we cancel it. This
+    /// is the precondition for the abort path (`cancel_turn`) — a finished turn
+    /// would have nothing to abort.
+    struct HangingProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for HangingProvider {
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn name(&self) -> &str {
+            "hanging"
+        }
+
+        async fn stream(&self, _request: ModelRequest) -> Result<EventStream, LlmError> {
+            let head = stream::iter(vec![
+                Ok(StreamEvent::BlockStart {
+                    index: 0,
+                    block_type: ContentBlockType::Text,
+                }),
+                Ok(StreamEvent::TextDelta {
+                    index: 0,
+                    text: "working".to_owned(),
+                }),
+            ]);
+            // Never yields again: the turn parks here until aborted.
+            let tail = stream::pending::<Result<StreamEvent, LlmError>>();
+            Ok(Box::pin(head.chain(tail)))
+        }
+    }
+
+    /// Cancelling a running turn must leave a durable terminator in the log.
+    /// Without it, replaying the session (which never re-sends the live
+    /// `TurnSettled`) ends on a dangling `Turn::Started`, so a client can't tell
+    /// the turn stopped and a turn-running UI stays stuck on. We assert the log's
+    /// last event is `Turn::Interrupted` for the turn that was open.
+    #[tokio::test]
+    async fn cancel_persists_interrupted_terminator() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let agent = Agent::new(
+            Arc::new(HangingProvider),
+            ToolRegistry::new(),
+            AgentConfig {
+                model: "mock".to_owned(),
+                ..AgentConfig::default()
+            },
+        );
+        let system = vec![Message::System {
+            content: "sys".to_owned(),
+        }];
+        let writer = store.create_new(None, None, vec![]).unwrap();
+        let sid = writer.session_id().clone();
+        let runtime = SessionRuntime::new(system.clone());
+        let handle = SessionActor::spawn(
+            Arc::new(agent),
+            store.clone(),
+            system,
+            (writer, runtime),
+            std::time::Duration::from_secs(3600),
+            Vec::new(),
+        );
+
+        let mut rx = handle.subscribe();
+        handle
+            .send(Command::Send {
+                text: "hi".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        // Wait until the turn is actually running (a committed Turn::Started has
+        // been forwarded) before cancelling, so there's a task to abort.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            assert!(tokio::time::Instant::now() < deadline, "turn never started");
+            if let Ok(Ok(GatewayEvent::Event { event })) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await
+            {
+                if matches!(event.payload, EventPayload::Turn(TurnEvent::Started { .. })) {
+                    break;
+                }
+            }
+        }
+
+        handle.send(Command::Cancel).await.unwrap();
+
+        // Poll the log until the committed Interrupted lands (the append happens
+        // after the abort completes, slightly after Cancel is accepted).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut last = None;
+        while tokio::time::Instant::now() < deadline {
+            let events = store.read_events(&sid).unwrap_or_default();
+            if let Some(e) = events.last() {
+                if matches!(e.payload, EventPayload::Turn(TurnEvent::Interrupted { .. })) {
+                    last = Some(e.payload.clone());
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        match last {
+            Some(EventPayload::Turn(TurnEvent::Interrupted { .. })) => {}
+            other => panic!("log should end with Turn::Interrupted, got {other:?}"),
+        }
+
+        // And the fold the frontend uses must read this log as a finished turn,
+        // i.e. open_turn_id finds nothing open after the terminator.
+        let events = store.read_events(&sid).unwrap();
+        assert_eq!(open_turn_id(&events), None, "turn must read as closed");
+    }
+
+    /// Build a committed event carrying `payload` at `seq` (test helper for the
+    /// open-turn scan; only seq + payload matter to `open_turn_id`).
+    fn ev(seq: u64, payload: EventPayload) -> CoreEvent {
+        CoreEvent {
+            schema_version: "ominiforge.event.v1".to_owned(),
+            seq,
+            session_id: SessionId("s".to_owned()),
+            timestamp: chrono::Utc::now(),
+            source: EventSource {
+                kind: SourceKind::Runtime,
+                id: "ominiforge".to_owned(),
+            },
+            parent_event_id: None,
+            turn_id: None,
+            payload,
+        }
+    }
+
+    fn started(seq: u64, id: &str) -> CoreEvent {
+        ev(
+            seq,
+            EventPayload::Turn(TurnEvent::Started {
+                turn_id: TurnId(id.to_owned()),
+                input: Some("hi".to_owned()),
+            }),
+        )
+    }
+
+    fn completed(seq: u64, id: &str) -> CoreEvent {
+        ev(
+            seq,
+            EventPayload::Turn(TurnEvent::Completed {
+                turn_id: TurnId(id.to_owned()),
+            }),
+        )
+    }
+
+    /// The open-turn scan underpins cancel's durable terminator: cancel must
+    /// know *which* turn to mark Interrupted, and must not double-terminate an
+    /// already-finished turn.
+
+    #[test]
+    fn open_turn_id_finds_the_dangling_started() {
+        // A Started with no following terminator — exactly the post-abort log.
+        let events = vec![started(1, "t1")];
+        assert_eq!(open_turn_id(&events), Some(TurnId("t1".to_owned())));
+    }
+
+    #[test]
+    fn open_turn_id_none_when_last_turn_completed() {
+        // A cleanly finished turn must not be re-terminated on a stray cancel.
+        let events = vec![started(1, "t1"), completed(2, "t1")];
+        assert_eq!(open_turn_id(&events), None);
+    }
+
+    #[test]
+    fn open_turn_id_tracks_the_latest_turn() {
+        // Turn 1 finished, turn 2 is open: the open one is what cancel terminates.
+        let events = vec![started(1, "t1"), completed(2, "t1"), started(3, "t2")];
+        assert_eq!(open_turn_id(&events), Some(TurnId("t2".to_owned())));
+    }
+
+    #[test]
+    fn open_turn_id_none_on_empty_log() {
+        assert_eq!(open_turn_id(&[]), None);
+    }
+
+    #[test]
+    fn open_turn_id_ignores_non_turn_tail_events() {
+        // A non-Turn event after Started (here an Error) doesn't close the turn —
+        // it's still open, so cancel still has a turn to terminate.
+        let err = EventPayload::Error(crate::core::payload::ErrorEvent::Raised(
+            crate::core::payload::ErrorDetail {
+                code: "x".to_owned(),
+                message: "boom".to_owned(),
+                severity: crate::core::payload::ErrorSeverity::Error,
+                retryable: false,
+                source_event_id: None,
+                provider_raw: None,
+            },
+        ));
+        let events = vec![started(1, "t1"), ev(2, err)];
+        assert_eq!(open_turn_id(&events), Some(TurnId("t1".to_owned())));
     }
 }

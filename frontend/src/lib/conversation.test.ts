@@ -73,6 +73,32 @@ function turnStarted(seq: number, input: string): GatewayEvent {
 	} as unknown as GatewayEvent;
 }
 
+/** Build a committed Turn lifecycle event (Completed/Interrupted) — the kind
+ *  that survives history replay, unlike the live-only `turn_settled`. */
+function turnLifecycle(seq: number, payload: Record<string, unknown>): GatewayEvent {
+	return {
+		type: 'event',
+		schema_version: 'ominiforge.event.v1',
+		seq,
+		session_id: 's',
+		timestamp: '2026-06-24T00:00:00Z',
+		source: { kind: 'Runtime', id: 'ominiforge' },
+		parent_event_id: null,
+		turn_id: null,
+		payload: { Turn: payload }
+	} as unknown as GatewayEvent;
+}
+
+function turnCompleted(seq: number): GatewayEvent {
+	return turnLifecycle(seq, { Completed: { turn_id: 't1' } });
+}
+
+function turnInterrupted(seq: number): GatewayEvent {
+	return turnLifecycle(seq, {
+		Interrupted: { turn_id: 't1', interrupted_at_event_id: { session_id: 's', seq } }
+	});
+}
+
 describe('conversation fold', () => {
 	// ── Streaming: temporal ordering ───────────────────────────────────
 
@@ -470,5 +496,76 @@ describe('conversation fold', () => {
 
 	it('runtime models: empty before any request', () => {
 		expect(emptyState().runtimeModels.size).toBe(0);
+	});
+
+	// ── Turn running flag (drives Cancel visibility) ───────────────────
+	//
+	// Cancel is meaningful only while a turn runs (the gateway ignores Cancel
+	// when idle), so the button's visibility hangs entirely on turnRunning.
+	// These pin the property that matters: it tracks the lifecycle AND lands
+	// correct on history replay, where only committed events exist.
+
+	it('turnRunning: false before any turn', () => {
+		expect(emptyState().turnRunning).not.toBe(true);
+		expect(fold([reqStarted(1)]).turnRunning).not.toBe(true);
+	});
+
+	it('turnRunning: true after Turn.Started, while the turn is live', () => {
+		const state = fold([turnStarted(1, 'hi'), reqStarted(2)]);
+		expect(state.turnRunning).toBe(true);
+	});
+
+	it('turnRunning: live turn_settled ends the turn', () => {
+		// The live path: a turn completes in-session and the gateway emits the
+		// ephemeral turn_settled. Cancel must disappear the instant it lands.
+		const state = fold([
+			turnStarted(1, 'hi'),
+			reqStarted(2),
+			contentBlock(3, { Text: { text: 'done' } }),
+			{ type: 'turn_settled', incomplete: null }
+		]);
+		expect(state.turnRunning).toBe(false);
+	});
+
+	it('turnRunning: reconstructs as false on history replay via committed Completed', () => {
+		// Replaying a finished session sends committed events only — never the
+		// live turn_settled. Without folding the committed Turn.Completed the flag
+		// would stay stuck true and show a stale Cancel on every loaded session.
+		// This is the test that would fail if we relied on turn_settled alone.
+		const replay = fold([
+			turnStarted(1, 'hi'),
+			reqStarted(2),
+			contentBlock(3, { Text: { text: 'done' } }),
+			turnCompleted(4)
+		]);
+		expect(replay.turnRunning).toBe(false);
+	});
+
+	it('turnRunning: committed Interrupted ends the turn', () => {
+		const state = fold([turnStarted(1, 'hi'), reqStarted(2), turnInterrupted(3)]);
+		expect(state.turnRunning).toBe(false);
+	});
+
+	it('turnRunning: a notice (e.g. "turn cancelled") ends the turn', () => {
+		// Cancel aborts the task and emits a notice rather than a committed
+		// terminator; the notice must also drop the flag so the live session's
+		// Cancel button clears right after the user cancels.
+		const state = fold([
+			turnStarted(1, 'hi'),
+			reqStarted(2),
+			{ type: 'notice', message: 'turn cancelled' }
+		]);
+		expect(state.turnRunning).toBe(false);
+	});
+
+	it('turnRunning: a second turn re-arms the flag after the first settles', () => {
+		const state = fold([
+			turnStarted(1, 'one'),
+			reqStarted(2),
+			turnCompleted(3),
+			turnStarted(4, 'two'),
+			reqStarted(5)
+		]);
+		expect(state.turnRunning).toBe(true);
 	});
 });
