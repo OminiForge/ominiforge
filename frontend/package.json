@@ -29,6 +29,7 @@
 	},
 	"dependencies": {
 		"dompurify": "^3.4.11",
+		"highlight.js": "^11.11.1",
 		"layerchart": "^1.0.0",
 		"marked": "^18.0.5"
 	}

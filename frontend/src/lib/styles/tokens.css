@@ -121,10 +121,15 @@
 	--user-bg: rgba(198, 241, 53, 0.06);
 	--user-border: rgba(198, 241, 53, 0.18);
 
-	/* Param syntax highlight (tool JSON) */
+	/* Param syntax highlight (tool JSON) + code-block highlight (hljs).
+	   Lime-adjacent cool palette so code reads calm against near-black. */
 	--syntax-key: #7b9bd8;
 	--syntax-str: #a8d68a;
 	--syntax-num: #e8a838;
+	--syntax-keyword: #c98fd4;
+	--syntax-comment: #5c5c6e;
+	--syntax-fn: #7bc4d8;
+	--syntax-type: #d8c47b;
 
 	--shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.3);
 	--shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4);
@@ -198,10 +203,14 @@
 	--user-bg: rgba(140, 175, 20, 0.1);
 	--user-border: rgba(140, 175, 20, 0.28);
 
-	/* Param syntax highlight */
+	/* Param syntax highlight + code-block highlight (hljs), deepened for light bg */
 	--syntax-key: #3a5fa8;
 	--syntax-str: #4d8a2f;
 	--syntax-num: #9c6a14;
+	--syntax-keyword: #9333a8;
+	--syntax-comment: #85858f;
+	--syntax-fn: #1f7a93;
+	--syntax-type: #8a6d12;
 
 	--shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.08);
 	--shadow-md: 0 4px 12px rgba(0, 0, 0, 0.1);

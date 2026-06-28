@@ -3,7 +3,8 @@
 	import { browser } from '$app/environment';
 	import { page } from '$app/state';
 	import { goto, replaceState } from '$app/navigation';
-	import { marked } from 'marked';
+	import { Marked } from 'marked';
+	import hljs from 'highlight.js/lib/common';
 	import DOMPurify from 'dompurify';
 	import { client } from '$lib/client';
 	import type { EventSubscription } from '$lib/client-core';
@@ -186,9 +187,45 @@
 		}
 	}
 
+	/** Markdown renderer with synchronous syntax highlighting + a language
+	 *  badge on every fenced block. Built once at module load so highlight.js
+	 *  language defs register a single time. `gfm` is on by default in marked
+	 *  v18 — that's what enables pipe tables.
+	 *
+	 *  We use a custom `code` renderer (not marked-highlight) because we need the
+	 *  *resolved* language for the badge: when a fence has no tag we run
+	 *  `highlightAuto`, whose result carries the detected language — info the
+	 *  highlight-only plugin throws away. The emitted markup is a wrapper holding
+	 *  a label + the usual <pre><code>; hljs output is pre-escaped and the whole
+	 *  thing is DOMPurify-sanitized downstream. */
+	const md = new Marked();
+	md.use({
+		renderer: {
+			code({ text, lang }) {
+				const tag = (lang ?? '').trim().split(/\s+/)[0];
+				let label: string;
+				let html: string;
+				if (tag && hljs.getLanguage(tag)) {
+					label = tag;
+					html = hljs.highlight(text, { language: tag, ignoreIllegals: true }).value;
+				} else {
+					const auto = hljs.highlightAuto(text);
+					label = auto.language ?? 'text';
+					html = auto.value;
+				}
+				return (
+					`<div class="code-block">` +
+					`<div class="code-lang">${escapeHtml(label)}</div>` +
+					`<pre><code class="hljs language-${escapeHtml(label)}">${html}</code></pre>` +
+					`</div>`
+				);
+			}
+		}
+	});
+
 	function renderMarkdown(text: string): string {
 		if (!browser) return escapeHtml(text);
-		const raw = marked.parse(text, { async: false }) as string;
+		const raw = md.parse(text, { async: false }) as string;
 		return DOMPurify.sanitize(raw);
 	}
 
@@ -641,18 +678,125 @@
 		border-radius: 3px;
 		border: 1px solid var(--border-subtle);
 	}
-	.item-text :global(pre) {
-		background: var(--canvas-float);
-		padding: var(--space-3);
-		border-radius: var(--radius-md);
-		border: 1px solid var(--border-subtle);
-		overflow-x: auto;
+	.item-text :global(.code-block) {
 		margin: var(--space-3) 0;
+		border: 1px solid var(--border-subtle);
+		border-radius: var(--radius-md);
+		overflow: hidden;
+		background: var(--canvas-float);
+	}
+	.item-text :global(.code-lang) {
+		font-family: var(--font-mono);
+		font-size: 10px;
+		font-weight: 510;
+		letter-spacing: 0.08em;
+		text-transform: uppercase;
+		color: var(--text-tertiary);
+		padding: 5px var(--space-3);
+		background: var(--canvas-overlay);
+		border-bottom: 1px solid var(--border-subtle);
+		user-select: none;
+	}
+	.item-text :global(.code-block pre) {
+		margin: 0;
+		padding: var(--space-3);
+		background: none;
+		border: none;
+		border-radius: 0;
+		overflow-x: auto;
 	}
 	.item-text :global(pre code) {
 		background: none;
 		border: none;
 		padding: 0;
+		color: var(--text-secondary);
+	}
+
+	/* ---- CODE SYNTAX HIGHLIGHT (hljs token → design token) ---- */
+	.item-text :global(.hljs-comment),
+	.item-text :global(.hljs-quote) {
+		color: var(--syntax-comment);
+		font-style: italic;
+	}
+	.item-text :global(.hljs-keyword),
+	.item-text :global(.hljs-selector-tag),
+	.item-text :global(.hljs-literal),
+	.item-text :global(.hljs-section),
+	.item-text :global(.hljs-doctag),
+	.item-text :global(.hljs-name) {
+		color: var(--syntax-keyword);
+	}
+	.item-text :global(.hljs-string),
+	.item-text :global(.hljs-regexp),
+	.item-text :global(.hljs-meta .hljs-string) {
+		color: var(--syntax-str);
+	}
+	.item-text :global(.hljs-number),
+	.item-text :global(.hljs-bullet) {
+		color: var(--syntax-num);
+	}
+	.item-text :global(.hljs-title),
+	.item-text :global(.hljs-title.function_),
+	.item-text :global(.hljs-function .hljs-title),
+	.item-text :global(.hljs-built_in) {
+		color: var(--syntax-fn);
+	}
+	.item-text :global(.hljs-type),
+	.item-text :global(.hljs-class .hljs-title),
+	.item-text :global(.hljs-attr),
+	.item-text :global(.hljs-attribute),
+	.item-text :global(.hljs-property) {
+		color: var(--syntax-type);
+	}
+	.item-text :global(.hljs-variable),
+	.item-text :global(.hljs-template-variable),
+	.item-text :global(.hljs-symbol) {
+		color: var(--syntax-key);
+	}
+	.item-text :global(.hljs-emphasis) {
+		font-style: italic;
+	}
+	.item-text :global(.hljs-strong) {
+		font-weight: 600;
+	}
+
+	/* ---- TABLES (GFM) ---- */
+	.item-text :global(table) {
+		border-collapse: collapse;
+		width: max-content;
+		max-width: 100%;
+		margin: var(--space-3) 0;
+		font-size: 12.5px;
+		font-family: var(--font-sans);
+		display: block;
+		overflow-x: auto;
+		border: 1px solid var(--border-subtle);
+		border-radius: var(--radius-md);
+	}
+	.item-text :global(th),
+	.item-text :global(td) {
+		border-right: 1px solid var(--border-subtle);
+		border-bottom: 1px solid var(--border-subtle);
+		padding: var(--space-2) var(--space-3);
+		text-align: left;
+		vertical-align: top;
+		line-height: 1.5;
+	}
+	.item-text :global(tr > th:last-child),
+	.item-text :global(tr > td:last-child) {
+		border-right: none;
+	}
+	.item-text :global(tbody tr:last-child td) {
+		border-bottom: none;
+	}
+	.item-text :global(thead th) {
+		color: var(--text-primary);
+		font-weight: 590;
+		font-size: 11px;
+		letter-spacing: 0.02em;
+		border-bottom: 1px solid var(--border-default);
+	}
+	.item-text :global(tbody td) {
 		color: var(--text-secondary);
 	}
 	.item-text :global(ol),
