@@ -155,8 +155,8 @@
 
 <style>
 	.shell {
-		display: flex;
-		width: 100vw;
+		display: grid;
+		grid-template-columns: var(--sidebar-width) 1fr;
 		height: 100vh;
 		overflow: hidden;
 	}
@@ -347,7 +347,8 @@
 
 	@media (max-width: 768px) {
 		.shell {
-			flex-direction: column;
+			grid-template-columns: 1fr;
+			grid-template-rows: auto 1fr;
 		}
 		.sidebar {
 			width: 100%;
