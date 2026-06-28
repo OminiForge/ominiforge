@@ -53,9 +53,12 @@
       # Frontend toolchain (doc/frontend.md §7). pnpm-in-nix sandboxed builds
       # are a known hard point; initially we just provide the tools in the
       # devShell and run the frontend build inside the shell (non-sandboxed).
+      # `chromium` drives the offline UI screenshot tool (frontend/scripts/shot.mjs)
+      # via playwright-core, so no Playwright browser download is needed.
       nodeTools = with pkgs; [
         nodejs_22
         pnpm
+        chromium
       ];
 
       miscTools = with pkgs; [
@@ -69,6 +72,10 @@
 
         RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
         PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig";
+        # Point the screenshot tool (and playwright-core) at the nix Chromium and
+        # stop Playwright trying to download its own browser.
+        CHROMIUM_BIN = "${pkgs.chromium}/bin/chromium";
+        PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
 
         shellHook = ''
           export CARGO_HOME="''${CARGO_HOME:-$HOME/.cargo}"
