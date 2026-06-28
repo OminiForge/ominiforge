@@ -4,6 +4,7 @@
 	import { client } from '$lib/client';
 	import type { SessionMeta } from '$lib/types/SessionMeta';
 	import type { SessionSummary } from '$lib/types/SessionSummary';
+	import { statLabel, formatCost, cacheLabel, topTools } from '$lib/stats';
 	import Button from '$lib/components/Button.svelte';
 
 	/** One dashboard card: a session's metadata plus its folded summary. `summary`
@@ -45,13 +46,6 @@
 	}
 
 	// u64 fields arrive as JS number|bigint over JSON; coerce defensively.
-	const num = (v: number | bigint): number => Number(v);
-
-	/** English plural for a stat label: `1 turn`, `2 turns`. Stat counts are all
-	 *  regular nouns (turn/req/tool), so a trailing `s` is the only rule needed. */
-	function plural(n: number, word: string): string {
-		return n === 1 ? word : `${word}s`;
-	}
 
 	function formatTime(iso: string): string {
 		const date = new Date(iso);
@@ -97,22 +91,6 @@
 		return null;
 	}
 
-	function cost(s: SessionSummary): string {
-		if (s.cost_usd == null) return 'unpriced';
-		return `$${s.cost_usd.toFixed(s.cost_usd < 0.01 ? 4 : 2)}`;
-	}
-
-	/** Top tools by call count, capped to the busiest few so a card stays compact.
-	 *  Width is relative to the card's own max, so each card's bars read on their
-	 *  own scale (not comparable across cards — these are per-session breakdowns). */
-	function topTools(s: SessionSummary, cap = 4): { tool: string; count: number; pct: number }[] {
-		const entries = Object.entries(s.tools_used)
-			.map(([tool, c]) => ({ tool, count: num(c) }))
-			.sort((a, b) => b.count - a.count);
-		const max = Math.max(1, ...entries.map((e) => e.count));
-		return entries.slice(0, cap).map((e) => ({ ...e, pct: (e.count / max) * 100 }));
-	}
-
 	onMount(refresh);
 </script>
 
@@ -137,7 +115,7 @@
 					{@const s = row.summary}
 					{@const ws = workspace(row.meta)}
 					{@const badge = originBadge(row.meta)}
-					{@const tools = s ? topTools(s) : []}
+					{@const tools = s ? topTools(s, 4) : []}
 					<li>
 						<a href={`/sessions/${row.meta.id}`} class="card">
 							<div class="card-head">
@@ -155,25 +133,25 @@
 								<div class="stats">
 									<div class="stat">
 										<span class="stat-value">{s.total_turns}</span>
-										<span class="stat-label">{plural(s.total_turns, 'turn')}</span>
+										<span class="stat-label">{statLabel.turns(s.total_turns)}</span>
 									</div>
 									<div class="stat">
 										<span class="stat-value">{s.total_model_requests}</span>
-										<span class="stat-label">{plural(s.total_model_requests, 'req')}</span>
+										<span class="stat-label">{statLabel.reqs(s.total_model_requests)}</span>
 									</div>
 									<div class="stat">
 										<span class="stat-value">
 											{s.total_tool_calls}{#if s.total_tool_failures > 0}<span class="stat-fail">/{s.total_tool_failures}✗</span>{/if}
 										</span>
-										<span class="stat-label">{plural(s.total_tool_calls, 'tool')}</span>
+										<span class="stat-label">{statLabel.toolCalls(s.total_tool_calls)}</span>
 									</div>
 									<div class="stat">
-										<span class="stat-value cost" class:unpriced={s.cost_usd == null}>{cost(s)}</span>
-										<span class="stat-label">cost</span>
+										<span class="stat-value cost" class:unpriced={s.cost_usd == null}>{formatCost(s)}</span>
+										<span class="stat-label">{statLabel.cost}</span>
 									</div>
 									<div class="stat">
-										<span class="stat-value">{(s.cache_hit_rate * 100).toFixed(0)}%</span>
-										<span class="stat-label">cache</span>
+										<span class="stat-value">{cacheLabel(s)}</span>
+										<span class="stat-label">{statLabel.cache}</span>
 									</div>
 								</div>
 

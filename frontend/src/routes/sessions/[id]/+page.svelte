@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onDestroy } from 'svelte';
+	import { onDestroy, onMount } from 'svelte';
 	import { browser } from '$app/environment';
 	import { page } from '$app/state';
 	import { goto, replaceState } from '$app/navigation';
@@ -9,8 +9,10 @@
 	import { client } from '$lib/client';
 	import type { EventSubscription } from '$lib/client-core';
 	import type { SessionMeta } from '$lib/types/SessionMeta';
+	import type { RuntimeInfo } from '$lib/types/RuntimeInfo';
+	import type { SessionSummary } from '$lib/types/SessionSummary';
 	import { apply, emptyState, type ConversationState, type Item } from '$lib/conversation';
-	import { currentSession, currentRuntime, currentRuntimeModels } from '$lib/stores/currentSession';
+	import { num, statLabel, formatCost, cacheLabel, topTools } from '$lib/stats';
 
 	/** Sentinel id for a not-yet-created (draft) session. Reaching `/sessions/new`
 	 *  shows an empty conversation; the real session is created lazily on the
@@ -30,12 +32,34 @@
 	let error = $state<string | null>(null);
 	let sessionId = $state(page.params.id!);
 	let meta = $state<SessionMeta | null>(null);
+	// Config-layer provider/model for the RUNTIME panel; null until loaded or on
+	// a failed lookup. Local to this page now (the panel moved off the global
+	// sidebar into this page's right detail column).
+	let runtime = $state<RuntimeInfo | null>(null);
+	// Folded summary snapshot for the STATS panel. Best-effort: refreshed on load
+	// and whenever a turn settles, so the metrics track the live conversation
+	// without rebuilding them from the event fold.
+	let summary = $state<SessionSummary | null>(null);
 	let sub: EventSubscription | undefined;
 	let streamEl = $state<HTMLElement | null>(null);
 	// Whether the user is scrolled to (or near) the bottom – controls auto-scroll.
 	let shouldAutoScroll = $state(true);
 	// Track collapsed state for reasoning items separately (index → collapsed)
 	let collapsed = $state<Record<number, boolean>>({});
+	// Whether the right detail rail (INFO + STATS) is shown. Persisted so the
+	// choice survives reloads/navigation; defaults open. On narrow screens the
+	// user can collapse it to give the conversation the full width.
+	let detailOpen = $state(true);
+
+	function toggleDetail() {
+		detailOpen = !detailOpen;
+		localStorage.setItem('detailOpen', detailOpen ? '1' : '0');
+	}
+
+	onMount(() => {
+		// Restore the persisted rail state; default open when unset.
+		detailOpen = localStorage.getItem('detailOpen') !== '0';
+	});
 
 	const isDraft = $derived(sessionId === DRAFT_ID);
 
@@ -53,22 +77,33 @@
 		}
 	}
 
-	/** Load session meta for the RUNTIME sidebar panel. Best-effort: a failure
-	 *  here must not break the conversation view, so errors are swallowed. */
+	/** Load session meta + config-layer runtime + summary snapshot for the right
+	 *  detail panel. Best-effort: a failure here must not break the conversation
+	 *  view, so each lookup owns its own try/clear and errors are swallowed. */
 	async function loadMeta(id: string) {
 		try {
 			meta = await client.getSession(id);
-			currentSession.set(meta);
 		} catch {
-			/* RUNTIME panel just stays empty; conversation still works. */
+			/* INFO panel just stays empty; conversation still works. */
 		}
 		// Resolve the config-layer model independently: a runtime failure must not
 		// blank the meta we just loaded, and a stale value must not linger, so it
 		// owns its own try/clear.
 		try {
-			currentRuntime.set(await client.getRuntime(id));
+			runtime = await client.getRuntime(id);
 		} catch {
-			currentRuntime.set(null);
+			runtime = null;
+		}
+		await refreshSummary(id);
+	}
+
+	/** Pull the folded summary snapshot for the STATS panel. Best-effort: a fold
+	 *  failure leaves the panel showing the last good value rather than blanking. */
+	async function refreshSummary(id: string) {
+		try {
+			summary = await client.getSummary(id);
+		} catch {
+			/* keep prior summary */
 		}
 	}
 
@@ -85,6 +120,11 @@
 					sessionId = ev.new_session_id;
 					subscribe(ev.new_session_id);
 					void loadMeta(ev.new_session_id);
+				}
+				// A settled turn means the fold's aggregates changed — refresh the
+				// STATS snapshot so turns/cost/tokens track the live conversation.
+				if (ev.type === 'turn_settled') {
+					void refreshSummary(id);
 				}
 				// Only auto-scroll when the user is already at (or near) the
 				// bottom of the stream. This prevents yanking them back to the
@@ -109,29 +149,27 @@
 			sub?.close();
 			convo = emptyState();
 			collapsed = {};
-			currentSession.set(null);
-			currentRuntime.set(null);
-			currentRuntimeModels.set([]);
+			meta = null;
+			runtime = null;
+			summary = null;
 			return;
 		}
 		subscribe(id);
 		void loadMeta(id);
 	});
 
-	// Mirror the runtime-layer models the fold collected into the store the
-	// sidebar RUNTIME panel reads, so it can flag divergence from the configured
-	// model (B4). Reactive on convo so it tracks each new RequestStarted.
-	$effect(() => {
-		currentRuntimeModels.set([...convo.runtimeModels]);
-	});
+	/** Runtime-layer models that diverge from the configured model: models a
+	 *  RequestStarted actually used (folded into convo.runtimeModels) that aren't
+	 *  the config-layer selection (a subagent/fork on a different model). Empty
+	 *  until the config model is known, so we never flag divergence we can't yet
+	 *  judge. Fail-loud (CLAUDE.md #12); the displayed Model row stays the stable
+	 *  config layer (B4). */
+	const divergent = $derived(
+		runtime ? [...convo.runtimeModels].filter((m) => m !== runtime!.model) : []
+	);
 
 	onDestroy(() => {
 		sub?.close();
-		// Clear so the sidebar RUNTIME panel doesn't leak this session's context
-		// onto the list / monitor / evolution pages.
-		currentSession.set(null);
-		currentRuntime.set(null);
-		currentRuntimeModels.set([]);
 	});
 
 	async function send() {
@@ -318,12 +356,20 @@
 		return id.length > 14 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id;
 	}
 
+	/** Short workspace label for the INFO panel: last two path segments, full
+	 *  path on hover. */
+	function wsLabel(ws: string): string {
+		const parts = ws.split('/').filter(Boolean);
+		return parts.length > 2 ? '…/' + parts.slice(-2).join('/') : ws;
+	}
+
 	const incomplete = $derived(convo.lastSettle != null);
 	// Cancel only makes sense while a turn is running (the backend ignores Cancel
 	// when idle), so the button is shown only then — see ConversationState.turnRunning.
 	const turnRunning = $derived(convo.turnRunning === true);
 </script>
 
+<div class="session-grid" class:no-detail={isDraft || !detailOpen}>
 <div class="conv-page">
 	<!-- TOPBAR -->
 	<div class="topbar">
@@ -344,6 +390,21 @@
 				{/if}
 			{/if}
 		</div>
+		{#if !isDraft}
+			<button
+				class="detail-toggle"
+				class:on={detailOpen}
+				onclick={toggleDetail}
+				title={detailOpen ? '收起信息栏' : '展开信息栏'}
+				aria-label="Toggle detail panel"
+				aria-pressed={detailOpen}
+			>
+				<svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+					<rect x="1.5" y="2.5" width="11" height="9" rx="1.5" />
+					<line x1="9" y1="2.5" x2="9" y2="11.5" />
+				</svg>
+			</button>
+		{/if}
 	</div>
 
 	{#if error}
@@ -496,12 +557,287 @@
 	</div>
 </div>
 
+{#if !isDraft}
+	<aside class="detail">
+		<!-- INFO: config-layer session context (moved off the global sidebar) -->
+		<section class="detail-section">
+			<div class="detail-label">Info</div>
+			{#if meta?.workspace}
+				<div class="kv">
+					<div class="kv-key">Workspace</div>
+					<div class="kv-val" title={meta.workspace}>{wsLabel(meta.workspace)}</div>
+				</div>
+			{/if}
+			{#if runtime && runtime.env.length > 0}
+				<div class="kv">
+					<div class="kv-key">Env</div>
+					<div class="kv-val" title={runtime.env.join(' · ')}>{runtime.env.join(' · ')}</div>
+				</div>
+			{/if}
+			{#if runtime}
+				<div class="kv">
+					<div class="kv-key">Model</div>
+					<div class="kv-val" title={`${runtime.provider} · ${runtime.model}`}>{runtime.model}</div>
+				</div>
+			{/if}
+			{#if divergent.length > 0}
+				<div class="kv warn">
+					<div class="kv-key warn-key">⚠ Runtime</div>
+					<div class="kv-val warn-val" title={`runtime used ${divergent.join(', ')}, configured ${runtime?.model}`}>
+						{divergent.join(' · ')} ≠ {runtime?.model}
+					</div>
+				</div>
+			{/if}
+			{#if meta?.profile_id}
+				<div class="kv">
+					<div class="kv-key">Profile</div>
+					<div class="kv-val">{meta.profile_id}</div>
+				</div>
+			{/if}
+		</section>
+
+		<!-- STATS: folded summary snapshot, refreshed on each settled turn -->
+		{#if summary}
+			{@const s = summary}
+			{@const tools = topTools(s, 6)}
+			<section class="detail-section">
+				<div class="detail-label">Stats</div>
+				<div class="stat-grid">
+					<div class="stat">
+						<span class="stat-value">{s.total_turns}</span>
+						<span class="stat-key">{statLabel.turns(s.total_turns)}</span>
+					</div>
+					<div class="stat">
+						<span class="stat-value">{s.total_model_requests}</span>
+						<span class="stat-key">{statLabel.reqs(s.total_model_requests)}</span>
+					</div>
+					<div class="stat">
+						<span class="stat-value">
+							{s.total_tool_calls}{#if s.total_tool_failures > 0}<span class="stat-fail">/{s.total_tool_failures}✗</span>{/if}
+						</span>
+						<span class="stat-key">{statLabel.toolCalls(s.total_tool_calls)}</span>
+					</div>
+					<div class="stat">
+						<span class="stat-value cost" class:unpriced={s.cost_usd == null}>{formatCost(s)}</span>
+						<span class="stat-key">{statLabel.cost}</span>
+					</div>
+					<div class="stat">
+						<span class="stat-value">{num(s.total_input_tokens).toLocaleString()}</span>
+						<span class="stat-key">{statLabel.inTok}</span>
+					</div>
+					<div class="stat">
+						<span class="stat-value">{num(s.total_output_tokens).toLocaleString()}</span>
+						<span class="stat-key">{statLabel.outTok}</span>
+					</div>
+					<div class="stat">
+						<span class="stat-value">{cacheLabel(s)}</span>
+						<span class="stat-key">{statLabel.cache}</span>
+					</div>
+				</div>
+			</section>
+
+			{#if tools.length > 0}
+				<section class="detail-section">
+					<div class="detail-label">Tool usage</div>
+					<ul class="bars">
+						{#each tools as t (t.tool)}
+							<li class="bar-row">
+								<span class="bar-label" title={t.tool}>{t.tool}</span>
+								<span class="bar-track"><span class="bar-fill" style="width: {t.pct}%"></span></span>
+								<span class="bar-count">{t.count}</span>
+							</li>
+						{/each}
+					</ul>
+				</section>
+			{/if}
+		{/if}
+	</aside>
+{/if}
+</div>
+
 <style>
+	/* 2-col shell: conversation flexes, the detail rail is a fixed reading width.
+	 * Fills the main area's full height; each column owns its own scroll. The
+	 * draft state has no detail (no meta/summary yet), so it collapses to 1 col. */
+	.session-grid {
+		display: grid;
+		grid-template-columns: 1fr 300px;
+		height: 100%;
+		overflow: hidden;
+		min-width: 0;
+	}
+
+	.session-grid.no-detail {
+		grid-template-columns: 1fr;
+	}
+
+	/* Collapsed: the rail is still in the DOM (toggle lives in the topbar), but
+	 * the grid drops its column — hide it so it doesn't overflow the single col. */
+	.session-grid.no-detail .detail {
+		display: none;
+	}
+
 	.conv-page {
 		display: flex;
 		flex-direction: column;
 		height: 100%;
 		overflow: hidden;
+		min-width: 0;
+	}
+
+	/* ---- DETAIL RAIL (INFO + STATS + tool usage) ---- */
+	.detail {
+		height: 100%;
+		overflow-y: auto;
+		border-left: 1px solid var(--border-subtle);
+		background: var(--canvas-raised);
+		padding: var(--space-5) var(--space-4);
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-5);
+	}
+
+	.detail-section {
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-3);
+	}
+
+	.detail-label {
+		font-size: 10.5px;
+		font-weight: 510;
+		color: var(--text-tertiary);
+		letter-spacing: 0.07em;
+		text-transform: uppercase;
+	}
+
+	.kv {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+	}
+
+	.kv-key {
+		font-family: var(--font-mono);
+		font-size: 9.5px;
+		font-weight: 510;
+		color: var(--text-tertiary);
+		letter-spacing: 0.09em;
+		text-transform: uppercase;
+		line-height: 1;
+	}
+
+	.kv-val {
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--text-secondary);
+		line-height: 1.4;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		max-width: 100%;
+	}
+
+	/* Divergence marker: runtime model ≠ configured model (fail-loud, B4) */
+	.warn-key {
+		color: var(--state-error-text);
+	}
+	.warn-val {
+		color: var(--state-error-text);
+		white-space: normal;
+	}
+
+	.stat-grid {
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+		gap: var(--space-3) var(--space-4);
+	}
+
+	.stat {
+		display: flex;
+		flex-direction: column;
+		gap: 1px;
+		min-width: 0;
+	}
+
+	.stat-value {
+		font-family: var(--font-mono);
+		font-size: 14px;
+		font-weight: 500;
+		color: var(--text-primary);
+		font-variant-numeric: tabular-nums;
+		line-height: 1.2;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+
+	.stat-value.cost {
+		color: var(--accent-ink);
+	}
+	.stat-value.cost.unpriced {
+		color: var(--text-tertiary);
+		font-size: 12px;
+	}
+
+	.stat-fail {
+		color: var(--state-error-text);
+		font-size: 11px;
+	}
+
+	.stat-key {
+		font-size: 9.5px;
+		font-weight: 510;
+		letter-spacing: 0.07em;
+		text-transform: uppercase;
+		color: var(--text-tertiary);
+	}
+
+	.bars {
+		list-style: none;
+		display: grid;
+		gap: 6px;
+	}
+
+	.bar-row {
+		display: grid;
+		grid-template-columns: minmax(48px, 84px) 1fr auto;
+		align-items: center;
+		gap: var(--space-2);
+	}
+
+	.bar-label {
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--text-secondary);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.bar-track {
+		background: var(--canvas-float);
+		border-radius: var(--radius-sm);
+		height: 6px;
+		overflow: hidden;
+	}
+
+	.bar-fill {
+		display: block;
+		height: 100%;
+		/* Muted, not accent: dense data, not the screen's one CTA. */
+		background: var(--text-tertiary);
+		border-radius: var(--radius-sm);
+		transition: width var(--dur-std) var(--ease-out);
+	}
+
+	.bar-count {
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--text-tertiary);
+		font-variant-numeric: tabular-nums;
+		min-width: 2ch;
+		text-align: right;
 	}
 
 	/* ---- TOPBAR ---- */
@@ -534,6 +870,37 @@
 	.topbar-back:hover {
 		color: var(--text-primary);
 		background: var(--surface-hover);
+	}
+
+	/* Detail-rail toggle: pinned to the topbar's right edge. `on` = rail open. */
+	.detail-toggle {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		width: 24px;
+		height: 24px;
+		margin-left: auto;
+		border-radius: var(--radius-sm);
+		border: 1px solid transparent;
+		background: transparent;
+		color: var(--text-tertiary);
+		cursor: pointer;
+		flex-shrink: 0;
+		transition:
+			color var(--dur-fast) var(--ease-out),
+			background var(--dur-fast) var(--ease-out),
+			border-color var(--dur-fast) var(--ease-out);
+	}
+
+	.detail-toggle:hover {
+		color: var(--text-primary);
+		background: var(--surface-hover);
+	}
+
+	.detail-toggle.on {
+		color: var(--text-secondary);
+		border-color: var(--border-default);
+		background: var(--canvas-overlay);
 	}
 
 	.topbar-title {
@@ -1355,6 +1722,21 @@
 		}
 		.streaming-dot {
 			animation: none;
+		}
+	}
+
+	/* Narrow: stack the detail rail under the conversation instead of beside it,
+	 * so neither column gets crushed. The grid drives both columns to one. */
+	@media (max-width: 900px) {
+		.session-grid {
+			grid-template-columns: 1fr;
+			grid-template-rows: 1fr auto;
+			overflow-y: auto;
+		}
+		.detail {
+			height: auto;
+			border-left: none;
+			border-top: 1px solid var(--border-subtle);
 		}
 	}
 </style>

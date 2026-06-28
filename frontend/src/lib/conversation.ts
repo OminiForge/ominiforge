@@ -56,11 +56,11 @@ export interface ConversationState {
 	turnRunning?: boolean;
 	/** Distinct models seen on the runtime layer: every model a `RequestStarted`
 	 *  actually used this session (deduplicated). The display source stays the
-	 *  config layer (`currentRuntime`); this is the *validation* source — a model
-	 *  here that isn't the configured one (a subagent/fork using something else)
-	 *  is surfaced as a fail-loud divergence, not silently shown (`doc/frontend.md`
-	 *  B4, CLAUDE.md #12). It deliberately does not drive the RUNTIME Model row,
-	 *  so that row never flickers as subagents switch models. */
+	 *  config layer (the session page's `runtime`); this is the *validation*
+	 *  source — a model here that isn't the configured one (a subagent/fork using
+	 *  something else) is surfaced as a fail-loud divergence, not silently shown
+	 *  (`doc/frontend.md` B4, CLAUDE.md #12). It deliberately does not drive the
+	 *  INFO Model row, so that row never flickers as subagents switch models. */
 	runtimeModels: Set<string>;
 }
 

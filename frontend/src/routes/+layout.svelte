@@ -3,7 +3,6 @@
 	import '$lib/styles/global.css';
 	import { page } from '$app/state';
 	import { onMount } from 'svelte';
-	import { currentSession, currentRuntime, currentRuntimeModels } from '$lib/stores/currentSession';
 
 	let { children } = $props();
 
@@ -11,17 +10,6 @@
 		{ href: '/', label: 'Dashboard' },
 		{ href: '/evolution', label: 'Evolution' }
 	];
-
-	/** Runtime-layer models that diverge from the configured model: models a
-	 *  RequestStarted actually used that aren't the config-layer selection (a
-	 *  subagent/fork on a different model). Empty until the config model is known,
-	 *  so we never flag divergence we can't yet judge. Surfacing this is fail-loud
-	 *  (CLAUDE.md #12); the displayed Model row stays the stable config layer. */
-	const divergent = $derived(
-		$currentRuntime
-			? $currentRuntimeModels.filter((m) => m !== $currentRuntime!.model)
-			: []
-	);
 
 	let theme = $state<'light' | 'dark'>('dark');
 
@@ -41,12 +29,6 @@
 		theme = stored ?? (prefersDark ? 'dark' : 'light');
 		document.documentElement.setAttribute('data-theme', theme);
 	});
-
-	/** Short workspace label: last two path segments, full path on hover. */
-	function wsLabel(ws: string): string {
-		const parts = ws.split('/').filter(Boolean);
-		return parts.length > 2 ? '…/' + parts.slice(-2).join('/') : ws;
-	}
 </script>
 
 <div class="shell">
@@ -73,54 +55,6 @@
 		</nav>
 
 		<div class="sidebar-spacer"></div>
-
-		{#if $currentSession}
-			{@const s = $currentSession}
-			<div class="sidebar-runtime">
-				<div class="sidebar-label">Runtime</div>
-
-				{#if s.workspace}
-					<div class="rt-entry">
-						<div class="rt-label">Workspace</div>
-						<div class="rt-value" title={s.workspace}>{wsLabel(s.workspace)}</div>
-					</div>
-				{/if}
-
-				{#if $currentRuntime && $currentRuntime.env.length > 0}
-					<div class="rt-entry">
-						<div class="rt-label">Env</div>
-						<div class="rt-value" title={$currentRuntime.env.join(' · ')}>
-							{$currentRuntime.env.join(' · ')}
-						</div>
-					</div>
-				{/if}
-
-				{#if $currentRuntime}
-					<div class="rt-entry">
-						<div class="rt-label">Model</div>
-						<div class="rt-value" title={`${$currentRuntime.provider} · ${$currentRuntime.model}`}>
-							{$currentRuntime.model}
-						</div>
-					</div>
-				{/if}
-
-				{#if divergent.length > 0}
-					<div class="rt-entry rt-warn">
-						<div class="rt-label rt-warn-label">⚠ Runtime</div>
-						<div class="rt-value rt-warn-value" title={`runtime used ${divergent.join(', ')}, configured ${$currentRuntime?.model}`}>
-							{divergent.join(' · ')} ≠ {$currentRuntime?.model}
-						</div>
-					</div>
-				{/if}
-
-				{#if s.profile_id}
-					<div class="rt-entry">
-						<div class="rt-label">Profile</div>
-						<div class="rt-value">{s.profile_id}</div>
-					</div>
-				{/if}
-			</div>
-		{/if}
 
 		<div class="sidebar-bottom">
 			<button class="theme-btn" onclick={toggleTheme} title="切换主题">
@@ -260,53 +194,6 @@
 		flex: 1;
 	}
 
-	/* RUNTIME — current session context, hidden when not on a session page */
-	.sidebar-runtime {
-		padding: var(--space-3) var(--space-3) var(--space-2);
-		border-top: 1px solid var(--border-subtle);
-	}
-
-	.rt-entry {
-		padding: 0 var(--space-1);
-		margin-bottom: var(--space-3);
-	}
-
-	.rt-entry:last-child {
-		margin-bottom: 0;
-	}
-
-	.rt-label {
-		font-family: var(--font-mono);
-		font-size: 9.5px;
-		font-weight: 510;
-		color: var(--text-tertiary);
-		letter-spacing: 0.09em;
-		text-transform: uppercase;
-		margin-bottom: 2px;
-		line-height: 1;
-	}
-
-	.rt-value {
-		font-family: var(--font-mono);
-		font-size: 11px;
-		color: var(--text-secondary);
-		line-height: 1.4;
-		white-space: nowrap;
-		overflow: hidden;
-		text-overflow: ellipsis;
-		max-width: 100%;
-	}
-
-	/* Divergence marker: runtime model ≠ configured model (fail-loud, B4) */
-	.rt-warn-label {
-		color: var(--state-error-text);
-	}
-
-	.rt-warn-value {
-		color: var(--state-error-text);
-		white-space: normal;
-	}
-
 	.sidebar-bottom {
 		padding: var(--space-3) var(--space-4) 0;
 		border-top: 1px solid var(--border-subtle);
@@ -370,9 +257,6 @@
 			flex-direction: row;
 		}
 		.sidebar-section .sidebar-label {
-			display: none;
-		}
-		.sidebar-runtime {
 			display: none;
 		}
 		.sidebar-bottom {
