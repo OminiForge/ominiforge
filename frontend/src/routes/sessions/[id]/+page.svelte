@@ -327,7 +327,7 @@
 <div class="conv-page">
 	<!-- TOPBAR -->
 	<div class="topbar">
-		<a href="/sessions" class="topbar-back" title="返回会话列表" aria-label="Back to sessions">
+		<a href="/" class="topbar-back" title="返回首页" aria-label="Back to home">
 			<svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
 				<polyline points="8.5,2.5 4,7 8.5,11.5" />
 			</svg>
