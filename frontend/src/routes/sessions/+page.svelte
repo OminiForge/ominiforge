@@ -3,9 +3,18 @@
 	import { goto } from '$app/navigation';
 	import { client } from '$lib/client';
 	import type { SessionMeta } from '$lib/types/SessionMeta';
+	import type { SessionSummary } from '$lib/types/SessionSummary';
 	import Button from '$lib/components/Button.svelte';
 
-	let sessions = $state<SessionMeta[]>([]);
+	/** One list row: a session's metadata plus its derived summary. `summary` is
+	 *  null when the per-session summary fetch failed — the row still renders,
+	 *  just without a title/metrics, so one bad session never blanks the list. */
+	interface Row {
+		meta: SessionMeta;
+		summary: SessionSummary | null;
+	}
+
+	let rows = $state<Row[]>([]);
 	let loading = $state(true);
 	let error = $state<string | null>(null);
 
@@ -14,7 +23,14 @@
 		error = null;
 		try {
 			const ids = await client.listSessions();
-			sessions = await Promise.all(ids.map(id => client.getSession(id)));
+			rows = await Promise.all(
+				ids.map(async (id): Promise<Row> => {
+					const meta = await client.getSession(id);
+					// Summary is best-effort: a fold failure must not drop the row.
+					const summary = await client.getSummary(id).catch(() => null);
+					return { meta, summary };
+				})
+			);
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 		} finally {
@@ -31,8 +47,7 @@
 
 	function formatTime(iso: string): string {
 		const date = new Date(iso);
-		const now = Date.now();
-		const diff = now - date.getTime();
+		const diff = Date.now() - date.getTime();
 		const mins = Math.floor(diff / 60000);
 		const hours = Math.floor(diff / 3600000);
 		const days = Math.floor(diff / 86400000);
@@ -43,55 +58,103 @@
 		return date.toLocaleDateString('zh-CN');
 	}
 
-	function label(meta: SessionMeta): string {
-		const ws = meta.workspace ? meta.workspace.split('/').pop() || meta.workspace : null;
-		const originBadge =
-			meta.origin.kind === 'fork' ? ' [fork]' :
-			meta.origin.kind === 'compaction' ? ' [compacted]' : '';
-		const date = new Date(meta.created_at);
-		const datePart = date.toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' });
-		const timePart = date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
-		const workspace = ws ? `${ws} · ` : '';
-		return `${workspace}${datePart} ${timePart}${originBadge}`;
+	/** Card title: the opening user message, else a workspace/id fallback so a
+	 *  title-less session (draft never sent, or summary fetch failed) is still
+	 *  distinguishable. */
+	function title(row: Row): string {
+		const first = row.summary?.first_user_input?.trim();
+		if (first) return clip(first, 96);
+		const ws = workspace(row.meta);
+		return ws ?? shortId(row.meta.id);
+	}
+
+	function clip(s: string, n: number): string {
+		const line = s.split('\n')[0];
+		return line.length > n ? line.slice(0, n) + '…' : line;
+	}
+
+	function workspace(meta: SessionMeta): string | null {
+		if (!meta.workspace) return null;
+		return meta.workspace.split('/').filter(Boolean).pop() ?? meta.workspace;
+	}
+
+	function shortId(id: string): string {
+		return id.length > 14 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id;
+	}
+
+	function originBadge(meta: SessionMeta): string | null {
+		if (meta.origin.kind === 'fork') return 'fork';
+		if (meta.origin.kind === 'compaction') return 'compacted';
+		if (meta.origin.kind === 'reconfiguration') return 'reconfigured';
+		return null;
 	}
 
 	onMount(refresh);
 </script>
 
 <div class="page">
-	<header>
-		<h1>Sessions</h1>
-		<Button variant="accent" onclick={create}>New session</Button>
-	</header>
+	<div class="page-inner">
+		<header>
+			<h1>Sessions</h1>
+			<Button variant="accent" onclick={create}>New session</Button>
+		</header>
 
-	{#if error}
-		<p class="error">{error}</p>
-	{/if}
+		{#if error}
+			<p class="error">{error}</p>
+		{/if}
 
-	{#if loading}
-		<p class="muted">加载中…</p>
-	{:else if sessions.length === 0}
-		<p class="muted">还没有会话，创建一个开始吧。</p>
-	{:else}
-		<ul class="list">
-			{#each sessions as meta (meta.id)}
-				<li>
-					<a href={`/sessions/${meta.id}`}>
-						<span class="label">{label(meta)}</span>
-						<span class="time">{formatTime(meta.created_at)}</span>
-					</a>
-				</li>
-			{/each}
-		</ul>
-	{/if}
+		{#if loading}
+			<p class="muted">加载中…</p>
+		{:else if rows.length === 0}
+			<p class="muted">还没有会话，创建一个开始吧。</p>
+		{:else}
+			<ul class="list">
+				{#each rows as row (row.meta.id)}
+					{@const s = row.summary}
+					{@const ws = workspace(row.meta)}
+					{@const badge = originBadge(row.meta)}
+					<li>
+						<a href={`/sessions/${row.meta.id}`} class="card">
+							<div class="card-title" class:untitled={!s?.first_user_input}>
+								{title(row)}
+							</div>
+							<div class="card-meta">
+								{#if ws}<span class="meta-chip ws">{ws}</span>{/if}
+								{#if s}
+									<span class="meta-chip">{s.total_turns} turns</span>
+									{#if s.total_tool_calls > 0}
+										<span class="meta-chip">{s.total_tool_calls} tools</span>
+									{/if}
+									{#if s.cost_usd != null}
+										<span class="meta-chip cost">${s.cost_usd.toFixed(s.cost_usd < 0.01 ? 4 : 2)}</span>
+									{/if}
+								{/if}
+							</div>
+							<div class="card-footer">
+								<span class="time">{formatTime(row.meta.created_at)}</span>
+								{#if badge}<span class="origin-badge">{badge}</span>{/if}
+							</div>
+						</a>
+					</li>
+				{/each}
+			</ul>
+		{/if}
+	</div>
 </div>
 
 <style>
 	.page {
 		height: 100%;
 		overflow-y: auto;
-		padding: var(--space-8) var(--space-10);
+	}
+
+	/* The scroll container (.page) spans the full main area so its vertical
+	 * scrollbar sits at the viewport's right edge; the inner wrapper holds the
+	 * 880px reading column. Putting max-width on .page instead would park the
+	 * scrollbar at the 880px mark — mid-screen on wide displays. */
+	.page-inner {
 		max-width: 880px;
+		padding: var(--space-8) var(--space-10);
 	}
 
 	header {
@@ -132,31 +195,98 @@
 		gap: var(--space-2);
 	}
 
-	.list li a {
+	.list li {
+		/* Grid items default to min-width:auto, which lets a long, nowrap card
+		 * title push the item past the column width — overflowing the 880px page
+		 * and spawning a stray horizontal scrollbar. min-width:0 lets it shrink so
+		 * the title's ellipsis engages instead. */
+		min-width: 0;
+	}
+
+	.card {
 		display: flex;
-		justify-content: space-between;
-		align-items: center;
+		flex-direction: column;
+		gap: var(--space-2);
+		min-width: 0;
 		padding: var(--space-3) var(--space-4);
 		border: 1px solid var(--border-subtle);
 		border-radius: var(--radius-md);
 		background: var(--canvas-raised);
-		transition: all var(--dur-fast) var(--ease-out);
+		transition:
+			background var(--dur-fast) var(--ease-out),
+			border-color var(--dur-fast) var(--ease-out);
 	}
 
-	.label {
+	.card:hover {
+		background: var(--surface-hover);
+		border-color: var(--border-default);
+	}
+
+	.card-title {
 		color: var(--text-primary);
+		font-weight: 500;
+		font-size: 13.5px;
+		line-height: 1.5;
+		font-family: var(--font-chinese);
+		min-width: 0;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+
+	.card-title.untitled {
+		color: var(--text-tertiary);
+		font-family: var(--font-mono);
 		font-weight: 450;
-		font-size: 13px;
+	}
+
+	.card-meta {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: var(--space-2);
+	}
+
+	.meta-chip {
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--text-tertiary);
+		font-variant-numeric: tabular-nums;
+	}
+
+	.meta-chip.ws {
+		color: var(--text-secondary);
+		padding: 1px 6px;
+		border-radius: 3px;
+		background: var(--canvas-float);
+		border: 1px solid var(--border-subtle);
+	}
+
+	.meta-chip.cost {
+		color: var(--accent-ink);
+	}
+
+	.card-footer {
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
 	}
 
 	.time {
 		color: var(--text-tertiary);
-		font-size: 11.5px;
+		font-size: 11px;
 		font-variant-numeric: tabular-nums;
 	}
 
-	.list li a:hover {
-		background: var(--surface-hover);
-		border-color: var(--border-default);
+	.origin-badge {
+		font-size: 10px;
+		font-weight: 510;
+		letter-spacing: 0.04em;
+		text-transform: uppercase;
+		padding: 1px 5px;
+		border-radius: 3px;
+		color: var(--text-tertiary);
+		background: var(--canvas-float);
+		border: 1px solid var(--border-subtle);
 	}
 </style>

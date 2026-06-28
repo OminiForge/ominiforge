@@ -41,6 +41,11 @@ pub struct SessionSummary {
     pub cache_hit_rate: f64,
     /// Derived USD cost, or `None` if no model with pricing ran.
     pub cost_usd: Option<f64>,
+    /// The first turn's user input, if any — a human-readable title for the
+    /// session list (`doc/frontend.md`). `None` for sessions with no user turn
+    /// (e.g. an empty draft that was never sent). Not truncated server-side; the
+    /// UI clips it for display.
+    pub first_user_input: Option<String>,
     /// `tool_name → call count` (includes failures).
     pub tools_used: HashMap<String, u64>,
     /// One entry per error code, with how many times it occurred.
@@ -77,8 +82,17 @@ impl Monitor {
     /// Fold one event into the running aggregates.
     pub fn observe(&mut self, event: &CoreEvent) {
         match &event.payload {
-            EventPayload::Turn(TurnEvent::Started { .. }) => {
+            EventPayload::Turn(TurnEvent::Started { input, .. }) => {
                 self.summary.total_turns = self.summary.total_turns.saturating_add(1);
+                // Keep the first non-empty input as the session's title. Later
+                // turns don't overwrite it — the opening message is the most
+                // recognizable label.
+                if self.summary.first_user_input.is_none()
+                    && let Some(text) = input
+                    && !text.trim().is_empty()
+                {
+                    self.summary.first_user_input = Some(text.clone());
+                }
             }
             EventPayload::Model(ModelEvent::RequestStarted {
                 request_id, model, ..
@@ -317,6 +331,36 @@ mod tests {
             },
         );
         table
+    }
+
+    /// The first turn's user input becomes the session title and later turns
+    /// don't overwrite it — the opening message is the recognizable label, so a
+    /// long multi-turn session still lists under what it started as. An
+    /// empty/whitespace opening input is skipped in favour of the next real one.
+    #[test]
+    fn first_user_input_captures_opening_turn_only() {
+        let events = vec![
+            ev(0, runtime_src(), started("fix the auth bug")),
+            ev(1, model_src(), request_started("r1", "gpt-4o")),
+            ev(2, runtime_src(), started("now add a test")),
+        ];
+        let summary = summarize(&events, PricingTable::new());
+        assert_eq!(summary.total_turns, 2);
+        assert_eq!(summary.first_user_input.as_deref(), Some("fix the auth bug"));
+    }
+
+    /// A session whose only turn carried no input (or empty input) has no title,
+    /// so the UI falls back to workspace/id rather than printing a blank.
+    #[test]
+    fn first_user_input_is_none_without_real_input() {
+        let blank = EventPayload::Turn(TurnEvent::Started {
+            turn_id: TurnId("t".to_owned()),
+            input: Some("   ".to_owned()),
+        });
+        let events = vec![ev(0, runtime_src(), blank)];
+        let summary = summarize(&events, PricingTable::new());
+        assert_eq!(summary.total_turns, 1);
+        assert_eq!(summary.first_user_input, None);
     }
 
     /// A representative two-turn stream aggregates into the expected counts, and

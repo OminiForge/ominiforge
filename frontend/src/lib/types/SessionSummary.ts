@@ -16,6 +16,13 @@ cache_hit_rate: number,
  */
 cost_usd: number | null, 
 /**
+ * The first turn's user input, if any — a human-readable title for the
+ * session list (`doc/frontend.md`). `None` for sessions with no user turn
+ * (e.g. an empty draft that was never sent). Not truncated server-side; the
+ * UI clips it for display.
+ */
+first_user_input: string | null, 
+/**
  * `tool_name → call count` (includes failures).
  */
 tools_used: { [key in string]: bigint }, 
