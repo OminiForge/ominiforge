@@ -76,7 +76,14 @@
 					</div>
 				{/if}
 
-				<!-- ENV: detected env tools (nix/cargo/…) — needs backend support (Phase B2); hidden until available -->
+				{#if $currentRuntime && $currentRuntime.env.length > 0}
+					<div class="rt-entry">
+						<div class="rt-label">Env</div>
+						<div class="rt-value" title={$currentRuntime.env.join(' · ')}>
+							{$currentRuntime.env.join(' · ')}
+						</div>
+					</div>
+				{/if}
 
 				{#if $currentRuntime}
 					<div class="rt-entry">

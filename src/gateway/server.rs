@@ -279,7 +279,10 @@ async fn session_runtime(State(state): State<AppState>, Path(id): Path<String>) 
         Ok(meta) => meta,
         Err(e) => return not_found(&e),
     };
-    match state.registry.runtime_info(meta.profile_id.as_deref()) {
+    match state
+        .registry
+        .runtime_info(meta.profile_id.as_deref(), meta.workspace.as_deref())
+    {
         Ok(info) => Json(info).into_response(),
         Err(e) => internal_error(&e),
     }

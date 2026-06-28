@@ -16,7 +16,7 @@
 //! with stale handles.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
@@ -59,6 +59,38 @@ pub struct RuntimeInfo {
     pub provider: String,
     /// Model id sent to the API (e.g. `gpt-4o`).
     pub model: String,
+    /// Environment tags detected from marker files in the session's workspace
+    /// (e.g. `["nix", "cargo"]`). Empty when the session has no workspace or no
+    /// marker matched — the RUNTIME panel only shows the row when non-empty
+    /// ("detected, therefore shown"; `doc/frontend.md`, B2).
+    pub env: Vec<String>,
+}
+
+/// Detect environment tags from marker files at the workspace root.
+///
+/// Returns the tags in a stable order (nix, cargo, node, python) so the RUNTIME
+/// panel never reorders between requests. Empty when `workspace` is `None`
+/// (restricted session) or no marker is present.
+///
+/// Only the workspace root is probed — one `Path::exists` per marker, no
+/// directory walk — because this runs on a display GET and must stay cheap.
+fn detect_env(workspace: Option<&Path>) -> Vec<String> {
+    // (tag, marker files that imply it). First matching marker wins per tag; a
+    // workspace can carry several tags (a nix flake wrapping a cargo project).
+    const MARKERS: &[(&str, &[&str])] = &[
+        ("nix", &["flake.nix", ".envrc"]),
+        ("cargo", &["Cargo.toml"]),
+        ("node", &["package.json"]),
+        ("python", &["pyproject.toml"]),
+    ];
+    let Some(root) = workspace else {
+        return Vec::new();
+    };
+    MARKERS
+        .iter()
+        .filter(|(_, files)| files.iter().any(|f| root.join(f).exists()))
+        .map(|(tag, _)| (*tag).to_owned())
+        .collect()
 }
 
 /// Owns the live actors and the defaults used to spawn new ones.
@@ -116,20 +148,29 @@ impl SessionRegistry {
     }
 
     /// Resolve the config-layer provider/model for `profile_id` (the gateway's
-    /// default profile when `None`). This is the *configured* selection the
-    /// RUNTIME panel displays — read straight from config (providers + profile +
-    /// resolve), deliberately **not** through [`app::assemble`], which would also
-    /// spawn this profile's MCP subprocesses. Resolving is two small TOML reads;
-    /// a display GET must not pay the assembly cost.
+    /// default profile when `None`), plus the environment tags detected at
+    /// `workspace`. This is the *configured* selection the RUNTIME panel
+    /// displays — read straight from config (providers + profile + resolve),
+    /// deliberately **not** through [`app::assemble`], which would also spawn
+    /// this profile's MCP subprocesses. Resolving is two small TOML reads; a
+    /// display GET must not pay the assembly cost.
+    ///
+    /// `workspace` is the *session's* workspace (`SessionMeta.workspace`), not
+    /// the gateway default — env tags must reflect the directory this session
+    /// actually runs in. `None` (restricted session) yields no env tags.
     ///
     /// # Errors
     /// [`anyhow::Error`] if config is unreadable or the profile/model cannot be
     /// resolved (no model named, unknown provider, missing api key).
-    pub fn runtime_info(&self, profile_id: Option<&str>) -> Result<RuntimeInfo> {
-        let workspace = &self.inner.defaults.workspace;
+    pub fn runtime_info(
+        &self,
+        profile_id: Option<&str>,
+        workspace: Option<&Path>,
+    ) -> Result<RuntimeInfo> {
+        let config_root = &self.inner.defaults.workspace;
         let profile_name = profile_id.unwrap_or(&self.inner.defaults.profile);
 
-        let store = ConfigStore::discover(workspace);
+        let store = ConfigStore::discover(config_root);
         let providers = store
             .load_providers()
             .context("failed to load providers.toml")?;
@@ -143,6 +184,7 @@ impl SessionRegistry {
         Ok(RuntimeInfo {
             provider: resolved.provider_name,
             model: resolved.model_id,
+            env: detect_env(workspace),
         })
     }
 
@@ -309,5 +351,48 @@ impl SessionRegistry {
         vec![Message::System {
             content: assembled.system_prompt.clone(),
         }]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::detect_env;
+
+    /// No workspace (restricted session) yields no env tags, so the RUNTIME
+    /// panel omits the ENV row rather than showing an empty one.
+    #[test]
+    fn detect_env_none_workspace_is_empty() {
+        assert!(detect_env(None).is_empty());
+    }
+
+    /// An empty workspace (no marker files) yields no tags — detection is
+    /// presence-based, never a default guess.
+    #[test]
+    fn detect_env_no_markers_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(detect_env(Some(dir.path())).is_empty());
+    }
+
+    /// A nix flake wrapping a cargo project carries both tags, in the fixed
+    /// order (nix before cargo) regardless of which file was created first —
+    /// the panel must not reorder between requests.
+    #[test]
+    fn detect_env_reports_multiple_tags_in_fixed_order() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create cargo's marker first to prove ordering is by MARKERS, not fs.
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+        std::fs::write(dir.path().join("flake.nix"), "{}").unwrap();
+        assert_eq!(detect_env(Some(dir.path())), vec!["nix", "cargo"]);
+    }
+
+    /// `.envrc` alone implies nix (direnv-managed), matching the plan's marker
+    /// table.
+    #[test]
+    fn detect_env_envrc_implies_nix() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".envrc"), "use flake").unwrap();
+        assert_eq!(detect_env(Some(dir.path())), vec!["nix"]);
     }
 }

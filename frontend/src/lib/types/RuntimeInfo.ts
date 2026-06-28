@@ -15,4 +15,11 @@ provider: string,
 /**
  * Model id sent to the API (e.g. `gpt-4o`).
  */
-model: string, };
+model: string, 
+/**
+ * Environment tags detected from marker files in the session's workspace
+ * (e.g. `["nix", "cargo"]`). Empty when the session has no workspace or no
+ * marker matched — the RUNTIME panel only shows the row when non-empty
+ * ("detected, therefore shown"; `doc/frontend.md`, B2).
+ */
+env: Array<string>, };
