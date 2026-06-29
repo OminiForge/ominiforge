@@ -2,6 +2,24 @@ import type { GatewayEvent } from '$lib/types/GatewayEvent';
 import type { CoreEvent } from '$lib/types/CoreEvent';
 import type { BlockContent } from '$lib/types/BlockContent';
 
+/** The control tool whose calls drive the plan card. Must match
+ *  `PLAN_TOOL_NAME` in `src/agent/plan.rs` — plan calls are folded into a
+ *  structured plan card instead of rendered as generic tool blocks. */
+export const PLAN_TOOL_NAME = 'plan';
+
+/** Step lifecycle, mirroring `StepStatus` in `src/agent/plan.rs`. Terminal:
+ *  completed/cancelled/blocked; non-terminal: pending/in_progress. */
+export type PlanStatus = 'pending' | 'in_progress' | 'completed' | 'cancelled' | 'blocked';
+
+/** One plan step, mirroring `PlanStep` in `src/agent/plan.rs`. `reason` is
+ *  carried by cancelled/blocked steps (the why). */
+export interface PlanStep {
+	id: string;
+	content: string;
+	status: PlanStatus;
+	reason?: string;
+}
+
 export type Item =
 	| { kind: 'user'; text: string }
 	| { kind: 'text'; text: string; streaming: boolean }
@@ -14,6 +32,11 @@ export type Item =
 			status: 'running' | 'done' | 'error';
 			result?: string;
 	  }
+	/** A plan checklist, folded from `plan` control-tool calls (one card per
+	 *  `init`). `streaming` marks a placeholder shown while the call's args are
+	 *  still streaming (partial JSON, not yet foldable); it is replaced by the
+	 *  real card on commit. See foldPlanOp. */
+	| { kind: 'plan'; steps: PlanStep[]; streaming: boolean }
 	| { kind: 'error'; message: string }
 	| { kind: 'notice'; message: string };
 
@@ -207,6 +230,14 @@ function commitBlock(
 		items.splice(insertAt, 0, item);
 		commitBase = insertAt + 1;
 	} else {
+		// Plan is a control tool: fold its op into a plan card instead of
+		// rendering a generic tool block. The card lives where `init` lands and
+		// later ops mutate it in place (mirrors the backend's single authoritative
+		// plan, but each `init` starts a fresh card so turn history is preserved).
+		if (content.ToolCall.name === PLAN_TOOL_NAME) {
+			items = foldPlanOp(items, content.ToolCall.arguments);
+			return { ...state, items, requestCommitted: true, commitBase, committedEnd: items.length };
+		}
 		const toolSeqs = new Map(state.toolSeqs);
 		toolSeqs.set(seq, items.length);
 		item = { kind: 'tool', seq, name: content.ToolCall.name, args: content.ToolCall.arguments, status: 'running' };
@@ -215,6 +246,114 @@ function commitBlock(
 	}
 
 	return { ...state, items, requestCommitted: true, commitBase, committedEnd: items.length };
+}
+
+/// Decoded `plan` op, mirroring `PlanOp` in `src/agent/plan.rs` (externally
+/// tagged on `op`). Only the fields each op needs are read; the rest are
+/// ignored, matching serde's tolerance on the wire.
+type PlanOp =
+	| { op: 'init'; steps?: Array<{ content: string }> }
+	| { op: 'start'; id: string }
+	| { op: 'complete'; id: string }
+	| { op: 'cancel'; id: string; reason?: string }
+	| { op: 'block'; id: string; reason?: string }
+	| { op: 'add'; content: string; after_id?: string };
+
+/// Fold one committed `plan` tool call into the items list.
+///
+/// Strategy mirrors the backend (`src/agent/plan.rs`): `init` replaces the plan
+/// with a fresh card; every other op mutates the *latest* plan card in place.
+/// The frontend keeps one card per `init` (not a single global plan) so the
+/// conversation preserves the plan of each turn as history — the newest card is
+/// always the live one that subsequent ops target.
+///
+/// Robustness: the args are authoritative committed JSON, but a malformed op or
+/// a mutation with no card to target is ignored (the items list is returned
+/// unchanged), mirroring the backend's benign `is_error` handling — the model
+/// corrects itself next round and we never throw mid-fold.
+function foldPlanOp(items: Item[], args: string): Item[] {
+	let op: PlanOp;
+	try {
+		op = JSON.parse(args) as PlanOp;
+	} catch {
+		return items;
+	}
+	if (!op || typeof op !== 'object' || typeof op.op !== 'string') return items;
+
+	if (op.op === 'init') {
+		const steps: PlanStep[] = (op.steps ?? []).map((s, i) => ({
+			id: String(i + 1),
+			content: s.content,
+			status: 'pending'
+		}));
+		return [...items, { kind: 'plan', steps, streaming: false }];
+	}
+
+	// Mutate the latest plan card. No card → benign no-op (model misused plan).
+	const pos = lastPlanIndex(items);
+	if (pos === -1) return items;
+	const card = items[pos];
+	if (card.kind !== 'plan') return items;
+	const steps = applyPlanOp(card.steps, op);
+	if (steps === card.steps) return items; // unchanged (unknown id / anchor)
+	const next = [...items];
+	next[pos] = { kind: 'plan', steps, streaming: false };
+	return next;
+}
+
+/// Apply a non-init op to a step list, returning a new list (or the same
+/// reference unchanged when the target id/anchor is absent — a benign no-op
+/// matching the backend's `PlanError` → `is_error` path).
+function applyPlanOp(steps: PlanStep[], op: PlanOp): PlanStep[] {
+	switch (op.op) {
+		case 'start':
+			return setStatus(steps, op.id, 'in_progress');
+		case 'complete':
+			return setStatus(steps, op.id, 'completed');
+		case 'cancel':
+			return setStatus(steps, op.id, 'cancelled', op.reason);
+		case 'block':
+			return setStatus(steps, op.id, 'blocked', op.reason);
+		case 'add': {
+			const step: PlanStep = { id: nextPlanId(steps), content: op.content, status: 'pending' };
+			if (op.after_id == null) return [...steps, step];
+			const at = steps.findIndex((s) => s.id === op.after_id);
+			if (at === -1) return steps; // unknown anchor → no-op
+			return [...steps.slice(0, at + 1), step, ...steps.slice(at + 1)];
+		}
+		default:
+			return steps;
+	}
+}
+
+/// Set a step's status (and reason). Returns the same reference when no step
+/// matches `id`, so callers can detect the no-op.
+function setStatus(steps: PlanStep[], id: string, status: PlanStatus, reason?: string): PlanStep[] {
+	const at = steps.findIndex((s) => s.id === id);
+	if (at === -1) return steps;
+	const next = [...steps];
+	// Keep a prior reason when the new op carries none; a fresh reason overrides.
+	next[at] = { ...next[at], status, reason: reason ?? next[at].reason };
+	return next;
+}
+
+/// Next `add` id: one past the largest numeric id present (matches the backend,
+/// so ids stay stable across cancellations).
+function nextPlanId(steps: PlanStep[]): string {
+	const max = steps.reduce((m, s) => {
+		const n = Number(s.id);
+		return Number.isInteger(n) && n > m ? n : m;
+	}, 0);
+	return String(max + 1);
+}
+
+/// Index of the most recent plan card, or -1. The newest card is the live plan
+/// that non-init ops mutate, and what the UI surfaces as the current plan.
+function lastPlanIndex(items: Item[]): number {
+	for (let i = items.length - 1; i >= 0; i--) {
+		if (items[i].kind === 'plan') return i;
+	}
+	return -1;
 }
 
 function pairResult(
@@ -255,9 +394,18 @@ function applyDelta(
 		case 'block_start': {
 			const kind = ev.kind === 'reasoning' ? 'reasoning' : ev.kind === 'tool_call' ? 'tool_call' : 'text';
 			if (kind === 'tool_call') {
-				// Tool calls: immediate creation, index-based tracking
-				open[ev.index] = items.length;
-				items.push({ kind: 'tool', seq: -1, name: ev.tool ?? '', args: '', status: 'running' });
+				// Plan is a control tool: show a single streaming placeholder card,
+				// not a generic tool block. Its args stream as partial JSON (not
+				// foldable mid-stream), so we ignore tool_args for it and let the
+				// committed ContentBlock replace the placeholder with the real card.
+				if (ev.tool === PLAN_TOOL_NAME) {
+					open[ev.index] = items.length;
+					items.push({ kind: 'plan', steps: [], streaming: true });
+				} else {
+					// Tool calls: immediate creation, index-based tracking
+					open[ev.index] = items.length;
+					items.push({ kind: 'tool', seq: -1, name: ev.tool ?? '', args: '', status: 'running' });
+				}
 			} else {
 				// Text/reasoning: close the previous streaming item of the same kind
 				// (so new content for the same kind starts a fresh item at the end),
@@ -308,6 +456,9 @@ function applyDelta(
 		case 'tool_args': {
 			const pos = open[ev.index];
 			const cur = pos !== undefined ? items[pos] : undefined;
+			// Plan placeholder: args stream as partial JSON, not foldable until the
+			// committed ContentBlock arrives — ignore the stream for it.
+			if (cur?.kind === 'plan') return { ...state, items, open };
 			if (cur?.kind === 'tool') {
 				items[pos] = { ...cur, args: cur.args + ev.json };
 				return { ...state, items, open };

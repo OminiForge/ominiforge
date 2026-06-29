@@ -11,7 +11,7 @@
 	import type { SessionMeta } from '$lib/types/SessionMeta';
 	import type { RuntimeInfo } from '$lib/types/RuntimeInfo';
 	import type { SessionSummary } from '$lib/types/SessionSummary';
-	import { apply, emptyState, type ConversationState, type Item } from '$lib/conversation';
+	import { apply, emptyState, type ConversationState, type Item, type PlanStep } from '$lib/conversation';
 	import { num, statLabel, formatCost, cacheLabel, topTools } from '$lib/stats';
 
 	/** Sentinel id for a not-yet-created (draft) session. Reaching `/sessions/new`
@@ -312,7 +312,30 @@
 		// Auto-collapse finished reasoning and completed tools
 		if (item.kind === 'reasoning') return !item.streaming;
 		if (item.kind === 'tool') return item.status === 'done' || item.status === 'error';
+		// Auto-collapse a plan once every step is terminal (the work is done);
+		// keep an active plan open so the running task stays visible.
+		if (item.kind === 'plan') return item.steps.length > 0 && planDone(item.steps);
 		return false;
+	}
+
+	/** Whether every step has reached a terminal state. An empty plan is not
+	 *  "done" — it is a placeholder still being established. */
+	function planDone(steps: PlanStep[]): boolean {
+		return steps.length > 0 && steps.every((s) => isTerminal(s.status));
+	}
+
+	function isTerminal(status: PlanStep['status']): boolean {
+		return status === 'completed' || status === 'cancelled' || status === 'blocked';
+	}
+
+	/** Resolved-step count over total, for the plan header progress. Cancelled
+	 *  counts as resolved (the step was objectively unreachable and dealt with),
+	 *  so the bar only stays short while a step is still pending/in_progress or
+	 *  BLOCKED — i.e. a sub-100% bar signals a step is waiting on the user, not
+	 *  merely cancelled. See StepStatus in `src/agent/plan.rs`. */
+	function planProgress(steps: PlanStep[]): { done: number; total: number } {
+		const done = steps.filter((s) => s.status === 'completed' || s.status === 'cancelled').length;
+		return { done, total: steps.length };
 	}
 
 	function shortPreview(text: string): string {
@@ -395,6 +418,28 @@
 	// Cancel only makes sense while a turn is running (the backend ignores Cancel
 	// when idle), so the button is shown only then — see ConversationState.turnRunning.
 	const turnRunning = $derived(convo.turnRunning === true);
+
+	// The plan shown in the sticky dock: the latest committed plan card (running
+	// OR finished). Once any plan exists it stays docked, so a later plan swaps in
+	// place rather than the dock vanishing and a new one popping in abruptly.
+	// Older plans (superseded by a newer `init`) fall back to inline history.
+	// Carrying the index lets the inline render skip it — shown in one place only.
+	const dockPlan = $derived.by<{ steps: PlanStep[]; index: number } | null>(() => {
+		for (let i = convo.items.length - 1; i >= 0; i--) {
+			const it = convo.items[i];
+			// Skip streaming placeholders (empty, half-arrived) so the dock never
+			// blanks between ops; the last committed card is the live plan.
+			if (it.kind === 'plan' && !it.streaming && it.steps.length > 0) {
+				return { steps: it.steps, index: i };
+			}
+		}
+		return null;
+	});
+
+	// Collapsed state for the sticky dock. Defaults collapsed so the plan + input
+	// don't eat a big vertical slab; the user expands to see steps. Separate from
+	// the inline-item `collapsed` map (keyed by item index).
+	let pinnedPlanCollapsed = $state(true);
 </script>
 
 <div class="session-grid" class:no-detail={isDraft || !detailOpen}>
@@ -536,6 +581,57 @@
 						</div>
 					</div>
 
+				{:else if item.kind === 'plan'}
+					<!-- Streaming placeholders (item.streaming) render nothing: a flashing
+					     inline "planning…" card on every plan op is pure eye-strain, and
+					     the dock already shows the live plan. The docked card is shown in
+					     the dock, so skip it here too — only committed history cards render. -->
+					{#if !item.streaming && i !== dockPlan?.index}
+						{@const prog = planProgress(item.steps)}
+						<div class="item">
+							<div class="plan-card" class:expanded={!isCollapsed(item, i)} class:done={planDone(item.steps)}>
+								<button class="plan-head" onclick={() => toggleCollapse(item, i)} aria-expanded={!isCollapsed(item, i)}>
+									<svg class="plan-icon" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+										<path d="M3 3h8M3 7h8M3 11h5" />
+									</svg>
+									<span class="plan-title">Plan</span>
+									<span class="plan-progress">{prog.done}/{prog.total}</span>
+									<span class="plan-track"><span class="plan-bar" style="width: {prog.total ? (prog.done / prog.total) * 100 : 0}%"></span></span>
+									<svg class="plan-chevron" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+										<polyline points="4,2 8,6 4,10" />
+									</svg>
+								</button>
+								{#if !isCollapsed(item, i)}
+									<ol class="plan-steps">
+										{#each item.steps as step (step.id)}
+											<li class="plan-step" data-status={step.status}>
+												<span class="plan-step-mark" aria-hidden="true">
+													{#if step.status === 'completed'}
+														<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="2.5,6.5 5,9 9.5,3.5" /></svg>
+													{:else if step.status === 'in_progress'}
+														<span class="plan-spinner"></span>
+													{:else if step.status === 'cancelled'}
+														<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><line x1="3" y1="3" x2="9" y2="9" /><line x1="9" y1="3" x2="3" y2="9" /></svg>
+													{:else if step.status === 'blocked'}
+														<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="6" cy="6" r="4.2" /><line x1="3" y1="3" x2="9" y2="9" stroke-linecap="round" /></svg>
+													{:else}
+														<span class="plan-dot"></span>
+													{/if}
+												</span>
+												<span class="plan-step-body">
+													<span class="plan-step-text">{step.content}</span>
+													{#if step.reason}
+														<span class="plan-step-reason">{step.reason}</span>
+													{/if}
+												</span>
+											</li>
+										{/each}
+									</ol>
+								{/if}
+							</div>
+						</div>
+					{/if}
+
 				{:else if item.kind === 'error'}
 					<div class="item item-error">{item.message}</div>
 
@@ -550,8 +646,60 @@
 		</div>
 	</div>
 
+	<!-- ACTIVE PLAN (sticky above input) — the latest plan stays docked (running
+	     or done) so a later plan swaps in place instead of popping in abruptly.
+	     Default collapsed to spare vertical space; the dock carries the divider
+	     line so it reads as one zone with the input below. -->
+	{#if dockPlan}
+		{@const prog = planProgress(dockPlan.steps)}
+		<div class="plan-dock">
+			<div class="plan-dock-inner">
+				<div class="plan-card pinned" class:expanded={!pinnedPlanCollapsed}>
+					<button class="plan-head" onclick={() => (pinnedPlanCollapsed = !pinnedPlanCollapsed)} aria-expanded={!pinnedPlanCollapsed}>
+						<svg class="plan-icon" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+							<path d="M3 3h8M3 7h8M3 11h5" />
+						</svg>
+						<span class="plan-title">Plan</span>
+						<span class="plan-progress">{prog.done}/{prog.total}</span>
+						<span class="plan-track"><span class="plan-bar" style="width: {prog.total ? (prog.done / prog.total) * 100 : 0}%"></span></span>
+						<svg class="plan-chevron" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+							<polyline points="4,2 8,6 4,10" />
+						</svg>
+					</button>
+					{#if !pinnedPlanCollapsed}
+						<ol class="plan-steps">
+							{#each dockPlan.steps as step (step.id)}
+								<li class="plan-step" data-status={step.status}>
+									<span class="plan-step-mark" aria-hidden="true">
+										{#if step.status === 'completed'}
+											<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="2.5,6.5 5,9 9.5,3.5" /></svg>
+										{:else if step.status === 'in_progress'}
+											<span class="plan-spinner"></span>
+										{:else if step.status === 'cancelled'}
+											<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><line x1="3" y1="3" x2="9" y2="9" /><line x1="9" y1="3" x2="3" y2="9" /></svg>
+										{:else if step.status === 'blocked'}
+											<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="6" cy="6" r="4.2" /><line x1="3" y1="3" x2="9" y2="9" stroke-linecap="round" /></svg>
+										{:else}
+											<span class="plan-dot"></span>
+										{/if}
+									</span>
+									<span class="plan-step-body">
+										<span class="plan-step-text">{step.content}</span>
+										{#if step.reason}
+											<span class="plan-step-reason">{step.reason}</span>
+										{/if}
+									</span>
+								</li>
+							{/each}
+						</ol>
+					{/if}
+				</div>
+			</div>
+		</div>
+	{/if}
+
 	<!-- INPUT AREA -->
-	<div class="input-area">
+	<div class="input-area" class:seamless={dockPlan}>
 		<div class="input-inner">
 			<div class="input-box">
 				<textarea
@@ -1580,6 +1728,209 @@
 		font-family: var(--font-chinese);
 	}
 
+	/* ---- PLAN CARD (inline checklist + sticky dock) ---- */
+	/* Neutral surface, tool-block family — the indigo accent is rationed to the
+	   Plan label/icon only (like reasoning's indigo label), so the card blends
+	   into the conversation and the input dock rather than shouting. */
+	.plan-card {
+		border-radius: var(--radius-md);
+		overflow: hidden;
+		border: 1px solid var(--border-subtle);
+		background: var(--canvas-overlay);
+		transition: border-color var(--dur-std) var(--ease-out);
+	}
+
+	/* Sticky dock variant: matches the input box — same radius/surface/border so
+	   the running plan reads as part of the composer zone. */
+	.plan-card.pinned {
+		border-radius: var(--radius-lg);
+		border-color: var(--border-default);
+	}
+
+	.plan-head {
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+		padding: 7px var(--space-3);
+		width: 100%;
+		text-align: left;
+		background: transparent;
+		cursor: pointer;
+		user-select: none;
+		transition: background var(--dur-fast) var(--ease-out);
+	}
+
+	button.plan-head:hover {
+		background: color-mix(in srgb, var(--plan-accent) 8%, transparent);
+	}
+
+	.plan-icon {
+		width: 13px;
+		height: 13px;
+		flex-shrink: 0;
+		color: var(--plan-accent);
+	}
+
+	.plan-title {
+		font-size: 10.5px;
+		font-weight: 510;
+		color: var(--plan-accent);
+		text-transform: uppercase;
+		letter-spacing: 0.08em;
+		flex-shrink: 0;
+	}
+
+	.plan-progress {
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--text-tertiary);
+		font-variant-numeric: tabular-nums;
+		flex-shrink: 0;
+	}
+
+	/* Progress track: inline/dock use remaining flex width in the head row. */
+	.plan-track {
+		flex: 1;
+		height: 4px;
+		background: var(--canvas-float);
+		border-radius: var(--radius-sm);
+		overflow: hidden;
+	}
+
+	.plan-bar {
+		display: block;
+		height: 100%;
+		background: var(--plan-accent);
+		border-radius: var(--radius-sm);
+		transition: width var(--dur-std) var(--ease-out);
+	}
+
+	.plan-chevron {
+		width: 12px;
+		height: 12px;
+		color: var(--text-tertiary);
+		transition: transform var(--dur-std) var(--ease-out);
+		flex-shrink: 0;
+	}
+	.plan-card.expanded .plan-chevron {
+		transform: rotate(90deg);
+	}
+
+	.plan-steps {
+		list-style: none;
+		padding: var(--space-2) var(--space-3) var(--space-3);
+		margin: 0;
+		display: grid;
+		gap: var(--space-1);
+		border-top: 1px solid var(--border-subtle);
+	}
+
+	.plan-step {
+		display: grid;
+		grid-template-columns: 14px 1fr;
+		gap: var(--space-2);
+		align-items: start;
+		padding: 3px 0;
+	}
+
+	.plan-step-mark {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		width: 14px;
+		height: 16px; /* align icon to the first text line */
+		flex-shrink: 0;
+		color: var(--text-tertiary);
+	}
+	.plan-step-mark svg {
+		width: 12px;
+		height: 12px;
+	}
+
+	.plan-dot {
+		width: 6px;
+		height: 6px;
+		border-radius: 50%;
+		border: 1.5px solid var(--text-tertiary);
+	}
+
+	/* Per-status colours: in_progress=running amber, completed=done green,
+	   blocked=error red (needs user), cancelled=muted+struck. */
+	.plan-step[data-status='in_progress'] .plan-step-mark {
+		color: var(--state-running);
+	}
+	.plan-step[data-status='completed'] .plan-step-mark {
+		color: var(--state-done);
+	}
+	.plan-step[data-status='blocked'] .plan-step-mark {
+		color: var(--state-error);
+	}
+	.plan-step[data-status='cancelled'] .plan-step-mark {
+		color: var(--text-disabled);
+	}
+
+	.plan-step-body {
+		display: flex;
+		flex-direction: column;
+		gap: 1px;
+		min-width: 0;
+	}
+
+	.plan-step-text {
+		font-size: 12.5px;
+		line-height: 1.45;
+		color: var(--text-secondary);
+		font-family: var(--font-chinese);
+		text-wrap: pretty;
+		word-break: break-word;
+	}
+	.plan-step[data-status='in_progress'] .plan-step-text {
+		color: var(--text-primary);
+		font-weight: 500;
+	}
+	.plan-step[data-status='completed'] .plan-step-text {
+		color: var(--text-tertiary);
+	}
+	.plan-step[data-status='cancelled'] .plan-step-text {
+		color: var(--text-disabled);
+		text-decoration: line-through;
+	}
+
+	.plan-step-reason {
+		font-size: 11px;
+		line-height: 1.4;
+		color: var(--text-tertiary);
+		font-family: var(--font-chinese);
+	}
+	.plan-step[data-status='blocked'] .plan-step-reason {
+		color: var(--state-error-text);
+	}
+
+	.plan-spinner {
+		width: 10px;
+		height: 10px;
+		border: 1.5px solid color-mix(in srgb, var(--state-running) 25%, transparent);
+		border-top-color: var(--state-running);
+		border-radius: 50%;
+		animation: spin 700ms linear infinite;
+	}
+
+	/* Sticky dock: pins the active plan above the input, sharing the composer's
+	   width + horizontal padding so it lines up with the input box. */
+	/* Sticky dock owns the conversation↔composer divider (border-top); the input
+	   below drops its own top border when docked (.input-area.seamless) so there's
+	   one clean line above the dock, not a stray seam between dock and input. */
+	.plan-dock {
+		flex-shrink: 0;
+		padding: var(--space-3) var(--space-10) 0;
+		background: var(--canvas-raised);
+		border-top: 1px solid var(--border-subtle);
+	}
+	.plan-dock-inner {
+		max-width: 740px;
+		margin: 0 auto;
+	}
+
 	/* Streaming dot (reasoning / tool live indicator) */
 	.streaming-dot {
 		display: inline-block;
@@ -1607,6 +1958,12 @@
 		padding: var(--space-4) var(--space-10);
 		background: var(--canvas-raised);
 		flex-shrink: 0;
+	}
+
+	/* Docked plan above: the dock already drew the divider, so drop ours to avoid
+	   a double seam squeezed between the dock and the input box. */
+	.input-area.seamless {
+		border-top: none;
 	}
 
 	.input-inner {
@@ -1749,6 +2106,9 @@
 			animation: none;
 		}
 		.streaming-dot {
+			animation: none;
+		}
+		.plan-spinner {
 			animation: none;
 		}
 	}

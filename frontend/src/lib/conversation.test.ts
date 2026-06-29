@@ -569,3 +569,144 @@ describe('conversation fold', () => {
 		expect(state.turnRunning).toBe(true);
 	});
 });
+
+// ── Plan control tool: folded into structured plan cards ───────────────
+//
+// `plan` is a control tool (src/agent/plan.rs): its calls arrive as committed
+// ToolCall ContentBlocks whose `arguments` is a PlanOp JSON. The fold must turn
+// these into a single structured `plan` item (one card per `init`, later ops
+// mutating it in place) — NOT a generic tool block per op.
+
+/** A committed `plan` tool call carrying the given op JSON as its arguments. */
+function planCall(seq: number, op: object): GatewayEvent {
+	return contentBlock(seq, { ToolCall: { id: `p${seq}`, name: 'plan', arguments: JSON.stringify(op) } });
+}
+
+/** Pull the single plan card's steps (asserts exactly one exists). */
+function planSteps(state: ConversationState) {
+	const plans = state.items.filter((i) => i.kind === 'plan');
+	expect(plans).toHaveLength(1);
+	const p = plans[0];
+	return p.kind === 'plan' ? p.steps : [];
+}
+
+describe('plan fold', () => {
+	it('init creates one plan card with sequential pending steps (no tool blocks)', () => {
+		const state = fold([
+			reqStarted(1),
+			planCall(2, { op: 'init', steps: [{ content: 'a' }, { content: 'b' }, { content: 'c' }] })
+		]);
+		// A plan call must never surface as a generic tool block.
+		expect(state.items.filter((i) => i.kind === 'tool')).toHaveLength(0);
+		const steps = planSteps(state);
+		expect(steps.map((s) => s.id)).toEqual(['1', '2', '3']);
+		expect(steps.every((s) => s.status === 'pending')).toBe(true);
+	});
+
+	it('start/complete mutate the existing card in place, not append new cards', () => {
+		const state = fold([
+			reqStarted(1),
+			planCall(2, { op: 'init', steps: [{ content: 'a' }, { content: 'b' }] }),
+			reqStarted(3),
+			planCall(4, { op: 'start', id: '1' }),
+			reqStarted(5),
+			planCall(6, { op: 'complete', id: '1' })
+		]);
+		const steps = planSteps(state);
+		expect(steps[0].status).toBe('completed');
+		expect(steps[1].status).toBe('pending');
+	});
+
+	it('cancel and block record their reason', () => {
+		const state = fold([
+			reqStarted(1),
+			planCall(2, { op: 'init', steps: [{ content: 'a' }, { content: 'b' }] }),
+			reqStarted(3),
+			planCall(4, { op: 'cancel', id: '1', reason: 'no such tool' }),
+			reqStarted(5),
+			planCall(6, { op: 'block', id: '2', reason: 'needs API key' })
+		]);
+		const steps = planSteps(state);
+		expect(steps[0].status).toBe('cancelled');
+		expect(steps[0].reason).toBe('no such tool');
+		expect(steps[1].status).toBe('blocked');
+		expect(steps[1].reason).toBe('needs API key');
+	});
+
+	it('add appends at end and inserts after an anchor with max+1 id', () => {
+		const state = fold([
+			reqStarted(1),
+			planCall(2, { op: 'init', steps: [{ content: 'a' }, { content: 'b' }] }),
+			reqStarted(3),
+			planCall(4, { op: 'add', content: 'end' }),
+			reqStarted(5),
+			planCall(6, { op: 'add', content: 'mid', after_id: '1' })
+		]);
+		const steps = planSteps(state);
+		expect(steps.map((s) => s.content)).toEqual(['a', 'mid', 'b', 'end']);
+		// id is max+1, unaffected by insert position
+		const mid = steps.find((s) => s.content === 'mid');
+		expect(mid?.id).toBe('4');
+	});
+
+	it('a non-init op with no prior plan is a benign no-op', () => {
+		const state = fold([reqStarted(1), planCall(2, { op: 'start', id: '1' })]);
+		expect(state.items.filter((i) => i.kind === 'plan')).toHaveLength(0);
+		expect(state.items.filter((i) => i.kind === 'tool')).toHaveLength(0);
+	});
+
+	it('start on an unknown id leaves the plan unchanged', () => {
+		const state = fold([
+			reqStarted(1),
+			planCall(2, { op: 'init', steps: [{ content: 'a' }] }),
+			reqStarted(3),
+			planCall(4, { op: 'start', id: '99' })
+		]);
+		expect(planSteps(state)[0].status).toBe('pending');
+	});
+
+	it('a second init starts a fresh card, preserving the first as history', () => {
+		const state = fold([
+			reqStarted(1),
+			planCall(2, { op: 'init', steps: [{ content: 'a' }] }),
+			reqStarted(3),
+			planCall(4, { op: 'complete', id: '1' }),
+			reqStarted(5),
+			planCall(6, { op: 'init', steps: [{ content: 'x' }, { content: 'y' }] })
+		]);
+		const plans = state.items.filter((i) => i.kind === 'plan');
+		expect(plans).toHaveLength(2);
+		expect(plans[0].kind === 'plan' && plans[0].steps[0].status).toBe('completed');
+		expect(plans[1].kind === 'plan' && plans[1].steps.map((s) => s.content)).toEqual(['x', 'y']);
+	});
+
+	it('streaming plan placeholder is replaced by the committed card (no duplication)', () => {
+		const state = fold([
+			reqStarted(1),
+			{ type: 'delta', delta: 'block_start', index: 0, kind: 'tool_call', tool: 'plan' },
+			{ type: 'delta', delta: 'tool_args', index: 0, json: '{"op":"in' },
+			{ type: 'delta', delta: 'tool_args', index: 0, json: 'it","steps":[{"content":"a"}]}' },
+			planCall(2, { op: 'init', steps: [{ content: 'a' }] })
+		]);
+		const plans = state.items.filter((i) => i.kind === 'plan');
+		expect(plans).toHaveLength(1);
+		expect(plans[0].kind === 'plan' && plans[0].streaming).toBe(false);
+		expect(plans[0].kind === 'plan' && plans[0].steps[0].content).toBe('a');
+	});
+
+	it('a later turn op mutates a plan card from an earlier request', () => {
+		// The card lives before the second RequestStarted; commitBlock truncation
+		// must not lose it, and the op must still target it.
+		const state = fold([
+			turnStarted(1, 'go'),
+			reqStarted(2),
+			planCall(3, { op: 'init', steps: [{ content: 'a' }] }),
+			turnCompleted(4),
+			turnStarted(5, 'continue'),
+			reqStarted(6),
+			planCall(7, { op: 'complete', id: '1' })
+		]);
+		const steps = planSteps(state);
+		expect(steps[0].status).toBe('completed');
+	});
+});

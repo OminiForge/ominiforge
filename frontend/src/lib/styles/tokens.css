@@ -121,6 +121,10 @@
 	--user-bg: rgba(198, 241, 53, 0.06);
 	--user-border: rgba(198, 241, 53, 0.18);
 
+	/* Plan card — control-tool checklist. Neutral surface (see +page.svelte);
+	   only the Plan label/icon carries this indigo accent, like reasoning. */
+	--plan-accent: #8a8ad0;
+
 	/* Param syntax highlight (tool JSON) + code-block highlight (hljs).
 	   Lime-adjacent cool palette so code reads calm against near-black. */
 	--syntax-key: #7b9bd8;
@@ -202,6 +206,9 @@
 	/* User message */
 	--user-bg: rgba(140, 175, 20, 0.1);
 	--user-border: rgba(140, 175, 20, 0.28);
+
+	/* Plan card — indigo accent for label/icon only (neutral surface) */
+	--plan-accent: #5b5bbf;
 
 	/* Param syntax highlight + code-block highlight (hljs), deepened for light bg */
 	--syntax-key: #3a5fa8;
