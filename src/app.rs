@@ -22,7 +22,7 @@ use crate::agent::{Agent, AgentConfig};
 use crate::config::{ConfigStore, ResolvedModel};
 use crate::context::DEFAULT_COMPACTION_THRESHOLD;
 use crate::session::SessionStore;
-use crate::tool::{ReadTool, ShellTool, ToolRegistry, WriteTool};
+use crate::tool::{EditTool, ReadTool, ShellTool, SnapshotStore, ToolRegistry, WriteTool};
 
 /// Sessions live under `<workspace>/.omini/sessions`.
 pub const SESSIONS_SUBDIR: &str = ".omini/sessions";
@@ -185,17 +185,22 @@ pub async fn assemble(
 }
 
 /// Register the built-in filesystem/shell tools the profile allows, sandboxed to
-/// `workspace`.
+/// `workspace`. `read` and `edit` share one [`SnapshotStore`] so an `edit` patch
+/// is verified against the snapshot the preceding `read` recorded.
 fn register_profile_tools(
     registry: &mut ToolRegistry,
     profile: &crate::config::Profile,
     workspace: PathBuf,
 ) {
+    let snapshots = SnapshotStore::new();
     if profile.tools.allows("read") {
-        registry.register(Arc::new(ReadTool::new(workspace.clone())));
+        registry.register(Arc::new(ReadTool::new(workspace.clone(), snapshots.clone())));
     }
     if profile.tools.allows("write") {
         registry.register(Arc::new(WriteTool::new(workspace.clone())));
+    }
+    if profile.tools.allows("edit") {
+        registry.register(Arc::new(EditTool::new(workspace.clone(), snapshots)));
     }
     if profile.tools.allows("shell") {
         registry.register(Arc::new(ShellTool::new(workspace)));
@@ -281,5 +286,30 @@ mod tests {
     fn dotenv_absent_everywhere_is_none() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(pick_dotenv_path(&[dir.path().to_owned()], dir.path()), None);
+    }
+
+    /// The default profile leaves `[tools].builtin` unset, which means "all
+    /// built-ins". `edit` must register — regression guard for a profile that
+    /// shipped an explicit `["read","write","shell"]` list and silently dropped
+    /// `edit`.
+    #[test]
+    fn default_profile_registers_edit() {
+        let profile = crate::config::Profile::builtin_default();
+        let mut reg = ToolRegistry::new();
+        register_profile_tools(&mut reg, &profile, PathBuf::from("/tmp/ws"));
+        let names: Vec<String> = reg.descriptors().into_iter().map(|d| d.name).collect();
+        assert_eq!(names, vec!["edit", "read", "shell", "write"]);
+    }
+
+    /// An explicit `builtin` list that omits `edit` must not register it — the
+    /// allowlist is authoritative.
+    #[test]
+    fn explicit_builtin_list_excludes_edit() {
+        let mut profile = crate::config::Profile::builtin_default();
+        profile.tools.builtin = Some(vec!["read".to_owned(), "write".to_owned()]);
+        let mut reg = ToolRegistry::new();
+        register_profile_tools(&mut reg, &profile, PathBuf::from("/tmp/ws"));
+        let names: Vec<String> = reg.descriptors().into_iter().map(|d| d.name).collect();
+        assert_eq!(names, vec!["read", "write"]);
     }
 }

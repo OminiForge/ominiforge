@@ -7,14 +7,18 @@
 //! the artifact store once that exists (Phase 2); for now it is returned
 //! inline. See `doc/tool-protocol.md`.
 
+mod edit;
 mod error;
 mod read;
 mod shell;
+mod snapshot;
 mod write;
 
+pub use edit::EditTool;
 pub use error::ToolError;
 pub use read::ReadTool;
 pub use shell::ShellTool;
+pub use snapshot::SnapshotStore;
 pub use write::WriteTool;
 
 use std::collections::HashMap;
@@ -163,11 +167,19 @@ fn resolve_in_workspace(workspace: &Path, requested: &str) -> Result<PathBuf, To
     Ok(normalized)
 }
 
-/// Register the Phase 1 built-in tools (read, write, shell), all scoped to
-/// `workspace`.
+/// Register the built-in tools (read, write, edit, shell), all scoped to `workspace`.
+///
+/// `read` and `edit` share one [`SnapshotStore`] so an `edit` patch is verified
+/// against the snapshot the preceding `read` recorded.
+///
+/// TODO: The SnapshotStore wiring here mirrors `register_profile_tools` in
+/// `app.rs`. If a third tool needs the store, extract a shared helper rather
+/// than duplicating the wiring a third time.
 pub fn register_builtin(registry: &mut ToolRegistry, workspace: PathBuf) {
-    registry.register(Arc::new(ReadTool::new(workspace.clone())));
+    let snapshots = SnapshotStore::new();
+    registry.register(Arc::new(ReadTool::new(workspace.clone(), snapshots.clone())));
     registry.register(Arc::new(WriteTool::new(workspace.clone())));
+    registry.register(Arc::new(EditTool::new(workspace.clone(), snapshots)));
     registry.register(Arc::new(ShellTool::new(workspace)));
 }
 
@@ -182,7 +194,7 @@ mod tests {
         let mut reg = ToolRegistry::new();
         register_builtin(&mut reg, PathBuf::from("/tmp/ws"));
         let names: Vec<String> = reg.descriptors().into_iter().map(|d| d.name).collect();
-        assert_eq!(names, vec!["read", "shell", "write"]);
+        assert_eq!(names, vec!["edit", "read", "shell", "write"]);
     }
 
     #[test]

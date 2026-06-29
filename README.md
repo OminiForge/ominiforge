@@ -1,6 +1,6 @@
 # ominiforge
 
-a multi agent app
+a multi-agent coding assistant with tool-augmented LLM interaction
 
 ## 开发环境
 

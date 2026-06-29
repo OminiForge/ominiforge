@@ -16,8 +16,9 @@
 ```text
 Tool
 ├── Built-in（Rust 代码，编译进 ominiforge binary）
-│   ├── read        # 读取文件
-│   ├── write       # 写入文件
+│   ├── read        # 读取文件（输出 [path#TAG] + 行号，供 edit 锚定）
+│   ├── write       # 整文件写入
+│   ├── edit        # 行锚定 patch，经 snapshot 验证
 │   ├── shell       # 执行 shell 命令
 │   ├── search      # 代码搜索
 │   ├── lsp         # Language Server Protocol 交互
@@ -247,7 +248,68 @@ ToolRegistry
 
 Tool schemas 按 name 字母序排列（保障 prefix cache 命中率）。
 
-## 11. 与之前 WASM 方案的对比
+## 11. edit 工具：hashline grammar 与 snapshot 验证
+
+`edit` 是 `write` 的局部替代：`write` 重写整文件，`edit` 对已有文件打行锚定 patch，
+token 消耗更少，diff 更干净。
+
+### 11.1 使用流程
+
+```sh
+# 1. read — 获取 [path#TAG] anchor 和行号
+read path="src/lib.rs"
+# 输出：
+# [src/lib.rs#1F2A]
+# 1:fn main() {
+# 2:    println!("hello");
+# 3:}
+
+# 2. edit — 引用 TAG + 行号打 patch
+edit input="[src/lib.rs#1F2A]
+replace 2..2:
++    println!(\"world\");
+"
+```
+
+### 11.2 Patch grammar（variant: hashline）
+
+一个 patch 由一或多个 file section 组成。每个 section 以 `[path#TAG]` 开头，
+后接一或多个 op；payload 行以 `+` 前缀。
+
+| Op | 格式 | 说明 |
+|---|---|---|
+| replace | `replace N..M:` | 将第 N–M 行（含）替换为 payload |
+| delete  | `delete N..M`   | 删除第 N–M 行（无 payload）|
+| insert after  | `insert after N:`  | 在第 N 行之后插入 payload |
+| insert before | `insert before N:` | 在第 N 行之前插入 payload |
+| insert head   | `insert head:`     | 在文件头插入 payload |
+| insert tail   | `insert tail:`     | 在文件尾插入 payload |
+
+行号均为 1-based，与 `read` 输出一致。同一 section 内的多 op 按高行号优先应用，
+避免行号漂移。
+
+### 11.3 Snapshot 验证
+
+`read` 和 `edit` 共享一个 session 级 `SnapshotStore`（`Arc<Mutex<HashMap>>`），
+在 `register_profile_tools` 创建并注入。
+
+- `read` 成功后记录 `abs_path → tag`（FNV-1a 32-bit 低 16 位，4 位大写 hex）。
+- `edit` 调用时：①引用的 TAG 必须与 store 记录一致；②必须与磁盘当前 bytes 的 TAG 一致。
+  任一不匹配 → 返回 `is_error=true`, `error_code="stale_snapshot"`，文件不改动。
+- 多 file section 的 patch 先全部验证，全部通过才开始写入。验证阶段是 all-or-nothing；
+  写入阶段按 section 顺序依次执行，若中途 I/O 失败，已写入的 section 不会回滚。
+- `edit` 成功写入后，store 更新为新 TAG，同一 turn 内可链式调用。
+
+**关于 §1 "无状态" 原则：** §1 指 tool 是 request/response 操作，不支持 streaming。
+`SnapshotStore` 是构造时注入的 session 级共享状态，不破坏 request/response 语义，
+不属于 §1 禁止的流式状态。
+
+### 11.4 尚未实现
+
+- `replace block N`（tree-sitter 语法块替换）：需引入 tree-sitter 依赖，暂缓。
+- 多 variant（patch/apply_patch/replace）：当前只支持 hashline。
+
+## 12. 与之前 WASM 方案的对比
 
 WASM Component + WIT 扩展方案已废弃，统一改用 MCP（任意语言进程，JSON-RPC over
 stdio/SSE，完整 OS 能力，无需 ominiforge-sdk）。废弃理由见

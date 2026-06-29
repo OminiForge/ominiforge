@@ -673,7 +673,7 @@ accomplish the user's task, and explain what you did.
 default = "openai-main/gpt-4o"        # provider_name/model_id
 
 [tools]
-builtin = ["read", "write", "shell"]
+builtin = ["read", "write", "edit", "shell"]
 "#;
 
 /// Starter `gateway.toml`. Auth is off until you uncomment `api_key_env` and set
