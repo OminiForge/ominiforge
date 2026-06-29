@@ -50,6 +50,12 @@
 	// choice survives reloads/navigation; defaults open. On narrow screens the
 	// user can collapse it to give the conversation the full width.
 	let detailOpen = $state(true);
+	// Whether we're in the initial event-replay phase (loading existing history
+	// from the durable log). During replay, events arrive in rapid bursts and we
+	// use instant scroll instead of `behavior: 'smooth'` to avoid the visually
+	// uncomfortable rapid-scrolling animation through the entire conversation.
+	let isReplaying = $state(false);
+	let replayDebounce: ReturnType<typeof setTimeout> | undefined;
 
 	function toggleDetail() {
 		detailOpen = !detailOpen;
@@ -113,6 +119,11 @@
 		collapsed = {};
 		// A new subscription means fresh content – start auto-scrolling.
 		shouldAutoScroll = true;
+		// Enter replay mode: the gateway will replay committed events in rapid
+		// succession. During replay we use instant scroll (no smooth animation)
+		// and debounce — once events stop arriving we consider replay done.
+		isReplaying = true;
+		clearTimeout(replayDebounce);
 		sub = client.subscribeEvents(id, {
 			onEvent: (ev) => {
 				convo = apply(convo, ev);
@@ -126,10 +137,26 @@
 				if (ev.type === 'turn_settled') {
 					void refreshSummary(id);
 				}
-				// Only auto-scroll when the user is already at (or near) the
-				// bottom of the stream. This prevents yanking them back to the
-				// latest message while they're reading history.
-				if (shouldAutoScroll) {
+				if (isReplaying) {
+					// During replay: snap to bottom instantly (no animation) to
+					// avoid the uncomfortable rapid smooth-scrolling visual.
+					requestAnimationFrame(() => {
+						if (streamEl) streamEl.scrollTop = streamEl.scrollHeight;
+					});
+					// Reset the debounce timer — when events stop arriving for
+					// 300 ms we consider the replay phase complete.
+					clearTimeout(replayDebounce);
+					replayDebounce = setTimeout(() => {
+						isReplaying = false;
+						// Final instant snap to ensure we're at the bottom.
+						requestAnimationFrame(() => {
+							if (streamEl) streamEl.scrollTop = streamEl.scrollHeight;
+						});
+					}, 300);
+				} else if (shouldAutoScroll) {
+					// Live event: smooth scroll only when the user is already at
+					// (or near) the bottom. This prevents yanking them back to
+					// the latest message while they're reading history.
 					requestAnimationFrame(() => {
 						streamEl?.scrollTo({ top: streamEl.scrollHeight, behavior: 'smooth' });
 					});
@@ -170,6 +197,7 @@
 
 	onDestroy(() => {
 		sub?.close();
+		clearTimeout(replayDebounce);
 	});
 
 	async function send() {
