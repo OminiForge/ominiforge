@@ -14,6 +14,15 @@
 //! itself down (`actor.rs`), its `ActorHandle` goes dead, and the next lookup
 //! prunes the dead entry and respawns — so the registry never grows unbounded
 //! with stale handles.
+//!
+//! Limitation: [`get_or_spawn`] re-assembles a respawned (cold/idle-evicted)
+//! session's agent from the **gateway defaults**, not from the session's stored
+//! `profile_id`/`workspace`. So a per-session override passed to
+//! [`create_with`](SessionRegistry::create_with) is honored only for that
+//! session's first warm lifetime; after eviction + reopen the live agent reverts
+//! to defaults (while `session.toml` and the RUNTIME panel still show the
+//! override). Fixing this means persisting the override set and re-deriving from
+//! meta on respawn — deferred.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -25,7 +34,7 @@ use tokio::sync::Mutex;
 
 use crate::agent::SessionRuntime;
 use crate::app::{self, Assembled};
-use crate::config::ConfigStore;
+use crate::config::{ConfigStore, ModelSummary, ProfileSummary};
 use crate::core::SessionId;
 use crate::llm::Message;
 use crate::session::{SessionMeta, SessionStore};
@@ -35,10 +44,15 @@ use super::config::GatewayConfig;
 
 /// Default model/profile selection a new session is assembled with.
 ///
-/// Plus the workspace it operates in. Held by the registry so every spawned
-/// session uses the same base configuration (the gateway is single-user).
+/// Plus the workspace it operates in and the config store. Held by the registry
+/// so every spawned session uses the same base configuration (the gateway is
+/// single-user). The config store is discovered once at startup from
+/// `--config-dir` / launch cwd / home — **not** from the workspace — so a
+/// per-session workspace override never changes which config is read.
 #[derive(Debug, Clone)]
 pub struct SessionDefaults {
+    /// Config store (provider/profile roots), discovered at startup.
+    pub config: ConfigStore,
     /// Workspace root for assembled sessions.
     pub workspace: PathBuf,
     /// Profile name (looked up under `.omini/profiles`).
@@ -167,10 +181,9 @@ impl SessionRegistry {
         profile_id: Option<&str>,
         workspace: Option<&Path>,
     ) -> Result<RuntimeInfo> {
-        let config_root = &self.inner.defaults.workspace;
         let profile_name = profile_id.unwrap_or(&self.inner.defaults.profile);
 
-        let store = ConfigStore::discover(config_root);
+        let store = &self.inner.defaults.config;
         let providers = store
             .load_providers()
             .context("failed to load providers.toml")?;
@@ -239,12 +252,37 @@ impl SessionRegistry {
         Ok(handle)
     }
 
-    /// Create a brand-new session, spawn its actor, and return `(id, handle)`.
+    /// Create a brand-new session on the gateway defaults, spawn its actor, and
+    /// return `(id, handle)`.
     ///
     /// # Errors
     /// Agent assembly or session-creation failure.
     pub async fn create(&self) -> Result<(SessionId, ActorHandle)> {
-        let assembled = self.assemble().await?;
+        self.create_with(None, None, None).await
+    }
+
+    /// Create a brand-new session with optional per-session overrides — `profile`,
+    /// `model` (a `provider/model_id` or bare `model_id`), and `workspace` — each
+    /// falling back to the gateway default when `None`. The overrides apply to
+    /// this session only; they are not written back to config (`doc/profile.md`
+    /// §5). The session is stamped with the resolved profile + workspace via
+    /// `create_new`, so its `session.toml` records exactly what it ran on.
+    ///
+    /// Note: only the session's first warm lifetime honors a `model` override —
+    /// after idle eviction, [`get_or_spawn`](Self::get_or_spawn) respawns on the
+    /// gateway defaults (a pre-existing limitation; see the module docs).
+    ///
+    /// # Errors
+    /// - a `workspace` that does not exist (canonicalization fails)
+    /// - a `profile`/`model` that does not resolve
+    /// - session-creation failure
+    pub async fn create_with(
+        &self,
+        profile: Option<&str>,
+        model: Option<&str>,
+        workspace: Option<PathBuf>,
+    ) -> Result<(SessionId, ActorHandle)> {
+        let assembled = self.assemble_with(profile, model, workspace).await?;
         let writer = self
             .store()
             .create_new(
@@ -331,19 +369,131 @@ impl SessionRegistry {
         Ok((id, handle))
     }
 
+    /// Reconfigure `parent` into a new session under a different `profile` and/or
+    /// `model`, seeded with the parent's *full* conversation (`doc/profile.md`
+    /// §5). The session's config is immutable, so a config change is a new
+    /// session (`origin.kind = reconfiguration`), not an in-place edit. The
+    /// workspace is inherited from the parent (it is a session property, not a
+    /// reconfigurable one).
+    ///
+    /// Mirrors [`fork`](Self::fork) but keeps the whole history (no `at_seq`
+    /// truncation) and rebuilds context under the *new* assembled system prompt,
+    /// so a profile change swaps the system prompt while the conversation carries
+    /// over.
+    ///
+    /// # Errors
+    /// - parent not found/unreadable
+    /// - a `profile`/`model` that does not resolve
+    /// - agent assembly / session-creation failure
+    pub async fn reconfigure(
+        &self,
+        parent: &SessionId,
+        profile: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<(SessionId, ActorHandle)> {
+        let meta = self.meta(parent)?;
+        // The reconfigured session runs in the parent's workspace (immutable);
+        // only profile/model change.
+        let assembled = self
+            .assemble_with(profile, model, meta.workspace.clone())
+            .await?;
+        let system = Self::system_seed(&assembled);
+
+        // Rebuild the parent's full conversation under the new system seed: the
+        // new profile's system prompt replaces the old one, the conversation
+        // (user/assistant/tool messages) carries over.
+        let all = self
+            .store()
+            .read_events(parent)
+            .with_context(|| format!("failed to read parent session `{}`", parent.0))?;
+        let parent_runtime = crate::agent::rebuild_runtime(&all, system.clone());
+        let snapshot = parent_runtime.context;
+
+        let writer = self
+            .store()
+            .create_reconfiguration(
+                parent.clone(),
+                Some(assembled.profile_name.clone()),
+                Some(assembled.workspace.clone()),
+                assembled.tool_names.clone(),
+                &snapshot,
+            )
+            .context("failed to create reconfiguration session")?;
+        let id = writer.session_id().clone();
+        let runtime = SessionRuntime::new(snapshot);
+
+        let handle = SessionActor::spawn(
+            Arc::new(assembled.agent),
+            self.store(),
+            system,
+            (writer, runtime),
+            self.inner.idle_timeout,
+            assembled.mcp_clients,
+        );
+        self.inner
+            .actors
+            .lock()
+            .await
+            .insert(id.clone(), handle.clone());
+        Ok((id, handle))
+    }
+
     /// Assemble a fresh, isolated agent for one session (its own provider + MCP
-    /// subprocesses). Diagnostics go to stderr (the server's log).
+    /// subprocesses), on the gateway defaults. Diagnostics go to stderr (the
+    /// server's log).
     async fn assemble(&self) -> Result<Assembled> {
+        self.assemble_with(None, None, None).await
+    }
+
+    /// Like [`assemble`](Self::assemble) but with per-session overrides: `profile`
+    /// and `workspace` fall back to the gateway defaults when `None`, and `model`
+    /// (a `provider/model_id` or bare `model_id`) overrides the profile's default
+    /// model when set. Used by [`create_with`](Self::create_with) so a Web client
+    /// can choose profile/model/workspace for a *new* session without changing
+    /// config. Diagnostics go to stderr (the server's log).
+    async fn assemble_with(
+        &self,
+        profile: Option<&str>,
+        model: Option<&str>,
+        workspace: Option<PathBuf>,
+    ) -> Result<Assembled> {
         let d = &self.inner.defaults;
+        let workspace = workspace.unwrap_or_else(|| d.workspace.clone());
+        let profile = profile.unwrap_or(&d.profile);
         app::assemble(
-            d.workspace.clone(),
-            &d.profile,
-            None,
+            &d.config,
+            workspace,
+            profile,
+            model,
             None,
             d.no_dotenv,
             &|msg| eprintln!("gateway: {msg}"),
         )
         .await
+    }
+
+    /// List the profiles available for a new session (`doc/profile.md` §3.1),
+    /// resolved from the gateway's config roots. Infallible: an unreadable or
+    /// malformed profile file is skipped with a warning to the server log.
+    #[must_use]
+    pub fn list_profiles(&self) -> Vec<ProfileSummary> {
+        self.inner
+            .defaults
+            .config
+            .list_profiles(&|msg| eprintln!("gateway: {msg}"))
+    }
+
+    /// List the models available for a per-session override, flattened from the
+    /// configured providers.
+    ///
+    /// # Errors
+    /// [`anyhow::Error`] if `providers.toml` is unreadable or malformed.
+    pub fn list_models(&self) -> Result<Vec<ModelSummary>> {
+        self.inner
+            .defaults
+            .config
+            .list_models()
+            .context("failed to load providers.toml")
     }
 
     /// The system-prompt seed for a session built from `assembled`.

@@ -11,7 +11,10 @@
 	import type { SessionMeta } from '$lib/types/SessionMeta';
 	import type { RuntimeInfo } from '$lib/types/RuntimeInfo';
 	import type { SessionSummary } from '$lib/types/SessionSummary';
+	import type { ProfileSummary } from '$lib/types/ProfileSummary';
+	import type { ModelSummary } from '$lib/types/ModelSummary';
 	import { apply, emptyState, type ConversationState, type Item, type PlanStep } from '$lib/conversation';
+	import { takeDraftConfig } from '$lib/draft-config';
 	import { num, statLabel, formatCost, cacheLabel, topTools } from '$lib/stats';
 
 	/** Sentinel id for a not-yet-created (draft) session. Reaching `/sessions/new`
@@ -30,6 +33,17 @@
 	let input = $state('');
 	let sending = $state(false);
 	let error = $state<string | null>(null);
+	// Draft-only session config: profile / model override / workspace, chosen
+	// before the first send. Populated from the gateway when a draft opens; the
+	// real session is created with these on first send (and they're read-only
+	// thereafter — a session's config is immutable, doc/profile.md §5).
+	let profiles = $state<ProfileSummary[]>([]);
+	let models = $state<ModelSummary[]>([]);
+	let selProfile = $state('');
+	// Model override as `provider/model_id`; empty = use the profile default.
+	let selModel = $state('');
+	let selWorkspace = $state('');
+	let cfgOpen = $state(false);
 	let sessionId = $state(page.params.id!);
 	let meta = $state<SessionMeta | null>(null);
 	// Config-layer provider/model for the RUNTIME panel; null until loaded or on
@@ -100,6 +114,15 @@
 		} catch {
 			runtime = null;
 		}
+		// Sync the config picker to what this live session actually runs on, so it
+		// shows the current profile/model and a change is detectable (cfgDirty).
+		// The runtime model is a bare id; qualify it as `provider/model_id` to
+		// match the picker option values.
+		curProfile = meta?.profile_id ?? '';
+		curModel = runtime ? `${runtime.provider}/${runtime.model}` : '';
+		selProfile = curProfile;
+		selModel = curModel;
+		selWorkspace = meta?.workspace ?? '';
 		await refreshSummary(id);
 	}
 
@@ -179,11 +202,36 @@
 			meta = null;
 			runtime = null;
 			summary = null;
+			// Adopt a config stashed by the dashboard's "New session ▾" (read-once;
+			// it clears itself), so the draft opens prefilled with that choice.
+			const pre = takeDraftConfig();
+			if (pre.profile) selProfile = pre.profile;
+			if (pre.model) selModel = pre.model;
+			if (pre.workspace) selWorkspace = pre.workspace;
+			// Populate the config picker options (profiles + models). Best-effort:
+			// a failure leaves the dropdowns empty and send still works on defaults.
+			void loadConfigOptions();
 			return;
 		}
 		subscribe(id);
 		void loadMeta(id);
+		// The picker is persistent (live sessions can reconfigure), so load its
+		// profile/model options here too, not only on a draft.
+		void loadConfigOptions();
 	});
+
+	/** Load the profile + model lists for the config picker. Fetched once
+	 *  (guarded), best-effort — a failure leaves the lists empty so the picker
+	 *  just offers nothing (draft falls back to gateway defaults; a live session
+	 *  simply can't reconfigure). */
+	async function loadConfigOptions() {
+		if (profiles.length > 0 || models.length > 0) return;
+		try {
+			[profiles, models] = await Promise.all([client.listProfiles(), client.listModels()]);
+		} catch {
+			/* leave lists empty */
+		}
+	}
 
 	/** Runtime-layer models that diverge from the configured model: models a
 	 *  RequestStarted actually used (folded into convo.runtimeModels) that aren't
@@ -208,10 +256,16 @@
 		try {
 			if (sessionId === DRAFT_ID) {
 				// Lazily create the real session on first send, then adopt its id.
+				// Pass the draft picker's choices (only the set ones) so the session
+				// is created on the chosen profile / model / workspace.
 				// Setting sessionId drives the $effect to subscribe + load meta;
 				// replaceState swaps the URL without pushing a history entry (so
 				// Back doesn't return to the empty draft).
-				const realId = await client.createSession();
+				const realId = await client.createSession({
+					profile: selProfile || undefined,
+					model: selModel || undefined,
+					workspace: selWorkspace.trim() || undefined
+				});
 				sessionId = realId;
 				replaceState(`/sessions/${realId}`, {});
 				await client.sendMessage(realId, text);
@@ -440,6 +494,55 @@
 	// don't eat a big vertical slab; the user expands to see steps. Separate from
 	// the inline-item `collapsed` map (keyed by item index).
 	let pinnedPlanCollapsed = $state(true);
+
+	/** One-line label for the config trigger: the chosen profile (or "default")
+	 *  and the chosen model's bare id (or "default model"). On a draft this is
+	 *  what the session will be created on; on a live session it's what it runs on
+	 *  now (and what a reconfiguration would change). */
+	const cfgLabel = $derived.by(() => {
+		const p = selProfile || 'default';
+		const m = selModel ? selModel.split('/').pop() : 'default model';
+		return `${p} · ${m}`;
+	});
+
+	// Reconfiguration (live sessions only): changing profile/model on an existing
+	// session can't edit it in place (history is immutable), so it mints a new
+	// reconfiguration session seeded with this conversation. We track the live
+	// session's *current* profile/model to detect a pending change and whether a
+	// reconfigure request is in flight.
+	let curProfile = $state('');
+	let curModel = $state('');
+	let reconfiguring = $state(false);
+
+	/** A live session has a pending config change when the picker's profile/model
+	 *  differs from what the session currently runs on. Drives the Apply button. */
+	const cfgDirty = $derived(
+		!isDraft && (selProfile !== curProfile || selModel !== curModel)
+	);
+
+	/** Apply a live config change by reconfiguring into a new session, then adopt
+	 *  its id (same swap the compaction path uses). No-op on a draft (there the
+	 *  choice is applied at first send instead). */
+	async function applyReconfigure() {
+		if (isDraft || !cfgDirty || reconfiguring) return;
+		reconfiguring = true;
+		error = null;
+		try {
+			const newId = await client.reconfigure(sessionId, {
+				profile: selProfile || undefined,
+				model: selModel || undefined
+			});
+			cfgOpen = false;
+			sessionId = newId;
+			replaceState(`/sessions/${newId}`, {});
+			// The $effect re-subscribes + reloads meta for the new id, which
+			// refreshes curProfile/curModel via loadMeta below.
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
+		} finally {
+			reconfiguring = false;
+		}
+	}
 </script>
 
 <div class="session-grid" class:no-detail={isDraft || !detailOpen}>
@@ -713,6 +816,74 @@
 					<span class="input-status">
 						{#if incomplete}<span class="status-warn">Turn incomplete</span>{/if}
 					</span>
+					<div class="cfg">
+						<button
+							class="input-btn cfg-trigger"
+							class:on={cfgOpen}
+							onclick={() => (cfgOpen = !cfgOpen)}
+							title={isDraft
+								? '选择 profile / 模型 / 工作区（仅本次会话）'
+								: '查看 / 切换 profile / 模型（切换会基于当前对话开启一个新会话）'}
+							aria-expanded={cfgOpen}
+						>
+							<svg width="12" height="12" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+								<circle cx="7" cy="7" r="2.2" />
+								<path d="M7 1.2v1.6M7 11.2v1.6M1.2 7h1.6M11.2 7h1.6M2.9 2.9l1.1 1.1M10 10l1.1 1.1M11.1 2.9 10 4M4 10l-1.1 1.1" />
+							</svg>
+							<span class="cfg-label">{cfgLabel}</span>
+						</button>
+						{#if cfgOpen}
+							<div class="cfg-popover">
+								<label class="cfg-field">
+									<span class="cfg-key">Profile</span>
+									<select class="cfg-select" bind:value={selProfile}>
+										<option value="">默认</option>
+										{#each profiles as p (p.name)}
+											<option value={p.name}>{p.name}{p.description ? ` — ${p.description}` : ''}</option>
+										{/each}
+									</select>
+								</label>
+								<label class="cfg-field">
+									<span class="cfg-key">Model</span>
+									<select class="cfg-select" bind:value={selModel}>
+										<option value="">默认（按 profile）</option>
+										{#each models as m (`${m.provider}/${m.model_id}`)}
+											<option value={`${m.provider}/${m.model_id}`}>{m.model_id} · {m.provider}</option>
+										{/each}
+									</select>
+								</label>
+								<label class="cfg-field">
+									<span class="cfg-key">Workspace</span>
+									{#if isDraft}
+										<input
+											class="cfg-input"
+											type="text"
+											bind:value={selWorkspace}
+											placeholder="默认工作区（绝对路径）"
+											spellcheck="false"
+										/>
+									{:else}
+										<!-- Workspace is a session property, not reconfigurable: read-only on a live session. -->
+										<input class="cfg-input" type="text" value={selWorkspace} readonly title="工作区不可更改（会话属性）" />
+									{/if}
+								</label>
+								{#if !isDraft}
+									<!-- Live session: a profile/model change can't edit in place; it
+									     opens a new session seeded with this conversation. -->
+									<div class="cfg-foot">
+										<span class="cfg-hint">切换将基于当前对话开启新会话</span>
+										<button
+											class="input-btn primary cfg-apply"
+											disabled={!cfgDirty || reconfiguring}
+											onclick={applyReconfigure}
+										>
+											{reconfiguring ? '切换中…' : '切换'}
+										</button>
+									</div>
+								{/if}
+							</div>
+						{/if}
+					</div>
 					{#if !isDraft && turnRunning}
 						<button class="input-btn cancel" onclick={cancel}>
 							<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
@@ -1975,7 +2146,10 @@
 		background: var(--canvas-overlay);
 		border: 1px solid var(--border-default);
 		border-radius: var(--radius-lg);
-		overflow: hidden;
+		/* No overflow:hidden — the config popover (absolute, anchored in the
+		   actions row) must escape upward. Corners are rounded on the children
+		   (textarea top, actions bottom) instead so the box still reads as one
+		   rounded unit. */
 		transition:
 			border-color var(--dur-std) var(--ease-out),
 			box-shadow var(--dur-std) var(--ease-out);
@@ -1991,6 +2165,7 @@
 		padding: var(--space-3) var(--space-4);
 		background: transparent;
 		border: none;
+		border-radius: var(--radius-lg) var(--radius-lg) 0 0;
 		outline: none;
 		color: var(--text-primary);
 		font-family: var(--font-chinese);
@@ -2011,6 +2186,7 @@
 		gap: var(--space-2);
 		padding: var(--space-2) var(--space-3);
 		border-top: 1px solid var(--border-subtle);
+		border-radius: 0 0 var(--radius-lg) var(--radius-lg);
 	}
 
 	.input-status {
@@ -2072,6 +2248,120 @@
 		background: var(--state-error-bg);
 		border-color: color-mix(in srgb, var(--state-error) 40%, transparent);
 		color: var(--state-error-text);
+	}
+
+	/* ---- DRAFT CONFIG PICKER (profile / model / workspace) ---- */
+	/* Anchors the popover; lives in the input-actions row just left of Send so the
+	   pre-send config sits in the composer cluster (the space above the input is
+	   taken by the plan dock). Draft-only — gone once the session is real. */
+	.cfg {
+		position: relative;
+		display: flex;
+		flex-shrink: 0;
+	}
+
+	.cfg-trigger {
+		max-width: 220px;
+	}
+
+	.cfg-trigger.on {
+		background: var(--surface-hover);
+		color: var(--text-primary);
+		border-color: var(--border-strong);
+	}
+
+	.cfg-label {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		font-family: var(--font-mono);
+		font-size: 11px;
+	}
+
+	/* Opens upward (the input sits at the screen bottom). Right-aligned to the
+	   trigger so it stays within the composer width. */
+	.cfg-popover {
+		position: absolute;
+		bottom: calc(100% + 6px);
+		right: 0;
+		z-index: 20;
+		width: 300px;
+		max-width: min(300px, 80vw);
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-3);
+		padding: var(--space-3) var(--space-4);
+		background: var(--canvas-overlay);
+		border: 1px solid var(--border-default);
+		border-radius: var(--radius-lg);
+		box-shadow: var(--shadow-md, 0 8px 24px rgba(0, 0, 0, 0.18));
+	}
+
+	.cfg-field {
+		display: flex;
+		flex-direction: column;
+		gap: 3px;
+	}
+
+	.cfg-key {
+		font-family: var(--font-mono);
+		font-size: 9.5px;
+		font-weight: 510;
+		color: var(--text-tertiary);
+		letter-spacing: 0.09em;
+		text-transform: uppercase;
+	}
+
+	.cfg-select,
+	.cfg-input {
+		width: 100%;
+		padding: 5px 8px;
+		background: var(--canvas-base);
+		border: 1px solid var(--border-default);
+		border-radius: var(--radius-sm);
+		color: var(--text-primary);
+		font-family: var(--font-mono);
+		font-size: 12px;
+		outline: none;
+	}
+
+	.cfg-select:focus,
+	.cfg-input:focus {
+		border-color: var(--border-strong);
+		box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 10%, transparent);
+	}
+
+	.cfg-input::placeholder {
+		color: var(--text-disabled);
+	}
+
+	/* Read-only workspace on a live session: dimmed, no edit affordance. */
+	.cfg-input[readonly] {
+		color: var(--text-tertiary);
+		background: var(--canvas-float);
+		cursor: default;
+	}
+
+	/* Live-session footer: hint + the "switch" (reconfigure) action. */
+	.cfg-foot {
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+		padding-top: var(--space-1);
+		border-top: 1px solid var(--border-subtle);
+	}
+
+	.cfg-hint {
+		flex: 1;
+		font-size: 10.5px;
+		color: var(--text-tertiary);
+		font-family: var(--font-chinese);
+		line-height: 1.3;
+	}
+
+	.cfg-apply {
+		flex-shrink: 0;
+		padding: 4px 10px;
 	}
 
 	kbd {

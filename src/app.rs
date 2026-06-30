@@ -58,6 +58,11 @@ pub struct Assembled {
 /// Resolve config and build an [`Agent`] for `profile_name`, with optional model
 /// and temperature overrides.
 ///
+/// `config` is the already-discovered [`ConfigStore`] (its roots come from
+/// `--config-dir` / launch cwd / home, **not** from `workspace` — config is
+/// independent of the session's workspace). `workspace` is only the tool sandbox
+/// root + where sessions/skills live.
+///
 /// `on_warn` receives non-fatal diagnostics (a `.env` that was loaded, an MCP
 /// server that failed to connect, a hook at an unknown point). The CLI routes it
 /// to stderr; the gateway to its log.
@@ -67,6 +72,7 @@ pub struct Assembled {
 /// configured, an unresolvable profile or model, a provider type with no
 /// adapter, or an explicitly-named compaction model that cannot be resolved.
 pub async fn assemble(
+    config: &ConfigStore,
     workspace: PathBuf,
     profile_name: &str,
     model: Option<&str>,
@@ -76,9 +82,7 @@ pub async fn assemble(
 ) -> Result<Assembled> {
     let workspace = resolve_workspace(&workspace)?;
 
-    // Config is discovered relative to the workspace (project `.omini` first,
-    // then `~/.omini`).
-    let store = ConfigStore::discover(&workspace);
+    let store = config;
 
     // Load secrets from a `.env` file before anything reads `api_key_env`,
     // unless disabled. Real environment variables are never overwritten.

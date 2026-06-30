@@ -327,6 +327,64 @@ impl SessionStore {
         Ok(writer)
     }
 
+    /// Create a reconfiguration session: a config change (profile / model / tool
+    /// set) materialized as a new session seeded with the parent's full context
+    /// (`doc/profile.md` §5). Mirrors [`create_fork`](Self::create_fork) but the
+    /// origin is `reconfiguration` (whole conversation moves to the new config,
+    /// no branch point) and `profile_id`/`tools` reflect the *new* config.
+    ///
+    /// Returns a locked [`SessionWriter`] positioned after the `Created` event.
+    ///
+    /// # Errors
+    /// Filesystem or serialization failures surface as [`SessionError`].
+    pub fn create_reconfiguration(
+        &self,
+        parent_id: SessionId,
+        profile_id: Option<String>,
+        workspace: Option<PathBuf>,
+        tools: Vec<String>,
+        snapshot: &[crate::llm::Message],
+    ) -> Result<SessionWriter> {
+        let session_id = id::generate();
+        let dir = self.session_dir(&session_id);
+        std::fs::create_dir_all(&dir).map_err(|source| SessionError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+
+        let meta = SessionMeta {
+            id: session_id.clone(),
+            profile_id: profile_id.clone(),
+            created_at: Utc::now(),
+            workspace: workspace.clone(),
+            origin: Origin::reconfiguration(parent_id),
+        };
+        self.write_meta(&meta)?;
+
+        let snapshot_path = dir.join(SNAPSHOT_FILE);
+        let snapshot_json = serde_json::to_string_pretty(snapshot)?;
+        std::fs::write(&snapshot_path, snapshot_json).map_err(|source| SessionError::Io {
+            path: snapshot_path,
+            source,
+        })?;
+
+        let log = EventLog::open(&self.events_path(&session_id))?;
+        let mut writer = SessionWriter {
+            session_id,
+            log,
+            next_seq: 0,
+            bus: None,
+        };
+
+        let created = EventPayload::Session(SessionEvent::Created {
+            profile_id,
+            tools,
+            workspace,
+        });
+        writer.append(runtime_source(), created, None, None)?;
+        Ok(writer)
+    }
+
     /// Read the context snapshot for a non-new session (fork/compaction/reconfiguration).
     ///
     /// # Errors

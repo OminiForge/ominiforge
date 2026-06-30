@@ -31,6 +31,12 @@ pub struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
+    /// Directory whose `.omini/` holds config (providers, profiles, mcp, hooks).
+    /// Highest-priority config root: `--config-dir` → launch cwd → `~`. Config is
+    /// independent of a session's workspace (`doc/architecture.md` §15).
+    #[arg(long, global = true)]
+    config_dir: Option<PathBuf>,
+
     /// Open the interactive session picker on startup instead of starting a
     /// fresh session. Only meaningful for the bare `ominiforge` (TUI) command.
     #[arg(long, global = true)]
@@ -131,20 +137,21 @@ struct InspectArgs {
 /// Surfaces configuration, provider, and session errors to the process exit.
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
+    let config_dir = cli.config_dir;
     match cli.command {
-        None => tui_main(cli.resume).await,
-        Some(Command::Run(args)) => run_turn(args).await,
-        Some(Command::Inspect(args)) => inspect(&args),
+        None => tui_main(config_dir, cli.resume).await,
+        Some(Command::Run(args)) => run_turn(config_dir, args).await,
+        Some(Command::Inspect(args)) => inspect(config_dir.as_deref(), &args),
         Some(Command::Init(args)) => init(&args),
         #[cfg(feature = "gateway")]
-        Some(Command::Serve(args)) => serve_cmd(args).await,
+        Some(Command::Serve(args)) => serve_cmd(config_dir, args).await,
     }
 }
 
 /// Run the gateway server in the foreground (`doc/architecture.md` §18.1). A
 /// systemd user service wraps this; for development it runs directly.
 #[cfg(feature = "gateway")]
-async fn serve_cmd(args: ServeArgs) -> Result<()> {
+async fn serve_cmd(config_dir: Option<PathBuf>, args: ServeArgs) -> Result<()> {
     use crate::gateway::{GatewayConfig, SessionDefaults, SessionRegistry, serve};
 
     let workspace = match args.workspace {
@@ -153,10 +160,11 @@ async fn serve_cmd(args: ServeArgs) -> Result<()> {
     };
     let workspace = app::resolve_workspace(&workspace)?;
 
-    // Load `.env` up front so `api_key_env` and provider keys resolve, unless
-    // disabled. The registry assembles agents with `no_dotenv = true` afterward
-    // so it does not reload per session.
-    let config_store = ConfigStore::discover(&workspace);
+    // Config roots come from --config-dir / launch cwd / home — NOT the
+    // workspace (`doc/architecture.md` §15). Launch cwd is the directory the
+    // server was started in.
+    let launch_cwd = std::env::current_dir().context("cannot determine current directory")?;
+    let config_store = ConfigStore::discover_with(config_dir.as_deref(), &launch_cwd);
     if !args.no_dotenv {
         app::load_dotenv(config_store.roots(), &workspace, &|msg| eprintln!("{msg}"));
     }
@@ -188,6 +196,7 @@ async fn serve_cmd(args: ServeArgs) -> Result<()> {
         .unwrap_or_default();
 
     let defaults = SessionDefaults {
+        config: config_store,
         workspace,
         profile: args.profile,
         no_dotenv: true,
@@ -196,8 +205,8 @@ async fn serve_cmd(args: ServeArgs) -> Result<()> {
     serve(registry, &gateway_config, pricing).await
 }
 
-async fn tui_main(resume: bool) -> Result<()> {
-    let prep = prepare(None, DEFAULT_PROFILE, None, None, false).await?;
+async fn tui_main(config_dir: Option<PathBuf>, resume: bool) -> Result<()> {
+    let prep = prepare(config_dir, None, DEFAULT_PROFILE, None, None, false).await?;
     let system = vec![Message::System {
         content: prep.system_prompt.clone(),
     }];
@@ -224,19 +233,22 @@ type Prepared = app::Assembled;
 
 /// Resolve config and build the agent for an entry point, routing non-fatal
 /// diagnostics to stderr (the CLI's log). `workspace = None` means the current
-/// directory. Thin wrapper over [`app::assemble`].
+/// directory (tool sandbox); config roots come from `config_dir` / launch cwd /
+/// home, independent of the workspace (`doc/architecture.md` §15). Thin wrapper
+/// over [`app::assemble`].
 async fn prepare(
+    config_dir: Option<PathBuf>,
     workspace: Option<PathBuf>,
     profile_name: &str,
     model: Option<&str>,
     temperature: Option<f32>,
     no_dotenv: bool,
 ) -> Result<Prepared> {
-    let workspace = match workspace {
-        Some(path) => path,
-        None => std::env::current_dir().context("cannot determine current directory")?,
-    };
+    let launch_cwd = std::env::current_dir().context("cannot determine current directory")?;
+    let config = ConfigStore::discover_with(config_dir.as_deref(), &launch_cwd);
+    let workspace = workspace.unwrap_or_else(|| launch_cwd.clone());
     app::assemble(
+        &config,
         workspace,
         profile_name,
         model,
@@ -247,8 +259,9 @@ async fn prepare(
     .await
 }
 
-async fn run_turn(args: RunArgs) -> Result<()> {
+async fn run_turn(config_dir: Option<PathBuf>, args: RunArgs) -> Result<()> {
     let prep = prepare(
+        config_dir,
         args.workspace,
         &args.profile,
         args.model.as_deref(),
@@ -507,13 +520,16 @@ impl<O: Write + Send, E: Write + Send> StreamSink for CliSink<O, E> {
 /// its `events.jsonl` through the monitor (`doc/monitor.md` §8). Pricing comes
 /// from `providers.toml` + `pricing.toml`, so cost reflects current prices, not
 /// whatever was in effect when the session ran.
-fn inspect(args: &InspectArgs) -> Result<()> {
+fn inspect(config_dir: Option<&Path>, args: &InspectArgs) -> Result<()> {
     let requested = match args.workspace.clone() {
         Some(path) => path,
         None => std::env::current_dir().context("cannot determine current directory")?,
     };
     let workspace = app::resolve_workspace(&requested)?;
-    let config = ConfigStore::discover(&workspace);
+    // Config (providers + pricing) comes from --config-dir / launch cwd / home,
+    // independent of the session's workspace (`doc/architecture.md` §15).
+    let launch_cwd = std::env::current_dir().context("cannot determine current directory")?;
+    let config = ConfigStore::discover_with(config_dir, &launch_cwd);
     if !args.no_dotenv {
         app::load_dotenv(config.roots(), &workspace, &|msg| eprintln!("{msg}"));
     }

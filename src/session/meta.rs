@@ -96,6 +96,19 @@ impl Origin {
             fork_at_seq: Some(fork_at_seq),
         }
     }
+
+    /// Origin for a reconfiguration: a config change (profile / model / tool set)
+    /// materialized as a new session seeded with `parent_id`'s full context
+    /// (`doc/profile.md` §5). Like compaction it carries no `fork_at_seq` — the
+    /// whole conversation moves to the new config, not a branch point.
+    #[must_use]
+    pub const fn reconfiguration(parent_id: SessionId) -> Self {
+        Self {
+            kind: OriginKind::Reconfiguration,
+            parent_id: Some(parent_id),
+            fork_at_seq: None,
+        }
+    }
 }
 
 impl Default for Origin {

@@ -10,8 +10,16 @@ import type { SessionMeta } from '$lib/types/SessionMeta';
 import type { GatewayEvent } from '$lib/types/GatewayEvent';
 import type { SessionSummary } from '$lib/types/SessionSummary';
 import type { RuntimeInfo } from '$lib/types/RuntimeInfo';
+import type { ProfileSummary } from '$lib/types/ProfileSummary';
+import type { ModelSummary } from '$lib/types/ModelSummary';
 import { endpoints } from './endpoints';
-import type { EventHandlers, EventSubscription, SessionClient } from './types';
+import type {
+	CreateSessionOptions,
+	EventHandlers,
+	EventSubscription,
+	ReconfigureOptions,
+	SessionClient
+} from './types';
 
 export interface GatewayConfig {
 	/** Base URL of the gateway, e.g. `http://127.0.0.1:7878`. No trailing slash. */
@@ -61,11 +69,28 @@ export class GatewayTransport implements SessionClient {
 		return body.sessions;
 	}
 
-	async createSession(): Promise<string> {
-		const body = await this.#json<{ session_id: string }>(endpoints.sessions(), {
-			method: 'POST'
-		});
+	async createSession(opts?: CreateSessionOptions): Promise<string> {
+		// Overrides ride as query params (not a JSON body): the gateway reads
+		// `?profile=&model=&workspace=`, and a no-arg call sends no query string
+		// (and no body), which the server parses as all-defaults.
+		const qs = new URLSearchParams();
+		if (opts?.profile) qs.set('profile', opts.profile);
+		if (opts?.model) qs.set('model', opts.model);
+		if (opts?.workspace) qs.set('workspace', opts.workspace);
+		const query = qs.toString();
+		const path = query ? `${endpoints.sessions()}?${query}` : endpoints.sessions();
+		const body = await this.#json<{ session_id: string }>(path, { method: 'POST' });
 		return body.session_id;
+	}
+
+	async listProfiles(): Promise<ProfileSummary[]> {
+		const body = await this.#json<{ profiles: ProfileSummary[] }>(endpoints.profiles());
+		return body.profiles;
+	}
+
+	async listModels(): Promise<ModelSummary[]> {
+		const body = await this.#json<{ models: ModelSummary[] }>(endpoints.models());
+		return body.models;
 	}
 
 	getSession(id: string): Promise<SessionMeta> {
@@ -77,6 +102,18 @@ export class GatewayTransport implements SessionClient {
 			method: 'POST',
 			body: JSON.stringify({ at_seq: atSeq })
 		});
+		return body.session_id;
+	}
+
+	async reconfigure(id: string, opts: ReconfigureOptions): Promise<string> {
+		// Config changes ride as query params (`?profile=&model=`), mirroring
+		// createSession; the new session is seeded with this session's history.
+		const qs = new URLSearchParams();
+		if (opts.profile) qs.set('profile', opts.profile);
+		if (opts.model) qs.set('model', opts.model);
+		const query = qs.toString();
+		const path = query ? `${endpoints.reconfigure(id)}?${query}` : endpoints.reconfigure(id);
+		const body = await this.#json<{ session_id: string }>(path, { method: 'POST' });
 		return body.session_id;
 	}
 

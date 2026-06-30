@@ -4,8 +4,10 @@
 	import { client } from '$lib/client';
 	import type { SessionMeta } from '$lib/types/SessionMeta';
 	import type { SessionSummary } from '$lib/types/SessionSummary';
+	import type { ProfileSummary } from '$lib/types/ProfileSummary';
+	import type { ModelSummary } from '$lib/types/ModelSummary';
+	import { stashDraftConfig } from '$lib/draft-config';
 	import { statLabel, formatCost, cacheLabel, topTools } from '$lib/stats';
-	import Button from '$lib/components/Button.svelte';
 
 	/** One dashboard card: a session's metadata plus its folded summary. `summary`
 	 *  is null when the per-session fold failed — the card still renders (title +
@@ -18,6 +20,16 @@
 	let rows = $state<Row[]>([]);
 	let loading = $state(true);
 	let error = $state<string | null>(null);
+
+	// "New session ▾" config popover: profile / model / workspace for the next
+	// draft. Options are fetched once on mount; the choice is stashed and read by
+	// the draft page (see lib/draft-config).
+	let cfgOpen = $state(false);
+	let profiles = $state<ProfileSummary[]>([]);
+	let models = $state<ModelSummary[]>([]);
+	let selProfile = $state('');
+	let selModel = $state('');
+	let selWorkspace = $state('');
 
 	async function refresh() {
 		loading = true;
@@ -39,9 +51,33 @@
 		}
 	}
 
+	/** Load the profile + model options for the config popover. Best-effort: a
+	 *  failure leaves the dropdowns empty and the plain "New session" still works. */
+	async function loadConfigOptions() {
+		try {
+			[profiles, models] = await Promise.all([client.listProfiles(), client.listModels()]);
+		} catch {
+			/* leave empty */
+		}
+	}
+
 	function create() {
-		// Open a draft; the real session is created lazily on first send
-		// (sessions/[id]), so clicking "New session" never leaves an empty one.
+		// Plain "New session": open a draft on gateway defaults. The real session
+		// is created lazily on first send (sessions/[id]), so this never leaves an
+		// empty one. Clear any stale stashed config so defaults truly apply.
+		stashDraftConfig({});
+		void goto('/sessions/new');
+	}
+
+	/** "New session ▾": stash the chosen profile/model/workspace, then open the
+	 *  draft — the draft page reads the stash to prefill its config control. */
+	function createConfigured() {
+		stashDraftConfig({
+			profile: selProfile || undefined,
+			model: selModel || undefined,
+			workspace: selWorkspace.trim() || undefined
+		});
+		cfgOpen = false;
 		void goto('/sessions/new');
 	}
 
@@ -91,14 +127,66 @@
 		return null;
 	}
 
-	onMount(refresh);
+	onMount(() => {
+		void refresh();
+		void loadConfigOptions();
+	});
 </script>
 
 <div class="page">
 	<div class="page-inner">
 		<header>
 			<h1>Dashboard</h1>
-			<Button variant="accent" onclick={create}>New session</Button>
+			<!-- Split button: the left half opens a draft on defaults; the caret
+			     opens a popover to choose profile / model / workspace first. The two
+			     halves share one rounded shell so they read as a single control. -->
+			<div class="newbtn" class:open={cfgOpen}>
+				<button class="newbtn-main" onclick={create}>New session</button>
+				<button
+					class="newbtn-caret"
+					onclick={() => (cfgOpen = !cfgOpen)}
+					title="选择 profile / 模型 / 工作区后再新建"
+					aria-label="New session options"
+					aria-expanded={cfgOpen}
+				>
+					<svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+						<polyline points="3,4.5 6,7.5 9,4.5" />
+					</svg>
+				</button>
+				{#if cfgOpen}
+					<div class="newbtn-popover">
+						<label class="cfg-field">
+							<span class="cfg-key">Profile</span>
+							<select class="cfg-select" bind:value={selProfile}>
+								<option value="">默认</option>
+								{#each profiles as p (p.name)}
+									<option value={p.name}>{p.name}{p.description ? ` — ${p.description}` : ''}</option>
+								{/each}
+							</select>
+						</label>
+						<label class="cfg-field">
+							<span class="cfg-key">Model</span>
+							<select class="cfg-select" bind:value={selModel}>
+								<option value="">默认（按 profile）</option>
+								{#each models as m (`${m.provider}/${m.model_id}`)}
+									<option value={`${m.provider}/${m.model_id}`}>{m.model_id} · {m.provider}</option>
+								{/each}
+							</select>
+						</label>
+						<label class="cfg-field">
+							<span class="cfg-key">Workspace</span>
+							<input
+								class="cfg-input"
+								type="text"
+								bind:value={selWorkspace}
+								placeholder="默认工作区（绝对路径）"
+								spellcheck="false"
+							/>
+						</label>
+						<button class="newbtn-go" onclick={createConfigured}>用所选配置新建</button>
+					</div>
+				{/if}
+			</div>
 		</header>
 
 		{#if error}
@@ -200,6 +288,121 @@
 		font-size: 22px;
 		font-weight: 600;
 		letter-spacing: -0.01em;
+	}
+
+	/* ---- NEW SESSION SPLIT BUTTON ---- */
+	.newbtn {
+		position: relative;
+		display: inline-flex;
+		align-items: stretch;
+		border-radius: var(--radius-md);
+	}
+
+	.newbtn-main,
+	.newbtn-caret {
+		background: var(--accent);
+		color: var(--accent-fg);
+		border: 1px solid var(--accent);
+		font-size: 14px;
+		font-weight: 590;
+		cursor: pointer;
+		transition:
+			background var(--motion-fast),
+			border-color var(--motion-fast);
+	}
+
+	.newbtn-main {
+		padding: var(--gap-sm) var(--gap-lg);
+		border-radius: var(--radius-md) 0 0 var(--radius-md);
+		border-right-color: color-mix(in srgb, var(--accent-fg) 25%, var(--accent));
+	}
+
+	.newbtn-caret {
+		display: flex;
+		align-items: center;
+		padding: 0 8px;
+		border-radius: 0 var(--radius-md) var(--radius-md) 0;
+		border-left: none;
+	}
+
+	.newbtn-main:hover,
+	.newbtn-caret:hover,
+	.newbtn.open .newbtn-caret {
+		background: var(--accent-hover);
+		border-color: var(--accent-hover);
+	}
+
+	/* Popover: opens below the button, right-aligned so it stays on screen. */
+	.newbtn-popover {
+		position: absolute;
+		top: calc(100% + 6px);
+		right: 0;
+		z-index: 30;
+		width: 320px;
+		max-width: min(320px, 80vw);
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-3);
+		padding: var(--space-4);
+		background: var(--canvas-overlay);
+		border: 1px solid var(--border-default);
+		border-radius: var(--radius-lg);
+		box-shadow: var(--shadow-md, 0 8px 24px rgba(0, 0, 0, 0.18));
+	}
+
+	.cfg-field {
+		display: flex;
+		flex-direction: column;
+		gap: 3px;
+	}
+
+	.cfg-key {
+		font-family: var(--font-mono);
+		font-size: 9.5px;
+		font-weight: 510;
+		color: var(--text-tertiary);
+		letter-spacing: 0.09em;
+		text-transform: uppercase;
+	}
+
+	.cfg-select,
+	.cfg-input {
+		width: 100%;
+		padding: 6px 8px;
+		background: var(--canvas-base);
+		border: 1px solid var(--border-default);
+		border-radius: var(--radius-sm);
+		color: var(--text-primary);
+		font-family: var(--font-mono);
+		font-size: 12px;
+		outline: none;
+	}
+
+	.cfg-select:focus,
+	.cfg-input:focus {
+		border-color: var(--border-strong);
+		box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 10%, transparent);
+	}
+
+	.cfg-input::placeholder {
+		color: var(--text-disabled);
+	}
+
+	.newbtn-go {
+		margin-top: 2px;
+		padding: 7px 10px;
+		background: var(--accent);
+		color: var(--accent-fg);
+		border: 1px solid var(--accent);
+		border-radius: var(--radius-sm);
+		font-size: 13px;
+		font-weight: 590;
+		cursor: pointer;
+		transition: background var(--motion-fast);
+	}
+
+	.newbtn-go:hover {
+		background: var(--accent-hover);
 	}
 
 	.error {

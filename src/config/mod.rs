@@ -24,6 +24,7 @@ pub use error::{ConfigError, Result};
 pub use profile::{DEFAULT_SYSTEM_PROMPT, Profile, ProfileMeta, PromptSection, ToolsSection};
 pub use providers::{ModelConfig, Pricing, ProviderConfig, ProviderType, ProvidersFile};
 
+use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -58,8 +59,38 @@ pub struct ResolvedModel {
     pub pricing: Option<Pricing>,
 }
 
+/// A profile's listable identity: its name and human-readable description.
+///
+/// Surfaced to a front-end choosing a profile for a new session (`doc/profile.md`
+/// §3.1). Deliberately shallow — enumerating profiles must not resolve the
+/// `extends` chain (a broken parent must not hide a usable child).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
+pub struct ProfileSummary {
+    /// Profile name (the `<name>.toml` the session binds to).
+    pub name: String,
+    /// Human-readable description from `[profile].description`, if set.
+    pub description: Option<String>,
+}
+
+/// One selectable model offered by a provider, for a per-session override.
+///
+/// The override is sent back as `provider/model_id` (the qualified identity),
+/// since two providers may serve the same `model_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
+pub struct ModelSummary {
+    /// Provider name (e.g. `openai-main`).
+    pub provider: String,
+    /// Model id sent to the API (e.g. `gpt-4o`).
+    pub model_id: String,
+    /// Maximum context window in tokens (shown alongside the model).
+    pub context_window: u32,
+}
+
 /// Loads and resolves configuration from one or more `.omini` roots, searched
-/// in priority order (project first, then user home).
+/// in priority order: explicit `--config-dir`, then launch cwd, then user home.
+/// Independent of any session workspace ([`discover_with`](Self::discover_with)).
 #[derive(Debug, Clone)]
 pub struct ConfigStore {
     /// Config roots, highest priority first.
@@ -67,19 +98,41 @@ pub struct ConfigStore {
 }
 
 impl ConfigStore {
-    /// Discover config roots: the project `./.omini` (under `cwd`) takes
-    /// precedence over the user `~/.omini`. Either may be absent.
+    /// Discover config roots in priority order, highest first:
+    /// `--config-dir` (explicit) → launch cwd → user home. Each contributes its
+    /// `.omini` subdir if present; absent ones are simply skipped, and duplicates
+    /// (e.g. `--config-dir .` while launched there) collapse to one.
+    ///
+    /// Config discovery is deliberately **independent of the workspace**: a
+    /// session can run in any workspace (the web client picks one per session),
+    /// but config always comes from where `ominiforge` was launched (or an
+    /// explicit `--config-dir`), never from the session's workspace.
     #[must_use]
-    pub fn discover(cwd: &Path) -> Self {
+    pub fn discover_with(config_dir: Option<&Path>, launch_cwd: &Path) -> Self {
         let mut roots = Vec::new();
-        roots.push(cwd.join(OMINI_DIR));
-        if let Some(home) = home_dir() {
-            let user_root = home.join(OMINI_DIR);
-            if !roots.contains(&user_root) {
-                roots.push(user_root);
+        let mut push = |dir: PathBuf| {
+            let root = dir.join(OMINI_DIR);
+            if !roots.contains(&root) {
+                roots.push(root);
             }
+        };
+        if let Some(explicit) = config_dir {
+            push(explicit.to_path_buf());
+        }
+        push(launch_cwd.to_path_buf());
+        if let Some(home) = home_dir() {
+            push(home);
         }
         Self::from_roots(roots)
+    }
+
+    /// Discover config roots from `cwd` (launch directory) then user home, with
+    /// no explicit `--config-dir`. Thin shim over
+    /// [`discover_with`](Self::discover_with); kept for call sites and tests that
+    /// have only a launch directory.
+    #[must_use]
+    pub fn discover(cwd: &Path) -> Self {
+        Self::discover_with(None, cwd)
     }
 
     /// Build a store over explicit roots (highest priority first). Mainly for
@@ -233,6 +286,86 @@ impl ConfigStore {
     fn profile_path(&self, name: &str) -> PathBuf {
         let root = self.roots.first().cloned().unwrap_or_default();
         root.join(PROFILES_SUBDIR).join(format!("{name}.toml"))
+    }
+
+    /// List every profile across the config roots: each `<root>/profiles/*.toml`,
+    /// deduped by name (a higher-priority root shadows a same-named profile in a
+    /// lower one, mirroring [`load_providers`](Self::load_providers)).
+    ///
+    /// Deliberately infallible and shallow: it parses only each file's
+    /// `[profile]` table (name + description) and does **not** resolve `extends`,
+    /// so a profile with a broken parent still lists. A file that fails to parse
+    /// or read is skipped with a warning via `on_warn` (same posture as a broken
+    /// MCP server / hook — one bad profile must not blank the whole list).
+    #[must_use]
+    pub fn list_profiles(&self, on_warn: &(dyn Fn(&str) + Sync)) -> Vec<ProfileSummary> {
+        /// Minimal view over a profile file: just its `[profile]` table. Parsing
+        /// this instead of the full [`Profile`] keeps enumeration cheap and
+        /// tolerant of sections this build does not yet act on.
+        #[derive(serde::Deserialize)]
+        struct ProfileHead {
+            profile: ProfileMeta,
+        }
+
+        let mut summaries: Vec<ProfileSummary> = Vec::new();
+        for root in &self.roots {
+            let dir = root.join(PROFILES_SUBDIR);
+            // A missing profiles/ dir is normal (that root contributes none).
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                    continue;
+                }
+                let text = match std::fs::read_to_string(&path) {
+                    Ok(text) => text,
+                    Err(e) => {
+                        on_warn(&format!("skipping profile {}: {e}", path.display()));
+                        continue;
+                    }
+                };
+                match toml::from_str::<ProfileHead>(&text) {
+                    Ok(head) => {
+                        // Higher-priority root wins: skip a name already seen.
+                        if !summaries.iter().any(|s| s.name == head.profile.name) {
+                            summaries.push(ProfileSummary {
+                                name: head.profile.name,
+                                description: head.profile.description,
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        on_warn(&format!("skipping profile {}: {e}", path.display()));
+                    }
+                }
+            }
+        }
+        summaries
+    }
+
+    /// Flatten every configured provider's models into a selectable list for a
+    /// per-session model override. Order follows `providers.toml` (provider, then
+    /// model order within it), stable across calls so a front-end never reorders.
+    ///
+    /// # Errors
+    /// Propagates [`load_providers`](Self::load_providers) failures (malformed
+    /// `providers.toml`).
+    pub fn list_models(&self) -> Result<Vec<ModelSummary>> {
+        let providers = self.load_providers()?;
+        let models = providers
+            .providers
+            .iter()
+            .flat_map(|p| {
+                p.models.iter().map(move |m| ModelSummary {
+                    provider: p.name.clone(),
+                    model_id: m.id.clone(),
+                    context_window: m.context_window,
+                })
+            })
+            .collect();
+        Ok(models)
     }
 
     // __APPEND_MARKER2__
@@ -676,5 +809,45 @@ output_per_million = 0.60
         // PROVIDERS has no inline pricing → empty table, not an error.
         let pricing = store.load_pricing(&providers).unwrap();
         assert!(pricing.is_empty());
+    }
+
+    /// `discover_with` orders roots `--config-dir` → launch cwd → home, each as a
+    /// `.omini` subdir. This is the precedence the user specified; config is keyed
+    /// off the launch location + explicit flag, never a session workspace.
+    #[test]
+    fn discover_with_orders_explicit_then_cwd_then_home() {
+        let explicit = PathBuf::from("/etc/omini-conf");
+        let cwd = PathBuf::from("/home/u/project");
+        let store = ConfigStore::discover_with(Some(&explicit), &cwd);
+        let roots = store.roots();
+
+        // Explicit config dir wins, then launch cwd. (Home is appended last if
+        // $HOME is set; we assert only the leading, deterministic prefix.)
+        assert_eq!(roots[0], explicit.join(".omini"));
+        assert_eq!(roots[1], cwd.join(".omini"));
+        // The session workspace is irrelevant: no workspace path appears here.
+        assert!(!roots.contains(&PathBuf::from("/some/session/workspace/.omini")));
+    }
+
+    /// With no `--config-dir`, launch cwd is the highest-priority root (then home).
+    #[test]
+    fn discover_with_no_explicit_starts_at_cwd() {
+        let cwd = PathBuf::from("/home/u/project");
+        let store = ConfigStore::discover_with(None, &cwd);
+        assert_eq!(store.roots()[0], cwd.join(".omini"));
+    }
+
+    /// `--config-dir` equal to the launch cwd collapses to a single root (no
+    /// duplicate), so the same `.omini` isn't scanned twice.
+    #[test]
+    fn discover_with_dedups_explicit_equal_to_cwd() {
+        let cwd = PathBuf::from("/home/u/project");
+        let store = ConfigStore::discover_with(Some(&cwd), &cwd);
+        let count = store
+            .roots()
+            .iter()
+            .filter(|r| **r == cwd.join(".omini"))
+            .count();
+        assert_eq!(count, 1, "explicit == cwd must not duplicate the root");
     }
 }
