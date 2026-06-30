@@ -91,7 +91,10 @@ mod tests {
     fn tag_is_four_hex_digits() {
         let tag = tag_of(b"anything");
         assert_eq!(tag.len(), 4);
-        assert!(tag.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase()));
+        assert!(
+            tag.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase())
+        );
     }
 
     /// `record` then `get` round-trips; an unrecorded path is `None`.

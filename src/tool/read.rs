@@ -102,7 +102,10 @@ impl Tool for ReadTool {
             if parsed.range.is_some() || parsed.raw {
                 return Ok(business_error(
                     "invalid_selector",
-                    &format!("{} is a directory; selectors apply to files only", parsed.path),
+                    &format!(
+                        "{} is a directory; selectors apply to files only",
+                        parsed.path
+                    ),
                 ));
             }
             return Ok(self.list_dir(&parsed.path, &path).await);
@@ -118,7 +121,10 @@ impl Tool for ReadTool {
                         is_error: false,
                         error_code: None,
                     }),
-                    Err(msg) => Ok(business_error("bad_range", &format!("{}: {msg}", parsed.path))),
+                    Err(msg) => Ok(business_error(
+                        "bad_range",
+                        &format!("{}: {msg}", parsed.path),
+                    )),
                 }
             }
             // A missing/unreadable file is a business error the model can react
@@ -257,7 +263,12 @@ fn clamp_range(start: usize, end: usize, n: usize) -> Result<(usize, usize), Str
 /// `N:text` lines. An empty file yields just the header.
 fn numbered(path: &str, tag: &str, content: &str) -> String {
     let mut parts = vec![format!("[{path}#{tag}]")];
-    parts.extend(content.lines().enumerate().map(|(i, l)| format!("{}:{l}", i + 1)));
+    parts.extend(
+        content
+            .lines()
+            .enumerate()
+            .map(|(i, l)| format!("{}:{l}", i + 1)),
+    );
     parts.join("\n")
 }
 
@@ -351,7 +362,11 @@ mod tests {
     fn parse_plain_path() {
         assert_eq!(
             parse_arg("src/a.rs"),
-            ParsedArg { path: "src/a.rs".to_owned(), range: None, raw: false }
+            ParsedArg {
+                path: "src/a.rs".to_owned(),
+                range: None,
+                raw: false
+            }
         );
     }
 
@@ -366,11 +381,19 @@ mod tests {
     fn parse_raw_and_combo() {
         assert_eq!(
             parse_arg("a:raw"),
-            ParsedArg { path: "a".to_owned(), range: None, raw: true }
+            ParsedArg {
+                path: "a".to_owned(),
+                range: None,
+                raw: true
+            }
         );
         assert_eq!(
             parse_arg("src/p.ts:1-40:raw"),
-            ParsedArg { path: "src/p.ts".to_owned(), range: Some((1, 40)), raw: true }
+            ParsedArg {
+                path: "src/p.ts".to_owned(),
+                range: Some((1, 40)),
+                raw: true
+            }
         );
     }
 
@@ -408,7 +431,10 @@ mod tests {
         let t = ReadTool::new(dir.path().to_path_buf(), store.clone());
 
         t.invoke(input("a.txt:2-3")).await.unwrap();
-        assert_eq!(store.get(&dir.path().join("a.txt")), Some(tag_of(body.as_bytes())));
+        assert_eq!(
+            store.get(&dir.path().join("a.txt")),
+            Some(tag_of(body.as_bytes()))
+        );
     }
 
     #[tokio::test]

@@ -501,13 +501,11 @@ fn spawn_event_forwarder(bus: &EventBus, outbound: broadcast::Sender<GatewayEven
 /// means none is. Returns `None` when no turn is open (nothing to terminate).
 fn open_turn_id(events: &[CoreEvent]) -> Option<TurnId> {
     events.iter().rev().find_map(|e| match &e.payload {
-        EventPayload::Turn(TurnEvent::Started { turn_id, .. } | TurnEvent::Resumed { turn_id, .. }) => {
-            Some(Some(turn_id.clone()))
-        }
         EventPayload::Turn(
-            TurnEvent::Completed { .. }
-            | TurnEvent::Failed { .. }
-            | TurnEvent::Interrupted { .. },
+            TurnEvent::Started { turn_id, .. } | TurnEvent::Resumed { turn_id, .. },
+        ) => Some(Some(turn_id.clone())),
+        EventPayload::Turn(
+            TurnEvent::Completed { .. } | TurnEvent::Failed { .. } | TurnEvent::Interrupted { .. },
         ) => Some(None),
         _ => None,
     })?
@@ -572,8 +570,8 @@ mod tests {
     use crate::core::payload::{ContentBlockType, StopReason, Usage};
     use crate::llm::{EventStream, LlmError, ModelRequest, Provider, StreamEvent};
     use crate::tool::ToolRegistry;
-    use futures_util::stream;
     use futures_util::StreamExt as _;
+    use futures_util::stream;
     use std::sync::Mutex;
 
     /// A provider that replays one scripted batch of stream events per `stream()`
@@ -797,10 +795,9 @@ mod tests {
             assert!(tokio::time::Instant::now() < deadline, "turn never started");
             if let Ok(Ok(GatewayEvent::Event { event })) =
                 tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await
+                && matches!(event.payload, EventPayload::Turn(TurnEvent::Started { .. }))
             {
-                if matches!(event.payload, EventPayload::Turn(TurnEvent::Started { .. })) {
-                    break;
-                }
+                break;
             }
         }
 
@@ -812,11 +809,11 @@ mod tests {
         let mut last = None;
         while tokio::time::Instant::now() < deadline {
             let events = store.read_events(&sid).unwrap_or_default();
-            if let Some(e) = events.last() {
-                if matches!(e.payload, EventPayload::Turn(TurnEvent::Interrupted { .. })) {
-                    last = Some(e.payload.clone());
-                    break;
-                }
+            if let Some(e) = events.last()
+                && matches!(e.payload, EventPayload::Turn(TurnEvent::Interrupted { .. }))
+            {
+                last = Some(e.payload.clone());
+                break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }

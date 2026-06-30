@@ -11,6 +11,7 @@ pub mod core;
 // plan in `doc/todo.md`. Dependency direction (see `doc/workspace-plan.md`):
 // everything points down to `core`; `core` depends on nothing above it.
 pub mod agent;
+pub mod agents_md;
 pub mod app;
 pub mod cli;
 pub mod config;

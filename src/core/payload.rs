@@ -325,7 +325,7 @@ pub enum InjectionEvent {
 }
 
 /// What produced an injection. Ordering is kept stable (Memory → Rag → Acp →
-/// Hook → Runtime) to avoid needless prefix-cache churn.
+/// Hook → Runtime → `ProjectGuidance`) to avoid needless prefix-cache churn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub enum InjectionSource {
@@ -339,6 +339,9 @@ pub enum InjectionSource {
     /// stuck-step reminder pushed into the context to keep a turn on track.
     /// See `doc/plan.md` §8.
     Runtime,
+    /// A project guidance file (`AGENTS.md`/`CLAUDE.md`) loaded lazily when the
+    /// agent first touched a file under its directory. See `doc/agents-md.md`.
+    ProjectGuidance,
 }
 
 /// Hook execution at a pipeline point.

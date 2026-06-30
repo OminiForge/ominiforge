@@ -88,9 +88,11 @@ pub struct ModelSummary {
     pub context_window: u32,
 }
 
-/// Loads and resolves configuration from one or more `.omini` roots, searched
-/// in priority order: explicit `--config-dir`, then launch cwd, then user home.
-/// Independent of any session workspace ([`discover_with`](Self::discover_with)).
+/// Loads and resolves configuration from one or more `.omini` roots.
+///
+/// Roots are searched in priority order: explicit `--config-dir`, then launch
+/// cwd, then user home. Independent of any session workspace
+/// ([`discover_with`](Self::discover_with)).
 #[derive(Debug, Clone)]
 pub struct ConfigStore {
     /// Config roots, highest priority first.

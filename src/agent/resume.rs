@@ -30,11 +30,13 @@
 //! the same error tolerance as live dispatch (a bad op was never applied, so
 //! replay skips it too).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::core::CoreEvent;
 use crate::core::SourceKind;
-use crate::core::payload::{BlockContent, EventPayload, ModelEvent, ToolEvent, TurnEvent};
+use crate::core::payload::{
+    BlockContent, EventPayload, InjectionEvent, InjectionSource, ModelEvent, ToolEvent, TurnEvent,
+};
 use crate::llm::{Message, ToolCall};
 
 use super::plan::{PLAN_TOOL_NAME, PlanOp, apply_plan_op};
@@ -52,6 +54,7 @@ pub fn rebuild_runtime(events: &[CoreEvent], system: Vec<Message>) -> SessionRun
     // recalibrates it from real usage (`doc/phase2-plan.md` Step 2).
     let mut runtime = SessionRuntime::new(rebuild_context(events, system));
     runtime.plan = rebuild_plan(events);
+    runtime.loaded_guidance = rebuild_loaded_guidance(events);
     runtime
 }
 
@@ -227,6 +230,25 @@ fn rebuild_plan(events: &[CoreEvent]) -> Vec<PlanStep> {
         }
     }
     plan
+}
+
+/// Rebuild the set of nested project-guidance files already injected, so a
+/// resumed session does not re-inject one whose subtree it touches again. The
+/// label is recovered from each `ProjectGuidance` injection's wrapper
+/// (`doc/agents-md.md`); the injected text itself is replayed into the context
+/// view by [`ContextRebuilder`] like any other injection.
+fn rebuild_loaded_guidance(events: &[CoreEvent]) -> HashSet<String> {
+    events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            EventPayload::Injection(InjectionEvent::ContextInjected {
+                source: InjectionSource::ProjectGuidance,
+                content,
+                ..
+            }) => crate::agents_md::label_from_wrapped(content),
+            _ => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -572,6 +594,40 @@ mod tests {
         // Step two stayed pending: the cancel op was malformed and skipped.
         assert_eq!(rt.plan[1].id, "2");
         assert_eq!(rt.plan[1].status, super::super::StepStatus::Pending);
+    }
+
+    /// A `ProjectGuidance` injection rebuilds two things on resume: its wrapped
+    /// body replays into the context (like any injection), and its `path` label
+    /// repopulates `loaded_guidance` so the resumed session does not re-inject
+    /// the same guidance file when it touches that subtree again.
+    #[test]
+    fn rebuilds_project_guidance_dedup_set_and_context() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let label = format!("a{sep}AGENTS.md");
+        let wrapped = crate::agents_md::wrap(&label, "a-guidance");
+        let events = vec![
+            ev(0, runtime_src(), started("touch a/x.rs")),
+            ev(1, model_src(), text_block("r1", "ok")),
+            ev(
+                2,
+                runtime_src(),
+                EventPayload::Injection(InjectionEvent::ContextInjected {
+                    source: InjectionSource::ProjectGuidance,
+                    content: wrapped.clone(),
+                    token_count: 3,
+                }),
+            ),
+        ];
+
+        let rt = rebuild_runtime(&events, vec![]);
+
+        // Label recovered into the dedup set → no re-injection after resume.
+        assert!(rt.loaded_guidance.contains(&label));
+        // And the guidance body is back in the conversation view.
+        assert_eq!(
+            rt.context.last().unwrap(),
+            &Message::User { content: wrapped }
+        );
     }
 
     /// Usage/seq fields on events don't matter to reconstruction; an empty

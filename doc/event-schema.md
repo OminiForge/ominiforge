@@ -82,9 +82,11 @@ interrupted`。设计要点：
 ### 3.6 Injection
 
 记录动态注入，用于 replay 还原每轮 model 实际所见的 context。来源：Memory / RAG / ACP / Hook /
-**Runtime**。`Runtime` 用于 agent loop 自身注入的提醒（完成度门、卡死警告），见
+**Runtime** / **ProjectGuidance**。`Runtime` 用于 agent loop 自身注入的提醒（完成度门、卡死警告），见
 [`plan.md`](./plan.md) §6–§8，文本用 `<reminder>...</reminder>` 包裹，作为真实消息永久留在
-context 历史中（保 prefix cache）。Compaction 时历史 injection 被摘要浓缩。
+context 历史中（保 prefix cache）。`ProjectGuidance` 用于子目录 `AGENTS.md`/`CLAUDE.md` 懒加载注入
+（`<project-guidance path="...">...`），见 [`agents-md.md`](./agents-md.md)。Compaction 时历史
+injection 被摘要浓缩。
 
 ### 3.7 Hook
 

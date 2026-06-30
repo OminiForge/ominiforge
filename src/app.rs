@@ -137,6 +137,14 @@ pub async fn assemble(
 
     let tool_names = tools.descriptors().into_iter().map(|d| d.name).collect();
 
+    // Project guidance: the workspace-root `AGENTS.md` (or `CLAUDE.md` fallback)
+    // is always-on context, appended to the system prompt where it stays in the
+    // prefix cache (`doc/agents-md.md`). Nested sub-directory files are loaded
+    // lazily by the agent loop as their subtrees are touched.
+    let root_guidance = crate::agents_md::read_root(&workspace)
+        .map(|g| format!("\n\n{}", crate::agents_md::wrap(&g.label, &g.body)))
+        .unwrap_or_default();
+
     let mut agent = Agent::new(
         provider,
         tools,
@@ -150,6 +158,7 @@ pub async fn assemble(
                 .context
                 .compaction_threshold
                 .unwrap_or(DEFAULT_COMPACTION_THRESHOLD),
+            workspace: workspace.clone(),
             ..AgentConfig::default()
         },
     );
@@ -179,7 +188,7 @@ pub async fn assemble(
     Ok(Assembled {
         agent,
         session_store: SessionStore::new(workspace.join(SESSIONS_SUBDIR)),
-        system_prompt: ConfigStore::system_prompt(&profile) + &skill_index,
+        system_prompt: ConfigStore::system_prompt(&profile) + &skill_index + &root_guidance,
         profile_name: profile.profile.name.clone(),
         tool_names,
         workspace,
@@ -198,7 +207,10 @@ fn register_profile_tools(
 ) {
     let snapshots = SnapshotStore::new();
     if profile.tools.allows("read") {
-        registry.register(Arc::new(ReadTool::new(workspace.clone(), snapshots.clone())));
+        registry.register(Arc::new(ReadTool::new(
+            workspace.clone(),
+            snapshots.clone(),
+        )));
     }
     if profile.tools.allows("write") {
         registry.register(Arc::new(WriteTool::new(workspace.clone())));

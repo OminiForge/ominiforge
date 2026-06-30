@@ -346,7 +346,10 @@ mod tests {
         ];
         let summary = summarize(&events, PricingTable::new());
         assert_eq!(summary.total_turns, 2);
-        assert_eq!(summary.first_user_input.as_deref(), Some("fix the auth bug"));
+        assert_eq!(
+            summary.first_user_input.as_deref(),
+            Some("fix the auth bug")
+        );
     }
 
     /// A session whose only turn carried no input (or empty input) has no title,

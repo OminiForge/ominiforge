@@ -203,18 +203,16 @@ async fn create_session(
 /// inspecting the outermost error.
 fn create_error(e: &anyhow::Error) -> Response {
     let is_client_config_error = e.chain().any(|cause| {
-        cause
-            .downcast_ref::<ConfigError>()
-            .is_some_and(|cfg| {
-                matches!(
-                    cfg,
-                    ConfigError::UnknownModel(_)
-                        | ConfigError::UnknownProvider(_)
-                        | ConfigError::NoModel(_)
-                        | ConfigError::NotFound(_)
-                        | ConfigError::UnsupportedProviderType(_)
-                )
-            })
+        cause.downcast_ref::<ConfigError>().is_some_and(|cfg| {
+            matches!(
+                cfg,
+                ConfigError::UnknownModel(_)
+                    | ConfigError::UnknownProvider(_)
+                    | ConfigError::NoModel(_)
+                    | ConfigError::NotFound(_)
+                    | ConfigError::UnsupportedProviderType(_)
+            )
+        })
     });
     // A missing workspace comes from `resolve_workspace` (canonicalize) as a
     // plain io context string, not a ConfigError — treat "workspace does not
@@ -703,7 +701,11 @@ default = "openai-main/gpt-4o"
         let client = reqwest::Client::new();
 
         // No token → 401.
-        let resp = client.get(format!("{base}/api/sessions")).send().await.unwrap();
+        let resp = client
+            .get(format!("{base}/api/sessions"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 401);
 
         // Wrong token → 401.
@@ -1004,13 +1006,12 @@ default = "openai-main/gpt-4o"
         assert_ne!(new_id, parent.0, "reconfiguration mints a new session");
 
         // The new session's meta records the reconfiguration origin + parent.
-        let meta: serde_json::Value =
-            reqwest::get(format!("{base}/api/sessions/{new_id}"))
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
+        let meta: serde_json::Value = reqwest::get(format!("{base}/api/sessions/{new_id}"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
         assert_eq!(meta["origin"]["kind"], "reconfiguration");
         assert_eq!(meta["origin"]["parent_id"], parent.0);
         assert_eq!(meta["profile_id"], "coding");
@@ -1028,7 +1029,9 @@ default = "openai-main/gpt-4o"
         let base = serve_test(state).await;
 
         let resp = reqwest::Client::new()
-            .post(format!("{base}/api/sessions/does-not-exist/reconfigure?profile=coding"))
+            .post(format!(
+                "{base}/api/sessions/does-not-exist/reconfigure?profile=coding"
+            ))
             .send()
             .await
             .unwrap();

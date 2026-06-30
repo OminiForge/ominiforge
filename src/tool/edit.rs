@@ -110,8 +110,7 @@ impl Tool for EditTool {
                 ));
             }
             let new_tag = tag_of(plan.new_content.as_bytes());
-            self.snapshots
-                .record(&plan.abs_path, new_tag.clone());
+            self.snapshots.record(&plan.abs_path, new_tag.clone());
             summaries.push(format!(
                 "edited {} ({} ops, now {} lines) -> {}",
                 plan.rel_path, plan.op_count, plan.new_line_count, new_tag
@@ -478,7 +477,10 @@ mod tests {
 
         let out = tool.invoke(call(&patch)).await.unwrap();
         assert!(!out.is_error, "{:?}", out.content);
-        assert_eq!(std::fs::read_to_string(dir.path().join("f.txt")).unwrap(), "a\nB\nc\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "a\nB\nc\n"
+        );
     }
 
     #[tokio::test]
@@ -490,7 +492,10 @@ mod tests {
 
         let out = tool.invoke(call(&patch)).await.unwrap();
         assert!(!out.is_error, "{:?}", out.content);
-        assert_eq!(std::fs::read_to_string(dir.path().join("f.txt")).unwrap(), "a\nc\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "a\nc\n"
+        );
     }
 
     #[tokio::test]

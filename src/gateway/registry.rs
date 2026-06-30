@@ -61,11 +61,13 @@ pub struct SessionDefaults {
     pub no_dotenv: bool,
 }
 
-/// The config-layer model identity for a session: the provider and model the
-/// gateway resolves for it (`doc/frontend.md`, RUNTIME panel). This is the
-/// *configured* selection — stable for the session's lifetime — not whatever a
-/// given model request happened to use (subagents/forks may differ; that
-/// divergence is a runtime-validation concern, not this display source).
+/// The config-layer model identity for a session: the provider and model.
+///
+/// This is what the gateway resolves for the session (`doc/frontend.md`,
+/// RUNTIME panel) — the *configured* selection, stable for the session's
+/// lifetime — not whatever a given model request happened to use
+/// (subagents/forks may differ; that divergence is a runtime-validation
+/// concern, not this display source).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct RuntimeInfo {

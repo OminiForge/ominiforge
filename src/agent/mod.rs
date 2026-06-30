@@ -31,7 +31,8 @@ pub use plan::{PlanStep, StepStatus};
 pub use resume::rebuild_runtime;
 pub use sink::{BlockKind, NullSink, StreamSink};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -85,6 +86,10 @@ pub struct AgentConfig {
     /// (`doc/context-management.md` §4.2). Step 2 only warns at this threshold;
     /// compaction itself lands in Step 3.
     pub compaction_threshold: f32,
+    /// Canonical workspace root, used to discover project guidance files
+    /// (`AGENTS.md`/`CLAUDE.md`) for the paths tools touch (`doc/agents-md.md`).
+    /// Empty disables nested-guidance discovery.
+    pub workspace: PathBuf,
 }
 
 impl Default for AgentConfig {
@@ -97,6 +102,7 @@ impl Default for AgentConfig {
             max_rounds: 100,
             context_window: 0,
             compaction_threshold: DEFAULT_COMPACTION_THRESHOLD,
+            workspace: PathBuf::new(),
         }
     }
 }
@@ -118,6 +124,12 @@ pub struct SessionRuntime {
     /// Running input-token estimate for the context view, calibrated each round
     /// from the provider's authoritative usage (`doc/phase2-plan.md` Step 2).
     pub ledger: ContextLedger,
+    /// Workspace-relative paths of nested project-guidance files
+    /// (`AGENTS.md`/`CLAUDE.md`) already injected this session, so each is loaded
+    /// at most once however many times its subtree is touched
+    /// (`doc/agents-md.md`). The root file lives in the system prompt and is
+    /// never tracked here. Rebuilt on resume from the injection log.
+    pub loaded_guidance: HashSet<String>,
 }
 
 impl SessionRuntime {
@@ -131,6 +143,7 @@ impl SessionRuntime {
             context,
             plan: Vec::new(),
             ledger,
+            loaded_guidance: HashSet::new(),
         }
     }
 
@@ -508,12 +521,21 @@ impl TurnState<'_> {
             // stuck counter while one that only spins keeps climbing toward the
             // threshold (`doc/plan.md` §7).
             let mut progressed = false;
+            let mut touched: Vec<String> = Vec::new();
             for call in tool_calls {
                 let event_id = outcome.tool_call_event_ids.get(&call.id).cloned();
+                if let Some(path) = touched_path(&call) {
+                    touched.push(path);
+                }
                 let (result, made_progress) = self.dispatch(&call, event_id).await?;
                 progressed |= made_progress;
                 self.runtime.push_message(result);
             }
+            // Load any nested project-guidance file the touched paths sit under,
+            // once per session, *after* the round's tool results are in place so
+            // the assistant→tool message pairing the provider expects is intact
+            // (`doc/agents-md.md`).
+            self.load_project_guidance(&touched)?;
             self.check_stuck(progressed)?;
         }
 
@@ -717,7 +739,39 @@ impl TurnState<'_> {
         Ok(())
     }
 
-    /// Persist a `HookEvent` for every hook execution at a point. Hook records
+    /// For each path a filesystem tool touched this round, find the nearest
+    /// nested project-guidance file and inject it once per session. The dedup
+    /// set is checked and updated synchronously, so several tool calls in one
+    /// round that share a guidance directory load it a single time
+    /// (`doc/agents-md.md`).
+    fn load_project_guidance(&mut self, touched: &[String]) -> Result<(), AgentError> {
+        let workspace = &self.agent.config.workspace;
+        if workspace.as_os_str().is_empty() {
+            return Ok(());
+        }
+        for path in touched {
+            let Some(g) = crate::agents_md::discover_nearest(workspace, path) else {
+                continue;
+            };
+            if !self.runtime.loaded_guidance.insert(g.label.clone()) {
+                continue;
+            }
+            let content = crate::agents_md::wrap(&g.label, &g.body);
+            let token_count = estimate_tokens(&content);
+            self.writer.append(
+                runtime_source(),
+                EventPayload::Injection(InjectionEvent::ContextInjected {
+                    source: InjectionSource::ProjectGuidance,
+                    content: content.clone(),
+                    token_count,
+                }),
+                None,
+                Some(self.turn_id.clone()),
+            )?;
+            self.runtime.push_message(Message::User { content });
+        }
+        Ok(())
+    }
     /// carry no parent and are attributed to a `hook`-named source so monitoring
     /// can route on them (`doc/hook-protocol.md` §11).
     fn record_hook_executions(&mut self, execs: &[HookExecution]) -> Result<(), AgentError> {
@@ -1193,6 +1247,21 @@ fn assistant_tool_calls(message: &Message) -> Vec<ToolCall> {
     }
 }
 
+/// The workspace path a built-in filesystem tool call targets, for nested
+/// project-guidance discovery. Only `read`/`write`/`edit` carry a `path`; other
+/// tools (shell, MCP, the `plan` control tool) have no single path and return
+/// `None` (`doc/agents-md.md`).
+fn touched_path(call: &ToolCall) -> Option<String> {
+    if !matches!(call.name.as_str(), "read" | "write" | "edit") {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(&call.arguments)
+        .ok()?
+        .get("path")?
+        .as_str()
+        .map(ToOwned::to_owned)
+}
+
 /// Accumulate per-round token usage into a turn total (saturating).
 const fn add_usage(acc: Usage, round: Usage) -> Usage {
     Usage {
@@ -1439,6 +1508,46 @@ mod tests {
                 )
             })
             .count()
+    }
+
+    fn project_guidance_count(events: &[CoreEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.payload,
+                    EventPayload::Injection(InjectionEvent::ContextInjected {
+                        source: InjectionSource::ProjectGuidance,
+                        ..
+                    })
+                )
+            })
+            .count()
+    }
+
+    /// A single model round that issues several tool calls (each its own block).
+    fn multi_tool_call_round(calls: &[(&str, &str, &str)]) -> Vec<StreamEvent> {
+        let mut events = Vec::new();
+        for (i, (id, name, args)) in calls.iter().enumerate() {
+            let index = u32::try_from(i).unwrap();
+            events.push(StreamEvent::BlockStart {
+                index,
+                block_type: ContentBlockType::ToolCall {
+                    id: (*id).to_owned(),
+                    name: (*name).to_owned(),
+                },
+            });
+            events.push(StreamEvent::ToolCallDelta {
+                index,
+                json_delta: (*args).to_owned(),
+            });
+            events.push(StreamEvent::BlockStop { index });
+        }
+        events.push(StreamEvent::Completed {
+            stop_reason: StopReason::ToolUse,
+            usage: Usage::default(),
+        });
+        events
     }
 
     /// The `plan` control tool is dispatched like a leaf tool — same
@@ -1816,6 +1925,82 @@ mod tests {
             !stuck_warning,
             "a step making progress every round must not be flagged stuck"
         );
+    }
+
+    /// A nested `AGENTS.md` is injected once per session: several tool calls in
+    /// one round that touch its subtree load it a single time, a later round
+    /// touching the same subtree does not reload it, and a different subtree
+    /// loads its own. This is the dedup guarantee (`doc/agents-md.md`).
+    #[tokio::test]
+    async fn nested_project_guidance_injected_once_per_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(workspace.join("a")).unwrap();
+        std::fs::create_dir_all(workspace.join("b")).unwrap();
+        std::fs::write(workspace.join("a/AGENTS.md"), "a-guidance").unwrap();
+        std::fs::write(workspace.join("b/AGENTS.md"), "b-guidance").unwrap();
+        std::fs::write(workspace.join("a/one.txt"), "1").unwrap();
+        std::fs::write(workspace.join("a/two.txt"), "2").unwrap();
+        std::fs::write(workspace.join("b/three.txt"), "3").unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            // Round 1: two reads under a/ in ONE round → guidance a loaded once.
+            multi_tool_call_round(&[
+                ("r1", "read", r#"{"path":"a/one.txt"}"#),
+                ("r2", "read", r#"{"path":"a/two.txt"}"#),
+            ]),
+            // Round 2: another read under a/ → already loaded, no new injection.
+            tool_call_round("r3", "read", r#"{"path":"a/one.txt"}"#),
+            // Round 3: a read under b/ → loads guidance b.
+            tool_call_round("r4", "read", r#"{"path":"b/three.txt"}"#),
+            text_round("done"),
+        ]));
+
+        let mut tools = ToolRegistry::new();
+        crate::tool::register_builtin(&mut tools, workspace.clone());
+        let agent = Agent::new(
+            provider,
+            tools,
+            AgentConfig {
+                model: "mock".to_owned(),
+                workspace: workspace.clone(),
+                ..AgentConfig::default()
+            },
+        );
+
+        let store = SessionStore::new(dir.path().join("sessions"));
+        let mut writer = store
+            .create_new(None, None, vec!["read".to_owned()])
+            .unwrap();
+        let sid = writer.session_id().clone();
+        let mut runtime = SessionRuntime::default();
+
+        agent
+            .run_turn(&mut writer, &mut runtime, "touch files".to_owned())
+            .await
+            .unwrap();
+        drop(writer);
+
+        let events = store.read_events(&sid).unwrap();
+        // a loaded once (despite 3 touches across 2 rounds), b once → 2 total.
+        assert_eq!(project_guidance_count(&events), 2);
+        let sep = std::path::MAIN_SEPARATOR;
+        assert!(
+            runtime
+                .loaded_guidance
+                .contains(&format!("a{sep}AGENTS.md"))
+        );
+        assert!(
+            runtime
+                .loaded_guidance
+                .contains(&format!("b{sep}AGENTS.md"))
+        );
+        // The guidance bodies reached the model's context, wrapped + attributed.
+        assert!(runtime.context.iter().any(|m| matches!(
+            m,
+            Message::User { content }
+                if content.contains("a-guidance") && content.contains("project-guidance")
+        )));
     }
 
     #[tokio::test]

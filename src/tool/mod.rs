@@ -172,12 +172,15 @@ fn resolve_in_workspace(workspace: &Path, requested: &str) -> Result<PathBuf, To
 /// `read` and `edit` share one [`SnapshotStore`] so an `edit` patch is verified
 /// against the snapshot the preceding `read` recorded.
 ///
-/// TODO: The SnapshotStore wiring here mirrors `register_profile_tools` in
+/// TODO: The `SnapshotStore` wiring here mirrors `register_profile_tools` in
 /// `app.rs`. If a third tool needs the store, extract a shared helper rather
 /// than duplicating the wiring a third time.
 pub fn register_builtin(registry: &mut ToolRegistry, workspace: PathBuf) {
     let snapshots = SnapshotStore::new();
-    registry.register(Arc::new(ReadTool::new(workspace.clone(), snapshots.clone())));
+    registry.register(Arc::new(ReadTool::new(
+        workspace.clone(),
+        snapshots.clone(),
+    )));
     registry.register(Arc::new(WriteTool::new(workspace.clone())));
     registry.register(Arc::new(EditTool::new(workspace.clone(), snapshots)));
     registry.register(Arc::new(ShellTool::new(workspace)));
