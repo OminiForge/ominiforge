@@ -524,9 +524,7 @@ impl TurnState<'_> {
             let mut touched: Vec<String> = Vec::new();
             for call in tool_calls {
                 let event_id = outcome.tool_call_event_ids.get(&call.id).cloned();
-                if let Some(path) = touched_path(&call) {
-                    touched.push(path);
-                }
+                touched.extend(touched_paths(&call));
                 let (result, made_progress) = self.dispatch(&call, event_id).await?;
                 progressed |= made_progress;
                 self.runtime.push_message(result);
@@ -1247,19 +1245,42 @@ fn assistant_tool_calls(message: &Message) -> Vec<ToolCall> {
     }
 }
 
-/// The workspace path a built-in filesystem tool call targets, for nested
-/// project-guidance discovery. Only `read`/`write`/`edit` carry a `path`; other
-/// tools (shell, MCP, the `plan` control tool) have no single path and return
-/// `None` (`doc/agents-md.md`).
-fn touched_path(call: &ToolCall) -> Option<String> {
+/// Workspace paths a built-in filesystem tool call targets, for nested
+/// project-guidance discovery. `read`/`write` target one path; `edit` may target
+/// one `path` or several `sections`. Other tools have no single path and return
+/// none (`doc/agents-md.md`).
+fn touched_paths(call: &ToolCall) -> Vec<String> {
     if !matches!(call.name.as_str(), "read" | "write" | "edit") {
-        return None;
+        return Vec::new();
     }
-    serde_json::from_str::<serde_json::Value>(&call.arguments)
-        .ok()?
-        .get("path")?
-        .as_str()
-        .map(ToOwned::to_owned)
+    let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) else {
+        return Vec::new();
+    };
+
+    if call.name == "edit" {
+        return edit_touched_paths(&args);
+    }
+
+    args.get("path")
+        .and_then(serde_json::Value::as_str)
+        .map(|path| vec![path.to_owned()])
+        .unwrap_or_default()
+}
+
+fn edit_touched_paths(args: &serde_json::Value) -> Vec<String> {
+    let mut paths = Vec::new();
+    if let Some(path) = args.get("path").and_then(serde_json::Value::as_str) {
+        paths.push(path.to_owned());
+    }
+    if let Some(sections) = args.get("sections").and_then(serde_json::Value::as_array) {
+        paths.extend(sections.iter().filter_map(|section| {
+            section
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+        }));
+    }
+    paths
 }
 
 /// Accumulate per-round token usage into a turn total (saturating).
@@ -1451,6 +1472,37 @@ mod tests {
                 usage: Usage::default(),
             },
         ]
+    }
+
+    #[test]
+    fn touched_paths_include_structured_edit_targets() {
+        let multi = ToolCall {
+            id: "c1".to_owned(),
+            name: "edit".to_owned(),
+            arguments: serde_json::json!({
+                "sections": [
+                    { "path": "a/one.txt", "tag": "AAAA", "ops": [] },
+                    { "path": "b/two.txt", "tag": "BBBB", "ops": [] }
+                ]
+            })
+            .to_string(),
+        };
+        assert_eq!(
+            touched_paths(&multi),
+            vec!["a/one.txt".to_owned(), "b/two.txt".to_owned()]
+        );
+
+        let single = ToolCall {
+            id: "c2".to_owned(),
+            name: "edit".to_owned(),
+            arguments: serde_json::json!({
+                "path": "c/three.txt",
+                "tag": "CCCC",
+                "ops": []
+            })
+            .to_string(),
+        };
+        assert_eq!(touched_paths(&single), vec!["c/three.txt".to_owned()]);
     }
 
     /// Like [`text_round`] but the `Completed` carries a provider `input_tokens`

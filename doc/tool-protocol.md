@@ -248,9 +248,9 @@ ToolRegistry
 
 Tool schemas 按 name 字母序排列（保障 prefix cache 命中率）。
 
-## 11. edit 工具：hashline grammar 与 snapshot 验证
+## 11. edit 工具：结构化 edits 与 snapshot 验证
 
-`edit` 是 `write` 的局部替代：`write` 重写整文件，`edit` 对已有文件打行锚定 patch，
+`edit` 是 `write` 的局部替代：`write` 重写整文件，`edit` 对已有文件做行锚定修改，
 token 消耗更少，diff 更干净。
 
 ### 11.1 使用流程
@@ -264,26 +264,26 @@ read path="src/lib.rs"
 # 2:    println!("hello");
 # 3:}
 
-# 2. edit — 引用 TAG + 行号打 patch
-edit input="[src/lib.rs#1F2A]
-replace 2..2:
-+    println!(\"world\");
-"
+# 2. edit — 引用 TAG + 行号。优先使用结构化输入；lines 数组一项就是输出的一行。
+edit path="src/lib.rs" tag="1F2A" ops='[
+  { "op": "replace", "start": 2, "end": 2, "lines": ["    println!(\"world\");"] }
+]'
 ```
 
-### 11.2 Patch grammar（variant: hashline）
+### 11.2 结构化输入
 
-一个 patch 由一或多个 file section 组成。每个 section 以 `[path#TAG]` 开头，
-后接一或多个 op；payload 行以 `+` 前缀。
+单文件编辑使用顶层 `path` / `tag` / `ops`；多文件编辑使用 `sections`，每个 section
+包含自己的 `path` / `tag` / `ops`。`lines` 必须是数组，且每项不能内嵌换行；空行用
+`""` 表示。这避免把整段 patch 塞进一个 JSON string 后被模型或 provider 双重转义成一行。
 
-| Op | 格式 | 说明 |
+| Op | 必填字段 | 说明 |
 |---|---|---|
-| replace | `replace N..M:` | 将第 N–M 行（含）替换为 payload |
-| delete  | `delete N..M`   | 删除第 N–M 行（无 payload）|
-| insert after  | `insert after N:`  | 在第 N 行之后插入 payload |
-| insert before | `insert before N:` | 在第 N 行之前插入 payload |
-| insert head   | `insert head:`     | 在文件头插入 payload |
-| insert tail   | `insert tail:`     | 在文件尾插入 payload |
+| `replace` | `start`, `lines` | 将 `start..end`（含）替换为 `lines`；`end` 缺省为 `start` |
+| `delete` | `start` | 删除 `start..end`（含）；`end` 缺省为 `start`，不能带 `lines` |
+| `insert_after` | `start`, `lines` | 在第 `start` 行之后插入 |
+| `insert_before` | `start`, `lines` | 在第 `start` 行之前插入 |
+| `insert_head` | `lines` | 在文件头插入 |
+| `insert_tail` | `lines` | 在文件尾插入 |
 
 行号均为 1-based，与 `read` 输出一致。同一 section 内的多 op 按高行号优先应用，
 避免行号漂移。
@@ -307,7 +307,6 @@ replace 2..2:
 ### 11.4 尚未实现
 
 - `replace block N`（tree-sitter 语法块替换）：需引入 tree-sitter 依赖，暂缓。
-- 多 variant（patch/apply_patch/replace）：当前只支持 hashline。
 
 ## 12. 与之前 WASM 方案的对比
 

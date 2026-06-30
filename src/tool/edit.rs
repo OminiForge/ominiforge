@@ -1,24 +1,15 @@
 //! The `edit` built-in tool: apply a line-anchored patch verified against the
 //! per-session snapshot recorded by [`read`](super::ReadTool).
 //!
-//! A patch is one `input` string of one or more file sections. Each section
-//! opens with a `[path#TAG]` header — the same header `read` prints — and is
-//! followed by ops that name plain line numbers. Before touching a file the tool
-//! checks the cited `TAG` against both the snapshot store and the file's current
-//! bytes; a mismatch means the read was stale, so the patch is rejected rather
-//! than applied to the wrong lines. See `doc/tool-protocol.md`.
+//! Input is structured JSON: a single section (`path`, `tag`, `ops`) or
+//! multiple `sections`. Each replacement line is one string in `lines`, avoiding
+//! the fragile "patch embedded in a JSON string" shape that can double-escape
+//! newlines.
 //!
-//! Grammar (variant `hashline`):
-//! ```text
-//! [src/app.rs#1F2A]
-//! replace 12..14:
-//! +    let x = 1;
-//! delete 20..20
-//! insert after 30:
-//! +// trailing note
-//! ```
-//! Ops: `replace N..M:`, `delete N..M`, `insert after N:`, `insert before N:`,
-//! `insert head:`, `insert tail:`. Payload lines are prefixed `+`.
+//! Before touching a file the tool checks the cited `TAG` against both the
+//! snapshot store and the file's current bytes; a mismatch means the read was
+//! stale, so the patch is rejected rather than applied to the wrong lines. See
+//! `doc/tool-protocol.md`.
 
 use std::path::PathBuf;
 
@@ -37,8 +28,38 @@ pub struct EditTool {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EditArgs {
-    input: String,
+    /// Single-file structured form.
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    tag: Option<String>,
+    #[serde(default)]
+    ops: Vec<EditOpArg>,
+    /// Multi-file structured form.
+    #[serde(default)]
+    sections: Vec<EditSectionArg>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditSectionArg {
+    path: String,
+    tag: String,
+    ops: Vec<EditOpArg>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditOpArg {
+    op: String,
+    #[serde(default)]
+    start: Option<usize>,
+    #[serde(default)]
+    end: Option<usize>,
+    #[serde(default)]
+    lines: Vec<String>,
 }
 
 impl EditTool {
@@ -56,25 +77,96 @@ impl EditTool {
 #[async_trait::async_trait]
 impl Tool for EditTool {
     fn descriptor(&self) -> ToolDescriptor {
+        let op_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "op": {
+                    "type": "string",
+                    "enum": [
+                        "replace",
+                        "delete",
+                        "insert_after",
+                        "insert_before",
+                        "insert_head",
+                        "insert_tail"
+                    ],
+                    "description": "Operation to apply."
+                },
+                "start": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "1-based line number. Required for replace/delete/insert_after/insert_before."
+                },
+                "end": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Inclusive 1-based end line for replace/delete. Defaults to start."
+                },
+                "lines": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Replacement/inserted content, one output line per array item. Do not embed newline characters; use an empty string for a blank line."
+                }
+            },
+            "required": ["op"],
+            "additionalProperties": false
+        });
+        let section_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "File path relative to the workspace root."
+                },
+                "tag": {
+                    "type": "string",
+                    "description": "Snapshot TAG from the prior read header."
+                },
+                "ops": {
+                    "type": "array",
+                    "items": op_schema,
+                    "minItems": 1
+                }
+            },
+            "required": ["path", "tag", "ops"],
+            "additionalProperties": false
+        });
         ToolDescriptor {
             name: "edit".to_owned(),
-            description: "Apply a line-anchored patch to one or more files. Each file \
-                          section starts with the `[path#TAG]` header from a prior \
-                          `read`; ops cite 1-based line numbers. Ops: `replace N..M:`, \
-                          `delete N..M`, `insert after N:`, `insert before N:`, \
-                          `insert head:`, `insert tail:`. Payload lines start with `+`. \
-                          If a file changed since you read it the TAG no longer matches \
-                          and the patch is rejected — re-`read` and try again."
+            description: "Apply line-anchored edits verified against a prior `read` TAG. \
+                          Use `path`, `tag`, and `ops` for one file, or `sections` for \
+                          multiple files. Each `lines` item is one file line, so \
+                          multi-line edits must be arrays, not one string with embedded \
+                          newlines."
                 .to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "input": {
+                    "path": {
                         "type": "string",
-                        "description": "The patch: one or more `[path#TAG]` sections with ops."
+                        "description": "Single-file form: file path relative to the workspace root."
+                    },
+                    "tag": {
+                        "type": "string",
+                        "description": "Single-file form: snapshot TAG from the prior read header."
+                    },
+                    "ops": {
+                        "type": "array",
+                        "items": op_schema,
+                        "minItems": 1,
+                        "description": "Single-file form operations."
+                    },
+                    "sections": {
+                        "type": "array",
+                        "items": section_schema,
+                        "minItems": 1,
+                        "description": "Multi-file form; every section has its own path, tag, and ops."
                     }
                 },
-                "required": ["input"],
+                "oneOf": [
+                    { "required": ["path", "tag", "ops"] },
+                    { "required": ["sections"] }
+                ],
                 "additionalProperties": false
             }),
         }
@@ -84,9 +176,9 @@ impl Tool for EditTool {
         let args: EditArgs = serde_json::from_value(input.input)
             .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
 
-        // Parse errors are protocol faults: the model sent something that is not
-        // a patch at all, so it cannot be retried by reacting to is_error.
-        let sections = parse_patch(&args.input).map_err(ToolError::InvalidInput)?;
+        // Parse errors are protocol faults: the model sent malformed edit input,
+        // so it cannot be retried by reacting to is_error.
+        let sections = sections_from_args(args).map_err(ToolError::InvalidInput)?;
         if sections.is_empty() {
             return Err(ToolError::InvalidInput("empty patch".to_owned()));
         }
@@ -212,147 +304,157 @@ enum AnchorRange {
     Tail,
 }
 
-/// Close the in-progress op (if any) into the current section.
-fn flush_op(
-    current: &mut Option<Section>,
-    pending: &mut Option<(AnchorRange, Vec<String>)>,
-) -> Result<(), String> {
-    if let Some((anchor, payload)) = pending.take() {
-        let section = current
-            .as_mut()
-            .ok_or_else(|| "op before any [path#TAG] header".to_owned())?;
-        validate_payload(anchor, &payload)?;
-        section.ops.push(Op { anchor, payload });
+/// Convert the structured input form into internal file sections.
+fn sections_from_args(args: EditArgs) -> Result<Vec<Section>, String> {
+    let has_sections = !args.sections.is_empty();
+    let has_single = args.path.is_some() || args.tag.is_some() || !args.ops.is_empty();
+
+    match (has_single, has_sections) {
+        (true, true) => {
+            Err("edit input must use either `path`/`tag`/`ops` or `sections`, not both".to_owned())
+        }
+        (false, false) => {
+            Err("edit input must include `path`/`tag`/`ops` or `sections`".to_owned())
+        }
+        (false, true) => args
+            .sections
+            .into_iter()
+            .map(section_from_arg)
+            .collect::<Result<Vec<_>, _>>(),
+        (true, false) => section_from_parts(
+            args.path
+                .ok_or_else(|| "structured edit requires `path`".to_owned())?,
+            args.tag
+                .ok_or_else(|| "structured edit requires `tag`".to_owned())?,
+            args.ops,
+        )
+        .map(|section| vec![section]),
+    }
+}
+
+fn section_from_arg(arg: EditSectionArg) -> Result<Section, String> {
+    section_from_parts(arg.path, arg.tag, arg.ops)
+}
+
+fn section_from_parts(path: String, tag: String, ops: Vec<EditOpArg>) -> Result<Section, String> {
+    if path.is_empty() {
+        return Err("structured edit section has empty `path`".to_owned());
+    }
+    if tag.is_empty() {
+        return Err(format!("{path}: structured edit section has empty `tag`"));
+    }
+    if ops.is_empty() {
+        return Err(format!("{path}: structured edit section has no ops"));
+    }
+
+    let ops = ops
+        .into_iter()
+        .enumerate()
+        .map(|(idx, op)| op_from_arg(&path, idx, op))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Section { path, tag, ops })
+}
+
+fn op_from_arg(path: &str, idx: usize, arg: EditOpArg) -> Result<Op, String> {
+    let EditOpArg {
+        op,
+        start,
+        end,
+        lines,
+    } = arg;
+    let ctx = format!("{path} op {} `{op}`", idx + 1);
+    validate_structured_lines(&ctx, &lines)?;
+
+    let anchor = match op.as_str() {
+        "replace" => {
+            let start = required_start(&ctx, start)?;
+            require_lines(&ctx, &lines)?;
+            AnchorRange::Range(start, end.unwrap_or(start))
+        }
+        "delete" => {
+            let start = required_start(&ctx, start)?;
+            reject_lines(&ctx, &lines)?;
+            AnchorRange::Range(start, end.unwrap_or(start))
+        }
+        "insert_after" => {
+            let start = required_start(&ctx, start)?;
+            reject_end(&ctx, end)?;
+            require_lines(&ctx, &lines)?;
+            AnchorRange::After(start)
+        }
+        "insert_before" => {
+            let start = required_start(&ctx, start)?;
+            reject_end(&ctx, end)?;
+            require_lines(&ctx, &lines)?;
+            AnchorRange::Before(start)
+        }
+        "insert_head" => {
+            reject_start(&ctx, start)?;
+            reject_end(&ctx, end)?;
+            require_lines(&ctx, &lines)?;
+            AnchorRange::Head
+        }
+        "insert_tail" => {
+            reject_start(&ctx, start)?;
+            reject_end(&ctx, end)?;
+            require_lines(&ctx, &lines)?;
+            AnchorRange::Tail
+        }
+        _ => return Err(format!("{ctx}: unknown op")),
+    };
+
+    Ok(Op {
+        anchor,
+        payload: lines,
+    })
+}
+
+fn required_start(ctx: &str, start: Option<usize>) -> Result<usize, String> {
+    match start {
+        Some(0) => Err(format!("{ctx}: `start` must be 1-based; 0 is invalid")),
+        Some(n) => Ok(n),
+        None => Err(format!("{ctx}: missing required `start`")),
+    }
+}
+
+fn reject_start(ctx: &str, start: Option<usize>) -> Result<(), String> {
+    if start.is_some() {
+        return Err(format!("{ctx}: `start` is not valid for this op"));
     }
     Ok(())
 }
 
-/// Parse the patch string into sections. Returns a protocol-error message string
-/// on any malformed line.
-fn parse_patch(input: &str) -> Result<Vec<Section>, String> {
-    let mut sections: Vec<Section> = Vec::new();
-    let mut current: Option<Section> = None;
-    let mut pending: Option<(AnchorRange, Vec<String>)> = None;
-
-    for raw in input.lines() {
-        if let Some(header) = parse_header(raw) {
-            flush_op(&mut current, &mut pending)?;
-            if let Some(section) = current.take() {
-                sections.push(section);
-            }
-            let (path, tag) = header;
-            current = Some(Section {
-                path,
-                tag,
-                ops: Vec::new(),
-            });
-            continue;
-        }
-
-        if let Some(payload) = raw.strip_prefix('+') {
-            let (_, lines) = pending
-                .as_mut()
-                .ok_or_else(|| format!("payload line with no preceding op: {raw}"))?;
-            lines.push(payload.to_owned());
-            continue;
-        }
-
-        if let Some(anchor) = parse_op(raw)? {
-            flush_op(&mut current, &mut pending)?;
-            if current.is_none() {
-                return Err("op before any [path#TAG] header".to_owned());
-            }
-            pending = Some((anchor, Vec::new()));
-            continue;
-        }
-
-        if raw.trim().is_empty() {
-            continue;
-        }
-
-        return Err(format!("unrecognized patch line: {raw}"));
+fn reject_end(ctx: &str, end: Option<usize>) -> Result<(), String> {
+    if end.is_some() {
+        return Err(format!("{ctx}: `end` is only valid for replace/delete"));
     }
-
-    flush_op(&mut current, &mut pending)?;
-    if let Some(section) = current.take() {
-        sections.push(section);
-    }
-    Ok(sections)
+    Ok(())
 }
 
-/// Parse a `[path#TAG]` header line. `None` if the line is not a header.
-fn parse_header(line: &str) -> Option<(String, String)> {
-    let inner = line.strip_prefix('[')?.strip_suffix(']')?;
-    let (path, tag) = inner.rsplit_once('#')?;
-    if path.is_empty() || tag.is_empty() {
-        return None;
+fn require_lines(ctx: &str, lines: &[String]) -> Result<(), String> {
+    if lines.is_empty() {
+        return Err(format!("{ctx}: missing required `lines`"));
     }
-    Some((path.to_owned(), tag.to_owned()))
+    Ok(())
 }
 
-/// Parse an op line into its anchor. `Ok(None)` if the line is not an op line at
-/// all (so the caller can try other line kinds); `Err` if it looks like an op
-/// but is malformed.
-fn parse_op(line: &str) -> Result<Option<AnchorRange>, String> {
-    let line = line.trim_end();
-    if let Some(rest) = line.strip_prefix("replace ") {
-        let spec = rest
-            .strip_suffix(':')
-            .ok_or_else(|| format!("`replace` needs a trailing `:` — {line}"))?;
-        let (a, b) = parse_range(spec)?;
-        return Ok(Some(AnchorRange::Range(a, b)));
+fn reject_lines(ctx: &str, lines: &[String]) -> Result<(), String> {
+    if !lines.is_empty() {
+        return Err(format!("{ctx}: `lines` is not valid for delete"));
     }
-    if let Some(rest) = line.strip_prefix("delete ") {
-        let (a, b) = parse_range(rest)?;
-        return Ok(Some(AnchorRange::Range(a, b)));
-    }
-    if let Some(rest) = line.strip_prefix("insert ") {
-        let rest = rest.trim();
-        if rest == "head:" || rest == "head" {
-            return Ok(Some(AnchorRange::Head));
-        }
-        if rest == "tail:" || rest == "tail" {
-            return Ok(Some(AnchorRange::Tail));
-        }
-        if let Some(n) = rest.strip_prefix("after ") {
-            let n = parse_line_no(n.trim_end_matches(':'))?;
-            return Ok(Some(AnchorRange::After(n)));
-        }
-        if let Some(n) = rest.strip_prefix("before ") {
-            let n = parse_line_no(n.trim_end_matches(':'))?;
-            return Ok(Some(AnchorRange::Before(n)));
-        }
-        return Err(format!("unknown insert form: {line}"));
-    }
-    Ok(None)
+    Ok(())
 }
 
-/// Parse an inclusive `N..M` range (or a bare `N` as `N..N`).
-fn parse_range(spec: &str) -> Result<(usize, usize), String> {
-    let spec = spec.trim();
-    if let Some((a, b)) = spec.split_once("..") {
-        Ok((parse_line_no(a)?, parse_line_no(b)?))
-    } else {
-        let n = parse_line_no(spec)?;
-        Ok((n, n))
+fn validate_structured_lines(ctx: &str, lines: &[String]) -> Result<(), String> {
+    if lines
+        .iter()
+        .any(|line| line.contains('\n') || line.contains('\r'))
+    {
+        return Err(format!(
+            "{ctx}: each `lines` item must be one output line; split multi-line content into multiple array items"
+        ));
     }
-}
-
-fn parse_line_no(s: &str) -> Result<usize, String> {
-    s.trim()
-        .parse::<usize>()
-        .map_err(|_| format!("invalid line number: {s:?}"))
-}
-
-/// Reject payloads that cannot belong to their op: insert ops require at least
-/// one `+` line, otherwise the op is a no-op and almost certainly a mistake. A
-/// `Range` with no payload is a valid delete; with payload, a valid replace.
-fn validate_payload(anchor: AnchorRange, payload: &[String]) -> Result<(), String> {
-    match anchor {
-        AnchorRange::Range(..) => Ok(()),
-        _ if payload.is_empty() => Err("insert op has no `+` payload lines".to_owned()),
-        _ => Ok(()),
-    }
+    Ok(())
 }
 
 /// Apply a section's ops to `lines`, returning the new file content.
@@ -456,10 +558,21 @@ mod tests {
         EditTool::new(dir.to_path_buf(), store)
     }
 
-    fn call(patch: &str) -> ToolInput {
+    fn call_edit(path: &str, content: &str, ops: serde_json::Value) -> ToolInput {
+        let mut input = serde_json::Map::new();
+        input.insert(
+            "path".to_owned(),
+            serde_json::Value::String(path.to_owned()),
+        );
+        input.insert("tag".to_owned(), serde_json::Value::String(tag(content)));
+        input.insert("ops".to_owned(), ops);
+        call_json(serde_json::Value::Object(input))
+    }
+
+    fn call_json(input: serde_json::Value) -> ToolInput {
         ToolInput {
             call_id: "c1".to_owned(),
-            input: serde_json::json!({ "input": patch }),
+            input,
             timeout: Duration::from_secs(5),
         }
     }
@@ -473,9 +586,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = "a\nb\nc\n";
         let tool = primed(dir.path(), "f.txt", src);
-        let patch = format!("[f.txt#{}]\nreplace 2..2:\n+B", tag(src));
 
-        let out = tool.invoke(call(&patch)).await.unwrap();
+        let out = tool
+            .invoke(call_edit(
+                "f.txt",
+                src,
+                serde_json::json!([{ "op": "replace", "start": 2, "end": 2, "lines": ["B"] }]),
+            ))
+            .await
+            .unwrap();
         assert!(!out.is_error, "{:?}", out.content);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
@@ -484,13 +603,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replace_range_preserves_multiline_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = "a\nb\nc\n";
+        let tool = primed(dir.path(), "f.txt", src);
+
+        let out = tool
+            .invoke(call_edit(
+                "f.txt",
+                src,
+                serde_json::json!([{ "op": "replace", "start": 2, "end": 2, "lines": ["B1", "B2"] }]),
+            ))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{:?}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "a\nB1\nB2\nc\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn structured_lines_reject_embedded_newlines() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = "a\nb\nc\n";
+        let tool = primed(dir.path(), "f.txt", src);
+        let input = serde_json::json!({
+            "path": "f.txt",
+            "tag": tag(src),
+            "ops": [
+                { "op": "replace", "start": 2, "lines": ["B1\nB2"] }
+            ]
+        });
+
+        assert!(matches!(
+            tool.invoke(call_json(input)).await,
+            Err(ToolError::InvalidInput(msg)) if msg.contains("one output line")
+        ));
+    }
+
+    #[tokio::test]
     async fn delete_range_removes_lines() {
         let dir = tempfile::tempdir().unwrap();
         let src = "a\nb\nc\n";
         let tool = primed(dir.path(), "f.txt", src);
-        let patch = format!("[f.txt#{}]\ndelete 2..2", tag(src));
 
-        let out = tool.invoke(call(&patch)).await.unwrap();
+        let out = tool
+            .invoke(call_edit(
+                "f.txt",
+                src,
+                serde_json::json!([{ "op": "delete", "start": 2, "end": 2 }]),
+            ))
+            .await
+            .unwrap();
         assert!(!out.is_error, "{:?}", out.content);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
@@ -503,12 +668,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = "a\nb\n";
         let tool = primed(dir.path(), "f.txt", src);
-        let patch = format!(
-            "[f.txt#{}]\ninsert after 1:\n+A1\ninsert before 1:\n+B0",
-            tag(src)
-        );
 
-        let out = tool.invoke(call(&patch)).await.unwrap();
+        let out = tool
+            .invoke(call_edit(
+                "f.txt",
+                src,
+                serde_json::json!([
+                    { "op": "insert_after", "start": 1, "lines": ["A1"] },
+                    { "op": "insert_before", "start": 1, "lines": ["B0"] }
+                ]),
+            ))
+            .await
+            .unwrap();
         assert!(!out.is_error, "{:?}", out.content);
         // before-1 inserts at head, after-1 inserts following the original a.
         assert_eq!(
@@ -522,12 +693,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = "x\n";
         let tool = primed(dir.path(), "f.txt", src);
-        let patch = format!(
-            "[f.txt#{}]\ninsert head:\n+top\ninsert tail:\n+bottom",
-            tag(src)
-        );
 
-        let out = tool.invoke(call(&patch)).await.unwrap();
+        let out = tool
+            .invoke(call_edit(
+                "f.txt",
+                src,
+                serde_json::json!([
+                    { "op": "insert_head", "lines": ["top"] },
+                    { "op": "insert_tail", "lines": ["bottom"] }
+                ]),
+            ))
+            .await
+            .unwrap();
         assert!(!out.is_error, "{:?}", out.content);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
@@ -542,12 +719,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = "1\n2\n3\n4\n5\n";
         let tool = primed(dir.path(), "f.txt", src);
-        let patch = format!(
-            "[f.txt#{}]\nreplace 1..1:\n+one\nreplace 5..5:\n+five",
-            tag(src)
-        );
 
-        let out = tool.invoke(call(&patch)).await.unwrap();
+        let out = tool
+            .invoke(call_edit(
+                "f.txt",
+                src,
+                serde_json::json!([
+                    { "op": "replace", "start": 1, "end": 1, "lines": ["one"] },
+                    { "op": "replace", "start": 5, "end": 5, "lines": ["five"] }
+                ]),
+            ))
+            .await
+            .unwrap();
         assert!(!out.is_error, "{:?}", out.content);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
@@ -563,12 +746,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let original = "a\nb\nc\n";
         let tool = primed(dir.path(), "f.txt", original);
-        // Patch cites the original tag…
-        let patch = format!("[f.txt#{}]\nreplace 2..2:\n+B", tag(original));
-        // …but the file changes out-of-band before edit runs.
+        let input = call_edit(
+            "f.txt",
+            original,
+            serde_json::json!([{ "op": "replace", "start": 2, "end": 2, "lines": ["B"] }]),
+        );
+        // The file changes out-of-band before edit runs.
         std::fs::write(dir.path().join("f.txt"), "a\nb\nc\nd\n").unwrap();
 
-        let out = tool.invoke(call(&patch)).await.unwrap();
+        let out = tool.invoke(input).await.unwrap();
         assert!(out.is_error);
         assert_eq!(out.error_code.as_deref(), Some("stale_snapshot"));
         assert_eq!(
@@ -587,9 +773,15 @@ mod tests {
         std::fs::write(dir.path().join("f.txt"), src).unwrap();
         // Empty store: never read.
         let tool = EditTool::new(dir.path().to_path_buf(), SnapshotStore::new());
-        let patch = format!("[f.txt#{}]\nreplace 1..1:\n+A", tag(src));
 
-        let out = tool.invoke(call(&patch)).await.unwrap();
+        let out = tool
+            .invoke(call_edit(
+                "f.txt",
+                src,
+                serde_json::json!([{ "op": "replace", "start": 1, "end": 1, "lines": ["A"] }]),
+            ))
+            .await
+            .unwrap();
         assert!(out.is_error);
         assert_eq!(out.error_code.as_deref(), Some("stale_snapshot"));
     }
@@ -605,13 +797,22 @@ mod tests {
         store.record(&dir.path().join("a.txt"), tag_of(b"a\n"));
         // b.txt deliberately NOT recorded -> its section will be stale.
         let tool = EditTool::new(dir.path().to_path_buf(), store);
-        let patch = format!(
-            "[a.txt#{}]\nreplace 1..1:\n+A\n[b.txt#{}]\nreplace 1..1:\n+B",
-            tag("a\n"),
-            tag("b\n")
-        );
+        let input = serde_json::json!({
+            "sections": [
+                {
+                    "path": "a.txt",
+                    "tag": tag("a\n"),
+                    "ops": [{ "op": "replace", "start": 1, "end": 1, "lines": ["A"] }]
+                },
+                {
+                    "path": "b.txt",
+                    "tag": tag("b\n"),
+                    "ops": [{ "op": "replace", "start": 1, "end": 1, "lines": ["B"] }]
+                }
+            ]
+        });
 
-        let out = tool.invoke(call(&patch)).await.unwrap();
+        let out = tool.invoke(call_json(input)).await.unwrap();
         assert!(out.is_error);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
@@ -625,19 +826,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = "a\nb\n";
         let tool = primed(dir.path(), "f.txt", src);
-        let patch = format!("[f.txt#{}]\nreplace 5..5:\n+x", tag(src));
 
-        let out = tool.invoke(call(&patch)).await.unwrap();
+        let out = tool
+            .invoke(call_edit(
+                "f.txt",
+                src,
+                serde_json::json!([{ "op": "replace", "start": 5, "end": 5, "lines": ["x"] }]),
+            ))
+            .await
+            .unwrap();
         assert!(out.is_error);
         assert_eq!(out.error_code.as_deref(), Some("bad_range"));
     }
 
     #[tokio::test]
-    async fn malformed_patch_is_protocol_error() {
+    async fn input_field_is_protocol_error() {
         let dir = tempfile::tempdir().unwrap();
         let tool = primed(dir.path(), "f.txt", "a\n");
         assert!(matches!(
-            tool.invoke(call("not a patch at all")).await,
+            tool.invoke(call_json(serde_json::json!({ "input": "not supported" })))
+                .await,
             Err(ToolError::InvalidInput(_))
         ));
     }
@@ -646,10 +854,14 @@ mod tests {
     async fn escaping_path_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let tool = primed(dir.path(), "f.txt", "a\n");
-        // A header that escapes the workspace resolves to a path error surfaced
-        // as a business error (per-section), not a panic.
-        let patch = "[../escape#AAAA]\nreplace 1..1:\n+x";
-        let out = tool.invoke(call(patch)).await.unwrap();
+        let out = tool
+            .invoke(call_json(serde_json::json!({
+                "path": "../escape",
+                "tag": "AAAA",
+                "ops": [{ "op": "replace", "start": 1, "end": 1, "lines": ["x"] }]
+            })))
+            .await
+            .unwrap();
         assert!(out.is_error);
         assert_eq!(out.error_code.as_deref(), Some("invalid_path"));
     }
