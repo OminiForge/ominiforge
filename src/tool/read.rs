@@ -1,12 +1,10 @@
 //! The `read` built-in tool: read a UTF-8 file or list a directory within the
 //! workspace.
 //!
-//! A bare path reads the whole file. Append a `:` selector to scope the read:
-//! `:50-200` is an inclusive 1-based line range, `:50+150` is the count form
-//! (200 lines from line 50), and `:raw` returns verbatim bytes with no header or
-//! line numbers. A range and `:raw` combine (`file:1-40:raw`).
+//! A bare path reads the whole file. Provide an optional `range` object to scope
+//! the read to an inclusive 1-based line range.
 //!
-//! Output for a non-raw read is anchored for [`edit`](super::EditTool): a
+//! Output is anchored for [`edit`](super::EditTool): a
 //! `[path#TAG]` header fingerprints the whole file (the snapshot the later patch
 //! is verified against) and every line is prefixed `N:`. Line numbers are
 //! *absolute* even for a range, so an `edit` patch built off a sliced read still
@@ -34,17 +32,22 @@ pub struct ReadTool {
 #[derive(Deserialize)]
 struct ReadArgs {
     path: String,
+    range: Option<LineRange>,
 }
 
-/// A `path` argument split into its file path and optional selector.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+struct LineRange {
+    start: usize,
+    end: usize,
+}
+
+/// A `path` argument and optional range.
 #[derive(Debug, PartialEq, Eq)]
 struct ParsedArg {
-    /// The path with any trailing selector removed.
+    /// The path to read.
     path: String,
-    /// Inclusive 1-based line range, when a `:N-M` / `:N+C` selector was given.
-    range: Option<(usize, usize)>,
-    /// `:raw` — emit verbatim bytes, no header, no line numbers.
-    raw: bool,
+    /// Inclusive 1-based line range.
+    range: Option<LineRange>,
 }
 
 impl ReadTool {
@@ -67,18 +70,34 @@ impl Tool for ReadTool {
             description: "Read a UTF-8 text file or list a directory, relative to the \
                           workspace root. A bare file path numbers every line (`N:text`) \
                           under a `[path#TAG]` header; cite that TAG and those numbers \
-                          when calling `edit`. Append a selector: `:50-200` (line range), \
-                          `:50+150` (200 lines from line 50), `:raw` (verbatim, no header \
-                          or numbers). A range and `:raw` combine. Line numbers stay \
-                          absolute for a range. A directory path lists its entries."
+                          when calling `edit`. Provide `range: { start, end }` to read \
+                          an inclusive 1-based line range. Line numbers stay absolute \
+                          for a range. A directory path lists its entries."
                 .to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Path relative to the workspace root, with an \
-                                        optional `:N-M`, `:N+C`, and/or `:raw` selector."
+                        "description": "Path relative to the workspace root."
+                    },
+                    "range": {
+                        "type": "object",
+                        "description": "Optional inclusive 1-based line range to read.",
+                        "properties": {
+                            "start": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "First line to read, 1-based and inclusive."
+                            },
+                            "end": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "Last line to read, 1-based and inclusive."
+                            }
+                        },
+                        "required": ["start", "end"],
+                        "additionalProperties": false
                     }
                 },
                 "required": ["path"],
@@ -90,7 +109,10 @@ impl Tool for ReadTool {
     async fn invoke(&self, input: ToolInput) -> ToolResult {
         let args: ReadArgs = serde_json::from_value(input.input)
             .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
-        let parsed = parse_arg(&args.path);
+        let parsed = ParsedArg {
+            path: args.path,
+            range: args.range,
+        };
         let path = resolve_in_workspace(&self.workspace, &parsed.path)?;
 
         let meta = match tokio::fs::metadata(&path).await {
@@ -99,11 +121,11 @@ impl Tool for ReadTool {
         };
 
         if meta.is_dir() {
-            if parsed.range.is_some() || parsed.raw {
+            if parsed.range.is_some() {
                 return Ok(business_error(
-                    "invalid_selector",
+                    "invalid_range",
                     &format!(
-                        "{} is a directory; selectors apply to files only",
+                        "{} is a directory; range applies to files only",
                         parsed.path
                     ),
                 ));
@@ -164,81 +186,26 @@ impl ReadTool {
     }
 }
 
-/// Split a `path` argument into its path and optional `:` selectors.
+/// Render file content per the optional range.
 ///
-/// `:raw` is stripped first (it always trails), then a `:N-M` / `:N+C` range.
-/// A suffix that does not parse as a selector is left as part of the path, so a
-/// path that legitimately contains `:` is not mangled.
-fn parse_arg(arg: &str) -> ParsedArg {
-    let mut s = arg;
-    let mut raw = false;
-    if let Some(rest) = s.strip_suffix(":raw") {
-        raw = true;
-        s = rest;
-    }
-
-    let mut range = None;
-    if let Some((rest, sel)) = s.rsplit_once(':')
-        && let Some(r) = parse_range_selector(sel)
-    {
-        range = Some(r);
-        s = rest;
-    }
-
-    ParsedArg {
-        path: s.to_owned(),
-        range,
-        raw,
-    }
-}
-
-/// Parse a range selector into an inclusive 1-based `(start, end)`. `None` if the
-/// text is not a range selector.
-///
-/// `N-M` is an explicit range; `N+C` is the count form (`C` lines from `N`).
-fn parse_range_selector(sel: &str) -> Option<(usize, usize)> {
-    if let Some((a, b)) = sel.split_once('-') {
-        let start = a.parse::<usize>().ok()?;
-        let end = b.parse::<usize>().ok()?;
-        return Some((start, end));
-    }
-    if let Some((a, c)) = sel.split_once('+') {
-        let start = a.parse::<usize>().ok()?;
-        let count = c.parse::<usize>().ok()?;
-        // C lines starting at N: lines N..=N+C-1. A zero count yields an empty,
-        // inverted range that render() rejects as bad_range.
-        return Some((start, start + count.saturating_sub(1)));
-    }
-    None
-}
-
-/// Render file content per the parsed selector.
-///
-/// - `raw` whole file: verbatim content, untouched.
-/// - `raw` + range: the selected lines joined verbatim, no header/numbers.
 /// - range: `[path#TAG]` header then absolute `N:text` lines for the slice.
-/// - none: `[path#TAG]` header then every line numbered (the original form).
+/// - none: `[path#TAG]` header then every line numbered.
 fn render(parsed: &ParsedArg, tag: &str, content: &str) -> Result<String, String> {
-    match (parsed.range, parsed.raw) {
-        (None, true) => Ok(content.to_owned()),
-        (None, false) => Ok(numbered(&parsed.path, tag, content)),
-        (Some((start, end)), raw) => {
+    match parsed.range {
+        None => Ok(numbered(&parsed.path, tag, content)),
+        Some(LineRange { start, end }) => {
             let lines: Vec<&str> = content.lines().collect();
             let (lo, hi) = clamp_range(start, end, lines.len())?;
             // lo/hi are 1-based inclusive; slice is 0-based half-open.
             let slice = &lines[lo - 1..hi];
-            if raw {
-                Ok(slice.join("\n"))
-            } else {
-                let mut parts = vec![format!("[{}#{tag}]", parsed.path)];
-                parts.extend(
-                    slice
-                        .iter()
-                        .enumerate()
-                        .map(|(i, l)| format!("{}:{l}", lo + i)),
-                );
-                Ok(parts.join("\n"))
-            }
+            let mut parts = vec![format!("[{}#{tag}]", parsed.path)];
+            parts.extend(
+                slice
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| format!("{}:{l}", lo + i)),
+            );
+            Ok(parts.join("\n"))
         }
     }
 }
@@ -295,6 +262,17 @@ mod tests {
         ToolInput {
             call_id: "c1".to_owned(),
             input: serde_json::json!({ "path": path }),
+            timeout: Duration::from_secs(5),
+        }
+    }
+
+    fn range_input(path: &str, start: usize, end: usize) -> ToolInput {
+        ToolInput {
+            call_id: "c1".to_owned(),
+            input: serde_json::json!({
+                "path": path,
+                "range": { "start": start, "end": end }
+            }),
             timeout: Duration::from_secs(5),
         }
     }
@@ -356,55 +334,7 @@ mod tests {
         ));
     }
 
-    // --- selector parsing ---------------------------------------------------
-
-    #[test]
-    fn parse_plain_path() {
-        assert_eq!(
-            parse_arg("src/a.rs"),
-            ParsedArg {
-                path: "src/a.rs".to_owned(),
-                range: None,
-                raw: false
-            }
-        );
-    }
-
-    #[test]
-    fn parse_range_dash_and_count() {
-        assert_eq!(parse_arg("a:50-200").range, Some((50, 200)));
-        // count form: 150 lines from 50 -> 50..=199
-        assert_eq!(parse_arg("a:50+150").range, Some((50, 199)));
-    }
-
-    #[test]
-    fn parse_raw_and_combo() {
-        assert_eq!(
-            parse_arg("a:raw"),
-            ParsedArg {
-                path: "a".to_owned(),
-                range: None,
-                raw: true
-            }
-        );
-        assert_eq!(
-            parse_arg("src/p.ts:1-40:raw"),
-            ParsedArg {
-                path: "src/p.ts".to_owned(),
-                range: Some((1, 40)),
-                raw: true
-            }
-        );
-    }
-
-    /// A non-selector suffix (e.g. a scheme-like `:foo`) stays part of the path.
-    #[test]
-    fn parse_non_selector_suffix_is_kept() {
-        assert_eq!(parse_arg("a:foo").path, "a:foo");
-        assert!(parse_arg("a:foo").range.is_none());
-    }
-
-    // --- selector behavior --------------------------------------------------
+    // --- range behavior -----------------------------------------------------
 
     /// A range keeps ABSOLUTE line numbers so an `edit` built off the slice still
     /// cites the correct lines.
@@ -414,7 +344,7 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), "l1\nl2\nl3\nl4\nl5\n").unwrap();
         let t = tool(dir.path().to_path_buf());
 
-        let out = t.invoke(input("a.txt:2-4")).await.unwrap();
+        let out = t.invoke(range_input("a.txt", 2, 4)).await.unwrap();
         assert!(!out.is_error, "{:?}", out.content);
         let tag = tag_of(b"l1\nl2\nl3\nl4\nl5\n");
         assert_eq!(text(&out), format!("[a.txt#{tag}]\n2:l2\n3:l3\n4:l4"));
@@ -430,43 +360,11 @@ mod tests {
         let store = SnapshotStore::new();
         let t = ReadTool::new(dir.path().to_path_buf(), store.clone());
 
-        t.invoke(input("a.txt:2-3")).await.unwrap();
+        t.invoke(range_input("a.txt", 2, 3)).await.unwrap();
         assert_eq!(
             store.get(&dir.path().join("a.txt")),
             Some(tag_of(body.as_bytes()))
         );
-    }
-
-    #[tokio::test]
-    async fn count_form_selects_n_lines() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.txt"), "1\n2\n3\n4\n5\n").unwrap();
-        let t = tool(dir.path().to_path_buf());
-
-        // 2 lines from line 3 -> lines 3,4
-        let out = t.invoke(input("a.txt:3+2")).await.unwrap();
-        let tag = tag_of(b"1\n2\n3\n4\n5\n");
-        assert_eq!(text(&out), format!("[a.txt#{tag}]\n3:3\n4:4"));
-    }
-
-    #[tokio::test]
-    async fn raw_whole_file_is_verbatim() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.txt"), "x\ny\n").unwrap();
-        let t = tool(dir.path().to_path_buf());
-
-        let out = t.invoke(input("a.txt:raw")).await.unwrap();
-        assert_eq!(text(&out), "x\ny\n");
-    }
-
-    #[tokio::test]
-    async fn raw_range_is_slice_without_anchors() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.txt"), "a\nb\nc\nd\n").unwrap();
-        let t = tool(dir.path().to_path_buf());
-
-        let out = t.invoke(input("a.txt:2-3:raw")).await.unwrap();
-        assert_eq!(text(&out), "b\nc");
     }
 
     /// `end` past EOF clamps to the last line; this is a friendly "to the end".
@@ -476,7 +374,7 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), "a\nb\n").unwrap();
         let t = tool(dir.path().to_path_buf());
 
-        let out = t.invoke(input("a.txt:1-99")).await.unwrap();
+        let out = t.invoke(range_input("a.txt", 1, 99)).await.unwrap();
         let tag = tag_of(b"a\nb\n");
         assert_eq!(text(&out), format!("[a.txt#{tag}]\n1:a\n2:b"));
     }
@@ -488,7 +386,7 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), "a\nb\n").unwrap();
         let t = tool(dir.path().to_path_buf());
 
-        let out = t.invoke(input("a.txt:5-9")).await.unwrap();
+        let out = t.invoke(range_input("a.txt", 5, 9)).await.unwrap();
         assert!(out.is_error);
         assert_eq!(out.error_code.as_deref(), Some("bad_range"));
     }
@@ -499,7 +397,7 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), "a\nb\nc\n").unwrap();
         let t = tool(dir.path().to_path_buf());
 
-        let out = t.invoke(input("a.txt:3-1")).await.unwrap();
+        let out = t.invoke(range_input("a.txt", 3, 1)).await.unwrap();
         assert!(out.is_error);
         assert_eq!(out.error_code.as_deref(), Some("bad_range"));
     }
@@ -520,13 +418,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn selector_on_directory_is_rejected() {
+    async fn range_on_directory_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         let t = tool(dir.path().to_path_buf());
 
-        let out = t.invoke(input("sub:1-10")).await.unwrap();
+        let out = t.invoke(range_input("sub", 1, 10)).await.unwrap();
         assert!(out.is_error);
-        assert_eq!(out.error_code.as_deref(), Some("invalid_selector"));
+        assert_eq!(out.error_code.as_deref(), Some("invalid_range"));
     }
 }
