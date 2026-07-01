@@ -54,6 +54,15 @@
 	// and whenever a turn settles, so the metrics track the live conversation
 	// without rebuilding them from the event fold.
 	let summary = $state<SessionSummary | null>(null);
+	// Live context-window occupancy, from the per-round `context_updated` event.
+	// `tokens` is the running estimate; `window` the model's full context window
+	// (0 = unknown); `threshold` the compaction fraction (drawn as a gauge tick,
+	// mirroring the TUI — the gauge is tokens/window, NOT tokens/effective_limit).
+	// Reset on session switch.
+	let context = $state<{ tokens: number; window: number; threshold: number } | null>(null);
+	// Debounce handle for per-request STATS refresh (Q2): a long turn fires many
+	// RequestCompleted events; coalesce them so we don't replay the log per event.
+	let summaryDebounce: ReturnType<typeof setTimeout> | undefined;
 	let sub: EventSubscription | undefined;
 	let streamEl = $state<HTMLElement | null>(null);
 	// Whether the user is scrolled to (or near) the bottom – controls auto-scroll.
@@ -136,10 +145,19 @@
 		}
 	}
 
+	/** Debounced STATS refresh (Q2): coalesces the burst of per-request refreshes
+	 *  in a long turn into one log-replay every ~500 ms, so metrics track the live
+	 *  conversation per round without hammering the summary endpoint each request. */
+	function scheduleSummaryRefresh(id: string) {
+		clearTimeout(summaryDebounce);
+		summaryDebounce = setTimeout(() => void refreshSummary(id), 500);
+	}
+
 	function subscribe(id: string) {
 		sub?.close();
 		convo = emptyState();
 		collapsed = {};
+		context = null;
 		// A new subscription means fresh content – start auto-scrolling.
 		shouldAutoScroll = true;
 		// Enter replay mode: the gateway will replay committed events in rapid
@@ -159,6 +177,19 @@
 				// STATS snapshot so turns/cost/tokens track the live conversation.
 				if (ev.type === 'turn_settled') {
 					void refreshSummary(id);
+				}
+				// Live context occupancy (per round): drive the STATS context bar.
+				if (ev.type === 'context_updated') {
+					context = { tokens: ev.tokens, window: ev.window, threshold: ev.threshold };
+				}
+				// Per-request STATS refresh (Q2): a committed RequestCompleted means a
+				// model round's usage landed, so the aggregates moved mid-turn. Debounced,
+				// and skipped during history replay (loadMeta already refreshed on load).
+				if (!isReplaying && ev.type === 'event') {
+					const p = ev.payload;
+					if ('Model' in p && 'RequestCompleted' in p.Model) {
+						scheduleSummaryRefresh(id);
+					}
 				}
 				if (isReplaying) {
 					// During replay: snap to bottom instantly (no animation) to
@@ -202,6 +233,7 @@
 			meta = null;
 			runtime = null;
 			summary = null;
+			context = null;
 			// Adopt a config stashed by the dashboard's "New session ▾" (read-once;
 			// it clears itself), so the draft opens prefilled with that choice.
 			const pre = takeDraftConfig();
@@ -246,6 +278,7 @@
 	onDestroy(() => {
 		sub?.close();
 		clearTimeout(replayDebounce);
+		clearTimeout(summaryDebounce);
 	});
 
 	async function send() {
@@ -943,6 +976,38 @@
 			{/if}
 		</section>
 
+		<!-- CONTEXT: live per-round window occupancy (context_updated event). Its
+		     own section (driven by live events, not the summary endpoint) so it
+		     shows mid-turn even before the first summary snapshot loads. -->
+		{#if context}
+			{@const pct = context.window ? Math.min(100, (context.tokens / context.window) * 100) : null}
+			{@const overThreshold = pct !== null && pct / 100 >= context.threshold}
+			<section class="detail-section">
+				<div class="detail-label">Context</div>
+				<div class="ctx">
+					<div class="ctx-nums">
+						<span class="ctx-val">{context.tokens.toLocaleString()}</span>
+						{#if context.window}
+							<span class="ctx-limit">/ {context.window.toLocaleString()}</span>
+						{/if}
+					</div>
+					{#if pct !== null}
+						<div
+							class="ctx-track"
+							title={`${context.tokens.toLocaleString()} / ${context.window.toLocaleString()} tokens · compaction at ${(context.threshold * 100).toFixed(0)}%`}
+						>
+							<span class="ctx-fill" class:warn={overThreshold} style="width: {pct}%"></span>
+							<!-- compaction-threshold tick, mirroring the TUI gauge marker -->
+							<span class="ctx-tick" style="left: {context.threshold * 100}%"></span>
+						</div>
+						<span class="ctx-pct" class:warn={overThreshold}>{pct.toFixed(0)}%</span>
+					{:else}
+						<span class="ctx-pct unpriced">window unknown</span>
+					{/if}
+				</div>
+			</section>
+		{/if}
+
 		<!-- STATS: folded summary snapshot, refreshed on each settled turn -->
 		{#if summary}
 			{@const s = summary}
@@ -1185,6 +1250,69 @@
 		font-variant-numeric: tabular-nums;
 		min-width: 2ch;
 		text-align: right;
+	}
+
+	/* ---- CONTEXT (live per-round window occupancy) ---- */
+	.ctx {
+		display: grid;
+		grid-template-columns: 1fr auto;
+		align-items: center;
+		gap: var(--space-2) var(--space-3);
+	}
+	.ctx-nums {
+		font-family: var(--font-mono);
+		font-variant-numeric: tabular-nums;
+		white-space: nowrap;
+	}
+	.ctx-val {
+		font-size: 14px;
+		font-weight: 500;
+		color: var(--text-primary);
+	}
+	.ctx-limit {
+		font-size: 12px;
+		color: var(--text-tertiary);
+	}
+	.ctx-track {
+		grid-column: 1 / -1;
+		order: 3;
+		position: relative;
+		background: var(--canvas-float);
+		border-radius: var(--radius-sm);
+		height: 6px;
+		overflow: hidden;
+	}
+	.ctx-fill {
+		display: block;
+		height: 100%;
+		background: var(--text-tertiary);
+		border-radius: var(--radius-sm);
+		transition: width var(--dur-std) var(--ease-out);
+	}
+	.ctx-fill.warn {
+		background: var(--state-error-text);
+	}
+	/* Compaction-threshold marker (TUI gauge tick equivalent). */
+	.ctx-tick {
+		position: absolute;
+		top: 0;
+		bottom: 0;
+		width: 1px;
+		background: var(--text-secondary);
+		transform: translateX(-0.5px);
+	}
+	.ctx-pct {
+		font-family: var(--font-mono);
+		font-size: 12px;
+		color: var(--text-tertiary);
+		font-variant-numeric: tabular-nums;
+		text-align: right;
+	}
+	.ctx-pct.warn {
+		color: var(--state-error-text);
+	}
+	.ctx-pct.unpriced {
+		font-size: 11px;
 	}
 
 	/* ---- TOPBAR ---- */

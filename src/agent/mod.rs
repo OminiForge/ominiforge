@@ -882,6 +882,16 @@ impl TurnState<'_> {
         // usage (`0`) leaves the ledger on its heuristic (decision A).
         self.runtime.ledger.calibrate(outcome.usage.input_tokens);
 
+        // Per-round context snapshot for live display: the freshly-calibrated
+        // running estimate + the full window + compaction threshold. The gauge is
+        // `tokens/window` (threshold is a tick, not the denominator — matches the
+        // TUI status line). Emitted through the sink, not persisted.
+        self.sink.on_context(
+            self.runtime.ledger.running(),
+            self.agent.config.context_window,
+            self.agent.config.compaction_threshold,
+        );
+
         self.writer.append(
             source,
             EventPayload::Model(ModelEvent::RequestCompleted {

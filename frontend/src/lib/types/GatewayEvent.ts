@@ -42,4 +42,4 @@ turn_id: TurnId | null,
 /**
  * The domain payload.
  */
-payload: EventPayload, } | { "type": "delta" } & Delta | { "type": "turn_settled", incomplete: string | null, } | { "type": "compacted", new_session_id: string, } | { "type": "notice", message: string, };
+payload: EventPayload, } | { "type": "delta" } & Delta | { "type": "turn_settled", incomplete: string | null, } | { "type": "compacted", new_session_id: string, } | { "type": "notice", message: string, } | { "type": "context_updated", tokens: number, window: number, threshold: number, };

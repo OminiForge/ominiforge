@@ -64,6 +64,17 @@ pub enum GatewayEvent {
     Compacted { new_session_id: String },
     /// A non-fatal note (compaction failure, etc.) for display.
     Notice { message: String },
+    /// A per-round context-window occupancy snapshot for live display. Emitted
+    /// after each model round calibrates the ledger. `tokens` is the running
+    /// estimate; `window` the model's full context window (`0` when unknown);
+    /// `threshold` the compaction fraction (a gauge tick — the gauge is
+    /// `tokens/window`, not `tokens/effective_limit`, mirroring the TUI). Ephemeral
+    /// like [`Delta`]: not persisted, not replayed — a fresh snapshot arrives next round.
+    ContextUpdated {
+        tokens: u32,
+        window: u32,
+        threshold: f32,
+    },
 }
 
 /// A live streaming delta, mirroring [`StreamSink`] callbacks.
@@ -558,6 +569,14 @@ impl StreamSink for BroadcastSink {
             index,
             json: json_delta.to_owned(),
         }));
+    }
+
+    fn on_context(&mut self, tokens: u32, window: u32, threshold: f32) {
+        let _ = self.tx.send(GatewayEvent::ContextUpdated {
+            tokens,
+            window,
+            threshold,
+        });
     }
 }
 

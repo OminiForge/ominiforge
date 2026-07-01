@@ -105,6 +105,9 @@ export function apply(state: ConversationState, ev: GatewayEvent): ConversationS
 		};
 		case 'compacted':    return push({ ...state, turnRunning: false }, { kind: 'notice', message: `compacted → ${ev.new_session_id}` });
 		case 'notice':       return push({ ...state, turnRunning: false }, { kind: 'notice', message: ev.message });
+		// Live-only context occupancy snapshot: handled by the page (STATS panel),
+		// not folded into conversation items.
+		case 'context_updated': return state;
 		default: return assertNever(ev);
 	}
 }

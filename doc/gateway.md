@@ -48,6 +48,9 @@ turn 在 spawn 出的子 task 上运行（writer+runtime move 进去、跑完 mo
 - **committed events**：每条持久化的 `CoreEvent`，带 `seq`，供 SSE `Last-Event-ID` 续传。
   来自 session `EventBus`（publish-after-durable-append，订阅者只见已提交事件）。
 - **live deltas**：token 级流式（`Delta`），瞬态，**不重放**（重连从 committed events 重建）。
+- **live context**：每个 model round 校准 ledger 后发 `ContextUpdated{tokens, window, threshold}`
+  —— 上下文占用快照（gauge 为 `tokens/window`，`threshold` 是压缩刻度，非分母；对齐 TUI
+  状态行）。同 `Delta` 瞬态、**不重放**，运行时值不落 log。
 
 turn 跑完发 `TurnSettled`；超阈值自动 compaction 并发 `Compacted{new_session_id}`，actor
 跟随新 session（同 TUI poll_turn 逻辑）。turn 进行中收到的 `Send`/`Compact` 入队延后执行。
