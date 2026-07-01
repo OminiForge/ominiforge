@@ -13,7 +13,14 @@
 	import type { SessionSummary } from '$lib/types/SessionSummary';
 	import type { ProfileSummary } from '$lib/types/ProfileSummary';
 	import type { ModelSummary } from '$lib/types/ModelSummary';
-	import { apply, emptyState, type ConversationState, type Item, type PlanStep } from '$lib/conversation';
+	import {
+		apply,
+		emptyState,
+		type ConversationState,
+		type Item,
+		type PlanStep
+	} from '$lib/conversation';
+	import ToolBlock from '$lib/components/tools/ToolBlock.svelte';
 	import { takeDraftConfig } from '$lib/draft-config';
 	import { num, statLabel, formatCost, cacheLabel, topTools } from '$lib/stats';
 
@@ -430,54 +437,6 @@
 		return first.length < text.split('\n')[0].length ? first + '…' : first;
 	}
 
-	/** One-line summary of a tool call's arguments, shown when the tool is
-	 *  collapsed so the user sees *what* ran, not just the tool name. Pulls the
-	 *  most meaningful field (command/path/query/…) from the parsed JSON args,
-	 *  falling back to the raw args string. */
-	function toolPreview(args: string): string {
-		if (!args || args === '{}') return '';
-		let parsed: unknown;
-		try {
-			parsed = JSON.parse(args);
-		} catch {
-			return clip(args, 80);
-		}
-		if (parsed && typeof parsed === 'object') {
-			const obj = parsed as Record<string, unknown>;
-			const keys = ['command', 'cmd', 'script', 'path', 'file', 'file_path', 'query', 'url', 'pattern'];
-			for (const k of keys) {
-				if (typeof obj[k] === 'string' && obj[k]) return clip(obj[k] as string, 80);
-			}
-			// No known key: show first string value, else compact JSON.
-			const firstStr = Object.values(obj).find((v) => typeof v === 'string' && v);
-			if (typeof firstStr === 'string') return clip(firstStr, 80);
-		}
-		return clip(args, 80);
-	}
-
-	function clip(s: string, n: number): string {
-		const line = s.split('\n')[0];
-		return line.length > n ? line.slice(0, n) + '…' : line;
-	}
-
-	/** Pretty-print + syntax-highlight tool-call JSON args into safe HTML.
-	 *  Falls back to escaped raw text when args aren't valid JSON. Highlight
-	 *  classes mirror the design tokens (--syntax-key/str/num). */
-	function renderArgs(args: string): string {
-		let pretty = args;
-		try {
-			pretty = JSON.stringify(JSON.parse(args), null, 2);
-		} catch {
-			return escapeHtml(args);
-		}
-		const esc = escapeHtml(pretty);
-		// Keys: "foo": → highlight the key; strings / numbers as values.
-		return esc
-			.replace(/&quot;([^&]*?)&quot;(\s*:)/g, '<span class="syn-key">&quot;$1&quot;</span>$2')
-			.replace(/:\s*&quot;([^&]*?)&quot;/g, ': <span class="syn-str">&quot;$1&quot;</span>')
-			.replace(/:\s*(-?\d+(?:\.\d+)?)/g, ': <span class="syn-num">$1</span>');
-	}
-
 	/** Short session label for the topbar: prefer the latest user message would
 	 *  be ideal, but we don't track titles yet — show a workspace-derived label
 	 *  or the session id. */
@@ -549,9 +508,7 @@
 
 	/** A live session has a pending config change when the picker's profile/model
 	 *  differs from what the session currently runs on. Drives the Apply button. */
-	const cfgDirty = $derived(
-		!isDraft && (selProfile !== curProfile || selModel !== curModel)
-	);
+	const cfgDirty = $derived(!isDraft && (selProfile !== curProfile || selModel !== curModel));
 
 	/** Apply a live config change by reconfiguring into a new session, then adopt
 	 *  its id (same swap the compaction path uses). No-op on a draft (there the
@@ -579,492 +536,632 @@
 </script>
 
 <div class="session-grid" class:no-detail={isDraft || !detailOpen}>
-<div class="conv-page">
-	<!-- TOPBAR -->
-	<div class="topbar">
-		<a href="/" class="topbar-back" title="返回首页" aria-label="Back to home">
-			<svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-				<polyline points="8.5,2.5 4,7 8.5,11.5" />
-			</svg>
-		</a>
-		<span class="topbar-title">{topbarTitle()}</span>
-		<div class="topbar-sep"></div>
-		<div class="topbar-meta">
-			{#if isDraft}
-				<span class="mono draft-hint">draft · 发送后创建</span>
-			{:else}
-				<span class="mono">{shortId(sessionId)}</span>
-				{#if incomplete}
-					<span class="topbar-badge badge-running">incomplete</span>
+	<div class="conv-page">
+		<!-- TOPBAR -->
+		<div class="topbar">
+			<a href="/" class="topbar-back" title="返回首页" aria-label="Back to home">
+				<svg
+					width="14"
+					height="14"
+					viewBox="0 0 14 14"
+					fill="none"
+					stroke="currentColor"
+					stroke-width="1.6"
+					stroke-linecap="round"
+					stroke-linejoin="round"
+				>
+					<polyline points="8.5,2.5 4,7 8.5,11.5" />
+				</svg>
+			</a>
+			<span class="topbar-title">{topbarTitle()}</span>
+			<div class="topbar-sep"></div>
+			<div class="topbar-meta">
+				{#if isDraft}
+					<span class="mono draft-hint">draft · 发送后创建</span>
+				{:else}
+					<span class="mono">{shortId(sessionId)}</span>
+					{#if incomplete}
+						<span class="topbar-badge badge-running">incomplete</span>
+					{/if}
 				{/if}
+			</div>
+			{#if !isDraft}
+				<button
+					class="detail-toggle"
+					class:on={detailOpen}
+					onclick={toggleDetail}
+					title={detailOpen ? '收起信息栏' : '展开信息栏'}
+					aria-label="Toggle detail panel"
+					aria-pressed={detailOpen}
+				>
+					<svg
+						width="14"
+						height="14"
+						viewBox="0 0 14 14"
+						fill="none"
+						stroke="currentColor"
+						stroke-width="1.4"
+						stroke-linecap="round"
+						stroke-linejoin="round"
+					>
+						<rect x="1.5" y="2.5" width="11" height="9" rx="1.5" />
+						<line x1="9" y1="2.5" x2="9" y2="11.5" />
+					</svg>
+				</button>
 			{/if}
 		</div>
-		{#if !isDraft}
-			<button
-				class="detail-toggle"
-				class:on={detailOpen}
-				onclick={toggleDetail}
-				title={detailOpen ? '收起信息栏' : '展开信息栏'}
-				aria-label="Toggle detail panel"
-				aria-pressed={detailOpen}
-			>
-				<svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-					<rect x="1.5" y="2.5" width="11" height="9" rx="1.5" />
-					<line x1="9" y1="2.5" x2="9" y2="11.5" />
-				</svg>
-			</button>
+
+		{#if error}
+			<div class="error-bar">{error}</div>
 		{/if}
-	</div>
 
-	{#if error}
-		<div class="error-bar">{error}</div>
-	{/if}
-
-	<!-- CONVERSATION SCROLL -->
-	<div class="conv-scroll" bind:this={streamEl} onscroll={onStreamScroll}>
-		<div class="conv-inner">
-			{#each convo.items as item, i (i)}
-				{#if item.kind === 'user'}
-					<div class="item item-user">
-						<div class="user-bubble">{item.text}</div>
-					</div>
-
-				{:else if item.kind === 'text'}
-					{#if item.text.trim()}
-						<div class="item item-text" class:streaming={item.streaming}>
-							{#if browser}
-								<!-- eslint-disable-next-line svelte/no-at-html-tags -->
-								{@html renderMarkdown(item.text)}
-							{:else}
-								{item.text}
-							{/if}
+		<!-- CONVERSATION SCROLL -->
+		<div class="conv-scroll" bind:this={streamEl} onscroll={onStreamScroll}>
+			<div class="conv-inner">
+				{#each convo.items as item, i (i)}
+					{#if item.kind === 'user'}
+						<div class="item item-user">
+							<div class="user-bubble">{item.text}</div>
 						</div>
-					{/if}
-
-				{:else if item.kind === 'reasoning'}
-					{#if item.text.trim()}
-						<div class="item item-reasoning" class:expanded={!isCollapsed(item, i)}>
-							<button class="reasoning-toggle" onclick={() => toggleCollapse(item, i)} aria-expanded={!isCollapsed(item, i)}>
-								<svg class="reasoning-toggle-icon" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-									<polyline points="5,3 9,7 5,11" />
-								</svg>
-								<span class="reasoning-label">Thinking</span>
-								{#if isCollapsed(item, i)}
-									<span class="reasoning-preview">{shortPreview(item.text)}</span>
-								{/if}
-								{#if item.streaming}
-									<span class="streaming-dot"></span>
-								{/if}
-							</button>
-							{#if !isCollapsed(item, i)}
-								<div class="reasoning-body">
-									{#if browser}
-										<!-- eslint-disable-next-line svelte/no-at-html-tags -->
-										{@html renderMarkdown(item.text)}
-									{:else}
-										{item.text}
-									{/if}
-								</div>
-							{/if}
-						</div>
-					{/if}
-
-				{:else if item.kind === 'tool'}
-					<div class="item">
-						<div
-							class="tool-block"
-							class:done={item.status === 'done'}
-							class:running={item.status === 'running'}
-							class:error={item.status === 'error'}
-							class:expanded={!isCollapsed(item, i)}
-						>
-							<button class="tool-header" onclick={() => toggleCollapse(item, i)} aria-expanded={!isCollapsed(item, i)}>
-								<span class="tool-pip"></span>
-								{#if item.status === 'running'}
-									<span class="tool-spinner"></span>
-								{/if}
-								<span class="tool-name">{item.name}</span>
-								<span class="tool-status-badge">{item.status}</span>
-								{#if isCollapsed(item, i) && toolPreview(item.args)}
-									<span class="tool-preview">{toolPreview(item.args)}</span>
-								{/if}
-								<svg class="tool-chevron" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-									<polyline points="4,2 8,6 4,10" />
-								</svg>
-							</button>
-							{#if !isCollapsed(item, i)}
-								<div class="tool-detail">
-									{#if item.args && item.args !== '{}'}
-										<div class="tool-detail-section">
-											<div class="tool-detail-label">params</div>
-											<!-- eslint-disable-next-line svelte/no-at-html-tags -->
-											<div class="tool-params">{@html renderArgs(item.args)}</div>
-										</div>
-									{/if}
-									{#if item.result}
-										<div class="tool-detail-section">
-											<div class="tool-detail-label">result</div>
-											<div class="tool-result">{item.result}</div>
-										</div>
-									{:else if item.status === 'running'}
-										<div class="running-placeholder">
-											<span class="tool-spinner"></span>
-											正在执行…
-										</div>
-									{/if}
-								</div>
-							{/if}
-						</div>
-					</div>
-
-				{:else if item.kind === 'plan'}
-					<!-- Streaming placeholders (item.streaming) render nothing: a flashing
-					     inline "planning…" card on every plan op is pure eye-strain, and
-					     the dock already shows the live plan. The docked card is shown in
-					     the dock, so skip it here too — only committed history cards render. -->
-					{#if !item.streaming && i !== dockPlan?.index}
-						{@const prog = planProgress(item.steps)}
-						<div class="item">
-							<div class="plan-card" class:expanded={!isCollapsed(item, i)} class:done={planDone(item.steps)}>
-								<button class="plan-head" onclick={() => toggleCollapse(item, i)} aria-expanded={!isCollapsed(item, i)}>
-									<svg class="plan-icon" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-										<path d="M3 3h8M3 7h8M3 11h5" />
-									</svg>
-									<span class="plan-title">Plan</span>
-									<span class="plan-progress">{prog.done}/{prog.total}</span>
-									<span class="plan-track"><span class="plan-bar" style="width: {prog.total ? (prog.done / prog.total) * 100 : 0}%"></span></span>
-									<svg class="plan-chevron" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-										<polyline points="4,2 8,6 4,10" />
-									</svg>
-								</button>
-								{#if !isCollapsed(item, i)}
-									<ol class="plan-steps">
-										{#each item.steps as step (step.id)}
-											<li class="plan-step" data-status={step.status}>
-												<span class="plan-step-mark" aria-hidden="true">
-													{#if step.status === 'completed'}
-														<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="2.5,6.5 5,9 9.5,3.5" /></svg>
-													{:else if step.status === 'in_progress'}
-														<span class="plan-spinner"></span>
-													{:else if step.status === 'cancelled'}
-														<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><line x1="3" y1="3" x2="9" y2="9" /><line x1="9" y1="3" x2="3" y2="9" /></svg>
-													{:else if step.status === 'blocked'}
-														<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="6" cy="6" r="4.2" /><line x1="3" y1="3" x2="9" y2="9" stroke-linecap="round" /></svg>
-													{:else}
-														<span class="plan-dot"></span>
-													{/if}
-												</span>
-												<span class="plan-step-body">
-													<span class="plan-step-text">{step.content}</span>
-													{#if step.reason}
-														<span class="plan-step-reason">{step.reason}</span>
-													{/if}
-												</span>
-											</li>
-										{/each}
-									</ol>
+					{:else if item.kind === 'text'}
+						{#if item.text.trim()}
+							<div class="item item-text" class:streaming={item.streaming}>
+								{#if browser}
+									<!-- eslint-disable-next-line svelte/no-at-html-tags -->
+									{@html renderMarkdown(item.text)}
+								{:else}
+									{item.text}
 								{/if}
 							</div>
-						</div>
-					{/if}
-
-				{:else if item.kind === 'error'}
-					<div class="item item-error">{item.message}</div>
-
-				{:else if item.kind === 'notice'}
-					<div class="item item-notice">{item.message}</div>
-				{/if}
-			{/each}
-
-			{#if convo.items.length === 0}
-				<p class="empty">{isDraft ? '输入消息，开始一段新对话' : '发送消息开始对话'}</p>
-			{/if}
-		</div>
-	</div>
-
-	<!-- ACTIVE PLAN (sticky above input) — the latest plan stays docked (running
-	     or done) so a later plan swaps in place instead of popping in abruptly.
-	     Default collapsed to spare vertical space; the dock carries the divider
-	     line so it reads as one zone with the input below. -->
-	{#if dockPlan}
-		{@const prog = planProgress(dockPlan.steps)}
-		<div class="plan-dock">
-			<div class="plan-dock-inner">
-				<div class="plan-card pinned" class:expanded={!pinnedPlanCollapsed}>
-					<button class="plan-head" onclick={() => (pinnedPlanCollapsed = !pinnedPlanCollapsed)} aria-expanded={!pinnedPlanCollapsed}>
-						<svg class="plan-icon" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-							<path d="M3 3h8M3 7h8M3 11h5" />
-						</svg>
-						<span class="plan-title">Plan</span>
-						<span class="plan-progress">{prog.done}/{prog.total}</span>
-						<span class="plan-track"><span class="plan-bar" style="width: {prog.total ? (prog.done / prog.total) * 100 : 0}%"></span></span>
-						<svg class="plan-chevron" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-							<polyline points="4,2 8,6 4,10" />
-						</svg>
-					</button>
-					{#if !pinnedPlanCollapsed}
-						<ol class="plan-steps">
-							{#each dockPlan.steps as step (step.id)}
-								<li class="plan-step" data-status={step.status}>
-									<span class="plan-step-mark" aria-hidden="true">
-										{#if step.status === 'completed'}
-											<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="2.5,6.5 5,9 9.5,3.5" /></svg>
-										{:else if step.status === 'in_progress'}
-											<span class="plan-spinner"></span>
-										{:else if step.status === 'cancelled'}
-											<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><line x1="3" y1="3" x2="9" y2="9" /><line x1="9" y1="3" x2="3" y2="9" /></svg>
-										{:else if step.status === 'blocked'}
-											<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="6" cy="6" r="4.2" /><line x1="3" y1="3" x2="9" y2="9" stroke-linecap="round" /></svg>
-										{:else}
-											<span class="plan-dot"></span>
-										{/if}
-									</span>
-									<span class="plan-step-body">
-										<span class="plan-step-text">{step.content}</span>
-										{#if step.reason}
-											<span class="plan-step-reason">{step.reason}</span>
-										{/if}
-									</span>
-								</li>
-							{/each}
-						</ol>
-					{/if}
-				</div>
-			</div>
-		</div>
-	{/if}
-
-	<!-- INPUT AREA -->
-	<div class="input-area" class:seamless={dockPlan}>
-		<div class="input-inner">
-			<div class="input-box">
-				<textarea
-					class="input-field"
-					bind:value={input}
-					onkeydown={onKeydown}
-					placeholder="输入消息… Enter 发送，Shift+Enter 换行"
-					rows="2"
-				></textarea>
-				<div class="input-actions">
-					<span class="input-status">
-						{#if incomplete}<span class="status-warn">Turn incomplete</span>{/if}
-					</span>
-					<div class="cfg">
-						<button
-							class="input-btn cfg-trigger"
-							class:on={cfgOpen}
-							onclick={() => (cfgOpen = !cfgOpen)}
-							title={isDraft
-								? '选择 profile / 模型 / 工作区（仅本次会话）'
-								: '查看 / 切换 profile / 模型（切换会基于当前对话开启一个新会话）'}
-							aria-expanded={cfgOpen}
-						>
-							<svg width="12" height="12" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-								<circle cx="7" cy="7" r="2.2" />
-								<path d="M7 1.2v1.6M7 11.2v1.6M1.2 7h1.6M11.2 7h1.6M2.9 2.9l1.1 1.1M10 10l1.1 1.1M11.1 2.9 10 4M4 10l-1.1 1.1" />
-							</svg>
-							<span class="cfg-label">{cfgLabel}</span>
-						</button>
-						{#if cfgOpen}
-							<div class="cfg-popover">
-								<label class="cfg-field">
-									<span class="cfg-key">Profile</span>
-									<select class="cfg-select" bind:value={selProfile}>
-										<option value="">默认</option>
-										{#each profiles as p (p.name)}
-											<option value={p.name}>{p.name}{p.description ? ` — ${p.description}` : ''}</option>
-										{/each}
-									</select>
-								</label>
-								<label class="cfg-field">
-									<span class="cfg-key">Model</span>
-									<select class="cfg-select" bind:value={selModel}>
-										<option value="">默认（按 profile）</option>
-										{#each models as m (`${m.provider}/${m.model_id}`)}
-											<option value={`${m.provider}/${m.model_id}`}>{m.model_id} · {m.provider}</option>
-										{/each}
-									</select>
-								</label>
-								<label class="cfg-field">
-									<span class="cfg-key">Workspace</span>
-									{#if isDraft}
-										<input
-											class="cfg-input"
-											type="text"
-											bind:value={selWorkspace}
-											placeholder="默认工作区（绝对路径）"
-											spellcheck="false"
-										/>
-									{:else}
-										<!-- Workspace is a session property, not reconfigurable: read-only on a live session. -->
-										<input class="cfg-input" type="text" value={selWorkspace} readonly title="工作区不可更改（会话属性）" />
+						{/if}
+					{:else if item.kind === 'reasoning'}
+						{#if item.text.trim()}
+							<div class="item item-reasoning" class:expanded={!isCollapsed(item, i)}>
+								<button
+									class="reasoning-toggle"
+									onclick={() => toggleCollapse(item, i)}
+									aria-expanded={!isCollapsed(item, i)}
+								>
+									<svg
+										class="reasoning-toggle-icon"
+										viewBox="0 0 14 14"
+										fill="none"
+										stroke="currentColor"
+										stroke-width="1.6"
+										stroke-linecap="round"
+										stroke-linejoin="round"
+									>
+										<polyline points="5,3 9,7 5,11" />
+									</svg>
+									<span class="reasoning-label">Thinking</span>
+									{#if isCollapsed(item, i)}
+										<span class="reasoning-preview">{shortPreview(item.text)}</span>
 									{/if}
-								</label>
-								{#if !isDraft}
-									<!-- Live session: a profile/model change can't edit in place; it
-									     opens a new session seeded with this conversation. -->
-									<div class="cfg-foot">
-										<span class="cfg-hint">切换将基于当前对话开启新会话</span>
-										<button
-											class="input-btn primary cfg-apply"
-											disabled={!cfgDirty || reconfiguring}
-											onclick={applyReconfigure}
-										>
-											{reconfiguring ? '切换中…' : '切换'}
-										</button>
+									{#if item.streaming}
+										<span class="streaming-dot"></span>
+									{/if}
+								</button>
+								{#if !isCollapsed(item, i)}
+									<div class="reasoning-body">
+										{#if browser}
+											<!-- eslint-disable-next-line svelte/no-at-html-tags -->
+											{@html renderMarkdown(item.text)}
+										{:else}
+											{item.text}
+										{/if}
 									</div>
 								{/if}
 							</div>
 						{/if}
-					</div>
-					{#if !isDraft && turnRunning}
-						<button class="input-btn cancel" onclick={cancel}>
-							<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
-								<line x1="1" y1="1" x2="9" y2="9" />
-								<line x1="9" y1="1" x2="1" y2="9" />
-							</svg>
-							Cancel
-						</button>
+					{:else if item.kind === 'tool'}
+						<div class="item">
+							<ToolBlock {item} />
+						</div>
+					{:else if item.kind === 'plan'}
+						<!-- Streaming placeholders (item.streaming) render nothing: a flashing
+					     inline "planning…" card on every plan op is pure eye-strain, and
+					     the dock already shows the live plan. The docked card is shown in
+					     the dock, so skip it here too — only committed history cards render. -->
+						{#if !item.streaming && i !== dockPlan?.index}
+							{@const prog = planProgress(item.steps)}
+							<div class="item">
+								<div
+									class="plan-card"
+									class:expanded={!isCollapsed(item, i)}
+									class:done={planDone(item.steps)}
+								>
+									<button
+										class="plan-head"
+										onclick={() => toggleCollapse(item, i)}
+										aria-expanded={!isCollapsed(item, i)}
+									>
+										<svg
+											class="plan-icon"
+											viewBox="0 0 14 14"
+											fill="none"
+											stroke="currentColor"
+											stroke-width="1.5"
+											stroke-linecap="round"
+											stroke-linejoin="round"
+										>
+											<path d="M3 3h8M3 7h8M3 11h5" />
+										</svg>
+										<span class="plan-title">Plan</span>
+										<span class="plan-progress">{prog.done}/{prog.total}</span>
+										<span class="plan-track"
+											><span
+												class="plan-bar"
+												style="width: {prog.total ? (prog.done / prog.total) * 100 : 0}%"
+											></span></span
+										>
+										<svg
+											class="plan-chevron"
+											viewBox="0 0 12 12"
+											fill="none"
+											stroke="currentColor"
+											stroke-width="1.6"
+											stroke-linecap="round"
+											stroke-linejoin="round"
+										>
+											<polyline points="4,2 8,6 4,10" />
+										</svg>
+									</button>
+									{#if !isCollapsed(item, i)}
+										<ol class="plan-steps">
+											{#each item.steps as step (step.id)}
+												<li class="plan-step" data-status={step.status}>
+													<span class="plan-step-mark" aria-hidden="true">
+														{#if step.status === 'completed'}
+															<svg
+																viewBox="0 0 12 12"
+																fill="none"
+																stroke="currentColor"
+																stroke-width="2"
+																stroke-linecap="round"
+																stroke-linejoin="round"
+																><polyline points="2.5,6.5 5,9 9.5,3.5" /></svg
+															>
+														{:else if step.status === 'in_progress'}
+															<span class="plan-spinner"></span>
+														{:else if step.status === 'cancelled'}
+															<svg
+																viewBox="0 0 12 12"
+																fill="none"
+																stroke="currentColor"
+																stroke-width="1.8"
+																stroke-linecap="round"
+																><line x1="3" y1="3" x2="9" y2="9" /><line
+																	x1="9"
+																	y1="3"
+																	x2="3"
+																	y2="9"
+																/></svg
+															>
+														{:else if step.status === 'blocked'}
+															<svg
+																viewBox="0 0 12 12"
+																fill="none"
+																stroke="currentColor"
+																stroke-width="1.6"
+																><circle cx="6" cy="6" r="4.2" /><line
+																	x1="3"
+																	y1="3"
+																	x2="9"
+																	y2="9"
+																	stroke-linecap="round"
+																/></svg
+															>
+														{:else}
+															<span class="plan-dot"></span>
+														{/if}
+													</span>
+													<span class="plan-step-body">
+														<span class="plan-step-text">{step.content}</span>
+														{#if step.reason}
+															<span class="plan-step-reason">{step.reason}</span>
+														{/if}
+													</span>
+												</li>
+											{/each}
+										</ol>
+									{/if}
+								</div>
+							</div>
+						{/if}
+					{:else if item.kind === 'error'}
+						<div class="item item-error">{item.message}</div>
+					{:else if item.kind === 'notice'}
+						<div class="item item-notice">{item.message}</div>
 					{/if}
-					<button class="input-btn primary" disabled={sending} onclick={send}>
-						{sending ? 'Sending…' : 'Send'}
-						<kbd>↵</kbd>
-					</button>
-				</div>
+				{/each}
+
+				{#if convo.items.length === 0}
+					<p class="empty">{isDraft ? '输入消息，开始一段新对话' : '发送消息开始对话'}</p>
+				{/if}
 			</div>
-			<div class="input-hint">Type / for commands</div>
 		</div>
-	</div>
-</div>
 
-{#if !isDraft}
-	<aside class="detail">
-		<!-- INFO: config-layer session context (moved off the global sidebar) -->
-		<section class="detail-section">
-			<div class="detail-label">Info</div>
-			{#if meta?.workspace}
-				<div class="kv">
-					<div class="kv-key">Workspace</div>
-					<div class="kv-val" title={meta.workspace}>{wsLabel(meta.workspace)}</div>
-				</div>
-			{/if}
-			{#if runtime && runtime.env.length > 0}
-				<div class="kv">
-					<div class="kv-key">Env</div>
-					<div class="kv-val" title={runtime.env.join(' · ')}>{runtime.env.join(' · ')}</div>
-				</div>
-			{/if}
-			{#if runtime}
-				<div class="kv">
-					<div class="kv-key">Model</div>
-					<div class="kv-val" title={`${runtime.provider} · ${runtime.model}`}>{runtime.model}</div>
-				</div>
-			{/if}
-			{#if divergent.length > 0}
-				<div class="kv warn">
-					<div class="kv-key warn-key">⚠ Runtime</div>
-					<div class="kv-val warn-val" title={`runtime used ${divergent.join(', ')}, configured ${runtime?.model}`}>
-						{divergent.join(' · ')} ≠ {runtime?.model}
-					</div>
-				</div>
-			{/if}
-			{#if meta?.profile_id}
-				<div class="kv">
-					<div class="kv-key">Profile</div>
-					<div class="kv-val">{meta.profile_id}</div>
-				</div>
-			{/if}
-		</section>
-
-		<!-- CONTEXT: live per-round window occupancy (context_updated event). Its
-		     own section (driven by live events, not the summary endpoint) so it
-		     shows mid-turn even before the first summary snapshot loads. -->
-		{#if context}
-			{@const pct = context.window ? Math.min(100, (context.tokens / context.window) * 100) : null}
-			{@const overThreshold = pct !== null && pct / 100 >= context.threshold}
-			<section class="detail-section">
-				<div class="detail-label">Context</div>
-				<div class="ctx">
-					<div class="ctx-nums">
-						<span class="ctx-val">{context.tokens.toLocaleString()}</span>
-						{#if context.window}
-							<span class="ctx-limit">/ {context.window.toLocaleString()}</span>
+		<!-- ACTIVE PLAN (sticky above input) — the latest plan stays docked (running
+	     or done) so a later plan swaps in place instead of popping in abruptly.
+	     Default collapsed to spare vertical space; the dock carries the divider
+	     line so it reads as one zone with the input below. -->
+		{#if dockPlan}
+			{@const prog = planProgress(dockPlan.steps)}
+			<div class="plan-dock">
+				<div class="plan-dock-inner">
+					<div class="plan-card pinned" class:expanded={!pinnedPlanCollapsed}>
+						<button
+							class="plan-head"
+							onclick={() => (pinnedPlanCollapsed = !pinnedPlanCollapsed)}
+							aria-expanded={!pinnedPlanCollapsed}
+						>
+							<svg
+								class="plan-icon"
+								viewBox="0 0 14 14"
+								fill="none"
+								stroke="currentColor"
+								stroke-width="1.5"
+								stroke-linecap="round"
+								stroke-linejoin="round"
+							>
+								<path d="M3 3h8M3 7h8M3 11h5" />
+							</svg>
+							<span class="plan-title">Plan</span>
+							<span class="plan-progress">{prog.done}/{prog.total}</span>
+							<span class="plan-track"
+								><span
+									class="plan-bar"
+									style="width: {prog.total ? (prog.done / prog.total) * 100 : 0}%"
+								></span></span
+							>
+							<svg
+								class="plan-chevron"
+								viewBox="0 0 12 12"
+								fill="none"
+								stroke="currentColor"
+								stroke-width="1.6"
+								stroke-linecap="round"
+								stroke-linejoin="round"
+							>
+								<polyline points="4,2 8,6 4,10" />
+							</svg>
+						</button>
+						{#if !pinnedPlanCollapsed}
+							<ol class="plan-steps">
+								{#each dockPlan.steps as step (step.id)}
+									<li class="plan-step" data-status={step.status}>
+										<span class="plan-step-mark" aria-hidden="true">
+											{#if step.status === 'completed'}
+												<svg
+													viewBox="0 0 12 12"
+													fill="none"
+													stroke="currentColor"
+													stroke-width="2"
+													stroke-linecap="round"
+													stroke-linejoin="round"><polyline points="2.5,6.5 5,9 9.5,3.5" /></svg
+												>
+											{:else if step.status === 'in_progress'}
+												<span class="plan-spinner"></span>
+											{:else if step.status === 'cancelled'}
+												<svg
+													viewBox="0 0 12 12"
+													fill="none"
+													stroke="currentColor"
+													stroke-width="1.8"
+													stroke-linecap="round"
+													><line x1="3" y1="3" x2="9" y2="9" /><line
+														x1="9"
+														y1="3"
+														x2="3"
+														y2="9"
+													/></svg
+												>
+											{:else if step.status === 'blocked'}
+												<svg
+													viewBox="0 0 12 12"
+													fill="none"
+													stroke="currentColor"
+													stroke-width="1.6"
+													><circle cx="6" cy="6" r="4.2" /><line
+														x1="3"
+														y1="3"
+														x2="9"
+														y2="9"
+														stroke-linecap="round"
+													/></svg
+												>
+											{:else}
+												<span class="plan-dot"></span>
+											{/if}
+										</span>
+										<span class="plan-step-body">
+											<span class="plan-step-text">{step.content}</span>
+											{#if step.reason}
+												<span class="plan-step-reason">{step.reason}</span>
+											{/if}
+										</span>
+									</li>
+								{/each}
+							</ol>
 						{/if}
 					</div>
-					{#if pct !== null}
-						<div
-							class="ctx-track"
-							title={`${context.tokens.toLocaleString()} / ${context.window.toLocaleString()} tokens · compaction at ${(context.threshold * 100).toFixed(0)}%`}
-						>
-							<span class="ctx-fill" class:warn={overThreshold} style="width: {pct}%"></span>
-							<!-- compaction-threshold tick, mirroring the TUI gauge marker -->
-							<span class="ctx-tick" style="left: {context.threshold * 100}%"></span>
-						</div>
-						<span class="ctx-pct" class:warn={overThreshold}>{pct.toFixed(0)}%</span>
-					{:else}
-						<span class="ctx-pct unpriced">window unknown</span>
-					{/if}
 				</div>
-			</section>
+			</div>
 		{/if}
 
-		<!-- STATS: folded summary snapshot, refreshed on each settled turn -->
-		{#if summary}
-			{@const s = summary}
-			{@const tools = topTools(s, 6)}
-			<section class="detail-section">
-				<div class="detail-label">Stats</div>
-				<div class="stat-grid">
-					<div class="stat">
-						<span class="stat-value">{s.total_turns}</span>
-						<span class="stat-key">{statLabel.turns(s.total_turns)}</span>
-					</div>
-					<div class="stat">
-						<span class="stat-value">{s.total_model_requests}</span>
-						<span class="stat-key">{statLabel.reqs(s.total_model_requests)}</span>
-					</div>
-					<div class="stat">
-						<span class="stat-value">
-							{s.total_tool_calls}{#if s.total_tool_failures > 0}<span class="stat-fail">/{s.total_tool_failures}✗</span>{/if}
+		<!-- INPUT AREA -->
+		<div class="input-area" class:seamless={dockPlan}>
+			<div class="input-inner">
+				<div class="input-box">
+					<textarea
+						class="input-field"
+						bind:value={input}
+						onkeydown={onKeydown}
+						placeholder="输入消息… Enter 发送，Shift+Enter 换行"
+						rows="2"
+					></textarea>
+					<div class="input-actions">
+						<span class="input-status">
+							{#if incomplete}<span class="status-warn">Turn incomplete</span>{/if}
 						</span>
-						<span class="stat-key">{statLabel.toolCalls(s.total_tool_calls)}</span>
-					</div>
-					<div class="stat">
-						<span class="stat-value cost" class:unpriced={s.cost_usd == null}>{formatCost(s)}</span>
-						<span class="stat-key">{statLabel.cost}</span>
-					</div>
-					<div class="stat">
-						<span class="stat-value">{num(s.total_input_tokens).toLocaleString()}</span>
-						<span class="stat-key">{statLabel.inTok}</span>
-					</div>
-					<div class="stat">
-						<span class="stat-value">{num(s.total_output_tokens).toLocaleString()}</span>
-						<span class="stat-key">{statLabel.outTok}</span>
-					</div>
-					<div class="stat">
-						<span class="stat-value">{cacheLabel(s)}</span>
-						<span class="stat-key">{statLabel.cache}</span>
+						<div class="cfg">
+							<button
+								class="input-btn cfg-trigger"
+								class:on={cfgOpen}
+								onclick={() => (cfgOpen = !cfgOpen)}
+								title={isDraft
+									? '选择 profile / 模型 / 工作区（仅本次会话）'
+									: '查看 / 切换 profile / 模型（切换会基于当前对话开启一个新会话）'}
+								aria-expanded={cfgOpen}
+							>
+								<svg
+									width="12"
+									height="12"
+									viewBox="0 0 14 14"
+									fill="none"
+									stroke="currentColor"
+									stroke-width="1.4"
+									stroke-linecap="round"
+									stroke-linejoin="round"
+								>
+									<circle cx="7" cy="7" r="2.2" />
+									<path
+										d="M7 1.2v1.6M7 11.2v1.6M1.2 7h1.6M11.2 7h1.6M2.9 2.9l1.1 1.1M10 10l1.1 1.1M11.1 2.9 10 4M4 10l-1.1 1.1"
+									/>
+								</svg>
+								<span class="cfg-label">{cfgLabel}</span>
+							</button>
+							{#if cfgOpen}
+								<div class="cfg-popover">
+									<label class="cfg-field">
+										<span class="cfg-key">Profile</span>
+										<select class="cfg-select" bind:value={selProfile}>
+											<option value="">默认</option>
+											{#each profiles as p (p.name)}
+												<option value={p.name}
+													>{p.name}{p.description ? ` — ${p.description}` : ''}</option
+												>
+											{/each}
+										</select>
+									</label>
+									<label class="cfg-field">
+										<span class="cfg-key">Model</span>
+										<select class="cfg-select" bind:value={selModel}>
+											<option value="">默认（按 profile）</option>
+											{#each models as m (`${m.provider}/${m.model_id}`)}
+												<option value={`${m.provider}/${m.model_id}`}
+													>{m.model_id} · {m.provider}</option
+												>
+											{/each}
+										</select>
+									</label>
+									<label class="cfg-field">
+										<span class="cfg-key">Workspace</span>
+										{#if isDraft}
+											<input
+												class="cfg-input"
+												type="text"
+												bind:value={selWorkspace}
+												placeholder="默认工作区（绝对路径）"
+												spellcheck="false"
+											/>
+										{:else}
+											<!-- Workspace is a session property, not reconfigurable: read-only on a live session. -->
+											<input
+												class="cfg-input"
+												type="text"
+												value={selWorkspace}
+												readonly
+												title="工作区不可更改（会话属性）"
+											/>
+										{/if}
+									</label>
+									{#if !isDraft}
+										<!-- Live session: a profile/model change can't edit in place; it
+									     opens a new session seeded with this conversation. -->
+										<div class="cfg-foot">
+											<span class="cfg-hint">切换将基于当前对话开启新会话</span>
+											<button
+												class="input-btn primary cfg-apply"
+												disabled={!cfgDirty || reconfiguring}
+												onclick={applyReconfigure}
+											>
+												{reconfiguring ? '切换中…' : '切换'}
+											</button>
+										</div>
+									{/if}
+								</div>
+							{/if}
+						</div>
+						{#if !isDraft && turnRunning}
+							<button class="input-btn cancel" onclick={cancel}>
+								<svg
+									width="10"
+									height="10"
+									viewBox="0 0 10 10"
+									fill="none"
+									stroke="currentColor"
+									stroke-width="1.5"
+									stroke-linecap="round"
+								>
+									<line x1="1" y1="1" x2="9" y2="9" />
+									<line x1="9" y1="1" x2="1" y2="9" />
+								</svg>
+								Cancel
+							</button>
+						{/if}
+						<button class="input-btn primary" disabled={sending} onclick={send}>
+							{sending ? 'Sending…' : 'Send'}
+							<kbd>↵</kbd>
+						</button>
 					</div>
 				</div>
+				<div class="input-hint">Type / for commands</div>
+			</div>
+		</div>
+	</div>
+
+	{#if !isDraft}
+		<aside class="detail">
+			<!-- INFO: config-layer session context (moved off the global sidebar) -->
+			<section class="detail-section">
+				<div class="detail-label">Info</div>
+				{#if meta?.workspace}
+					<div class="kv">
+						<div class="kv-key">Workspace</div>
+						<div class="kv-val" title={meta.workspace}>{wsLabel(meta.workspace)}</div>
+					</div>
+				{/if}
+				{#if runtime && runtime.env.length > 0}
+					<div class="kv">
+						<div class="kv-key">Env</div>
+						<div class="kv-val" title={runtime.env.join(' · ')}>{runtime.env.join(' · ')}</div>
+					</div>
+				{/if}
+				{#if runtime}
+					<div class="kv">
+						<div class="kv-key">Model</div>
+						<div class="kv-val" title={`${runtime.provider} · ${runtime.model}`}>
+							{runtime.model}
+						</div>
+					</div>
+				{/if}
+				{#if divergent.length > 0}
+					<div class="kv warn">
+						<div class="kv-key warn-key">⚠ Runtime</div>
+						<div
+							class="kv-val warn-val"
+							title={`runtime used ${divergent.join(', ')}, configured ${runtime?.model}`}
+						>
+							{divergent.join(' · ')} ≠ {runtime?.model}
+						</div>
+					</div>
+				{/if}
+				{#if meta?.profile_id}
+					<div class="kv">
+						<div class="kv-key">Profile</div>
+						<div class="kv-val">{meta.profile_id}</div>
+					</div>
+				{/if}
 			</section>
 
-			{#if tools.length > 0}
+			<!-- CONTEXT: live per-round window occupancy (context_updated event). Its
+		     own section (driven by live events, not the summary endpoint) so it
+		     shows mid-turn even before the first summary snapshot loads. -->
+			{#if context}
+				{@const pct = context.window
+					? Math.min(100, (context.tokens / context.window) * 100)
+					: null}
+				{@const overThreshold = pct !== null && pct / 100 >= context.threshold}
 				<section class="detail-section">
-					<div class="detail-label">Tool usage</div>
-					<ul class="bars">
-						{#each tools as t (t.tool)}
-							<li class="bar-row">
-								<span class="bar-label" title={t.tool}>{t.tool}</span>
-								<span class="bar-track"><span class="bar-fill" style="width: {t.pct}%"></span></span>
-								<span class="bar-count">{t.count}</span>
-							</li>
-						{/each}
-					</ul>
+					<div class="detail-label">Context</div>
+					<div class="ctx">
+						<div class="ctx-nums">
+							<span class="ctx-val">{context.tokens.toLocaleString()}</span>
+							{#if context.window}
+								<span class="ctx-limit">/ {context.window.toLocaleString()}</span>
+							{/if}
+						</div>
+						{#if pct !== null}
+							<div
+								class="ctx-track"
+								title={`${context.tokens.toLocaleString()} / ${context.window.toLocaleString()} tokens · compaction at ${(context.threshold * 100).toFixed(0)}%`}
+							>
+								<span class="ctx-fill" class:warn={overThreshold} style="width: {pct}%"></span>
+								<!-- compaction-threshold tick, mirroring the TUI gauge marker -->
+								<span class="ctx-tick" style="left: {context.threshold * 100}%"></span>
+							</div>
+							<span class="ctx-pct" class:warn={overThreshold}>{pct.toFixed(0)}%</span>
+						{:else}
+							<span class="ctx-pct unpriced">window unknown</span>
+						{/if}
+					</div>
 				</section>
 			{/if}
-		{/if}
-	</aside>
-{/if}
+
+			<!-- STATS: folded summary snapshot, refreshed on each settled turn -->
+			{#if summary}
+				{@const s = summary}
+				{@const tools = topTools(s, 6)}
+				<section class="detail-section">
+					<div class="detail-label">Stats</div>
+					<div class="stat-grid">
+						<div class="stat">
+							<span class="stat-value">{s.total_turns}</span>
+							<span class="stat-key">{statLabel.turns(s.total_turns)}</span>
+						</div>
+						<div class="stat">
+							<span class="stat-value">{s.total_model_requests}</span>
+							<span class="stat-key">{statLabel.reqs(s.total_model_requests)}</span>
+						</div>
+						<div class="stat">
+							<span class="stat-value">
+								{s.total_tool_calls}{#if s.total_tool_failures > 0}<span class="stat-fail"
+										>/{s.total_tool_failures}✗</span
+									>{/if}
+							</span>
+							<span class="stat-key">{statLabel.toolCalls(s.total_tool_calls)}</span>
+						</div>
+						<div class="stat">
+							<span class="stat-value cost" class:unpriced={s.cost_usd == null}
+								>{formatCost(s)}</span
+							>
+							<span class="stat-key">{statLabel.cost}</span>
+						</div>
+						<div class="stat">
+							<span class="stat-value">{num(s.total_input_tokens).toLocaleString()}</span>
+							<span class="stat-key">{statLabel.inTok}</span>
+						</div>
+						<div class="stat">
+							<span class="stat-value">{num(s.total_output_tokens).toLocaleString()}</span>
+							<span class="stat-key">{statLabel.outTok}</span>
+						</div>
+						<div class="stat">
+							<span class="stat-value">{cacheLabel(s)}</span>
+							<span class="stat-key">{statLabel.cache}</span>
+						</div>
+					</div>
+				</section>
+
+				{#if tools.length > 0}
+					<section class="detail-section">
+						<div class="detail-label">Tool usage</div>
+						<ul class="bars">
+							{#each tools as t (t.tool)}
+								<li class="bar-row">
+									<span class="bar-label" title={t.tool}>{t.tool}</span>
+									<span class="bar-track"
+										><span class="bar-fill" style="width: {t.pct}%"></span></span
+									>
+									<span class="bar-count">{t.count}</span>
+								</li>
+							{/each}
+						</ul>
+					</section>
+				{/if}
+			{/if}
+		</aside>
+	{/if}
 </div>
 
 <style>
@@ -1782,232 +1879,6 @@
 		border-radius: 3px;
 	}
 
-	/* ---- TOOL (the 120% detail) ---- */
-	.tool-block {
-		border-radius: var(--radius-md);
-		overflow: hidden;
-		border: 1px solid var(--border-subtle);
-		transition: border-color var(--dur-std) var(--ease-out);
-	}
-
-	.tool-block.done {
-		border-color: color-mix(in srgb, var(--state-done) 22%, transparent);
-	}
-
-	.tool-block.running {
-		border-color: color-mix(in srgb, var(--state-running) 35%, transparent);
-		animation: tool-running-pulse 2s ease-in-out infinite;
-	}
-
-	@keyframes tool-running-pulse {
-		0%,
-		100% {
-			border-color: color-mix(in srgb, var(--state-running) 30%, transparent);
-			box-shadow: 0 0 0 0 transparent;
-		}
-		50% {
-			border-color: color-mix(in srgb, var(--state-running) 55%, transparent);
-			box-shadow: 0 0 0 3px color-mix(in srgb, var(--state-running) 6%, transparent);
-		}
-	}
-
-	.tool-block.error {
-		border-color: color-mix(in srgb, var(--state-error) 30%, transparent);
-	}
-
-	.tool-header {
-		display: flex;
-		align-items: center;
-		gap: var(--space-2);
-		padding: 7px var(--space-3);
-		background: var(--canvas-overlay);
-		cursor: pointer;
-		user-select: none;
-		transition: background var(--dur-fast) var(--ease-out);
-		width: 100%;
-		text-align: left;
-	}
-
-	.tool-header:hover {
-		background: var(--canvas-float);
-	}
-
-	.tool-pip {
-		width: 6px;
-		height: 6px;
-		border-radius: 50%;
-		flex-shrink: 0;
-		position: relative;
-		background: var(--text-tertiary);
-	}
-	.done .tool-pip {
-		background: var(--state-done);
-	}
-	.running .tool-pip {
-		background: var(--state-running);
-	}
-	.error .tool-pip {
-		background: var(--state-error);
-	}
-
-	.running .tool-pip::after {
-		content: '';
-		position: absolute;
-		inset: -3px;
-		border-radius: 50%;
-		border: 1.5px solid var(--state-running);
-		opacity: 0;
-		animation: pip-ripple 1.8s ease-out infinite;
-	}
-
-	@keyframes pip-ripple {
-		0% {
-			opacity: 0.7;
-			transform: scale(0.5);
-		}
-		100% {
-			opacity: 0;
-			transform: scale(2.2);
-		}
-	}
-
-	.tool-spinner {
-		width: 11px;
-		height: 11px;
-		border: 1.5px solid color-mix(in srgb, var(--state-running) 25%, transparent);
-		border-top-color: var(--state-running);
-		border-radius: 50%;
-		animation: spin 700ms linear infinite;
-		flex-shrink: 0;
-	}
-
-	@keyframes spin {
-		to {
-			transform: rotate(360deg);
-		}
-	}
-
-	.tool-name {
-		font-family: var(--font-mono);
-		font-size: 12px;
-		font-weight: 500;
-		color: var(--text-primary);
-		letter-spacing: -0.01em;
-		flex-shrink: 0;
-	}
-
-	.tool-status-badge {
-		font-size: 10px;
-		font-weight: 510;
-		padding: 1px 5px;
-		border-radius: 3px;
-		letter-spacing: 0.06em;
-		text-transform: uppercase;
-		flex-shrink: 0;
-	}
-	.done .tool-status-badge {
-		background: var(--state-done-bg);
-		color: var(--state-done-text);
-		border: 1px solid color-mix(in srgb, var(--state-done) 25%, transparent);
-	}
-	.running .tool-status-badge {
-		background: var(--state-running-bg);
-		color: var(--state-running-text);
-		border: 1px solid color-mix(in srgb, var(--state-running) 25%, transparent);
-	}
-	.error .tool-status-badge {
-		background: var(--state-error-bg);
-		color: var(--state-error-text);
-		border: 1px solid color-mix(in srgb, var(--state-error) 25%, transparent);
-	}
-
-	.tool-preview {
-		flex: 1;
-		min-width: 0;
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
-		color: var(--text-tertiary);
-		font-family: var(--font-mono);
-		font-size: 11px;
-	}
-
-	.tool-chevron {
-		margin-left: auto;
-		width: 12px;
-		height: 12px;
-		color: var(--text-tertiary);
-		transition: transform var(--dur-std) var(--ease-out);
-		flex-shrink: 0;
-	}
-
-	.tool-block.expanded .tool-chevron {
-		transform: rotate(90deg);
-	}
-
-	.tool-detail {
-		background: var(--canvas-base);
-		border-top: 1px solid var(--border-subtle);
-	}
-
-	.tool-detail-section {
-		padding: var(--space-3) var(--space-4);
-		border-bottom: 1px solid var(--border-subtle);
-	}
-	.tool-detail-section:last-child {
-		border-bottom: none;
-	}
-
-	.tool-detail-label {
-		font-size: 10px;
-		font-weight: 510;
-		color: var(--text-tertiary);
-		text-transform: uppercase;
-		letter-spacing: 0.1em;
-		margin-bottom: var(--space-2);
-	}
-
-	.tool-params {
-		font-family: var(--font-mono);
-		font-size: 11.5px;
-		color: var(--text-secondary);
-		line-height: 1.6;
-		white-space: pre;
-		overflow-x: auto;
-		max-height: 200px;
-	}
-
-	.tool-params :global(.syn-key) {
-		color: var(--syntax-key);
-	}
-	.tool-params :global(.syn-str) {
-		color: var(--syntax-str);
-	}
-	.tool-params :global(.syn-num) {
-		color: var(--syntax-num);
-	}
-
-	.tool-result {
-		font-family: var(--font-mono);
-		font-size: 11.5px;
-		color: var(--text-secondary);
-		line-height: 1.6;
-		white-space: pre-wrap;
-		word-break: break-word;
-		max-height: 220px;
-		overflow-y: auto;
-	}
-
-	.running-placeholder {
-		display: flex;
-		align-items: center;
-		gap: var(--space-2);
-		font-size: 12px;
-		color: var(--text-tertiary);
-		font-family: var(--font-chinese);
-		padding: var(--space-3) var(--space-4);
-	}
-
 	/* ---- ERROR / NOTICE ---- */
 	.item-error {
 		color: var(--state-error-text);
@@ -2511,15 +2382,6 @@
 	}
 
 	@media (prefers-reduced-motion: reduce) {
-		.tool-block.running {
-			animation: none;
-		}
-		.tool-spinner {
-			animation: none;
-		}
-		.running .tool-pip::after {
-			animation: none;
-		}
 		.item-text.streaming::after {
 			animation: none;
 		}

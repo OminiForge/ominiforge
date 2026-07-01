@@ -31,6 +31,7 @@ export type Item =
 			args: string;
 			status: 'running' | 'done' | 'error';
 			result?: string;
+			error_code?: string;
 	  }
 	/** A plan checklist, folded from `plan` control-tool calls (one card per
 	 *  `init`). `streaming` marks a placeholder shown while the call's args are
@@ -373,7 +374,12 @@ function pairResult(
 	const text = output.content
 		.map((c) => ('Text' in (c as object) ? (c as { Text: string }).Text : '[binary]'))
 		.join('');
-	items[pos] = { ...call, status: failed || output.is_error ? 'error' : 'done', result: text };
+	items[pos] = {
+		...call,
+		status: failed || output.is_error ? 'error' : 'done',
+		result: text,
+		error_code: output.error_code ?? undefined
+	};
 	return { ...state, items };
 }
 

@@ -146,7 +146,7 @@ const EVENTS = [
 	evt(2, { Model: { ContentBlock: { request_id: 'r1', index: 0, content: { Reasoning: { text: '先定位过期判断。`expires_at < now` 在相等时刻把 token 判成过期，应该是 `<=` 的反面——即 `now > expires_at` 才算过期。' } } } } }),
 	evt(3, { Model: { ContentBlock: { request_id: 'r1', index: 1, content: { Text: { text: '问题在 `auth/middleware.rs`：过期检查写成了 `expires_at < now`，边界时刻（`expires_at == now`）会被误判。改用 `now > expires_at`。\n\n```rust\nif now > token.expires_at {\n    return Err(AuthError::Expired);\n}\n```' } } } } }),
 	evt(4, { Model: { ContentBlock: { request_id: 'r1', index: 2, content: { ToolCall: { id: 'c1', name: 'edit', arguments: '{"file_path":"src/auth/middleware.rs","old":"expires_at < now","new":"now > expires_at"}' } } } } }),
-	evt(5, { Tool: { Completed: { tool_call_event_id: { session_id: '01J5SESSIONAAAAAAAAAAAAAAA', seq: 4 }, result: { content: [{ Text: 'edited 1 file' }], is_error: false, error_code: null }, duration_ms: 12, output_bytes: 12, artifacts_created: [] } } }),
+	evt(5, { Tool: { Completed: { tool_call_event_id: { session_id: '01J5SESSIONAAAAAAAAAAAAAAA', seq: 4 }, result: { content: [{ Text: 'edited src/auth/middleware.rs (1 ops) -> d4e5f6\n@@ -3,3 +3,3 @@\n fn check(token: &Token, now: u64) {\n-    if token.expires_at < now {\n+    if now > token.expires_at {\n         return Err(AuthError::Expired);' }], is_error: false, error_code: null }, duration_ms: 12, output_bytes: 12, artifacts_created: [] } } }),
 	evt(6, { Model: { ContentBlock: { request_id: 'r1', index: 3, content: { Text: { text: '已修复。边界时刻的 token 现在不再被误判为过期。' } } } } }),
 	// Padding turns to force the stream to overflow vertically, so screenshots
 	// surface scrollbar placement (the regression this tool was built to catch).

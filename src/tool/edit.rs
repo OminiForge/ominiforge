@@ -95,12 +95,12 @@ impl Tool for EditTool {
                 "start": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "1-based line number. Required for replace/delete/insert_after/insert_before."
+                    "description": "1-based line number in the ORIGINAL read snapshot (never re-count for earlier ops in the same call). Required for replace/delete/insert_after/insert_before. replace/delete remove start..=end; insert_after/before place lines relative to this original line."
                 },
                 "end": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Inclusive 1-based end line for replace/delete. Defaults to start."
+                    "description": "Inclusive 1-based end line (original snapshot) for replace/delete. Defaults to start."
                 },
                 "lines": {
                     "type": "array",
@@ -125,7 +125,8 @@ impl Tool for EditTool {
                 "ops": {
                     "type": "array",
                     "items": op_schema,
-                    "minItems": 1
+                    "minItems": 1,
+                    "description": "This section's operations. Line numbers anchor to this file's original read snapshot; ops must not overlap."
                 }
             },
             "required": ["path", "tag", "ops"],
@@ -137,7 +138,18 @@ impl Tool for EditTool {
                           Use `path`, `tag`, and `ops` for one file, or `sections` for \
                           multiple files. Each `lines` item is one file line, so \
                           multi-line edits must be arrays, not one string with embedded \
-                          newlines."
+                          newlines. \
+                          BATCH SEMANTICS (when `ops` has more than one entry): every \
+                          op's line numbers refer to the ORIGINAL file you read — the \
+                          same snapshot the TAG fingerprints — NOT to the file as \
+                          mutated by earlier ops in the same call. So cite every line \
+                          number straight off one `read`; do not shift later ops to \
+                          account for lines an earlier op added or removed. Ops may be \
+                          listed in any order (they are resolved against the original, \
+                          then applied safely). Two ops MUST NOT touch the same line \
+                          (overlapping ranges are rejected as a whole — nothing is \
+                          written). The batch is atomic: if any op or any section fails \
+                          validation, no file is changed."
                 .to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -154,7 +166,7 @@ impl Tool for EditTool {
                         "type": "array",
                         "items": op_schema,
                         "minItems": 1,
-                        "description": "Single-file form operations."
+                        "description": "Single-file form operations. All line numbers anchor to the original read snapshot; ops must not overlap; applied atomically."
                     },
                     "sections": {
                         "type": "array",
@@ -203,9 +215,11 @@ impl Tool for EditTool {
             }
             let new_tag = tag_of(plan.new_content.as_bytes());
             self.snapshots.record(&plan.abs_path, new_tag.clone());
+            // A compact header the model can scan, then a unified diff so both the
+            // model and the UI see exactly which lines changed.
             summaries.push(format!(
-                "edited {} ({} ops, now {} lines) -> {}",
-                plan.rel_path, plan.op_count, plan.new_line_count, new_tag
+                "edited {} ({} ops) -> {}\n{}",
+                plan.rel_path, plan.op_count, new_tag, plan.diff
             ));
         }
 
@@ -223,7 +237,7 @@ struct PlannedWrite {
     rel_path: String,
     new_content: String,
     op_count: usize,
-    new_line_count: usize,
+    diff: String,
 }
 
 impl EditTool {
@@ -261,14 +275,17 @@ impl EditTool {
         let lines: Vec<&str> = content.lines().collect();
         let new_content = apply_ops(&lines, &section.ops, content.ends_with('\n'))
             .map_err(|msg| business_error("bad_range", &format!("{}: {msg}", section.path)))?;
-        let new_line_count = new_content.lines().count();
+        // Build the diff from the same anchors `apply_ops` validated, so a plan
+        // that produced content also has a matching diff (both fail together).
+        let diff = unified_diff(&lines, &section.ops, DIFF_CONTEXT)
+            .map_err(|msg| business_error("bad_range", &format!("{}: {msg}", section.path)))?;
 
         Ok(PlannedWrite {
             abs_path,
             rel_path: section.path.clone(),
             new_content,
             op_count: section.ops.len(),
-            new_line_count,
+            diff,
         })
     }
 }
@@ -532,6 +549,99 @@ fn resolve_splice(anchor: AnchorRange, n: usize) -> Result<(usize, usize), Strin
         AnchorRange::Head => Ok((0, 0)),
         AnchorRange::Tail => Ok((n, n)),
     }
+}
+
+/// Context lines shown on each side of a change hunk in the edit diff.
+const DIFF_CONTEXT: usize = 3;
+
+/// Build a unified-style diff for a section's ops against the old `lines`.
+///
+/// The ops already carry validated 1-based anchors; each resolves to an old
+/// half-open range `[start, end)` that is deleted and a payload that is
+/// inserted. That *is* the diff — no LCS needed. Ranges are sorted ascending
+/// (matching `apply_ops`' overlap rule) and rendered as hunks with up to
+/// [`DIFF_CONTEXT`] unchanged lines on each side; hunks whose context windows
+/// touch are merged so adjacent edits read as one block.
+///
+/// Output shape (one hunk):
+/// ```text
+/// @@ -old_start,old_len +new_start,new_len @@
+///  context line
+/// -removed line
+/// +added line
+/// ```
+/// Line numbers are 1-based. An empty diff (no visible change) yields "".
+fn unified_diff(lines: &[&str], ops: &[Op], context: usize) -> Result<String, String> {
+    let n = lines.len();
+    // Resolve every op to (old_start, old_end, payload), sorted ascending. Same
+    // resolution `apply_ops` uses, so a valid patch always yields a valid diff.
+    let mut edits: Vec<(usize, usize, &[String])> = Vec::with_capacity(ops.len());
+    for op in ops {
+        let (start, end) = resolve_splice(op.anchor, n)?;
+        edits.push((start, end, &op.payload));
+    }
+    edits.sort_by_key(|e| e.0);
+
+    // Group edits whose context windows overlap into shared hunks. Each group is
+    // a run of edits where the next edit starts within `context` lines of the
+    // previous edit's end (so their context lines would touch/overlap).
+    let mut hunks: Vec<Vec<(usize, usize, &[String])>> = Vec::new();
+    for edit in edits {
+        match hunks.last_mut() {
+            Some(group) if edit.0 <= group.last().unwrap().1 + context * 2 => group.push(edit),
+            _ => hunks.push(vec![edit]),
+        }
+    }
+
+    let mut out = String::new();
+    // `new_off` tracks the running new-vs-old line-number delta so each hunk's
+    // `+` side is numbered correctly after earlier hunks grew/shrank the file.
+    let mut new_off: isize = 0;
+    for group in &hunks {
+        let first_start = group[0].0;
+        let last_end = group[group.len() - 1].1;
+        let ctx_start = first_start.saturating_sub(context);
+        let ctx_end = (last_end + context).min(n);
+
+        // Old span covered by this hunk (context + all edited ranges).
+        let old_len = ctx_end - ctx_start;
+        // New span = old span, minus each edit's removed lines, plus its payload.
+        let mut new_len = old_len;
+        for (s, e, payload) in group {
+            new_len = new_len - (e - s) + payload.len();
+        }
+        let old_start = ctx_start + 1;
+        let new_start = (ctx_start as isize + new_off + 1).max(1) as usize;
+        out.push_str(&format!(
+            "@@ -{old_start},{old_len} +{new_start},{new_len} @@\n"
+        ));
+
+        // Walk the old lines across the hunk, emitting context/removed/added in
+        // order. `cursor` is the next old line index not yet emitted.
+        let mut cursor = ctx_start;
+        for (s, e, payload) in group {
+            for line in &lines[cursor..*s] {
+                out.push_str(&format!(" {line}\n"));
+            }
+            for line in &lines[*s..*e] {
+                out.push_str(&format!("-{line}\n"));
+            }
+            for line in *payload {
+                out.push_str(&format!("+{line}\n"));
+            }
+            cursor = *e;
+            new_off += payload.len() as isize - (*e - *s) as isize;
+        }
+        for line in &lines[cursor..ctx_end] {
+            out.push_str(&format!(" {line}\n"));
+        }
+    }
+
+    // Trim the trailing newline so the caller controls final layout.
+    if out.ends_with('\n') {
+        out.pop();
+    }
+    Ok(out)
 }
 
 fn business_error(code: &str, message: &str) -> ToolOutput {
@@ -864,5 +974,91 @@ mod tests {
             .unwrap();
         assert!(out.is_error);
         assert_eq!(out.error_code.as_deref(), Some("invalid_path"));
+    }
+
+    // --- unified_diff --------------------------------------------------------
+
+    fn op(anchor: AnchorRange, payload: &[&str]) -> Op {
+        Op {
+            anchor,
+            payload: payload.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    /// A single replace renders one hunk: context lines prefixed ` `, the old
+    /// line `-`, the new line `+`, with correct 1-based @@ ranges. This is the
+    /// shape the frontend colours, so it must be exact.
+    #[test]
+    fn diff_replace_one_line_with_context() {
+        let lines = vec!["a", "b", "c", "d", "e"];
+        let ops = vec![op(AnchorRange::Range(3, 3), &["C"])];
+        let diff = unified_diff(&lines, &ops, 1).unwrap();
+        assert_eq!(diff, "@@ -2,3 +2,3 @@\n b\n-c\n+C\n d");
+    }
+
+    /// An insert removes nothing (no `-` line) and the @@ new-length grows by the
+    /// payload size — verifies the offset math, not just that text appears.
+    #[test]
+    fn diff_insert_after_grows_new_side() {
+        let lines = vec!["a", "b", "c"];
+        let ops = vec![op(AnchorRange::After(2), &["b2"])];
+        let diff = unified_diff(&lines, &ops, 1).unwrap();
+        assert_eq!(diff, "@@ -2,2 +2,3 @@\n b\n+b2\n c");
+    }
+
+    /// Two edits far apart produce two separate hunks; a diff that merged them
+    /// would wrongly bury unchanged lines as context, so the split matters.
+    #[test]
+    fn diff_distant_edits_split_into_two_hunks() {
+        let lines: Vec<&str> = (1..=12).map(|_| "x").collect();
+        let ops = vec![
+            op(AnchorRange::Range(2, 2), &["A"]),
+            op(AnchorRange::Range(11, 11), &["B"]),
+        ];
+        let diff = unified_diff(&lines, &ops, 1).unwrap();
+        assert_eq!(diff.matches("@@ ").count(), 2, "expected two hunks: {diff}");
+    }
+
+    /// Adjacent edits within 2·context of each other collapse into one hunk so
+    /// the reader sees a single continuous block, not two touching ones.
+    #[test]
+    fn diff_close_edits_merge_into_one_hunk() {
+        let lines = vec!["a", "b", "c", "d", "e"];
+        let ops = vec![
+            op(AnchorRange::Range(2, 2), &["B"]),
+            op(AnchorRange::Range(4, 4), &["D"]),
+        ];
+        let diff = unified_diff(&lines, &ops, 3).unwrap();
+        assert_eq!(diff.matches("@@ ").count(), 1, "expected one hunk: {diff}");
+    }
+
+    /// Multiple ops in ONE call anchor to the SAME read snapshot, not to an
+    /// intermediate state. Deleting line 3 and line 10 of a 10-line file must
+    /// drop exactly those two original lines — the second anchor is NOT
+    /// re-indexed by the first delete. This is the guarantee that lets the model
+    /// cite all its line numbers off one `read` without predicting shifts.
+    #[tokio::test]
+    async fn multi_delete_anchors_to_original_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n";
+        let tool = primed(dir.path(), "f.txt", src);
+
+        let out = tool
+            .invoke(call_edit(
+                "f.txt",
+                src,
+                serde_json::json!([
+                    { "op": "delete", "start": 3 },
+                    { "op": "delete", "start": 10 }
+                ]),
+            ))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{:?}", out.content);
+        // l3 and l10 gone; every other original line intact and in order.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "l1\nl2\nl4\nl5\nl6\nl7\nl8\nl9\n"
+        );
     }
 }
