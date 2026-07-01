@@ -199,7 +199,7 @@ async fn serve_cmd(config_dir: Option<PathBuf>, args: ServeArgs) -> Result<()> {
         config: config_store,
         workspace,
         profile: args.profile,
-        no_dotenv: true,
+        no_dotenv: args.no_dotenv,
     };
     let registry = SessionRegistry::new(defaults, &gateway_config);
     serve(registry, &gateway_config, pricing).await

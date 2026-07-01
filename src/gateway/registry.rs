@@ -57,7 +57,7 @@ pub struct SessionDefaults {
     pub workspace: PathBuf,
     /// Profile name (looked up under `.omini/profiles`).
     pub profile: String,
-    /// Whether to skip `.env` autoloading (already loaded at server startup).
+    /// Whether to skip workspace env activation/autoloading.
     pub no_dotenv: bool,
 }
 
@@ -75,38 +75,77 @@ pub struct RuntimeInfo {
     pub provider: String,
     /// Model id sent to the API (e.g. `gpt-4o`).
     pub model: String,
-    /// Environment tags detected from marker files in the session's workspace
-    /// (e.g. `["nix", "cargo"]`). Empty when the session has no workspace or no
-    /// marker matched — the RUNTIME panel only shows the row when non-empty
-    /// ("detected, therefore shown"; `doc/frontend.md`, B2).
+    /// Environment labels detected from the activated session environment (e.g.
+    /// `["dev shell: impure (nix-shell-env)"]` or `["venv: .venv"]`). Empty
+    /// when no activation signal is present — the RUNTIME panel only shows the
+    /// row when non-empty ("detected, therefore shown"; `doc/frontend.md`, B2).
     pub env: Vec<String>,
 }
 
-/// Detect environment tags from marker files at the workspace root.
+/// Detect environment labels from activated environment variables.
 ///
-/// Returns the tags in a stable order (nix, cargo, node, python) so the RUNTIME
-/// panel never reorders between requests. Empty when `workspace` is `None`
-/// (restricted session) or no marker is present.
-///
-/// Only the workspace root is probed — one `Path::exists` per marker, no
-/// directory walk — because this runs on a display GET and must stay cheap.
-fn detect_env(workspace: Option<&Path>) -> Vec<String> {
-    // (tag, marker files that imply it). First matching marker wins per tag; a
-    // workspace can carry several tags (a nix flake wrapping a cargo project).
-    const MARKERS: &[(&str, &[&str])] = &[
-        ("nix", &["flake.nix", ".envrc"]),
-        ("cargo", &["Cargo.toml"]),
-        ("node", &["package.json"]),
-        ("python", &["pyproject.toml"]),
-    ];
-    let Some(root) = workspace else {
-        return Vec::new();
-    };
-    MARKERS
-        .iter()
-        .filter(|(_, files)| files.iter().any(|f| root.join(f).exists()))
-        .map(|(tag, _)| (*tag).to_owned())
+/// This intentionally does not inspect project files: `Cargo.toml` or
+/// `pyproject.toml` describe language/project type, not whether the process is
+/// inside the corresponding development environment.
+fn current_env_overlay() -> std::collections::BTreeMap<String, Option<String>> {
+    std::env::vars()
+        .map(|(key, value)| (key, Some(value)))
         .collect()
+}
+
+fn apply_overlay(
+    env: &mut std::collections::BTreeMap<String, Option<String>>,
+    overlay: std::collections::BTreeMap<String, Option<String>>,
+) {
+    for (key, value) in overlay {
+        env.insert(key, value);
+    }
+}
+
+fn detect_env(env: &std::collections::BTreeMap<String, Option<String>>) -> Vec<String> {
+    let mut labels = Vec::new();
+
+    if let Some(mode) = env_value(env, "IN_NIX_SHELL") {
+        let mut label = format!("dev shell: {mode}");
+        if let Some(name) = env_value(env, "NIX_SHELL_NAME").or_else(|| env_value(env, "name")) {
+            label.push_str(" (");
+            label.push_str(name);
+            label.push(')');
+        }
+        labels.push(label);
+    }
+    if let Some(path) = env_value(env, "VIRTUAL_ENV") {
+        labels.push(format!("venv: {}", basename(path)));
+    }
+    if let Some(name) =
+        env_value(env, "CONDA_DEFAULT_ENV").or_else(|| env_value(env, "CONDA_PREFIX").map(basename))
+    {
+        labels.push(format!("conda: {name}"));
+    }
+    if labels.is_empty()
+        && let Some(path) = env_value(env, "DIRENV_FILE")
+    {
+        labels.push(format!("direnv: {}", basename(path)));
+    }
+
+    labels
+}
+
+fn env_value<'a>(
+    env: &'a std::collections::BTreeMap<String, Option<String>>,
+    key: &str,
+) -> Option<&'a str> {
+    env.get(key)
+        .and_then(|value| value.as_deref())
+        .filter(|value| !value.is_empty())
+}
+
+fn basename(path: &str) -> &str {
+    Path::new(path)
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(path)
 }
 
 /// Owns the live actors and the defaults used to spawn new ones.
@@ -178,7 +217,7 @@ impl SessionRegistry {
     /// # Errors
     /// [`anyhow::Error`] if config is unreadable or the profile/model cannot be
     /// resolved (no model named, unknown provider, missing api key).
-    pub fn runtime_info(
+    pub async fn runtime_info(
         &self,
         profile_id: Option<&str>,
         workspace: Option<&Path>,
@@ -196,10 +235,23 @@ impl SessionRegistry {
             .resolve(&providers, &profile, None, None)
             .context("failed to resolve model selection")?;
 
+        let mut env = current_env_overlay();
+        if !self.inner.defaults.no_dotenv
+            && let Some(workspace) = workspace
+        {
+            apply_overlay(
+                &mut env,
+                crate::app::activate_direnv(workspace, &|msg| {
+                    eprintln!("gateway: {msg}");
+                })
+                .await,
+            );
+        }
+
         Ok(RuntimeInfo {
             provider: resolved.provider_name,
             model: resolved.model_id,
-            env: detect_env(workspace),
+            env: detect_env(&env),
         })
     }
 
@@ -510,41 +562,87 @@ impl SessionRegistry {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use super::detect_env;
+    use super::{apply_overlay, detect_env};
+    use std::collections::BTreeMap;
 
-    /// No workspace (restricted session) yields no env tags, so the RUNTIME
-    /// panel omits the ENV row rather than showing an empty one.
+    /// No activation signals yields no env labels, so the RUNTIME panel omits
+    /// the ENV row rather than guessing from project files.
     #[test]
-    fn detect_env_none_workspace_is_empty() {
-        assert!(detect_env(None).is_empty());
+    fn detect_env_without_activation_signal_is_empty() {
+        assert!(detect_env(&BTreeMap::new()).is_empty());
     }
 
-    /// An empty workspace (no marker files) yields no tags — detection is
-    /// presence-based, never a default guess.
+    /// Activated environment labels include the environment kind and useful
+    /// names from the active environment, not language/project marker files.
     #[test]
-    fn detect_env_no_markers_is_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(detect_env(Some(dir.path())).is_empty());
+    fn detect_env_reports_activation_signals_in_fixed_order() {
+        let env = BTreeMap::from([
+            ("CONDA_PREFIX".to_owned(), Some("/tmp/conda".to_owned())),
+            ("IN_NIX_SHELL".to_owned(), Some("impure".to_owned())),
+            ("name".to_owned(), Some("nix-shell-env".to_owned())),
+            ("VIRTUAL_ENV".to_owned(), Some("/tmp/.venv".to_owned())),
+        ]);
+
+        assert_eq!(
+            detect_env(&env),
+            vec![
+                "dev shell: impure (nix-shell-env)",
+                "venv: .venv",
+                "conda: conda"
+            ]
+        );
     }
 
-    /// A nix flake wrapping a cargo project carries both tags, in the fixed
-    /// order (nix before cargo) regardless of which file was created first —
-    /// the panel must not reorder between requests.
+    /// `NIX_PROFILES` alone is not a dev-shell signal on NixOS/Home Manager; it
+    /// is too broad to report as an activated workspace environment.
     #[test]
-    fn detect_env_reports_multiple_tags_in_fixed_order() {
-        let dir = tempfile::tempdir().unwrap();
-        // Create cargo's marker first to prove ordering is by MARKERS, not fs.
-        std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
-        std::fs::write(dir.path().join("flake.nix"), "{}").unwrap();
-        assert_eq!(detect_env(Some(dir.path())), vec!["nix", "cargo"]);
+    fn detect_env_ignores_nix_profiles_without_dev_shell() {
+        let env = BTreeMap::from([("NIX_PROFILES".to_owned(), Some("/nix/profile".to_owned()))]);
+        assert!(detect_env(&env).is_empty());
     }
 
-    /// `.envrc` alone implies nix (direnv-managed), matching the plan's marker
-    /// table.
+    /// A plain direnv environment is shown as direnv only when no more specific
+    /// activated environment can be inferred.
     #[test]
-    fn detect_env_envrc_implies_nix() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(".envrc"), "use flake").unwrap();
-        assert_eq!(detect_env(Some(dir.path())), vec!["nix"]);
+    fn detect_env_reports_plain_direnv() {
+        let env = BTreeMap::from([("DIRENV_FILE".to_owned(), Some("/tmp/.envrc".to_owned()))]);
+        assert_eq!(detect_env(&env), vec!["direnv: .envrc"]);
+    }
+
+    /// More specific activated environment labels are preferred over the generic
+    /// direnv label, because direnv is only the activation mechanism.
+    #[test]
+    fn detect_env_prefers_specific_signal_over_direnv() {
+        let env = BTreeMap::from([
+            ("DIRENV_FILE".to_owned(), Some("/tmp/.envrc".to_owned())),
+            ("IN_NIX_SHELL".to_owned(), Some("impure".to_owned())),
+        ]);
+        assert_eq!(detect_env(&env), vec!["dev shell: impure"]);
+    }
+
+    /// Conda's explicit environment name is clearer than the prefix basename
+    /// when both are available.
+    #[test]
+    fn detect_env_prefers_conda_default_env_name() {
+        let env = BTreeMap::from([
+            ("CONDA_DEFAULT_ENV".to_owned(), Some("base".to_owned())),
+            (
+                "CONDA_PREFIX".to_owned(),
+                Some("/tmp/conda-prefix".to_owned()),
+            ),
+        ]);
+        assert_eq!(detect_env(&env), vec!["conda: base"]);
+    }
+
+    /// Runtime detection observes the effective environment after applying the
+    /// workspace overlay on top of the server's already-active environment.
+    #[test]
+    fn apply_overlay_preserves_existing_activation_signals() {
+        let mut env = BTreeMap::from([("IN_NIX_SHELL".to_owned(), Some("impure".to_owned()))]);
+        apply_overlay(
+            &mut env,
+            BTreeMap::from([("DIRENV_FILE".to_owned(), Some("/tmp/.envrc".to_owned()))]),
+        );
+        assert_eq!(detect_env(&env), vec!["dev shell: impure"]);
     }
 }

@@ -1,6 +1,7 @@
 //! The stdio MCP client: owns a server subprocess, frames JSON-RPC over its
 //! stdin/stdout, and adapts each MCP tool to the core [`Tool`] trait.
 
+use std::collections::BTreeMap;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +15,7 @@ use super::protocol::{
     self, ContentBlock, Notification, Request, Response, ToolCallResult, ToolDef, ToolsListResult,
 };
 use crate::core::payload::{Content, ToolOutput, ToolSource};
+use crate::process_env::apply_env_overlay;
 use crate::tool::{Tool, ToolDescriptor, ToolError, ToolInput, ToolResult};
 
 /// A connected MCP server: the subprocess plus its framed stdio. The subprocess
@@ -60,14 +62,19 @@ impl McpClient {
     /// # Errors
     /// [`McpError`] if the server is not stdio, fails to spawn, or the handshake
     /// / `tools/list` exchange fails.
-    pub async fn connect(server: &McpServerConfig) -> Result<(Self, Vec<ToolDef>), McpError> {
+    pub async fn connect(
+        server: &McpServerConfig,
+        env_overlay: &BTreeMap<String, Option<String>>,
+    ) -> Result<(Self, Vec<ToolDef>), McpError> {
         let command = server
             .command
             .as_deref()
             .ok_or_else(|| McpError::NotStdio(server.name.clone()))?;
 
-        let mut child = tokio::process::Command::new(command)
-            .args(&server.args)
+        let mut command = tokio::process::Command::new(command);
+        command.args(&server.args);
+        apply_env_overlay(&mut command, env_overlay);
+        let mut child = command
             .envs(&server.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -348,7 +355,9 @@ for line in sys.stdin:
     #[tokio::test]
     async fn connect_lists_tools_with_mcp_source() {
         let dir = tempfile::tempdir().unwrap();
-        let (client, tools) = McpClient::connect(&mock_server(dir.path())).await.unwrap();
+        let (client, tools) = McpClient::connect(&mock_server(dir.path()), &BTreeMap::new())
+            .await
+            .unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "echo");
 
@@ -366,7 +375,9 @@ for line in sys.stdin:
     #[tokio::test]
     async fn invoke_round_trips_through_stdio() {
         let dir = tempfile::tempdir().unwrap();
-        let (client, tools) = McpClient::connect(&mock_server(dir.path())).await.unwrap();
+        let (client, tools) = McpClient::connect(&mock_server(dir.path()), &BTreeMap::new())
+            .await
+            .unwrap();
         let tool = McpTool::new(Arc::new(client), "mock".to_owned(), tools[0].clone());
 
         let out = tool
@@ -383,7 +394,7 @@ for line in sys.stdin:
     async fn is_error_maps_to_business_error() {
         let dir = tempfile::tempdir().unwrap();
         let server = mock_server(dir.path());
-        let (client, _tools) = McpClient::connect(&server).await.unwrap();
+        let (client, _tools) = McpClient::connect(&server, &BTreeMap::new()).await.unwrap();
         // The mock returns isError for tool name `boom`; advertise it directly.
         let boom = ToolDef {
             name: "boom".to_owned(),

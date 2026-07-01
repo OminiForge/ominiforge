@@ -22,6 +22,7 @@ mod protocol;
 pub use client::{McpClient, McpError};
 pub use config::{McpConfig, McpServerConfig};
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::tool::ToolRegistry;
@@ -38,12 +39,13 @@ use crate::tool::ToolRegistry;
 /// skipped. The signature stays `Result` for forward compatibility.
 pub async fn connect_all(
     config: &McpConfig,
+    env_overlay: &BTreeMap<String, Option<String>>,
     registry: &mut ToolRegistry,
     on_warn: impl Fn(&str),
 ) -> Vec<Arc<McpClient>> {
     let mut clients = Vec::new();
     for server in &config.servers {
-        match McpClient::connect(server).await {
+        match McpClient::connect(server, env_overlay).await {
             Ok((client, tools)) => {
                 let client = Arc::new(client);
                 let count = tools.len();
@@ -108,7 +110,7 @@ for line in sys.stdin:
         };
 
         let mut registry = ToolRegistry::new();
-        let clients = connect_all(&config, &mut registry, |_| {}).await;
+        let clients = connect_all(&config, &BTreeMap::new(), &mut registry, |_| {}).await;
 
         assert_eq!(clients.len(), 1);
         assert_eq!(
@@ -134,7 +136,10 @@ for line in sys.stdin:
         };
         let mut registry = ToolRegistry::new();
         let warned = std::cell::Cell::new(false);
-        let clients = connect_all(&config, &mut registry, |_| warned.set(true)).await;
+        let clients = connect_all(&config, &BTreeMap::new(), &mut registry, |_| {
+            warned.set(true);
+        })
+        .await;
 
         assert!(clients.is_empty());
         assert!(registry.is_empty());

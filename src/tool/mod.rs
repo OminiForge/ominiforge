@@ -21,7 +21,7 @@ pub use shell::ShellTool;
 pub use snapshot::SnapshotStore;
 pub use write::WriteTool;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -183,7 +183,7 @@ pub fn register_builtin(registry: &mut ToolRegistry, workspace: PathBuf) {
     )));
     registry.register(Arc::new(WriteTool::new(workspace.clone())));
     registry.register(Arc::new(EditTool::new(workspace.clone(), snapshots)));
-    registry.register(Arc::new(ShellTool::new(workspace)));
+    registry.register(Arc::new(ShellTool::new(workspace, BTreeMap::new())));
 }
 
 #[cfg(test)]

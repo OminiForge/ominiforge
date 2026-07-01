@@ -411,6 +411,7 @@ async fn session_runtime(State(state): State<AppState>, Path(id): Path<String>) 
     match state
         .registry
         .runtime_info(meta.profile_id.as_deref(), meta.workspace.as_deref())
+        .await
     {
         Ok(info) => Json(info).into_response(),
         Err(e) => internal_error(&e),

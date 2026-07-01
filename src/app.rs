@@ -12,7 +12,9 @@
 //! loaded `.env`) are routed through an `on_warn` callback rather than hardcoded
 //! to stderr, so the gateway can send them to its log instead.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -84,11 +86,16 @@ pub async fn assemble(
 
     let store = config;
 
-    // Load secrets from a `.env` file before anything reads `api_key_env`,
-    // unless disabled. Real environment variables are never overwritten.
-    if !no_dotenv {
+    // Activate workspace env before registering tools, unless disabled. The
+    // overlay is passed to subprocesses (shell/MCP) so commands run inside the
+    // workspace's development environment without requiring `direnv exec`.
+    let env_overlay = if no_dotenv {
+        BTreeMap::new()
+    } else {
+        let env = activate_direnv(&workspace, on_warn).await;
         load_dotenv(store.roots(), &workspace, on_warn);
-    }
+        env
+    };
 
     let providers = store
         .load_providers()
@@ -111,7 +118,7 @@ pub async fn assemble(
         .context("provider type has no adapter (only openai-chat is wired)")?;
 
     let mut tools = ToolRegistry::new();
-    register_profile_tools(&mut tools, &profile, workspace.clone());
+    register_profile_tools(&mut tools, &profile, workspace.clone(), env_overlay.clone());
 
     // Connect configured MCP servers and register their tools alongside the
     // built-ins (`doc/tool-protocol.md` §5). A broken server is logged and
@@ -119,7 +126,8 @@ pub async fn assemble(
     // alive for the session.
     let mcp_config =
         crate::mcp::McpConfig::load(store.roots()).context("failed to load mcp.toml")?;
-    let mcp_clients = crate::mcp::connect_all(&mcp_config, &mut tools, |msg| on_warn(msg)).await;
+    let mcp_clients =
+        crate::mcp::connect_all(&mcp_config, &env_overlay, &mut tools, |msg| on_warn(msg)).await;
 
     // Skills: list those enabled by the profile (empty = all) and inject their
     // index into the system prompt. The `load_skill` tool is registered only
@@ -204,6 +212,7 @@ fn register_profile_tools(
     registry: &mut ToolRegistry,
     profile: &crate::config::Profile,
     workspace: PathBuf,
+    env_overlay: BTreeMap<String, Option<String>>,
 ) {
     let snapshots = SnapshotStore::new();
     if profile.tools.allows("read") {
@@ -219,7 +228,7 @@ fn register_profile_tools(
         registry.register(Arc::new(EditTool::new(workspace.clone(), snapshots)));
     }
     if profile.tools.allows("shell") {
-        registry.register(Arc::new(ShellTool::new(workspace)));
+        registry.register(Arc::new(ShellTool::new(workspace, env_overlay)));
     }
 }
 
@@ -232,6 +241,99 @@ pub fn resolve_workspace(requested: &Path) -> Result<PathBuf> {
     requested
         .canonicalize()
         .with_context(|| format!("workspace does not exist: {}", requested.display()))
+}
+
+/// Activate `<workspace>/.envrc` through direnv, if present.
+///
+/// direnv remains the source of truth for trust (`direnv allow`) and evaluation;
+/// this returns `direnv export json` as an environment overlay for subprocesses
+/// that need the workspace development environment. Failures are warnings: a
+/// blocked or missing direnv should explain itself without making unrelated
+/// workspaces unusable.
+pub(crate) async fn activate_direnv(
+    workspace: &Path,
+    on_warn: &(dyn Fn(&str) + Sync),
+) -> BTreeMap<String, Option<String>> {
+    let envrc = workspace.join(".envrc");
+    if !envrc.is_file() {
+        return BTreeMap::new();
+    }
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::process::Command::new("direnv")
+            .arg("export")
+            .arg("json")
+            .current_dir(workspace)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output(),
+    )
+    .await;
+
+    let output = match output {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => {
+            on_warn(&format!(
+                "warning: failed to run direnv for {}: {e}",
+                envrc.display()
+            ));
+            return BTreeMap::new();
+        }
+        Err(_) => {
+            on_warn(&format!(
+                "warning: timed out activating {} with direnv",
+                envrc.display()
+            ));
+            return BTreeMap::new();
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        on_warn(&format!(
+            "warning: direnv failed for {}: {}",
+            envrc.display(),
+            stderr.trim()
+        ));
+        return BTreeMap::new();
+    }
+
+    match parse_direnv_json(&output.stdout) {
+        Ok(env) => {
+            on_warn(&format!(
+                "loaded {} env vars from {} via direnv",
+                env.len(),
+                envrc.display()
+            ));
+            env
+        }
+        Err(e) => {
+            on_warn(&format!(
+                "warning: failed to import direnv env for {}: {e}",
+                envrc.display()
+            ));
+            BTreeMap::new()
+        }
+    }
+}
+
+pub(crate) fn parse_direnv_json(bytes: &[u8]) -> Result<BTreeMap<String, Option<String>>> {
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Ok(BTreeMap::new());
+    }
+    let env: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(bytes)?;
+    Ok(env
+        .into_iter()
+        .filter_map(|(key, value)| {
+            if value.is_null() {
+                Some((key, None))
+            } else {
+                value.as_str().map(|value| (key, Some(value.to_owned())))
+            }
+        })
+        .collect())
 }
 
 /// Load a single `.env` file into the environment, if one is found.
@@ -269,6 +371,28 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    /// direnv's JSON export becomes a per-workspace subprocess environment
+    /// overlay; non-string bookkeeping values are ignored.
+    #[test]
+    fn direnv_json_parses_string_env_overlay() {
+        assert!(parse_direnv_json(b"").unwrap().is_empty());
+
+        let json = br#"{"OMINI_SIMPLE":"a","OMINI_COMPLEX":"quote: \" slash: \\ line:\n","OMINI_UNSET":null,"IGNORED":false}"#;
+
+        let env = parse_direnv_json(json).unwrap();
+
+        assert_eq!(
+            env.get("OMINI_SIMPLE").and_then(|value| value.as_deref()),
+            Some("a")
+        );
+        assert_eq!(
+            env.get("OMINI_COMPLEX").and_then(|value| value.as_deref()),
+            Some("quote: \" slash: \\ line:\n")
+        );
+        assert_eq!(env.get("OMINI_UNSET"), Some(&None));
+        assert!(!env.contains_key("IGNORED"));
+    }
 
     /// `pick_dotenv_path` prefers a config root's `.env` over the workspace's.
     #[test]
@@ -312,7 +436,12 @@ mod tests {
     fn default_profile_registers_edit() {
         let profile = crate::config::Profile::builtin_default();
         let mut reg = ToolRegistry::new();
-        register_profile_tools(&mut reg, &profile, PathBuf::from("/tmp/ws"));
+        register_profile_tools(
+            &mut reg,
+            &profile,
+            PathBuf::from("/tmp/ws"),
+            BTreeMap::new(),
+        );
         let names: Vec<String> = reg.descriptors().into_iter().map(|d| d.name).collect();
         assert_eq!(names, vec!["edit", "read", "shell", "write"]);
     }
@@ -324,7 +453,12 @@ mod tests {
         let mut profile = crate::config::Profile::builtin_default();
         profile.tools.builtin = Some(vec!["read".to_owned(), "write".to_owned()]);
         let mut reg = ToolRegistry::new();
-        register_profile_tools(&mut reg, &profile, PathBuf::from("/tmp/ws"));
+        register_profile_tools(
+            &mut reg,
+            &profile,
+            PathBuf::from("/tmp/ws"),
+            BTreeMap::new(),
+        );
         let names: Vec<String> = reg.descriptors().into_iter().map(|d| d.name).collect();
         assert_eq!(names, vec!["read", "write"]);
     }

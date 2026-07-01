@@ -24,6 +24,7 @@ pub mod llm;
 pub mod mcp;
 pub mod memory;
 pub mod monitor;
+pub(crate) mod process_env;
 pub mod provider;
 pub mod session;
 pub mod skill;

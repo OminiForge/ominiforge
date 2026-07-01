@@ -4,6 +4,7 @@
 //! system shell with the workspace as its working directory, bounded only by a
 //! timeout. Container isolation and resource limits are Phase 2.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 
@@ -11,11 +12,13 @@ use serde::Deserialize;
 
 use super::{Tool, ToolDescriptor, ToolError, ToolInput, ToolResult};
 use crate::core::payload::{Content, ToolOutput};
+use crate::process_env::apply_env_overlay;
 
 /// Runs a shell command with the workspace as the working directory.
 #[derive(Debug, Clone)]
 pub struct ShellTool {
     workspace: PathBuf,
+    env_overlay: BTreeMap<String, Option<String>>,
 }
 
 #[derive(Deserialize)]
@@ -26,8 +29,12 @@ struct ShellArgs {
 impl ShellTool {
     /// Create a `shell` tool rooted at `workspace`.
     #[must_use]
-    pub const fn new(workspace: PathBuf) -> Self {
-        Self { workspace }
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn new(workspace: PathBuf, env_overlay: BTreeMap<String, Option<String>>) -> Self {
+        Self {
+            workspace,
+            env_overlay,
+        }
     }
 }
 
@@ -61,7 +68,9 @@ impl Tool for ShellTool {
         command
             .arg("-c")
             .arg(&args.command)
-            .current_dir(&self.workspace)
+            .current_dir(&self.workspace);
+        apply_env_overlay(&mut command, &self.env_overlay);
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -126,7 +135,7 @@ mod tests {
     #[tokio::test]
     async fn captures_stdout_on_success() {
         let dir = tempfile::tempdir().unwrap();
-        let tool = ShellTool::new(dir.path().to_path_buf());
+        let tool = ShellTool::new(dir.path().to_path_buf(), BTreeMap::new());
 
         let out = tool
             .invoke(input("echo hello", Duration::from_secs(5)))
@@ -139,7 +148,7 @@ mod tests {
     #[tokio::test]
     async fn nonzero_exit_is_business_error() {
         let dir = tempfile::tempdir().unwrap();
-        let tool = ShellTool::new(dir.path().to_path_buf());
+        let tool = ShellTool::new(dir.path().to_path_buf(), BTreeMap::new());
 
         let out = tool
             .invoke(input("exit 3", Duration::from_secs(5)))
@@ -153,7 +162,7 @@ mod tests {
     async fn runs_in_workspace_directory() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("marker.txt"), "").unwrap();
-        let tool = ShellTool::new(dir.path().to_path_buf());
+        let tool = ShellTool::new(dir.path().to_path_buf(), BTreeMap::new());
 
         let out = tool
             .invoke(input("ls", Duration::from_secs(5)))
@@ -166,9 +175,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn env_overlay_is_visible_to_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ShellTool::new(
+            dir.path().to_path_buf(),
+            BTreeMap::from([("OMINI_SHELL_TEST".to_owned(), Some("active".to_owned()))]),
+        );
+
+        let out = tool
+            .invoke(input(
+                "printf %s \"$OMINI_SHELL_TEST\"",
+                Duration::from_secs(5),
+            ))
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert_eq!(out.content, vec![Content::Text("active".to_owned())]);
+    }
+
+    #[tokio::test]
     async fn timeout_is_protocol_error() {
         let dir = tempfile::tempdir().unwrap();
-        let tool = ShellTool::new(dir.path().to_path_buf());
+        let tool = ShellTool::new(dir.path().to_path_buf(), BTreeMap::new());
 
         let result = tool
             .invoke(input("sleep 5", Duration::from_millis(50)))
