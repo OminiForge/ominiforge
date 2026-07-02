@@ -12,6 +12,7 @@
 //! `doc/tool-protocol.md`.
 
 use std::path::PathBuf;
+use std::fmt::Write;
 
 use serde::Deserialize;
 
@@ -74,64 +75,99 @@ impl EditTool {
     }
 }
 
+/// Build the edit tool's input schema (op + section schemas, oneOf shape). Extracted
+/// to keep `descriptor()` under clippy's 100-line function limit.
+fn edit_input_schema() -> serde_json::Value {
+    let op_schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "op": {
+                "type": "string",
+                "enum": [
+                    "replace",
+                    "delete",
+                    "insert_after",
+                    "insert_before",
+                    "insert_head",
+                    "insert_tail"
+                ],
+                "description": "Operation to apply."
+            },
+            "start": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "1-based line number in the ORIGINAL read snapshot (never re-count for earlier ops in the same call). Required for replace/delete/insert_after/insert_before. replace/delete remove start..=end; insert_after/before place lines relative to this original line."
+            },
+            "end": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Inclusive 1-based end line (original snapshot) for replace/delete. Defaults to start."
+            },
+            "lines": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Replacement/inserted content, one output line per array item. Do not embed newline characters; use an empty string for a blank line."
+            }
+        },
+        "required": ["op"],
+        "additionalProperties": false
+    });
+    let section_schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "File path relative to the workspace root."
+            },
+            "tag": {
+                "type": "string",
+                "description": "Snapshot TAG from the prior read header."
+            },
+            "ops": {
+                "type": "array",
+                "items": op_schema,
+                "minItems": 1,
+                "description": "This section's operations. Line numbers anchor to this file's original read snapshot; ops must not overlap."
+            }
+        },
+        "required": ["path", "tag", "ops"],
+        "additionalProperties": false
+    });
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Single-file form: file path relative to the workspace root."
+            },
+            "tag": {
+                "type": "string",
+                "description": "Single-file form: snapshot TAG from the prior read header."
+            },
+            "ops": {
+                "type": "array",
+                "items": op_schema,
+                "minItems": 1,
+                "description": "Single-file form operations. All line numbers anchor to the original read snapshot; ops must not overlap; applied atomically."
+            },
+            "sections": {
+                "type": "array",
+                "items": section_schema,
+                "minItems": 1,
+                "description": "Multi-file form; every section has its own path, tag, and ops."
+            }
+        },
+        "oneOf": [
+            { "required": ["path", "tag", "ops"] },
+            { "required": ["sections"] }
+        ],
+        "additionalProperties": false
+    })
+}
+
 #[async_trait::async_trait]
 impl Tool for EditTool {
     fn descriptor(&self) -> ToolDescriptor {
-        let op_schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "op": {
-                    "type": "string",
-                    "enum": [
-                        "replace",
-                        "delete",
-                        "insert_after",
-                        "insert_before",
-                        "insert_head",
-                        "insert_tail"
-                    ],
-                    "description": "Operation to apply."
-                },
-                "start": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "1-based line number in the ORIGINAL read snapshot (never re-count for earlier ops in the same call). Required for replace/delete/insert_after/insert_before. replace/delete remove start..=end; insert_after/before place lines relative to this original line."
-                },
-                "end": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "Inclusive 1-based end line (original snapshot) for replace/delete. Defaults to start."
-                },
-                "lines": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Replacement/inserted content, one output line per array item. Do not embed newline characters; use an empty string for a blank line."
-                }
-            },
-            "required": ["op"],
-            "additionalProperties": false
-        });
-        let section_schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "File path relative to the workspace root."
-                },
-                "tag": {
-                    "type": "string",
-                    "description": "Snapshot TAG from the prior read header."
-                },
-                "ops": {
-                    "type": "array",
-                    "items": op_schema,
-                    "minItems": 1,
-                    "description": "This section's operations. Line numbers anchor to this file's original read snapshot; ops must not overlap."
-                }
-            },
-            "required": ["path", "tag", "ops"],
-            "additionalProperties": false
-        });
         ToolDescriptor {
             name: "edit".to_owned(),
             description: "Apply line-anchored edits verified against a prior `read` TAG. \
@@ -151,36 +187,7 @@ impl Tool for EditTool {
                           written). The batch is atomic: if any op or any section fails \
                           validation, no file is changed."
                 .to_owned(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Single-file form: file path relative to the workspace root."
-                    },
-                    "tag": {
-                        "type": "string",
-                        "description": "Single-file form: snapshot TAG from the prior read header."
-                    },
-                    "ops": {
-                        "type": "array",
-                        "items": op_schema,
-                        "minItems": 1,
-                        "description": "Single-file form operations. All line numbers anchor to the original read snapshot; ops must not overlap; applied atomically."
-                    },
-                    "sections": {
-                        "type": "array",
-                        "items": section_schema,
-                        "minItems": 1,
-                        "description": "Multi-file form; every section has its own path, tag, and ops."
-                    }
-                },
-                "oneOf": [
-                    { "required": ["path", "tag", "ops"] },
-                    { "required": ["sections"] }
-                ],
-                "additionalProperties": false
-            }),
+            input_schema: edit_input_schema(),
         }
     }
 
@@ -571,6 +578,7 @@ const DIFF_CONTEXT: usize = 3;
 /// +added line
 /// ```
 /// Line numbers are 1-based. An empty diff (no visible change) yields "".
+#[allow(clippy::unwrap_used)] // writeln! on String never fails
 fn unified_diff(lines: &[&str], ops: &[Op], context: usize) -> Result<String, String> {
     let n = lines.len();
     // Resolve every op to (old_start, old_end, payload), sorted ascending. Same
@@ -587,16 +595,23 @@ fn unified_diff(lines: &[&str], ops: &[Op], context: usize) -> Result<String, St
     // previous edit's end (so their context lines would touch/overlap).
     let mut hunks: Vec<Vec<(usize, usize, &[String])>> = Vec::new();
     for edit in edits {
-        match hunks.last_mut() {
-            Some(group) if edit.0 <= group.last().unwrap().1 + context * 2 => group.push(edit),
-            _ => hunks.push(vec![edit]),
+        let should_merge = hunks
+            .last()
+            .and_then(|g| g.last())
+            .is_some_and(|&(_, end, _)| edit.0 <= end + context * 2);
+        if should_merge {
+            hunks.last_mut().unwrap().push(edit);
+        } else {
+            hunks.push(vec![edit]);
         }
     }
 
     let mut out = String::new();
-    // `new_off` tracks the running new-vs-old line-number delta so each hunk's
-    // `+` side is numbered correctly after earlier hunks grew/shrank the file.
-    let mut new_off: isize = 0;
+    // Running totals of lines added/removed by earlier hunks, so each hunk's `+`
+    // side is numbered correctly after the file grew/shrank above it. Kept as two
+    // usize counters (not a signed delta) to avoid isize casts.
+    let mut cum_added: usize = 0;
+    let mut cum_removed: usize = 0;
     for group in &hunks {
         let first_start = group[0].0;
         let last_end = group[group.len() - 1].1;
@@ -611,29 +626,29 @@ fn unified_diff(lines: &[&str], ops: &[Op], context: usize) -> Result<String, St
             new_len = new_len - (e - s) + payload.len();
         }
         let old_start = ctx_start + 1;
-        let new_start = (ctx_start as isize + new_off + 1).max(1) as usize;
-        out.push_str(&format!(
-            "@@ -{old_start},{old_len} +{new_start},{new_len} @@\n"
-        ));
+        // New-side start = old start shifted by the net add/remove of prior hunks.
+        let new_start = (ctx_start + cum_added).saturating_sub(cum_removed) + 1;
+        writeln!(out, "@@ -{old_start},{old_len} +{new_start},{new_len} @@").unwrap();
 
         // Walk the old lines across the hunk, emitting context/removed/added in
         // order. `cursor` is the next old line index not yet emitted.
         let mut cursor = ctx_start;
         for (s, e, payload) in group {
             for line in &lines[cursor..*s] {
-                out.push_str(&format!(" {line}\n"));
+                writeln!(out, " {line}").unwrap();
             }
             for line in &lines[*s..*e] {
-                out.push_str(&format!("-{line}\n"));
+                writeln!(out, "-{line}").unwrap();
             }
             for line in *payload {
-                out.push_str(&format!("+{line}\n"));
+                writeln!(out, "+{line}").unwrap();
             }
             cursor = *e;
-            new_off += payload.len() as isize - (*e - *s) as isize;
+            cum_added += payload.len();
+            cum_removed += *e - *s;
         }
         for line in &lines[cursor..ctx_end] {
-            out.push_str(&format!(" {line}\n"));
+            writeln!(out, " {line}").unwrap();
         }
     }
 
