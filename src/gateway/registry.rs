@@ -550,6 +550,109 @@ impl SessionRegistry {
             .context("failed to load providers.toml")
     }
 
+    /// The raw `providers.toml` contents (for the settings UI to edit).
+    ///
+    /// # Errors
+    /// [`anyhow::Error`] if `providers.toml` is unreadable or malformed.
+    pub fn load_providers(&self) -> Result<crate::config::ProvidersFile> {
+        self.inner
+            .defaults
+            .config
+            .load_providers()
+            .context("failed to load providers.toml")
+    }
+
+    /// Overwrite `providers.toml` with `providers` (settings UI full-state save).
+    ///
+    /// # Errors
+    /// [`anyhow::Error`] on serialize/io failure.
+    pub fn save_providers(&self, providers: &crate::config::ProvidersFile) -> Result<()> {
+        self.inner
+            .defaults
+            .config
+            .save_providers(providers)
+            .context("failed to write providers.toml")
+    }
+
+    /// The raw (unresolved) profile file `name`, for editing.
+    ///
+    /// # Errors
+    /// [`anyhow::Error`] if the profile is missing or unparsable.
+    pub fn load_profile_raw(&self, name: &str) -> Result<crate::config::Profile> {
+        self.inner
+            .defaults
+            .config
+            .load_profile_raw(name)
+            .with_context(|| format!("failed to load profile `{name}`"))
+    }
+
+    /// Overwrite profile `name`'s file with `profile`.
+    ///
+    /// # Errors
+    /// [`anyhow::Error`] on serialize/io failure.
+    pub fn save_profile(&self, name: &str, profile: &crate::config::Profile) -> Result<()> {
+        self.inner
+            .defaults
+            .config
+            .save_profile(name, profile)
+            .with_context(|| format!("failed to write profile `{name}`"))
+    }
+
+    /// Delete profile `name`'s file. Returns whether a file was removed.
+    ///
+    /// # Errors
+    /// [`anyhow::Error`] on io failure.
+    pub fn delete_profile(&self, name: &str) -> Result<bool> {
+        self.inner
+            .defaults
+            .config
+            .delete_profile(name)
+            .with_context(|| format!("failed to delete profile `{name}`"))
+    }
+
+    /// The provider names that have an API key stored in the secret store.
+    ///
+    /// # Errors
+    /// [`anyhow::Error`] if the secret store cannot be read.
+    pub fn secret_names(&self) -> Result<Vec<String>> {
+        self.inner.defaults.config.secret_store().map_or_else(
+            || Ok(Vec::new()),
+            |store| store.list_names().context("failed to read secret store"),
+        )
+    }
+
+    /// Store an API key for `provider` in the secret store.
+    ///
+    /// # Errors
+    /// [`anyhow::Error`] if the store has no config root or cannot be written.
+    pub fn set_secret(&self, provider: &str, api_key: &str) -> Result<()> {
+        let store = self
+            .inner
+            .defaults
+            .config
+            .secret_store()
+            .context("no config root for the secret store")?;
+        store
+            .set(provider, api_key)
+            .context("failed to write the secret store")
+    }
+
+    /// Delete `provider`'s stored API key. Returns whether a key existed.
+    ///
+    /// # Errors
+    /// [`anyhow::Error`] if the store has no config root or cannot be written.
+    pub fn delete_secret(&self, provider: &str) -> Result<bool> {
+        let store = self
+            .inner
+            .defaults
+            .config
+            .secret_store()
+            .context("no config root for the secret store")?;
+        store
+            .delete(provider)
+            .context("failed to write the secret store")
+    }
+
     /// The system-prompt seed for a session built from `assembled`.
     fn system_seed(assembled: &Assembled) -> Vec<Message> {
         vec![Message::System {

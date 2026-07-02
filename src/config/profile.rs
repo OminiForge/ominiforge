@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 /// A parsed profile. Optional sections default so partial files load; unknown
 /// keys are ignored for forward compatibility.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct Profile {
     pub profile: ProfileMeta,
 
@@ -42,6 +43,7 @@ pub struct Profile {
 
 /// `[profile]`: identity and inheritance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct ProfileMeta {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -53,6 +55,7 @@ pub struct ProfileMeta {
 
 /// `[prompt]`: the system prompt, inline or from a file.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct PromptSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
@@ -63,6 +66,7 @@ pub struct PromptSection {
 
 /// `[model]`: which model to use and parameter overrides.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct ModelSection {
     /// Default model reference, `provider_name/model_id` or short `model_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -80,6 +84,7 @@ pub struct ModelSection {
 
 /// `[tools]`: which built-in tools and MCP servers are available.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct ToolsSection {
     /// Built-in tools to enable. `None` means "all registered built-ins".
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -108,6 +113,7 @@ impl ToolsSection {
 
 /// `[context]`: compaction and injection knobs (parsed; not yet wired).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct ContextSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_threshold: Option<f32>,
@@ -122,6 +128,7 @@ pub struct ContextSection {
 
 /// `[skills]` (parsed; not yet wired).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct SkillsSection {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enabled: Vec<String>,
@@ -129,6 +136,7 @@ pub struct SkillsSection {
 
 /// `[memory]` (parsed; not yet wired).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct MemorySection {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scopes: Vec<String>,
@@ -138,6 +146,7 @@ pub struct MemorySection {
 
 /// `[budget]` (parsed; not yet wired).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct BudgetSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_max_usd: Option<f64>,
@@ -149,6 +158,7 @@ pub struct BudgetSection {
 
 /// `[hooks]` (parsed; not yet wired).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct HooksSection {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub before_tool: Vec<String>,

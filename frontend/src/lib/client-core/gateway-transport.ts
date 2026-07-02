@@ -12,11 +12,14 @@ import type { SessionSummary } from '$lib/types/SessionSummary';
 import type { RuntimeInfo } from '$lib/types/RuntimeInfo';
 import type { ProfileSummary } from '$lib/types/ProfileSummary';
 import type { ModelSummary } from '$lib/types/ModelSummary';
+import type { ProvidersFile } from '$lib/types/ProvidersFile';
+import type { Profile } from '$lib/types/Profile';
 import { endpoints } from './endpoints';
 import type {
 	CreateSessionOptions,
 	EventHandlers,
 	EventSubscription,
+	ProvidersView,
 	ReconfigureOptions,
 	SessionClient
 } from './types';
@@ -141,6 +144,43 @@ export class GatewayTransport implements SessionClient {
 
 	getRuntime(id: string): Promise<RuntimeInfo> {
 		return this.#json<RuntimeInfo>(endpoints.runtime(id));
+	}
+
+	getProviders(): Promise<ProvidersView> {
+		return this.#json<ProvidersView>(endpoints.providers());
+	}
+
+	saveProviders(providers: ProvidersFile): Promise<void> {
+		return this.#send(endpoints.providers(), {
+			method: 'PUT',
+			body: JSON.stringify(providers)
+		});
+	}
+
+	getProfile(name: string): Promise<Profile> {
+		return this.#json<Profile>(endpoints.profile(name));
+	}
+
+	saveProfile(name: string, profile: Profile): Promise<void> {
+		return this.#send(endpoints.profile(name), {
+			method: 'PUT',
+			body: JSON.stringify(profile)
+		});
+	}
+
+	deleteProfile(name: string): Promise<void> {
+		return this.#send(endpoints.profile(name), { method: 'DELETE' });
+	}
+
+	setSecret(provider: string, apiKey: string): Promise<void> {
+		return this.#send(endpoints.secret(provider), {
+			method: 'PUT',
+			body: JSON.stringify({ api_key: apiKey })
+		});
+	}
+
+	deleteSecret(provider: string): Promise<void> {
+		return this.#send(endpoints.secret(provider), { method: 'DELETE' });
 	}
 
 	subscribeEvents(id: string, handlers: EventHandlers, lastSeq?: number): EventSubscription {

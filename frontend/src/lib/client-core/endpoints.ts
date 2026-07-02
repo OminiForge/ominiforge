@@ -18,5 +18,9 @@ export const endpoints = {
 	events: (id: string) => `${API}/sessions/${encodeURIComponent(id)}/events`,
 	ws: (id: string) => `${API}/sessions/${encodeURIComponent(id)}/ws`,
 	profiles: () => `${API}/profiles`,
-	models: () => `${API}/models`
+	profile: (name: string) => `${API}/profiles/${encodeURIComponent(name)}`,
+	models: () => `${API}/models`,
+	providers: () => `${API}/providers`,
+	secrets: () => `${API}/secrets`,
+	secret: (provider: string) => `${API}/secrets/${encodeURIComponent(provider)}`
 } as const;

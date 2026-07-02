@@ -24,6 +24,7 @@ pub use error::{ConfigError, Result};
 pub use profile::{DEFAULT_SYSTEM_PROMPT, Profile, ProfileMeta, PromptSection, ToolsSection};
 pub use providers::{ModelConfig, Pricing, ProviderConfig, ProviderType, ProvidersFile};
 
+use crate::secrets::SecretStore;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -148,6 +149,17 @@ impl ConfigStore {
     #[must_use]
     pub fn roots(&self) -> &[PathBuf] {
         &self.roots
+    }
+
+    /// The provider-secret store rooted at the highest-priority config root.
+    ///
+    /// Keys entered via the settings UI live here (`<root>/secrets.db`), taking
+    /// precedence over a provider's `api_key_env` at [`resolve`](Self::resolve)
+    /// time. Returns `None` only when no config root is configured (an empty
+    /// store), which never happens through [`discover`](Self::discover).
+    #[must_use]
+    pub fn secret_store(&self) -> Option<SecretStore> {
+        self.roots.first().map(|root| SecretStore::at_root(root))
     }
 
     /// Load and merge every root's `config/providers.toml`. A provider defined
@@ -372,6 +384,80 @@ impl ConfigStore {
 
     // __APPEND_MARKER2__
 
+    /// Write the merged provider set back to `<primary root>/config/providers.toml`,
+    /// replacing the file wholesale. The settings UI sends the full desired
+    /// state, so this is a full overwrite (not a merge). Written atomically
+    /// (temp file + rename) so a crash mid-write never leaves a truncated file.
+    ///
+    /// # Errors
+    /// [`ConfigError::NoRoot`] if the store has no config root; serialize or io
+    /// failure otherwise.
+    pub fn save_providers(&self, providers: &ProvidersFile) -> Result<()> {
+        let root = self.primary_root()?;
+        let path = root.join(CONFIG_SUBDIR).join(PROVIDERS_FILE);
+        let text = toml::to_string_pretty(providers).map_err(|source| ConfigError::Serialize {
+            path: path.clone(),
+            source,
+        })?;
+        write_atomic(&path, &text)
+    }
+
+    /// Read a single profile file **without** resolving its `extends` chain — the
+    /// raw authored content, so the settings UI edits exactly what is on disk
+    /// (editing the resolved/overlaid form would flatten inheritance and inline
+    /// the parent's fields). Returns the [`Profile::builtin_default`] when `name`
+    /// is `"default"` and no file exists (mirroring [`load_profile`]).
+    ///
+    /// # Errors
+    /// [`ConfigError::NotFound`] for a missing named profile; parse/io errors.
+    pub fn load_profile_raw(&self, name: &str) -> Result<Profile> {
+        match self.find_profile(name)? {
+            Some((profile, _dir)) => Ok(profile),
+            None if name == "default" => Ok(Profile::builtin_default()),
+            None => Err(ConfigError::NotFound(self.profile_path(name))),
+        }
+    }
+
+    /// Write a profile to `<primary root>/profiles/<name>.toml`, replacing the
+    /// file wholesale. Written atomically (temp + rename).
+    ///
+    /// # Errors
+    /// [`ConfigError::NoRoot`] if the store has no config root; serialize or io
+    /// failure otherwise.
+    pub fn save_profile(&self, name: &str, profile: &Profile) -> Result<()> {
+        let root = self.primary_root()?;
+        let path = root.join(PROFILES_SUBDIR).join(format!("{name}.toml"));
+        let text = toml::to_string_pretty(profile).map_err(|source| ConfigError::Serialize {
+            path: path.clone(),
+            source,
+        })?;
+        write_atomic(&path, &text)
+    }
+
+    /// Delete `<primary root>/profiles/<name>.toml`. Returns `true` if a file was
+    /// removed, `false` if it did not exist.
+    ///
+    /// # Errors
+    /// [`ConfigError::NoRoot`] if the store has no config root; io failure other
+    /// than not-found.
+    pub fn delete_profile(&self, name: &str) -> Result<bool> {
+        let root = self.primary_root()?;
+        let path = root.join(PROFILES_SUBDIR).join(format!("{name}.toml"));
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(ConfigError::Io { path, source }),
+        }
+    }
+
+    /// The highest-priority config root, where writes land.
+    fn primary_root(&self) -> Result<&Path> {
+        self.roots
+            .first()
+            .map(PathBuf::as_path)
+            .ok_or(ConfigError::NoRoot)
+    }
+
     /// Resolve a model selection into a [`ResolvedModel`], applying overrides.
     ///
     /// Precedence: `model_override` (CLI `--model`) wins over
@@ -405,11 +491,22 @@ impl ConfigStore {
             ));
         }
 
-        let api_key =
-            std::env::var(&provider.api_key_env).map_err(|_| ConfigError::MissingApiKey {
-                provider: provider.name.clone(),
-                env: provider.api_key_env.clone(),
-            })?;
+        // API key precedence: the secret store (settings UI) first, then the
+        // provider's `api_key_env`. The stored key is read only here, at resolve
+        // time, and never exported to a subprocess env overlay — so a shell/MCP
+        // command the agent runs cannot read it via `env`.
+        let api_key = match self
+            .secret_store()
+            .and_then(|s| s.get(&provider.name).transpose())
+        {
+            Some(result) => result?,
+            None => {
+                std::env::var(&provider.api_key_env).map_err(|_| ConfigError::MissingApiKey {
+                    provider: provider.name.clone(),
+                    env: provider.api_key_env.clone(),
+                })?
+            }
+        };
 
         let temperature = temperature_override
             .or(profile.model.temperature)
@@ -486,6 +583,28 @@ fn resolve_system_file(profile: &mut Profile, dir: &Path) -> Result<()> {
     })?;
     profile.prompt.system = Some(text);
     Ok(())
+}
+
+/// Write `text` to `path` atomically: write a sibling temp file, then rename it
+/// over `path` (an atomic replace on the same filesystem). Creates the parent
+/// directory if absent. A crash mid-write leaves either the old file or the new
+/// one, never a truncated one.
+fn write_atomic(path: &Path, text: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| ConfigError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, text).map_err(|source| ConfigError::Io {
+        path: tmp.clone(),
+        source,
+    })?;
+    std::fs::rename(&tmp, path).map_err(|source| ConfigError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 /// Read a file, returning `None` if it does not exist (a missing optional config
@@ -628,6 +747,51 @@ default = "openai-main/gpt-4o"
             }
             other => panic!("expected MissingApiKey, got {other:?}"),
         }
+    }
+
+    /// A key stored in the secret store resolves even when the provider's
+    /// `api_key_env` is unset — the store is the primary source (settings UI),
+    /// the env var only a fallback.
+    #[test]
+    fn secret_store_supplies_api_key_without_env() {
+        let providers_src = PROVIDERS.replace(
+            "api_key_env = \"HOME\"",
+            "api_key_env = \"OMINI_DEFINITELY_UNSET_VAR_XYZ\"",
+        );
+        let (_d, store) = store_with(&providers_src, &[]);
+        store
+            .secret_store()
+            .unwrap()
+            .set("openai-main", "sk-from-store")
+            .unwrap();
+        let providers = store.load_providers().unwrap();
+        let profile = Profile::builtin_default();
+        let r = store
+            .resolve(&providers, &profile, Some("gpt-4o"), None)
+            .unwrap();
+        assert_eq!(r.api_key, "sk-from-store");
+    }
+
+    /// The secret store wins over `api_key_env` when both are present, so a key
+    /// set in the UI overrides a stale environment variable.
+    #[test]
+    fn secret_store_takes_precedence_over_env() {
+        // PROVIDERS uses api_key_env = "HOME", which is set in the test env.
+        let (_d, store) = store_with(PROVIDERS, &[]);
+        store
+            .secret_store()
+            .unwrap()
+            .set("openai-main", "sk-store-wins")
+            .unwrap();
+        let providers = store.load_providers().unwrap();
+        let profile = Profile::builtin_default();
+        let r = store
+            .resolve(&providers, &profile, Some("gpt-4o"), None)
+            .unwrap();
+        assert_eq!(
+            r.api_key, "sk-store-wins",
+            "stored key must override the env-var fallback"
+        );
     }
 
     #[test]

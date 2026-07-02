@@ -57,6 +57,19 @@
 		<div class="sidebar-spacer"></div>
 
 		<div class="sidebar-bottom">
+			<a
+				href="/settings"
+				class="settings-btn"
+				class:active={active('/settings')}
+				title="设置"
+				aria-label="Settings"
+			>
+				<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+					<circle cx="12" cy="12" r="3" />
+					<path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+				</svg>
+				Settings
+			</a>
 			<button class="theme-btn" onclick={toggleTheme} title="切换主题">
 				{#if theme === 'dark'}
 					<svg width="11" height="11" viewBox="0 0 11 11" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">
@@ -198,9 +211,40 @@
 		padding: var(--space-3) var(--space-4) 0;
 		border-top: 1px solid var(--border-subtle);
 		display: flex;
-		align-items: center;
+		flex-direction: column;
+		align-items: stretch;
 		gap: var(--space-2);
 		margin-top: var(--space-3);
+	}
+
+	.settings-btn {
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+		padding: 5px var(--space-2);
+		border-radius: var(--radius-sm);
+		color: var(--text-secondary);
+		font-size: 12.5px;
+		font-weight: 450;
+		text-decoration: none;
+		transition:
+			color var(--dur-fast) var(--ease-out),
+			background var(--dur-fast) var(--ease-out);
+	}
+
+	.settings-btn:hover {
+		color: var(--text-primary);
+		background: var(--surface-hover);
+	}
+
+	.settings-btn.active {
+		color: var(--text-primary);
+		background: var(--surface-hover);
+		font-weight: 510;
+	}
+
+	.settings-btn svg {
+		flex-shrink: 0;
 	}
 
 	.theme-btn {

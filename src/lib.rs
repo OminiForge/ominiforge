@@ -26,6 +26,7 @@ pub mod memory;
 pub mod monitor;
 pub(crate) mod process_env;
 pub mod provider;
+pub mod secrets;
 pub mod session;
 pub mod skill;
 pub mod tool;

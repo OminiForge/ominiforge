@@ -103,7 +103,17 @@ fn router(state: AppState) -> Router {
         .route("/sessions/{id}/events", get(sse_events))
         .route("/sessions/{id}/ws", get(ws_events))
         .route("/profiles", get(list_profiles))
+        .route(
+            "/profiles/{name}",
+            get(get_profile).put(put_profile).delete(delete_profile),
+        )
         .route("/models", get(list_models))
+        .route("/providers", get(get_providers).put(put_providers))
+        .route(
+            "/secrets/{provider}",
+            axum::routing::put(put_secret).delete(delete_secret),
+        )
+        .route("/secrets", get(list_secrets))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state);
 
@@ -242,6 +252,109 @@ async fn list_profiles(State(state): State<AppState>) -> Response {
 async fn list_models(State(state): State<AppState>) -> Response {
     match state.registry.list_models() {
         Ok(models) => Json(json!({ "models": models })).into_response(),
+        Err(e) => internal_error(&e),
+    }
+}
+
+/// `GET /providers` — the full `providers.toml` for the settings UI, plus the
+/// set of provider names that have an API key in the secret store. Keys
+/// themselves are never returned; the UI shows only whether one is configured.
+async fn get_providers(State(state): State<AppState>) -> Response {
+    let providers = match state.registry.load_providers() {
+        Ok(p) => p,
+        Err(e) => return internal_error(&e),
+    };
+    let secret_names = match state.registry.secret_names() {
+        Ok(n) => n,
+        Err(e) => return internal_error(&e),
+    };
+    Json(json!({ "providers": providers.providers, "secret_names": secret_names })).into_response()
+}
+
+/// `PUT /providers` — overwrite `providers.toml` with the posted provider set
+/// (full desired state). A malformed body is a client error (400).
+async fn put_providers(
+    State(state): State<AppState>,
+    Json(providers): Json<crate::config::ProvidersFile>,
+) -> Response {
+    match state.registry.save_providers(&providers) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => internal_error(&e),
+    }
+}
+
+/// `GET /profiles/{name}` — the raw (unresolved) profile file, for editing.
+async fn get_profile(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    match state.registry.load_profile_raw(&name) {
+        Ok(profile) => Json(profile).into_response(),
+        Err(e) => not_found(&e),
+    }
+}
+
+/// `PUT /profiles/{name}` — overwrite (or create) profile `name`'s file.
+async fn put_profile(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(profile): Json<crate::config::Profile>,
+) -> Response {
+    match state.registry.save_profile(&name, &profile) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => internal_error(&e),
+    }
+}
+
+/// `DELETE /profiles/{name}` — remove profile `name`'s file. 404 if absent.
+async fn delete_profile(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    match state.registry.delete_profile(&name) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("profile `{name}` does not exist") })),
+        )
+            .into_response(),
+        Err(e) => internal_error(&e),
+    }
+}
+
+/// `GET /secrets` — the provider names that have an API key stored (never the
+/// keys themselves).
+async fn list_secrets(State(state): State<AppState>) -> Response {
+    match state.registry.secret_names() {
+        Ok(names) => Json(json!({ "secret_names": names })).into_response(),
+        Err(e) => internal_error(&e),
+    }
+}
+
+/// Body of a set-secret request: the API key to store for a provider.
+#[derive(Debug, Deserialize)]
+struct SecretBody {
+    /// The provider's API key. Stored in the secret store, never in
+    /// `providers.toml` and never exported to a subprocess environment.
+    api_key: String,
+}
+
+/// `PUT /secrets/{provider}` — store (or replace) the API key for `provider`.
+async fn put_secret(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+    Json(body): Json<SecretBody>,
+) -> Response {
+    match state.registry.set_secret(&provider, &body.api_key) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => internal_error(&e),
+    }
+}
+
+/// `DELETE /secrets/{provider}` — remove `provider`'s stored API key. 404 if
+/// none was stored.
+async fn delete_secret(State(state): State<AppState>, Path(provider): Path<String>) -> Response {
+    match state.registry.delete_secret(&provider) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("no stored key for provider `{provider}`") })),
+        )
+            .into_response(),
         Err(e) => internal_error(&e),
     }
 }
@@ -880,6 +993,171 @@ default = "openai-main/gpt-4o"
                 .any(|m| m["provider"] == "openai-main" && m["model_id"] == "gpt-4o"),
             "gpt-4o under openai-main must be listed, got {models:?}"
         );
+    }
+
+    /// `GET /providers` returns the raw provider set plus which providers have a
+    /// stored secret — the settings UI's read source. No key values appear.
+    #[tokio::test]
+    async fn get_providers_returns_config_and_secret_names() {
+        let (registry, _dir) = test_registry_with_config();
+        // Store a key so `secret_names` is non-empty.
+        registry.set_secret("openai-main", "sk-test").unwrap();
+        let state = AppState {
+            registry,
+            api_key: None,
+            pricing: Arc::new(PricingTable::default()),
+        };
+        let base = serve_test(state).await;
+
+        let resp = reqwest::get(format!("{base}/api/providers")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["providers"][0]["name"], "openai-main");
+        assert_eq!(body["secret_names"][0], "openai-main");
+        // The key value itself must never be serialized anywhere in the response.
+        assert!(
+            !serde_json::to_string(&body).unwrap().contains("sk-test"),
+            "the API key value must not appear in the providers response"
+        );
+    }
+
+    /// `PUT /providers` overwrites `providers.toml`; a following `GET` reflects
+    /// the new state — the settings UI's save round-trip.
+    #[tokio::test]
+    async fn put_providers_overwrites_and_reads_back() {
+        let (registry, _dir) = test_registry_with_config();
+        let state = AppState {
+            registry,
+            api_key: None,
+            pricing: Arc::new(PricingTable::default()),
+        };
+        let base = serve_test(state).await;
+
+        let body = json!({
+            "providers": [{
+                "name": "anthropic-main",
+                "type": "anthropic",
+                "base_url": "https://api.anthropic.com",
+                "api_key_env": "ANTHROPIC_API_KEY",
+                "models": [{
+                    "id": "claude-sonnet-4-6",
+                    "context_window": 200_000,
+                    "max_output_tokens": 16_000
+                }]
+            }]
+        });
+        let resp = reqwest::Client::new()
+            .put(format!("{base}/api/providers"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204);
+
+        let got: serde_json::Value = reqwest::get(format!("{base}/api/providers"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(got["providers"][0]["name"], "anthropic-main");
+        assert_eq!(got["providers"][0]["models"][0]["id"], "claude-sonnet-4-6");
+    }
+
+    /// Profile CRUD round-trip: PUT creates a file, GET reads it back raw, DELETE
+    /// removes it (and a second DELETE is a 404).
+    #[tokio::test]
+    async fn profile_put_get_delete_round_trip() {
+        let (registry, _dir) = test_registry_with_config();
+        let state = AppState {
+            registry,
+            api_key: None,
+            pricing: Arc::new(PricingTable::default()),
+        };
+        let base = serve_test(state).await;
+        let client = reqwest::Client::new();
+
+        let profile = json!({
+            "profile": { "name": "writing", "description": "Prose agent" },
+            "model": { "default": "openai-main/gpt-4o", "temperature": 0.7 }
+        });
+        let resp = client
+            .put(format!("{base}/api/profiles/writing"))
+            .json(&profile)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204);
+
+        let got: serde_json::Value = client
+            .get(format!("{base}/api/profiles/writing"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(got["profile"]["name"], "writing");
+        assert_eq!(got["model"]["temperature"], 0.7);
+
+        let resp = client
+            .delete(format!("{base}/api/profiles/writing"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204);
+        // Gone now → second delete is a 404.
+        let resp = client
+            .delete(format!("{base}/api/profiles/writing"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+    }
+
+    /// Secret set/delete round-trip: PUT stores a key (reflected in the secret
+    /// name list), DELETE removes it, and a second DELETE is a 404.
+    #[tokio::test]
+    async fn secret_put_delete_round_trip() {
+        let (registry, _dir) = test_registry_with_config();
+        let state = AppState {
+            registry,
+            api_key: None,
+            pricing: Arc::new(PricingTable::default()),
+        };
+        let base = serve_test(state).await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .put(format!("{base}/api/secrets/openai-main"))
+            .json(&json!({ "api_key": "sk-secret" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204);
+
+        let listed: serde_json::Value = client
+            .get(format!("{base}/api/secrets"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(listed["secret_names"][0], "openai-main");
+
+        let resp = client
+            .delete(format!("{base}/api/secrets/openai-main"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204);
+        let resp = client
+            .delete(format!("{base}/api/secrets/openai-main"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
     }
 
     /// A no-arg `POST /sessions` (no query string) still creates a session on the

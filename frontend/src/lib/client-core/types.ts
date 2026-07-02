@@ -8,6 +8,17 @@ import type { SessionSummary } from '$lib/types/SessionSummary';
 import type { RuntimeInfo } from '$lib/types/RuntimeInfo';
 import type { ProfileSummary } from '$lib/types/ProfileSummary';
 import type { ModelSummary } from '$lib/types/ModelSummary';
+import type { ProvidersFile } from '$lib/types/ProvidersFile';
+import type { Profile } from '$lib/types/Profile';
+
+/** The settings view of `providers.toml`: the raw provider set plus which
+ *  providers have an API key in the secret store. Key values are never sent —
+ *  the UI shows only whether one is configured (via `secret_names`). */
+export interface ProvidersView {
+	providers: ProvidersFile['providers'];
+	/** Provider names that have a stored API key. */
+	secret_names: string[];
+}
 
 /** Handle to a live event subscription; call `close()` to detach. */
 export interface EventSubscription {
@@ -68,6 +79,20 @@ export interface SessionClient {
 	getSummary(id: string): Promise<SessionSummary>;
 	/** Config-layer provider/model the gateway resolves for this session (RUNTIME panel). */
 	getRuntime(id: string): Promise<RuntimeInfo>;
+	/** The full provider set plus which providers have a stored API key (settings UI). */
+	getProviders(): Promise<ProvidersView>;
+	/** Overwrite `providers.toml` with the given provider set (full desired state). */
+	saveProviders(providers: ProvidersFile): Promise<void>;
+	/** The raw (unresolved) profile file `name`, for editing in the settings UI. */
+	getProfile(name: string): Promise<Profile>;
+	/** Overwrite (or create) profile `name`'s file. */
+	saveProfile(name: string, profile: Profile): Promise<void>;
+	/** Delete profile `name`'s file. */
+	deleteProfile(name: string): Promise<void>;
+	/** Store (or replace) the API key for `provider` in the secret store. */
+	setSecret(provider: string, apiKey: string): Promise<void>;
+	/** Delete `provider`'s stored API key. */
+	deleteSecret(provider: string): Promise<void>;
 	/**
 	 * Subscribe to a session's events. The transport replays committed events
 	 * after `lastSeq` from the durable log, then attaches the live stream

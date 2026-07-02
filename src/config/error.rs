@@ -28,9 +28,29 @@ pub enum ConfigError {
         source: toml::de::Error,
     },
 
-    /// The env var named by a provider's `api_key_env` is unset.
-    #[error("environment variable {env} (api_key_env for provider `{provider}`) is not set")]
+    /// A config value could not be serialized to TOML for writing.
+    #[error("failed to serialize {path}: {source}")]
+    Serialize {
+        path: PathBuf,
+        #[source]
+        source: toml::ser::Error,
+    },
+
+    /// A write was requested but the store has no config root to write into.
+    #[error("no config root available to write configuration")]
+    NoRoot,
+
+    /// Neither the secret store nor the env var named by `api_key_env` yields a
+    /// key for the provider.
+    #[error(
+        "no API key for provider `{provider}`: not in the secret store and \
+         environment variable {env} (api_key_env) is not set"
+    )]
     MissingApiKey { provider: String, env: String },
+
+    /// The secret store (`SQLite`) could not be opened or queried.
+    #[error(transparent)]
+    Secret(#[from] crate::secrets::SecretError),
 
     /// A model reference did not resolve to any configured provider/model.
     #[error("unknown model reference `{0}`: no matching provider/model in providers.toml")]
