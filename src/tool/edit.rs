@@ -11,8 +11,8 @@
 //! stale, so the patch is rejected rather than applied to the wrong lines. See
 //! `doc/tool-protocol.md`.
 
-use std::path::PathBuf;
 use std::fmt::Write;
+use std::path::PathBuf;
 
 use serde::Deserialize;
 
