@@ -309,4 +309,10 @@
 			padding: 0;
 		}
 	}
+
+	/* Scrollbar — cross-browser (Edge Fluent: color only; Chrome/Safari: full control) */
+	:global(html) {
+		scrollbar-width: thin;
+		scrollbar-color: var(--canvas-float) var(--canvas-overlay);
+	}
 </style>

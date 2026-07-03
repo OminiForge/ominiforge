@@ -48,3 +48,34 @@ pre {
 	outline: 2px solid var(--accent);
 	outline-offset: 2px;
 }
+
+/* Scrollbar — WebKit progressive enhancement (Edge ignores these) */
+::-webkit-scrollbar {
+	width: 5px;
+	height: 5px;
+}
+
+::-webkit-scrollbar-button {
+	background: transparent;
+	display: none;
+	width: 0;
+	height: 0;
+}
+
+::-webkit-scrollbar-track {
+	background: transparent;
+}
+
+::-webkit-scrollbar-corner {
+	background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+	background: var(--canvas-float);
+	border-radius: 10px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+	background: var(--text-disabled);
+}
+
