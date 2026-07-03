@@ -34,6 +34,11 @@ colors:
   syntax-key: '#7b9bd8'
   syntax-str: '#a8d68a'
   syntax-num: '#e8a838'
+  syntax-keyword: '#c98fd4'
+  syntax-comment: '#5c5c6e'
+  syntax-fn: '#7bc4d8'
+  syntax-type: '#d8c47b'
+  plan-accent: '#8a8ad0'
 typography:
   product-title:
     fontFamily: Inter
@@ -224,7 +229,8 @@ ominiforge Web 控制台是**开发者每天盯 8 小时的 agent 生产工具**
 | 状态      | `--state-{done,running,error}` + `-bg` + `-text`                | base=pip/边框；bg=徽章底；text=徽章字                                                                                             |
 | reasoning | `--reasoning-border/bg/text`                                    | think 块专用，靛蓝调，刻意「次一级」                                                                                              |
 | user 气泡 | `--user-bg/border`                                              | 用户消息，acid-lime 淡色调                                                                                                        |
-| 代码高亮  | `--syntax-key/str/num`                                          | tool JSON 参数着色                                                                                                                |
+| 代码高亮  | `--syntax-key/str/num/keyword/comment/fn/type`              | 语法高亮：key=变量、str=字符串、num=数字、keyword=关键字、comment=注释、fn=函数、type=类型                                    |
+| plan 卡片 | `--plan-accent`                                              | Plan 卡片专用，靛蓝调，与 reasoning 同系                                                                                         |
 
 > 旧变量名（`--bg-primary`/`--surface`/`--border`/`--accent-fg` 等）保留为别名，向后兼容。新代码优先用上表语义名。
 
@@ -239,6 +245,21 @@ ominiforge Web 控制台是**开发者每天盯 8 小时的 agent 生产工具**
 - 标题层级：18–28px 的产品标题可用 `letter-spacing: -0.01em` 到 `-0.03em`；不要引入 Linear 官网式 56/80px hero 标题，除非未来真的做 marketing page。
 - label/eyebrow：mono uppercase label 可用 `letter-spacing: 0.07em` 到 `0.09em`，作为分类信息，不要当装饰。
 
+### 3.1 间距规则
+
+使用 `--space-{n}` 命名，基于 4px 网格：
+
+- `--space-1: 4px`（对应旧 `xs`）
+- `--space-2: 8px`（对应旧 `sm`）
+- `--space-3: 12px`（对应旧 `md`）
+- `--space-4: 16px`（对应旧 `lg`）
+- `--space-5: 20px`
+- `--space-6: 24px`（对应旧 `xl`）
+- `--space-8: 32px`（对应旧 `xxl`）
+- `--space-10: 40px`（对应旧 `page-x`）
+- `--space-12: 48px`
+
+> 旧语义名（`--gap-xs/sm/md/lg/xl`）保留为别名，向后兼容。新代码优先用 `--space-{n}`。
 ---
 
 ## 4. 组件规范
@@ -264,15 +285,61 @@ ominiforge Web 控制台是**开发者每天盯 8 小时的 agent 生产工具**
 - 控件密度参考 Linear 的紧凑原则：按钮约 `8px 14px`，输入约 `8px 12px`；触屏断点下可放大点击面积，但不要默认做巨大 CTA。
 - 下方 `Type / for commands` 提示（`--text-disabled`，mono）。
 - 状态行：turn incomplete 时显示 `Turn incomplete`（`--state-running-text`）。
+- **Config Picker**：在输入区 actions 行，点击配置按钮弹出 popover（向上弹出），可选择 Profile 和 Model。
+  - 格式：`{profile} · {model}`，默认显示 `default · default model`。
+  - popover 使用 `--canvas-overlay` 背景、`--border-default` 边框、`--radius-lg` 圆角、`--shadow-md` 阴影。
+  - draft 时用于配置新会话；live session 时用于查看/切换配置（切换会基于当前对话开启新会话）。
 
-### 4.3 侧栏 + RUNTIME（`+layout.svelte`）
+### 4.3 侧栏 + Detail Rail（`+layout.svelte` + `Conversation.svelte`）
 
 - brand mark（acid-lime 方块）+ 分组 label（`Nav`/`Runtime`，mono uppercase）+ nav-item（active=lime 点+高亮）。
-- **RUNTIME**：仅当在 session 页（`currentSession` store 非 null）显示。竖排 label/value，顺序固定 **workspace → env → model → profile**，**每项仅有数据才渲染**（"检测到才显示"）。
-  - 当前：workspace/profile 接 `SessionMeta`（真）；model/env 待后端（Phase B1/B2），暂不渲染。
+- 侧栏仅保留导航（Dashboard、Evolution、Settings）和主题切换。
 - 离开 session 页清空 store，避免上下文泄漏到列表/monitor/evolution。
 
-### 4.4 内容页外壳（list/monitor/evolution）
+### 4.4 Detail Rail（会话详情栏）
+
+会话页面右侧的信息面板，宽度 300px，背景 `--canvas-raised`，左侧 `--border-subtle` 边框。
+
+包含三个 section，每 section 有 mono uppercase label（`Info`/`Context`/`Stats`）：
+
+- **INFO**：竖排 label/value（mono），显示以下项（**每项仅有数据才渲染**）：
+  - Workspace（工作区路径，取最后两段显示）
+  - Env（环境信息，待后端 Phase B2）
+  - Model（`runtime.model`）
+  - Profile（`meta.profile_id`）
+  - ⚠ Runtime（当运行时模型 ≠ 配置模型时显示，红色警告）
+- **CONTEXT**：实时上下文窗口占用（`context_updated` 事件驱动）
+  - 进度条显示 `tokens / window` 百分比
+  - 阈值标记（compaction-threshold tick）
+  - 超过阈值时进度条变红（`--state-error-text`）
+- **STATS**：折叠摘要快照（`SessionSummary`），每轮结束刷新
+  - 统计指标：轮次、请求数、工具调用/失败数、费用、输入/输出 token、缓存
+  - 工具使用：top 6 工具的使用次数和百分比进度条（`--text-tertiary` 色，不用 accent）
+
+可通过 topbar 右侧按钮切换显示/隐藏。小屏幕（<900px）堆叠到对话下方。
+
+### 4.5 Plan 卡片
+
+Plan 卡片用于显示任务计划，支持折叠/展开。颜色使用 `--plan-accent`（靛蓝调，与 reasoning 同系）。
+
+**内联版本**（历史记录）：
+- 使用 `--canvas-overlay` 背景、`--border-subtle` 边框
+- 头部：Plan 标题 + 进度条 + 展开/折叠箭头
+- 步骤列表：每步包含状态标记 + 内容
+
+**Pinned 版本**（固定在输入区上方）：
+- 与输入框共享宽度和内边距（`max-width: 740px`）
+- 使用 `--radius-lg` 圆角、`--border-default` 边框（匹配 input-box）
+- 默认折叠，节省垂直空间
+
+**步骤状态标记**（5 种，颜色+形状冗余表达）：
+- `pending`：灰色圆点（`--text-tertiary`）
+- `in_progress`：琥珀色 spinner（`--state-running`）
+- `completed`：绿色勾选图标（`--state-done`）
+- `blocked`：红色圆圈+斜线图标（`--state-error`）
+- `cancelled`：灰色叉号图标（`--text-disabled`），文字加删除线
+
+### 4.6 内容页外壳（list/monitor/evolution）
 
 layout 的 `main` **不带 padding**（对话页要全屏）。每个内容页自己包 `.page { height:100%; overflow-y:auto; padding: var(--space-8) var(--space-10); }`。
 
@@ -333,8 +400,8 @@ layout 的 `main` **不带 padding**（对话页要全屏）。每个内容页�
 
 ## 8. 路线图（详见 `~/.claude/plans/robust-toasting-moon.md`）
 
-- **B1** 后端 gateway 暴露 resolved provider/model → RUNTIME 显示真 model
-- **B2** 后端探测 workspace env（flake.nix/Cargo.toml…）→ RUNTIME 显示 env
-- **B3** 前端 RUNTIME 接 B1/B2 真数据（组件已写成「有值才渲染」，后端就绪即自动出现）
+- **B1** 后端 gateway 暴露 resolved provider/model → Detail Rail INFO 显示真 model
+- **B2** 后端探测 workspace env（flake.nix/Cargo.toml…）→ Detail Rail INFO 显示 env
+- **B3** 前端 Detail Rail 接 B1/B2 真数据（组件已写成「有值才渲染」，后端就绪即自动出现）
 - **B4** 运行层校验：从事件流 `ModelEvent::RequestStarted` 提取实际 model，与配置层比对，不一致 fail loud（不替换显示源）
 - **C** monitor + evolution 铺满 v2 设计语言（含 monitor 的 `.error` 样式统一为全框红边）
