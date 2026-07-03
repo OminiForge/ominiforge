@@ -15,9 +15,23 @@
 		status: 'running' | 'done' | 'error';
 		error_code?: string;
 	} = $props();
+
+	/** Extract the command string from the shell tool's JSON args. */
+	const command = $derived.by(() => {
+		try {
+			const obj = JSON.parse(args) as Record<string, unknown>;
+			for (const k of ['command', 'cmd', 'script']) {
+				if (typeof obj[k] === 'string' && obj[k]) return obj[k] as string;
+			}
+		} catch { /* partial or invalid JSON */ }
+		return null;
+	});
 </script>
 
 <div class="result">
+	{#if command}
+		<div class="cmd">{command}</div>
+	{/if}
 	{#if result}
 		<pre class="out">{result}</pre>
 	{:else if status === 'error'}
@@ -33,6 +47,15 @@
 		font-size: 11.5px;
 		max-height: 320px;
 		overflow: auto;
+	}
+	.cmd {
+		color: var(--accent-ink);
+		font-weight: 500;
+		line-height: 1.5;
+		margin-bottom: var(--space-2);
+		padding-bottom: var(--space-2);
+		border-bottom: 1px solid var(--border-subtle);
+		word-break: break-all;
 	}
 	.out {
 		margin: 0;

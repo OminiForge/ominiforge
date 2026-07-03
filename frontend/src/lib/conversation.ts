@@ -462,6 +462,11 @@ function applyDelta(
 			}
 			return { ...state, items, open };
 		}
+		// NOTE: The gateway no longer sends tool_args deltas (non-streaming
+		// tool calls — see actor.rs).  This branch is kept for:
+		//  1. TUI path which still uses live tool_args deltas
+		//  2. Defensive handling if a delta ever arrives
+		//  3. Test coverage (conversation.test.ts)
 		case 'tool_args': {
 			const pos = open[ev.index];
 			const cur = pos !== undefined ? items[pos] : undefined;

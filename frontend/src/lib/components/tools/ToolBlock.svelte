@@ -4,16 +4,16 @@
 
 	/** The 120% tool card (DESIGN.md §4.1): a collapsible three-state shell (pip +
 	 *  name + status badge + arg preview + chevron) whose body is dispatched to a
-	 *  per-tool result component by name. Expand follows status by default — a
-	 *  running tool is open, a finished one auto-collapses — until the user clicks,
-	 *  after which their choice sticks. */
+	 *  per-tool result component by name.  All tools stay open after completion;
+	 *  `read` auto-collapses.  The user's toggle overrides and persists across
+	 *  status flips. */
 	let { item }: { item: Item & { kind: 'tool' } } = $props();
 
-	// null = follow status default; true/false = user's explicit choice. A running
-	// tool defaults open (watch it work); done/error collapse (result is a click
-	// away). The user's toggle overrides and persists across status flips.
+	// Tools stay open after completion, except `read` which auto-collapses.
 	let override = $state<boolean | null>(null);
-	const expanded = $derived(override ?? item.status === 'running');
+	const expanded = $derived(
+		override ?? !(item.name === 'read' && item.status !== 'running')
+	);
 	const Body = $derived(resultComponent(item.name));
 
 	function clip(s: string, n: number): string {

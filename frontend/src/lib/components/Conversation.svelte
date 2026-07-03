@@ -415,9 +415,8 @@
 
 	function isCollapsed(item: Item, i: number): boolean {
 		if (i in collapsed) return collapsed[i];
-		// Auto-collapse finished reasoning and completed tools
+		// Auto-collapse finished reasoning (tools stay open per user preference)
 		if (item.kind === 'reasoning') return !item.streaming;
-		if (item.kind === 'tool') return item.status === 'done' || item.status === 'error';
 		// Auto-collapse a plan once every step is terminal (the work is done);
 		// keep an active plan open so the running task stays visible.
 		if (item.kind === 'plan') return item.steps.length > 0 && planDone(item.steps);
