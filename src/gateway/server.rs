@@ -40,10 +40,12 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::config::ConfigError;
 use crate::core::SessionId;
 use crate::monitor::{self, PricingTable};
+use crate::session::SessionMeta;
 
 use super::actor::{ActorHandle, Command, GatewayEvent};
 use super::config::GatewayConfig;
 use super::registry::SessionRegistry;
+use super::workspace::{WorkspaceId, group_sessions};
 
 /// Shared server state: the session registry and the optional bearer token.
 #[derive(Clone)]
@@ -91,6 +93,11 @@ pub async fn serve(
 /// gateway serves the static frontend from the same origin (`doc/gateway.md`).
 fn router(state: AppState) -> Router {
     let protected = Router::new()
+        .route("/workspaces", get(list_workspaces).post(create_workspace))
+        .route(
+            "/workspaces/{id}/sessions",
+            get(list_workspace_sessions).post(create_workspace_session),
+        )
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}", get(get_session))
         .route("/sessions/{id}/fork", post(fork_session))
@@ -153,6 +160,132 @@ async fn list_sessions(State(state): State<AppState>) -> Response {
             Json(json!({ "sessions": ids })).into_response()
         }
         Err(e) => internal_error(&e),
+    }
+}
+
+/// `GET /workspaces` — sessions grouped by workspace, most-recently-active
+/// first (the no-workspace group pinned last). This is the dashboard's read
+/// source: one call yields every workspace with its session count + latest
+/// activity, computed server-side so the frontend never groups client-side.
+async fn list_workspaces(State(state): State<AppState>) -> Response {
+    match state.registry.list_metas() {
+        Ok(metas) => {
+            let workspaces = group_sessions(metas);
+            Json(json!({ "workspaces": workspaces })).into_response()
+        }
+        Err(e) => internal_error(&e),
+    }
+}
+
+/// `GET /workspaces/{id}/sessions` — the session metadata for one workspace,
+/// newest first. `id` is a path-derived [`WorkspaceId`] (or the `"none"`
+/// sentinel); sessions whose workspace hashes to it are returned. Returns an
+/// empty list for an unknown id rather than 404 — a workspace only exists as
+/// long as a session references it, so "no such workspace" and "workspace with
+/// no sessions" are the same state.
+async fn list_workspace_sessions(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let metas = match state.registry.list_metas() {
+        Ok(m) => m,
+        Err(e) => return internal_error(&e),
+    };
+    let target = WorkspaceId(id);
+    let sessions: Vec<SessionMeta> = metas
+        .into_iter()
+        .filter(|m| {
+            let wid = m
+                .workspace
+                .as_deref()
+                .map_or_else(WorkspaceId::none, WorkspaceId::from_path);
+            wid == target
+        })
+        .collect();
+    Json(json!({ "sessions": sessions })).into_response()
+}
+
+/// Body of a create-workspace request: the absolute path to open.
+#[derive(Debug, Deserialize)]
+struct CreateWorkspaceBody {
+    /// Absolute path of the workspace directory.
+    path: String,
+}
+
+/// `POST /workspaces` — register a workspace by path and return its opaque id.
+/// The path is canonicalized and recorded in the gateway's workspace map (so a
+/// later `POST /workspaces/{id}/sessions` can resolve it server-side); only the
+/// id is returned — the path never travels back to the client. A path that does
+/// not exist or is not a directory is a client error (400).
+async fn create_workspace(
+    State(state): State<AppState>,
+    Json(body): Json<CreateWorkspaceBody>,
+) -> Response {
+    let path = std::path::PathBuf::from(&body.path);
+    // Guard "is a directory" before recording: sessions run in a directory, and
+    // canonicalize alone would accept a regular file.
+    match std::fs::canonicalize(&path) {
+        Ok(canonical) if canonical.is_dir() => {}
+        Ok(_) => {
+            return bad_request(&anyhow::anyhow!(
+                "workspace path is not a directory: {}",
+                body.path
+            ));
+        }
+        Err(_) => {
+            return bad_request(&anyhow::anyhow!(
+                "workspace path does not exist: {}",
+                body.path
+            ));
+        }
+    }
+    match state.registry.record_workspace(&path) {
+        Ok(id) => (StatusCode::CREATED, Json(json!({ "workspace_id": id.0 }))).into_response(),
+        Err(e) => internal_error(&e),
+    }
+}
+
+/// Optional per-session overrides for [`create_workspace_session`], as query
+/// params (`?profile=&model=`). Workspace is absent — it is fixed by the path
+/// the workspace id resolves to, never chosen by the client.
+#[derive(Debug, Default, Deserialize)]
+struct WorkspaceSessionParams {
+    /// Profile name to bind; gateway default when absent.
+    profile: Option<String>,
+    /// Model override (`provider/model_id` or bare `model_id`); profile default
+    /// when absent.
+    model: Option<String>,
+}
+
+/// `POST /workspaces/{id}/sessions` — create a session **in the workspace `id`**
+/// resolves to, returning its id. The workspace path is looked up server-side
+/// from the workspace map (recorded via `POST /workspaces` or seeded from an
+/// existing session), so the client never sends a path. Optional
+/// `?profile=&model=` choose per-session overrides. An unknown id is a 404; a
+/// bad profile/model is a 400.
+async fn create_workspace_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(params): Query<WorkspaceSessionParams>,
+) -> Response {
+    let wid = WorkspaceId(id);
+    let result = state
+        .registry
+        .create_in_workspace(&wid, params.profile.as_deref(), params.model.as_deref())
+        .await;
+    match result {
+        Ok((sid, _handle)) => {
+            (StatusCode::CREATED, Json(json!({ "session_id": sid.0 }))).into_response()
+        }
+        Err(e) => {
+            // An unknown workspace id is a 404; a bad profile/model is a 400
+            // (via create_error); anything else is a 500.
+            if e.to_string().contains("unknown workspace id") {
+                not_found(&e)
+            } else {
+                create_error(&e)
+            }
+        }
     }
 }
 
@@ -1338,5 +1471,232 @@ default = "openai-main/gpt-4o"
             .await
             .unwrap();
         assert_eq!(resp.status(), 400);
+    }
+
+    /// `GET /workspaces` groups sessions by their workspace path. Two sessions in
+    /// the same workspace collapse to one group with `session_count = 2`; a
+    /// session in a different workspace is its own group. This is the dashboard's
+    /// read source — grouping happens server-side.
+    #[tokio::test]
+    async fn list_workspaces_groups_by_path() {
+        let (registry, dir) = test_registry_with_config();
+        let store = registry.store();
+
+        // Two sessions in workspace A, one in workspace B. Use real dirs so the
+        // paths are stable (create_new stamps meta.workspace verbatim).
+        let ws_a = dir.path().join("proj-a");
+        let ws_b = dir.path().join("proj-b");
+        std::fs::create_dir_all(&ws_a).unwrap();
+        std::fs::create_dir_all(&ws_b).unwrap();
+
+        for _ in 0..2 {
+            drop(
+                store
+                    .create_new(None, Some(ws_a.clone()), vec![])
+                    .unwrap(),
+            );
+        }
+        drop(store.create_new(None, Some(ws_b.clone()), vec![]).unwrap());
+
+        let state = AppState {
+            registry,
+            api_key: None,
+            pricing: Arc::new(PricingTable::default()),
+        };
+        let base = serve_test(state).await;
+
+        let body: serde_json::Value = reqwest::get(format!("{base}/api/workspaces"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let workspaces = body["workspaces"].as_array().unwrap();
+        assert_eq!(workspaces.len(), 2, "two distinct workspaces");
+
+        let a = workspaces
+            .iter()
+            .find(|w| w["path"].as_str().unwrap().ends_with("proj-a"))
+            .unwrap();
+        assert_eq!(a["session_count"], 2);
+        let b = workspaces
+            .iter()
+            .find(|w| w["path"].as_str().unwrap().ends_with("proj-b"))
+            .unwrap();
+        assert_eq!(b["session_count"], 1);
+    }
+
+    /// `GET /workspaces/{id}/sessions` returns exactly the sessions whose
+    /// workspace hashes to `id`. Sessions in a different workspace are excluded,
+    /// so the panel's sidebar only ever shows its own workspace's sessions.
+    #[tokio::test]
+    async fn list_workspace_sessions_filters_to_the_workspace() {
+        let (registry, dir) = test_registry_with_config();
+        let store = registry.store();
+
+        let ws_a = dir.path().join("proj-a");
+        let ws_b = dir.path().join("proj-b");
+        std::fs::create_dir_all(&ws_a).unwrap();
+        std::fs::create_dir_all(&ws_b).unwrap();
+        let in_a = store
+            .create_new(None, Some(ws_a.clone()), vec![])
+            .unwrap()
+            .session_id()
+            .clone();
+        drop(store.create_new(None, Some(ws_b.clone()), vec![]).unwrap());
+
+        let wid = crate::gateway::WorkspaceId::from_path(&ws_a).0;
+
+        let state = AppState {
+            registry,
+            api_key: None,
+            pricing: Arc::new(PricingTable::default()),
+        };
+        let base = serve_test(state).await;
+
+        let body: serde_json::Value =
+            reqwest::get(format!("{base}/api/workspaces/{wid}/sessions"))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        let sessions = body["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1, "only workspace A's session");
+        assert_eq!(sessions[0]["id"], in_a.0);
+    }
+
+    /// `POST /workspaces` with an existing directory returns 201 + the id that
+    /// path hashes to (so the dashboard can route straight to the panel). The id
+    /// matches [`WorkspaceId::from_path`] on the canonicalized path.
+    #[tokio::test]
+    async fn create_workspace_returns_derived_id() {
+        let (registry, dir) = test_registry_with_config();
+        let ws = dir.path().join("new-proj");
+        std::fs::create_dir_all(&ws).unwrap();
+        let state = AppState {
+            registry,
+            api_key: None,
+            pricing: Arc::new(PricingTable::default()),
+        };
+        let base = serve_test(state).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/api/workspaces"))
+            .json(&json!({ "path": ws.to_str().unwrap() }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        // The returned id hashes the canonicalized path; recompute to compare.
+        let canonical = std::fs::canonicalize(&ws).unwrap();
+        let expected = crate::gateway::WorkspaceId::from_path(&canonical).0;
+        assert_eq!(body["workspace_id"], expected);
+    }
+
+    /// `POST /workspaces` with a path that does not exist is a client error (400),
+    /// not a 500 — the user typed a bad path.
+    #[tokio::test]
+    async fn create_workspace_missing_path_is_400() {
+        let (registry, _dir) = test_registry_with_config();
+        let state = AppState {
+            registry,
+            api_key: None,
+            pricing: Arc::new(PricingTable::default()),
+        };
+        let base = serve_test(state).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/api/workspaces"))
+            .json(&json!({ "path": "/no/such/dir/ominiforge-ws-test" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    /// `POST /workspaces/{id}/sessions` creates a session in the workspace the id
+    /// resolves to: after recording a workspace, the session created via its id
+    /// has `meta.workspace` hashing back to that same id — NOT the gateway
+    /// default. This is the regression guard for "new sessions all land in the
+    /// default workspace" (bug 3).
+    #[tokio::test]
+    async fn create_workspace_session_lands_in_that_workspace() {
+        let (registry, dir) = test_registry_with_config();
+        // A real target workspace distinct from the gateway default (dir.path()).
+        let ws = dir.path().join("target-ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let canonical = std::fs::canonicalize(&ws).unwrap();
+        let wid = crate::gateway::WorkspaceId::from_path(&canonical).0;
+
+        let state = AppState {
+            registry,
+            api_key: None,
+            pricing: Arc::new(PricingTable::default()),
+        };
+        let base = serve_test(state).await;
+        let http = reqwest::Client::new();
+
+        // Record the workspace (returns the same id we computed).
+        let rec: serde_json::Value = http
+            .post(format!("{base}/api/workspaces"))
+            .json(&json!({ "path": ws.to_str().unwrap() }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(rec["workspace_id"], wid);
+
+        // Create a session in that workspace by id.
+        let resp = http
+            .post(format!("{base}/api/workspaces/{wid}/sessions"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        let sid = resp.json::<serde_json::Value>().await.unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // The new session's workspace hashes back to the id we created under.
+        let meta: serde_json::Value = http
+            .get(format!("{base}/api/sessions/{sid}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let landed = std::path::PathBuf::from(meta["workspace"].as_str().unwrap());
+        assert_eq!(
+            crate::gateway::WorkspaceId::from_path(&landed).0,
+            wid,
+            "session must land in the requested workspace, not the gateway default"
+        );
+    }
+
+    /// `POST /workspaces/{id}/sessions` for an id the gateway has never seen (no
+    /// recorded path, no session to seed from) is a 404 — not a 500 or a session
+    /// silently created in the default workspace.
+    #[tokio::test]
+    async fn create_workspace_session_unknown_id_is_404() {
+        let (registry, _dir) = test_registry_with_config();
+        let state = AppState {
+            registry,
+            api_key: None,
+            pricing: Arc::new(PricingTable::default()),
+        };
+        let base = serve_test(state).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/api/workspaces/deadbeefdeadbeef/sessions"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
     }
 }

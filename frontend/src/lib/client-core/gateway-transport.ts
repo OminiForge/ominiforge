@@ -14,6 +14,7 @@ import type { ProfileSummary } from '$lib/types/ProfileSummary';
 import type { ModelSummary } from '$lib/types/ModelSummary';
 import type { ProvidersFile } from '$lib/types/ProvidersFile';
 import type { Profile } from '$lib/types/Profile';
+import type { WorkspaceSummary } from '$lib/types/WorkspaceSummary';
 import { endpoints } from './endpoints';
 import type {
 	CreateSessionOptions,
@@ -70,6 +71,43 @@ export class GatewayTransport implements SessionClient {
 	async listSessions(): Promise<string[]> {
 		const body = await this.#json<{ sessions: string[] }>(endpoints.sessions());
 		return body.sessions;
+	}
+
+	async listWorkspaces(): Promise<WorkspaceSummary[]> {
+		const body = await this.#json<{ workspaces: WorkspaceSummary[] }>(endpoints.workspaces());
+		return body.workspaces;
+	}
+
+	async listWorkspaceSessions(workspaceId: string): Promise<SessionMeta[]> {
+		const body = await this.#json<{ sessions: SessionMeta[] }>(
+			endpoints.workspaceSessions(workspaceId)
+		);
+		return body.sessions;
+	}
+
+	async createWorkspace(path: string): Promise<string> {
+		const body = await this.#json<{ workspace_id: string }>(endpoints.workspaces(), {
+			method: 'POST',
+			body: JSON.stringify({ path })
+		});
+		return body.workspace_id;
+	}
+
+	async createWorkspaceSession(
+		workspaceId: string,
+		opts?: { profile?: string; model?: string }
+	): Promise<string> {
+		// Overrides ride as query params (`?profile=&model=`), mirroring
+		// createSession; the workspace is implicit in the path, resolved
+		// server-side from `workspaceId` — no path is ever sent.
+		const qs = new URLSearchParams();
+		if (opts?.profile) qs.set('profile', opts.profile);
+		if (opts?.model) qs.set('model', opts.model);
+		const query = qs.toString();
+		const base = endpoints.workspaceSessions(workspaceId);
+		const path = query ? `${base}?${query}` : base;
+		const body = await this.#json<{ session_id: string }>(path, { method: 'POST' });
+		return body.session_id;
 	}
 
 	async createSession(opts?: CreateSessionOptions): Promise<string> {

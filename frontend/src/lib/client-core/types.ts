@@ -10,6 +10,7 @@ import type { ProfileSummary } from '$lib/types/ProfileSummary';
 import type { ModelSummary } from '$lib/types/ModelSummary';
 import type { ProvidersFile } from '$lib/types/ProvidersFile';
 import type { Profile } from '$lib/types/Profile';
+import type { WorkspaceSummary } from '$lib/types/WorkspaceSummary';
 
 /** The settings view of `providers.toml`: the raw provider set plus which
  *  providers have an API key in the secret store. Key values are never sent —
@@ -52,6 +53,23 @@ export interface EventHandlers {
 }
 
 export interface SessionClient {
+	/** Sessions grouped by workspace, most-recently-active first (no-workspace
+	 *  group pinned last). The dashboard's read source — grouping is server-side. */
+	listWorkspaces(): Promise<WorkspaceSummary[]>;
+	/** The session metadata for one workspace (by path-derived id, or `"none"`),
+	 *  newest first. Empty for an unknown id — a workspace only exists while a
+	 *  session references it. */
+	listWorkspaceSessions(workspaceId: string): Promise<SessionMeta[]>;
+	/** Register a workspace by absolute path; resolves to its derived id (the
+	 *  route the dashboard should open). Rejects if the path does not exist. */
+	createWorkspace(path: string): Promise<string>;
+	/** Create a session inside the workspace `workspaceId` resolves to; resolves
+	 *  to the new session id. The workspace is fixed by the id (its path is
+	 *  resolved server-side, never sent), so only profile/model are overridable. */
+	createWorkspaceSession(
+		workspaceId: string,
+		opts?: { profile?: string; model?: string }
+	): Promise<string>;
 	/** Session ids, newest first. */
 	listSessions(): Promise<string[]>;
 	/** Create a fresh session; resolves to its id. `opts` chooses a per-session

@@ -6,6 +6,8 @@
 const API = '/api';
 
 export const endpoints = {
+	workspaces: () => `${API}/workspaces`,
+	workspaceSessions: (id: string) => `${API}/workspaces/${encodeURIComponent(id)}/sessions`,
 	sessions: () => `${API}/sessions`,
 	session: (id: string) => `${API}/sessions/${encodeURIComponent(id)}`,
 	fork: (id: string) => `${API}/sessions/${encodeURIComponent(id)}/fork`,

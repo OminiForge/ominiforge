@@ -2,48 +2,25 @@
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { client } from '$lib/client';
-	import type { SessionMeta } from '$lib/types/SessionMeta';
-	import type { SessionSummary } from '$lib/types/SessionSummary';
-	import type { ProfileSummary } from '$lib/types/ProfileSummary';
-	import type { ModelSummary } from '$lib/types/ModelSummary';
-	import { stashDraftConfig } from '$lib/draft-config';
-	import { statLabel, formatCost, cacheLabel, topTools } from '$lib/stats';
+	import type { WorkspaceSummary } from '$lib/types/WorkspaceSummary';
 
-	/** One dashboard card: a session's metadata plus its folded summary. `summary`
-	 *  is null when the per-session fold failed — the card still renders (title +
-	 *  time), just without metrics, so one bad session never blanks the grid. */
-	interface Row {
-		meta: SessionMeta;
-		summary: SessionSummary | null;
-	}
-
-	let rows = $state<Row[]>([]);
+	let workspaces = $state<WorkspaceSummary[]>([]);
 	let loading = $state(true);
 	let error = $state<string | null>(null);
 
-	// "New session ▾" config popover: profile / model / workspace for the next
-	// draft. Options are fetched once on mount; the choice is stashed and read by
-	// the draft page (see lib/draft-config).
+	// "New workspace" popover: an absolute path to open. We have no filesystem
+	// picker yet, so the user types the path; the gateway validates it exists and
+	// returns the id to route to.
 	let cfgOpen = $state(false);
-	let profiles = $state<ProfileSummary[]>([]);
-	let models = $state<ModelSummary[]>([]);
-	let selProfile = $state('');
-	let selModel = $state('');
-	let selWorkspace = $state('');
+	let newPath = $state('');
+	let creating = $state(false);
+	let createError = $state<string | null>(null);
 
 	async function refresh() {
 		loading = true;
 		error = null;
 		try {
-			const ids = await client.listSessions();
-			rows = await Promise.all(
-				ids.map(async (id): Promise<Row> => {
-					const meta = await client.getSession(id);
-					// Summary is best-effort: a fold failure must not drop the card.
-					const summary = await client.getSummary(id).catch(() => null);
-					return { meta, summary };
-				})
-			);
+			workspaces = await client.listWorkspaces();
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 		} finally {
@@ -51,39 +28,34 @@
 		}
 	}
 
-	/** Load the profile + model options for the config popover. Best-effort: a
-	 *  failure leaves the dropdowns empty and the plain "New session" still works. */
-	async function loadConfigOptions() {
+	/** Register the typed path as a workspace and open its panel. The gateway
+	 *  rejects a non-existent path (400) — surfaced inline, not thrown away. */
+	async function createWorkspace() {
+		const path = newPath.trim();
+		if (!path || creating) return;
+		creating = true;
+		createError = null;
 		try {
-			[profiles, models] = await Promise.all([client.listProfiles(), client.listModels()]);
-		} catch {
-			/* leave empty */
+			const id = await client.createWorkspace(path);
+			cfgOpen = false;
+			newPath = '';
+			void goto(`/workspaces/${id}`);
+		} catch (e) {
+			createError = e instanceof Error ? e.message : String(e);
+		} finally {
+			creating = false;
 		}
 	}
 
-	function create() {
-		// Plain "New session": open a draft on gateway defaults. The real session
-		// is created lazily on first send (sessions/[id]), so this never leaves an
-		// empty one. Clear any stale stashed config so defaults truly apply.
-		stashDraftConfig({});
-		void goto('/sessions/new');
+	function onPathKeydown(e: KeyboardEvent) {
+		if (e.key === 'Enter') {
+			e.preventDefault();
+			void createWorkspace();
+		}
 	}
 
-	/** "New session ▾": stash the chosen profile/model/workspace, then open the
-	 *  draft — the draft page reads the stash to prefill its config control. */
-	function createConfigured() {
-		stashDraftConfig({
-			profile: selProfile || undefined,
-			model: selModel || undefined,
-			workspace: selWorkspace.trim() || undefined
-		});
-		cfgOpen = false;
-		void goto('/sessions/new');
-	}
-
-	// u64 fields arrive as JS number|bigint over JSON; coerce defensively.
-
-	function formatTime(iso: string): string {
+	function formatTime(iso: string | null): string {
+		if (!iso) return '—';
 		const date = new Date(iso);
 		const diff = Date.now() - date.getTime();
 		const mins = Math.floor(diff / 60000);
@@ -96,94 +68,59 @@
 		return date.toLocaleDateString('zh-CN');
 	}
 
-	/** Card title: the opening user message, else a workspace/id fallback so a
-	 *  title-less session (draft never sent, or summary fetch failed) is still
-	 *  distinguishable. */
-	function title(row: Row): string {
-		const first = row.summary?.first_user_input?.trim();
-		if (first) return clip(first, 96);
-		const ws = workspace(row.meta);
-		return ws ?? shortId(row.meta.id);
+	/** Workspace display name: the last path segment, or "无工作区" for the
+	 *  no-workspace group (path is null there). */
+	function wsName(ws: WorkspaceSummary): string {
+		if (!ws.path) return '无工作区';
+		return ws.path.split('/').filter(Boolean).pop() ?? ws.path;
 	}
 
-	function clip(s: string, n: number): string {
-		const line = s.split('\n')[0];
-		return line.length > n ? line.slice(0, n) + '…' : line;
+	/** Shorter path for the card subtitle: keep the last two segments. */
+	function wsPathLabel(path: string): string {
+		const parts = path.split('/').filter(Boolean);
+		return parts.length > 2 ? '…/' + parts.slice(-2).join('/') : path;
 	}
 
-	function workspace(meta: SessionMeta): string | null {
-		if (!meta.workspace) return null;
-		return meta.workspace.split('/').filter(Boolean).pop() ?? meta.workspace;
-	}
-
-	function shortId(id: string): string {
-		return id.length > 14 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id;
-	}
-
-	function originBadge(meta: SessionMeta): string | null {
-		if (meta.origin.kind === 'fork') return 'fork';
-		if (meta.origin.kind === 'compaction') return 'compacted';
-		if (meta.origin.kind === 'reconfiguration') return 'reconfigured';
-		return null;
+	function sessionCountLabel(n: number): string {
+		return n === 1 ? '1 个会话' : `${n} 个会话`;
 	}
 
 	onMount(() => {
 		void refresh();
-		void loadConfigOptions();
 	});
 </script>
 
 <div class="page">
 	<div class="page-inner">
 		<header>
-			<h1>Dashboard</h1>
-			<!-- Split button: the left half opens a draft on defaults; the caret
-			     opens a popover to choose profile / model / workspace first. The two
-			     halves share one rounded shell so they read as a single control. -->
+			<h1>Workspaces</h1>
 			<div class="newbtn" class:open={cfgOpen}>
-				<button class="newbtn-main" onclick={create}>New session</button>
-				<button
-					class="newbtn-caret"
-					onclick={() => (cfgOpen = !cfgOpen)}
-					title="选择 profile / 模型 / 工作区后再新建"
-					aria-label="New session options"
-					aria-expanded={cfgOpen}
-				>
-					<svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-						<polyline points="3,4.5 6,7.5 9,4.5" />
-					</svg>
+				<button class="newbtn-main" onclick={() => (cfgOpen = !cfgOpen)} aria-expanded={cfgOpen}>
+					New workspace
 				</button>
 				{#if cfgOpen}
 					<div class="newbtn-popover">
 						<label class="cfg-field">
-							<span class="cfg-key">Profile</span>
-							<select class="cfg-select" bind:value={selProfile}>
-								<option value="">默认</option>
-								{#each profiles as p (p.name)}
-									<option value={p.name}>{p.name}{p.description ? ` — ${p.description}` : ''}</option>
-								{/each}
-							</select>
-						</label>
-						<label class="cfg-field">
-							<span class="cfg-key">Model</span>
-							<select class="cfg-select" bind:value={selModel}>
-								<option value="">默认（按 profile）</option>
-								{#each models as m (`${m.provider}/${m.model_id}`)}
-									<option value={`${m.provider}/${m.model_id}`}>{m.model_id} · {m.provider}</option>
-								{/each}
-							</select>
-						</label>
-						<label class="cfg-field">
-							<span class="cfg-key">Workspace</span>
+							<span class="cfg-key">Workspace path</span>
 							<input
 								class="cfg-input"
 								type="text"
-								bind:value={selWorkspace}
-								placeholder="默认工作区（绝对路径）"
+								bind:value={newPath}
+								onkeydown={onPathKeydown}
+								placeholder="/absolute/path/to/project"
 								spellcheck="false"
 							/>
 						</label>
-						<button class="newbtn-go" onclick={createConfigured}>用所选配置新建</button>
+						{#if createError}
+							<p class="cfg-error">{createError}</p>
+						{/if}
+						<button
+							class="newbtn-go"
+							disabled={!newPath.trim() || creating}
+							onclick={createWorkspace}
+						>
+							{creating ? '创建中…' : '打开工作区'}
+						</button>
 					</div>
 				{/if}
 			</div>
@@ -195,66 +132,23 @@
 
 		{#if loading}
 			<p class="muted">加载中…</p>
-		{:else if rows.length === 0}
-			<p class="muted">还没有会话，创建一个开始吧。</p>
+		{:else if workspaces.length === 0}
+			<p class="muted">还没有工作区，新建一个开始吧。</p>
 		{:else}
 			<ul class="grid">
-				{#each rows as row (row.meta.id)}
-					{@const s = row.summary}
-					{@const ws = workspace(row.meta)}
-					{@const badge = originBadge(row.meta)}
-					{@const tools = s ? topTools(s, 4) : []}
+				{#each workspaces as ws (ws.id)}
 					<li>
-						<a href={`/sessions/${row.meta.id}`} class="card">
+						<a href={`/workspaces/${ws.id}`} class="card">
 							<div class="card-head">
-								<div class="card-title" class:untitled={!s?.first_user_input}>
-									{title(row)}
-								</div>
-								<div class="card-sub">
-									{#if ws}<span class="chip ws">{ws}</span>{/if}
-									<span class="time">{formatTime(row.meta.created_at)}</span>
-									{#if badge}<span class="origin-badge">{badge}</span>{/if}
-								</div>
-							</div>
-
-							{#if s}
-								<div class="stats">
-									<div class="stat">
-										<span class="stat-value">{s.total_turns}</span>
-										<span class="stat-label">{statLabel.turns(s.total_turns)}</span>
-									</div>
-									<div class="stat">
-										<span class="stat-value">{s.total_model_requests}</span>
-										<span class="stat-label">{statLabel.reqs(s.total_model_requests)}</span>
-									</div>
-									<div class="stat">
-										<span class="stat-value">
-											{s.total_tool_calls}{#if s.total_tool_failures > 0}<span class="stat-fail">/{s.total_tool_failures}✗</span>{/if}
-										</span>
-										<span class="stat-label">{statLabel.toolCalls(s.total_tool_calls)}</span>
-									</div>
-									<div class="stat">
-										<span class="stat-value cost" class:unpriced={s.cost_usd == null}>{formatCost(s)}</span>
-										<span class="stat-label">{statLabel.cost}</span>
-									</div>
-									<div class="stat">
-										<span class="stat-value">{cacheLabel(s)}</span>
-										<span class="stat-label">{statLabel.cache}</span>
-									</div>
-								</div>
-
-								{#if tools.length > 0}
-									<ul class="bars">
-										{#each tools as t (t.tool)}
-											<li class="bar-row">
-												<span class="bar-label">{t.tool}</span>
-												<span class="bar-track"><span class="bar-fill" style="width: {t.pct}%"></span></span>
-												<span class="bar-count">{t.count}</span>
-											</li>
-										{/each}
-									</ul>
+								<div class="card-title">{wsName(ws)}</div>
+								{#if ws.path}
+									<div class="card-path" title={ws.path}>{wsPathLabel(ws.path)}</div>
 								{/if}
-							{/if}
+							</div>
+							<div class="card-foot">
+								<span class="count">{sessionCountLabel(ws.session_count)}</span>
+								<span class="time">{formatTime(ws.latest_session_time)}</span>
+							</div>
 						</a>
 					</li>
 				{/each}
@@ -269,8 +163,6 @@
 		overflow-y: auto;
 	}
 
-	/* Full-bleed: dashboard fills the whole main area; no centered reading
-	 * column. The grid wraps cards across the full width on wide displays. */
 	.page-inner {
 		padding: var(--space-8) var(--space-10);
 	}
@@ -290,7 +182,7 @@
 		letter-spacing: -0.01em;
 	}
 
-	/* ---- NEW SESSION SPLIT BUTTON ---- */
+	/* ---- NEW WORKSPACE BUTTON + POPOVER ---- */
 	.newbtn {
 		position: relative;
 		display: inline-flex;
@@ -298,41 +190,26 @@
 		border-radius: var(--radius-md);
 	}
 
-	.newbtn-main,
-	.newbtn-caret {
+	.newbtn-main {
 		background: var(--accent);
 		color: var(--accent-fg);
 		border: 1px solid var(--accent);
 		font-size: 14px;
 		font-weight: 590;
 		cursor: pointer;
+		padding: var(--gap-sm) var(--gap-lg);
+		border-radius: var(--radius-md);
 		transition:
 			background var(--motion-fast),
 			border-color var(--motion-fast);
 	}
 
-	.newbtn-main {
-		padding: var(--gap-sm) var(--gap-lg);
-		border-radius: var(--radius-md) 0 0 var(--radius-md);
-		border-right-color: color-mix(in srgb, var(--accent-fg) 25%, var(--accent));
-	}
-
-	.newbtn-caret {
-		display: flex;
-		align-items: center;
-		padding: 0 8px;
-		border-radius: 0 var(--radius-md) var(--radius-md) 0;
-		border-left: none;
-	}
-
 	.newbtn-main:hover,
-	.newbtn-caret:hover,
-	.newbtn.open .newbtn-caret {
+	.newbtn.open .newbtn-main {
 		background: var(--accent-hover);
 		border-color: var(--accent-hover);
 	}
 
-	/* Popover: opens below the button, right-aligned so it stays on screen. */
 	.newbtn-popover {
 		position: absolute;
 		top: calc(100% + 6px);
@@ -365,7 +242,6 @@
 		text-transform: uppercase;
 	}
 
-	.cfg-select,
 	.cfg-input {
 		width: 100%;
 		padding: 6px 8px;
@@ -378,7 +254,6 @@
 		outline: none;
 	}
 
-	.cfg-select:focus,
 	.cfg-input:focus {
 		border-color: var(--border-strong);
 		box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 10%, transparent);
@@ -386,6 +261,15 @@
 
 	.cfg-input::placeholder {
 		color: var(--text-disabled);
+	}
+
+	.cfg-error {
+		font-size: 11px;
+		color: var(--state-error-text);
+		background: var(--state-error-bg);
+		padding: var(--space-2);
+		border-radius: var(--radius-sm);
+		line-height: 1.4;
 	}
 
 	.newbtn-go {
@@ -405,6 +289,11 @@
 		background: var(--accent-hover);
 	}
 
+	.newbtn-go:disabled {
+		opacity: 0.55;
+		cursor: not-allowed;
+	}
+
 	.error {
 		color: var(--state-error-text);
 		background: var(--state-error-bg);
@@ -421,32 +310,30 @@
 		text-align: center;
 		padding: var(--space-12);
 	}
-	/* STYLE-APPEND */
 
+	/* ---- WORKSPACE GRID ---- */
 	.grid {
 		list-style: none;
 		display: grid;
-		grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+		grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
 		gap: var(--space-3);
 	}
 
 	.grid li {
-		/* Grid items default to min-width:auto; a long nowrap title would push the
-		 * item past its column and spawn a stray scrollbar. min-width:0 lets the
-		 * title ellipsis engage instead. */
 		min-width: 0;
 	}
 
 	.card {
 		display: flex;
 		flex-direction: column;
-		gap: var(--space-3);
+		gap: var(--space-4);
 		min-width: 0;
 		height: 100%;
 		padding: var(--space-4);
 		border: 1px solid var(--border-subtle);
 		border-radius: var(--radius-md);
 		background: var(--canvas-raised);
+		text-decoration: none;
 		transition:
 			background var(--dur-fast) var(--ease-out),
 			border-color var(--dur-fast) var(--ease-out);
@@ -456,20 +343,19 @@
 		background: var(--surface-hover);
 		border-color: var(--border-default);
 	}
-	/* CARD-APPEND */
 
 	.card-head {
 		display: flex;
 		flex-direction: column;
-		gap: var(--space-2);
+		gap: var(--space-1);
 		min-width: 0;
 	}
 
 	.card-title {
 		color: var(--text-primary);
-		font-weight: 500;
-		font-size: 13.5px;
-		line-height: 1.5;
+		font-weight: 590;
+		font-size: 14px;
+		line-height: 1.4;
 		font-family: var(--font-chinese);
 		min-width: 0;
 		white-space: nowrap;
@@ -477,27 +363,30 @@
 		text-overflow: ellipsis;
 	}
 
-	.card-title.untitled {
-		color: var(--text-tertiary);
-		font-family: var(--font-mono);
-		font-weight: 450;
-	}
-
-	.card-sub {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: center;
-		gap: var(--space-2);
-	}
-
-	.chip.ws {
+	.card-path {
 		font-family: var(--font-mono);
 		font-size: 11px;
+		color: var(--text-tertiary);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		min-width: 0;
+	}
+
+	.card-foot {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--space-2);
+		padding-top: var(--space-3);
+		border-top: 1px solid var(--border-subtle);
+		margin-top: auto;
+	}
+
+	.count {
+		font-size: 12px;
+		font-weight: 510;
 		color: var(--text-secondary);
-		padding: 1px 6px;
-		border-radius: 3px;
-		background: var(--canvas-float);
-		border: 1px solid var(--border-subtle);
 	}
 
 	.time {
@@ -505,116 +394,4 @@
 		font-size: 11px;
 		font-variant-numeric: tabular-nums;
 	}
-
-	.origin-badge {
-		font-size: 10px;
-		font-weight: 510;
-		letter-spacing: 0.04em;
-		text-transform: uppercase;
-		padding: 1px 5px;
-		border-radius: 3px;
-		color: var(--text-tertiary);
-		background: var(--canvas-float);
-		border: 1px solid var(--border-subtle);
-	}
-	/* STATS-APPEND */
-
-	.stats {
-		display: flex;
-		flex-wrap: wrap;
-		gap: var(--space-4);
-		padding-top: var(--space-3);
-		border-top: 1px solid var(--border-subtle);
-		margin-top: auto;
-	}
-
-	.stat {
-		display: flex;
-		flex-direction: column;
-		gap: 1px;
-	}
-
-	.stat-value {
-		font-family: var(--font-mono);
-		font-size: 14px;
-		font-weight: 500;
-		color: var(--text-primary);
-		font-variant-numeric: tabular-nums;
-		line-height: 1.2;
-	}
-
-	.stat-value.cost {
-		color: var(--accent-ink);
-	}
-
-	.stat-value.cost.unpriced {
-		color: var(--text-tertiary);
-		font-size: 12px;
-	}
-
-	.stat-fail {
-		color: var(--state-error-text);
-		font-size: 11px;
-	}
-
-	.stat-label {
-		font-size: 9.5px;
-		font-weight: 510;
-		letter-spacing: 0.07em;
-		text-transform: uppercase;
-		color: var(--text-tertiary);
-	}
-
-	.bars {
-		list-style: none;
-		display: grid;
-		gap: 5px;
-	}
-
-	.bar-row {
-		display: grid;
-		grid-template-columns: minmax(56px, 96px) 1fr auto;
-		align-items: center;
-		gap: var(--space-2);
-	}
-
-	.bar-label {
-		font-family: var(--font-mono);
-		font-size: 11px;
-		color: var(--text-secondary);
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
-	}
-
-	.bar-track {
-		background: var(--canvas-float);
-		border-radius: var(--radius-sm);
-		height: 6px;
-		overflow: hidden;
-	}
-
-	.bar-fill {
-		display: block;
-		height: 100%;
-		/* Muted, not accent: bars are dense data, not the screen's one CTA. */
-		background: var(--text-tertiary);
-		border-radius: var(--radius-sm);
-		transition: width var(--dur-std) var(--ease-out);
-	}
-
-	.bar-count {
-		font-family: var(--font-mono);
-		font-size: 11px;
-		color: var(--text-tertiary);
-		font-variant-numeric: tabular-nums;
-		min-width: 2ch;
-		text-align: right;
-	}
-
-
-
 </style>
-
-
-

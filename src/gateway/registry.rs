@@ -161,6 +161,9 @@ struct RegistryInner {
     /// (which assembles an agent and connects MCP) is async and must not race two
     /// callers into two actors for the same session.
     actors: Mutex<HashMap<SessionId, ActorHandle>>,
+    /// The persisted `hash → path` workspace map, guarded by a std mutex (all its
+    /// operations are synchronous filesystem reads/writes — no await is held).
+    workspaces: std::sync::Mutex<super::workspace::WorkspaceRegistry>,
 }
 
 impl SessionRegistry {
@@ -168,11 +171,23 @@ impl SessionRegistry {
     /// idle timeout.
     #[must_use]
     pub fn new(defaults: SessionDefaults, config: &GatewayConfig) -> Self {
+        // The workspace map lives beside the session store, under `.omini`.
+        let workspaces_path = defaults
+            .workspace
+            .join(app::SESSIONS_SUBDIR)
+            .parent()
+            .map_or_else(
+                || defaults.workspace.join("workspaces.json"),
+                |omini| omini.join("workspaces.json"),
+            );
+        let workspaces =
+            std::sync::Mutex::new(super::workspace::WorkspaceRegistry::load(workspaces_path));
         Self {
             inner: Arc::new(RegistryInner {
                 defaults,
                 idle_timeout: config.idle_timeout(),
                 actors: Mutex::new(HashMap::new()),
+                workspaces,
             }),
         }
     }
@@ -189,6 +204,96 @@ impl SessionRegistry {
     /// Filesystem errors reading the store root.
     pub fn list(&self) -> Result<Vec<SessionId>> {
         self.store().list().context("failed to list sessions")
+    }
+
+    /// Read every session's metadata, newest first. An individual session whose
+    /// `session.toml` is unreadable is skipped (not fatal) so one corrupt session
+    /// never blanks the workspace grouping.
+    ///
+    /// Side effect: seeds the workspace map from the metadata, so every workspace
+    /// that has at least one session becomes addressable by its id (even if it
+    /// predates `workspaces.json`). Best-effort — a seed-persist failure is
+    /// swallowed (the map stays in memory for this run).
+    ///
+    /// # Errors
+    /// Filesystem errors reading the store root (listing the ids).
+    pub fn list_metas(&self) -> Result<Vec<SessionMeta>> {
+        let store = self.store();
+        let ids = store.list().context("failed to list sessions")?;
+        let metas: Vec<SessionMeta> = ids
+            .iter()
+            .filter_map(|id| store.read_meta(id).ok())
+            .collect();
+        if let Ok(mut ws) = self.inner.workspaces.lock() {
+            // Best-effort persist: a session-only workspace stays resolvable this
+            // run even if the write fails, but surface the failure so a full disk
+            // (which would silently lose the seeded entries on restart) is
+            // diagnosable rather than invisible (fail loud).
+            if let Err(e) = ws.seed_from_metas(&metas) {
+                eprintln!("gateway: failed to persist workspace map seed: {e:#}");
+            }
+        }
+        Ok(metas)
+    }
+
+    /// Record a workspace by `path` and return its opaque id (the route the
+    /// dashboard opens). The path is canonicalized and persisted in the workspace
+    /// map so a later `create_in_workspace` can resolve it server-side — the path
+    /// itself never travels to the client.
+    ///
+    /// # Errors
+    /// A `path` that does not exist (canonicalization fails), a poisoned lock, or
+    /// an io error persisting the map.
+    pub fn record_workspace(&self, path: &Path) -> Result<super::workspace::WorkspaceId> {
+        let mut ws = self
+            .inner
+            .workspaces
+            .lock()
+            .map_err(|_| anyhow!("workspace map lock poisoned"))?;
+        ws.record(path)
+    }
+
+    /// Resolve a workspace id to its canonical path, seeding from session metadata
+    /// only on a miss.
+    ///
+    /// The name carries the side effect deliberately: a **miss** triggers
+    /// [`list_metas`](Self::list_metas) — a full store scan (every session's
+    /// `.toml`) plus a possible `workspaces.json` write — to recover a workspace
+    /// known only through its sessions (one created before it was recorded). A
+    /// **hit** is a pure in-memory lookup with no IO, so the common path (a
+    /// workspace already recorded via `POST /workspaces`) pays nothing.
+    fn resolve_or_seed_workspace_id(&self, id: &super::workspace::WorkspaceId) -> Option<PathBuf> {
+        // Fast path: already known → no IO.
+        if let Ok(ws) = self.inner.workspaces.lock()
+            && let Some(path) = ws.path_for(id)
+        {
+            return Some(path);
+        }
+        // Miss: seed from session metadata (scans the store), then retry once.
+        let _ = self.list_metas();
+        self.inner.workspaces.lock().ok()?.path_for(id)
+    }
+
+    /// Create a new session **in the workspace identified by `id`**, resolving the
+    /// path from the workspace map (never from client input). `profile`/`model`
+    /// are optional per-session overrides, exactly as [`create_with`]. The session
+    /// is stamped with the resolved workspace, so its `meta.workspace` hashes back
+    /// to `id`.
+    ///
+    /// # Errors
+    /// - the id is unknown (no recorded path and no session to seed from) → the
+    ///   server maps this to 404
+    /// - a `profile`/`model` that does not resolve, or session-creation failure
+    pub async fn create_in_workspace(
+        &self,
+        id: &super::workspace::WorkspaceId,
+        profile: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<(SessionId, ActorHandle)> {
+        let path = self
+            .resolve_or_seed_workspace_id(id)
+            .ok_or_else(|| anyhow!("unknown workspace id `{}`", id.0))?;
+        self.create_with(profile, model, Some(path)).await
     }
 
     /// Read a session's metadata.

@@ -1,8 +1,7 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
 	import { browser } from '$app/environment';
-	import { page } from '$app/state';
-	import { goto, replaceState } from '$app/navigation';
+	import { goto } from '$app/navigation';
 	import { Marked } from 'marked';
 	import hljs from 'highlight.js/lib/common';
 	import DOMPurify from 'dompurify';
@@ -21,13 +20,22 @@
 		type PlanStep
 	} from '$lib/conversation';
 	import ToolBlock from '$lib/components/tools/ToolBlock.svelte';
-	import { takeDraftConfig } from '$lib/draft-config';
 	import { num, statLabel, formatCost, cacheLabel, topTools } from '$lib/stats';
 
-	/** Sentinel id for a not-yet-created (draft) session. Reaching `/sessions/new`
-	 *  shows an empty conversation; the real session is created lazily on the
-	 *  first send, so merely opening a draft never litters the store with empty
-	 *  sessions. The backend never mints `new` as a real id, so it can't clash. */
+	/** Props: the workspace this conversation lives under (its path-derived id,
+	 *  used to build session URLs) and the session id to show (`'new'` for a
+	 *  draft). Both come from the route params via the thin page wrappers, so a
+	 *  sidebar navigation (URL change) re-seeds the view. */
+	interface Props {
+		workspaceId: string;
+		routeSessionId: string;
+	}
+	let { workspaceId, routeSessionId }: Props = $props();
+
+	/** Sentinel id for a not-yet-created (draft) session. Opening a draft shows an
+	 *  empty conversation; the real session is created lazily on the first send, so
+	 *  merely opening a draft never litters the store with empty sessions. The
+	 *  backend never mints `new` as a real id, so it can't clash. */
 	const DRAFT_ID = 'new';
 
 	/** When the user is within this many pixels from the bottom we consider
@@ -49,9 +57,14 @@
 	let selProfile = $state('');
 	// Model override as `provider/model_id`; empty = use the profile default.
 	let selModel = $state('');
-	let selWorkspace = $state('');
 	let cfgOpen = $state(false);
-	let sessionId = $state(page.params.id!);
+	// The active session id is exactly the route param: the draft (`'new'`), or a
+	// real id under `.../sessions/[id]`. Every transition — draft first-send,
+	// reconfigure, compaction, sidebar click, back/forward — is a real navigation
+	// (goto), so the id only ever changes via the route. Deriving it (rather than
+	// mirroring it into local state) means the main effect below re-subscribes on
+	// every route change with no chance of local state fighting the prop.
+	const sessionId = $derived(routeSessionId);
 	let meta = $state<SessionMeta | null>(null);
 	// Config-layer provider/model for the RUNTIME panel; null until loaded or on
 	// a failed lookup. Local to this page now (the panel moved off the global
@@ -138,7 +151,6 @@
 		curModel = runtime ? `${runtime.provider}/${runtime.model}` : '';
 		selProfile = curProfile;
 		selModel = curModel;
-		selWorkspace = meta?.workspace ?? '';
 		await refreshSummary(id);
 	}
 
@@ -176,9 +188,12 @@
 			onEvent: (ev) => {
 				convo = apply(convo, ev);
 				if (ev.type === 'compacted') {
-					sessionId = ev.new_session_id;
-					subscribe(ev.new_session_id);
-					void loadMeta(ev.new_session_id);
+					// Compaction swaps the live session for a fresh one. Navigate to
+					// its route; page.params.id updates → the sync $effect re-subscribes
+					// and reloads meta for the new id (and the sidebar highlights it).
+					// The new session's committed events replay over the fresh stream,
+					// so nothing is lost in the brief gap.
+					void goto(`/workspaces/${workspaceId}/sessions/${ev.new_session_id}`);
 				}
 				// A settled turn means the fold's aggregates changed — refresh the
 				// STATS snapshot so turns/cost/tokens track the live conversation.
@@ -241,12 +256,6 @@
 			runtime = null;
 			summary = null;
 			context = null;
-			// Adopt a config stashed by the dashboard's "New session ▾" (read-once;
-			// it clears itself), so the draft opens prefilled with that choice.
-			const pre = takeDraftConfig();
-			if (pre.profile) selProfile = pre.profile;
-			if (pre.model) selModel = pre.model;
-			if (pre.workspace) selWorkspace = pre.workspace;
 			// Populate the config picker options (profiles + models). Best-effort:
 			// a failure leaves the dropdowns empty and send still works on defaults.
 			void loadConfigOptions();
@@ -295,24 +304,27 @@
 		error = null;
 		try {
 			if (sessionId === DRAFT_ID) {
-				// Lazily create the real session on first send, then adopt its id.
-				// Pass the draft picker's choices (only the set ones) so the session
-				// is created on the chosen profile / model / workspace.
-				// Setting sessionId drives the $effect to subscribe + load meta;
-				// replaceState swaps the URL without pushing a history entry (so
-				// Back doesn't return to the empty draft).
-				const realId = await client.createSession({
+				// Lazily create the real session on first send. The workspace is fixed
+				// by `workspaceId` (its path is resolved server-side, never sent), so
+				// only the picker's profile/model ride along.
+				const realId = await client.createWorkspaceSession(workspaceId, {
 					profile: selProfile || undefined,
-					model: selModel || undefined,
-					workspace: selWorkspace.trim() || undefined
+					model: selModel || undefined
 				});
-				sessionId = realId;
-				replaceState(`/sessions/${realId}`, {});
+				// Send the first turn (committed to the log), then navigate to the real
+				// session route. The draft and a real session are DIFFERENT routes
+				// (`/workspaces/[wsId]` vs `.../sessions/[id]`), so a shallow
+				// replaceState wouldn't rematch — the page would stay on the draft and
+				// the sidebar wouldn't see the new id. A real goto mounts the session
+				// page (which replays the just-committed turn over SSE) and updates
+				// page.params.id so the sidebar highlights + inserts the new row.
 				await client.sendMessage(realId, text);
+				input = '';
+				await goto(`/workspaces/${workspaceId}/sessions/${realId}`);
 			} else {
 				await client.sendMessage(sessionId, text);
+				input = '';
 			}
-			input = '';
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 		} finally {
@@ -523,10 +535,10 @@
 				model: selModel || undefined
 			});
 			cfgOpen = false;
-			sessionId = newId;
-			replaceState(`/sessions/${newId}`, {});
-			// The $effect re-subscribes + reloads meta for the new id, which
-			// refreshes curProfile/curModel via loadMeta below.
+			// Navigate to the reconfigured session's route (a real goto, not a
+			// shallow replaceState) so page.params.id updates — the sync $effect then
+			// re-subscribes + reloads meta, and the sidebar highlights the new row.
+			await goto(`/workspaces/${workspaceId}/sessions/${newId}`);
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 		} finally {
@@ -954,27 +966,6 @@
 												>
 											{/each}
 										</select>
-									</label>
-									<label class="cfg-field">
-										<span class="cfg-key">Workspace</span>
-										{#if isDraft}
-											<input
-												class="cfg-input"
-												type="text"
-												bind:value={selWorkspace}
-												placeholder="默认工作区（绝对路径）"
-												spellcheck="false"
-											/>
-										{:else}
-											<!-- Workspace is a session property, not reconfigurable: read-only on a live session. -->
-											<input
-												class="cfg-input"
-												type="text"
-												value={selWorkspace}
-												readonly
-												title="工作区不可更改（会话属性）"
-											/>
-										{/if}
 									</label>
 									{#if !isDraft}
 										<!-- Live session: a profile/model change can't edit in place; it
@@ -2311,8 +2302,7 @@
 		text-transform: uppercase;
 	}
 
-	.cfg-select,
-	.cfg-input {
+	.cfg-select {
 		width: 100%;
 		padding: 5px 8px;
 		background: var(--canvas-base);
@@ -2324,21 +2314,9 @@
 		outline: none;
 	}
 
-	.cfg-select:focus,
-	.cfg-input:focus {
+	.cfg-select:focus {
 		border-color: var(--border-strong);
 		box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 10%, transparent);
-	}
-
-	.cfg-input::placeholder {
-		color: var(--text-disabled);
-	}
-
-	/* Read-only workspace on a live session: dimmed, no edit affordance. */
-	.cfg-input[readonly] {
-		color: var(--text-tertiary);
-		background: var(--canvas-float);
-		cursor: default;
 	}
 
 	/* Live-session footer: hint + the "switch" (reconfigure) action. */
