@@ -15,6 +15,7 @@ import type { ModelSummary } from '$lib/types/ModelSummary';
 import type { ProvidersFile } from '$lib/types/ProvidersFile';
 import type { Profile } from '$lib/types/Profile';
 import type { WorkspaceSummary } from '$lib/types/WorkspaceSummary';
+import type { SessionStatus } from '$lib/types/SessionStatus';
 import { endpoints } from './endpoints';
 import type {
 	CreateSessionOptions,
@@ -22,7 +23,8 @@ import type {
 	EventSubscription,
 	ProvidersView,
 	ReconfigureOptions,
-	SessionClient
+	SessionClient,
+	StatusHandlers
 } from './types';
 
 export interface GatewayConfig {
@@ -249,6 +251,46 @@ export class GatewayTransport implements SessionClient {
 					handlers.onError?.(err);
 				}
 				// Reconnect after a brief backoff, resuming from lastSeen.
+				if (!closed) await delay(1000);
+			}
+		};
+		void run();
+
+		return {
+			close() {
+				closed = true;
+				controller.abort();
+			}
+		};
+	}
+
+	subscribeStatus(handlers: StatusHandlers): EventSubscription {
+		// Same SSE-over-fetch machinery as subscribeEvents (bearer header, manual
+		// parseSse), minus Last-Event-ID: this stream isn't resumed by seq — a
+		// reconnect just re-snapshots the current status of every session.
+		const url = this.#baseUrl + endpoints.statusEvents();
+		const controller = new AbortController();
+		let closed = false;
+
+		const run = async () => {
+			while (!closed) {
+				try {
+					const headers = this.#headers({ Accept: 'text/event-stream' });
+					const res = await fetch(url, { headers, signal: controller.signal });
+					if (!res.ok) throw await gatewayError(res);
+					if (!res.body) throw new Error('status stream has no body');
+
+					for await (const frame of parseSse(res.body, controller.signal)) {
+						if (frame.data) {
+							const status = JSON.parse(frame.data) as SessionStatus;
+							handlers.onStatus(status);
+						}
+					}
+				} catch (err) {
+					if (closed || controller.signal.aborted) return;
+					handlers.onError?.(err);
+				}
+				// Reconnect after a brief backoff; the server re-sends a fresh snapshot.
 				if (!closed) await delay(1000);
 			}
 		};

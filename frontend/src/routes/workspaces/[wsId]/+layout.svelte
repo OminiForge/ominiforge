@@ -1,11 +1,18 @@
 <script lang="ts">
 	import { page } from '$app/state';
+	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { client } from '$lib/client';
 	import type { SessionMeta } from '$lib/types/SessionMeta';
 	import type { SessionSummary } from '$lib/types/SessionSummary';
+	import SessionStatusIcon from '$lib/components/SessionStatusIcon.svelte';
+	import { connectStatus, viewState } from '$lib/status.svelte';
 
 	let { children } = $props();
+
+	// One shared gateway-wide status subscription for the whole app (ref-counted);
+	// drives every row's live status icon without per-session requests.
+	onMount(() => connectStatus());
 
 	/** One sidebar row: a session's metadata plus its folded summary (for the
 	 *  title). `summary` is null until the per-session fold arrives (or if it
@@ -218,6 +225,7 @@
 							{title(row)}
 						</div>
 						<div class="row-sub">
+							<SessionStatusIcon state={viewState(row.meta.id)} />
 							<span class="row-time">{formatTime(row.meta.created_at)}</span>
 							{#if badge}<span class="row-badge">{badge}</span>{/if}
 						</div>

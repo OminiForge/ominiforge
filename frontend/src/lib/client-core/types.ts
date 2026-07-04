@@ -11,6 +11,7 @@ import type { ModelSummary } from '$lib/types/ModelSummary';
 import type { ProvidersFile } from '$lib/types/ProvidersFile';
 import type { Profile } from '$lib/types/Profile';
 import type { WorkspaceSummary } from '$lib/types/WorkspaceSummary';
+import type { SessionStatus } from '$lib/types/SessionStatus';
 
 /** The settings view of `providers.toml`: the raw provider set plus which
  *  providers have an API key in the secret store. Key values are never sent —
@@ -48,6 +49,14 @@ export interface ReconfigureOptions {
 export interface EventHandlers {
 	/** Each committed event or live delta, as the tagged `GatewayEvent` union. */
 	onEvent: (event: GatewayEvent) => void;
+	/** Transport-level stream error (connection dropped, parse failure). */
+	onError?: (error: unknown) => void;
+}
+
+/** Callbacks for the gateway-wide session status stream. */
+export interface StatusHandlers {
+	/** Each status delta (or snapshot entry) for a session, across all workspaces. */
+	onStatus: (status: SessionStatus) => void;
 	/** Transport-level stream error (connection dropped, parse failure). */
 	onError?: (error: unknown) => void;
 }
@@ -117,4 +126,12 @@ export interface SessionClient {
 	 * (gateway.md §4); live deltas are not replayed on reconnect.
 	 */
 	subscribeEvents(id: string, handlers: EventHandlers, lastSeq?: number): EventSubscription;
+	/**
+	 * Subscribe to the gateway-wide session activity status stream: one feed
+	 * carrying every session's `running | awaiting_approval | idle` status across
+	 * all workspaces (the session list's cross-session read source). The transport
+	 * sends a snapshot of current statuses on connect, then live deltas; apply them
+	 * idempotently (last-write-wins by session id). Reconnect re-snapshots.
+	 */
+	subscribeStatus(handlers: StatusHandlers): EventSubscription;
 }

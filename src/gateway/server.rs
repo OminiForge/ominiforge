@@ -45,6 +45,7 @@ use crate::session::SessionMeta;
 use super::actor::{ActorHandle, Command, GatewayEvent};
 use super::config::GatewayConfig;
 use super::registry::SessionRegistry;
+use super::status::SessionStatus;
 use super::workspace::{WorkspaceId, group_sessions};
 
 /// Shared server state: the session registry and the optional bearer token.
@@ -109,6 +110,7 @@ fn router(state: AppState) -> Router {
         .route("/sessions/{id}/runtime", get(session_runtime))
         .route("/sessions/{id}/events", get(sse_events))
         .route("/sessions/{id}/ws", get(ws_events))
+        .route("/status/events", get(status_events))
         .route("/profiles", get(list_profiles))
         .route(
             "/profiles/{name}",
@@ -688,6 +690,49 @@ async fn sse_events(
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+/// `GET /status/events` — the gateway-wide session-activity stream: one SSE
+/// feed carrying every session's `running | awaiting_approval | idle` status,
+/// across all workspaces, so the session list lights up without subscribing to
+/// each session's own event stream.
+///
+/// Ordering mirrors [`sse_events`]' replay-then-live: subscribe to the hub
+/// **first**, then take a snapshot, then stream `snapshot ++ live`. Subscribing
+/// before snapshotting means a transition landing in the gap is delivered live
+/// rather than lost; the frontend applies each delta idempotently (last-write-wins
+/// by session id), so a status appearing in both the snapshot and the live tail is
+/// harmless. Unlike the per-session stream there is no `Last-Event-ID` resume — a
+/// reconnect simply re-snapshots.
+async fn status_events(State(state): State<AppState>) -> Response {
+    let hub = state.registry.status_hub();
+    // Subscribe before snapshot so no transition slips through the gap.
+    let live = live_status_stream(hub.subscribe());
+    let snapshot: Vec<Result<SseEvent, Infallible>> = hub
+        .snapshot()
+        .iter()
+        .map(|s| Ok(sse_from_status(s)))
+        .collect();
+
+    let stream = tokio_stream::iter(snapshot).chain(live);
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+/// Adapt the hub's status broadcast into an SSE stream, dropping `Lagged` gaps
+/// (a lagging client's snapshot on reconnect resyncs the full current state).
+fn live_status_stream(
+    rx: broadcast::Receiver<SessionStatus>,
+) -> impl Stream<Item = Result<SseEvent, Infallible>> {
+    BroadcastStream::new(rx).filter_map(|res| res.ok().map(|s| Ok(sse_from_status(&s))))
+}
+
+/// Serialize a [`SessionStatus`] as one SSE `data:` frame. No `id:` — this stream
+/// is not resumed by seq (a reconnect re-snapshots).
+fn sse_from_status(status: &SessionStatus) -> SseEvent {
+    let data = serde_json::to_string(status).unwrap_or_else(|_| "{}".to_owned());
+    SseEvent::default().data(data)
 }
 
 /// Build the replay portion of an SSE stream: committed events strictly after
@@ -1698,5 +1743,54 @@ default = "openai-main/gpt-4o"
             .await
             .unwrap();
         assert_eq!(resp.status(), 404);
+    }
+
+    /// `GET /status/events` streams the gateway-wide status snapshot: a status
+    /// published to the registry's hub before the client connects appears in the
+    /// initial SSE frames. This is the session list's cross-session read source.
+    #[tokio::test]
+    async fn status_events_streams_snapshot() {
+        use crate::gateway::{ActivityStatus, SessionStatus};
+
+        let (registry, _dir) = test_registry();
+        // Seed a status as if an actor had published it.
+        registry.status_hub().publish(SessionStatus {
+            session_id: crate::core::SessionId("sess-1".to_owned()),
+            workspace_id: crate::gateway::WorkspaceId::none(),
+            status: ActivityStatus::Running,
+            latest_seq: 4,
+        });
+        let state = AppState {
+            registry,
+            api_key: None,
+            pricing: Arc::new(PricingTable::default()),
+        };
+        let base = serve_test(state).await;
+
+        let mut resp = reqwest::get(format!("{base}/api/status/events"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|ct| ct.starts_with("text/event-stream")),
+            "status stream must be SSE"
+        );
+
+        // Read the first chunk (the snapshot frame) with a timeout, so the test
+        // never blocks on the open-ended stream. `chunk()` is reqwest-native — no
+        // extra stream adapter crates needed.
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), resp.chunk())
+            .await
+            .expect("snapshot frame should arrive promptly")
+            .expect("stream readable")
+            .expect("a snapshot frame is present");
+        let text = String::from_utf8_lossy(&chunk);
+        assert!(
+            text.contains("sess-1") && text.contains("running"),
+            "snapshot must carry the seeded running status, got: {text}"
+        );
     }
 }

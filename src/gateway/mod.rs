@@ -25,9 +25,11 @@ mod actor;
 mod config;
 mod registry;
 mod server;
+mod status;
 mod workspace;
 
 pub use config::GatewayConfig;
 pub use registry::{RuntimeInfo, SessionDefaults, SessionRegistry};
 pub use server::serve;
+pub use status::{ActivityStatus, SessionStatus, StatusHub};
 pub use workspace::{WorkspaceId, WorkspaceSummary, group_sessions};

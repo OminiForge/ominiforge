@@ -22,6 +22,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc};
@@ -32,6 +33,9 @@ use crate::core::payload::TurnEvent;
 use crate::core::{CoreEvent, EventId, EventPayload, EventSource, SessionId, SourceKind, TurnId};
 use crate::llm::Message;
 use crate::session::{EventBus, SessionStore, SessionWriter};
+
+use super::status::{ActivityStatus, SessionStatus, StatusHub};
+use super::workspace::WorkspaceId;
 
 /// Capacity of the per-session outbound broadcast. A subscriber that lags past
 /// this many buffered items gets a `Lagged` error and should resync from the log
@@ -166,6 +170,19 @@ pub struct SessionActor {
     session_id: SessionId,
     bus: EventBus,
     outbound: broadcast::Sender<GatewayEvent>,
+    /// Process-wide activity-status publisher: the actor pushes `Running` when a
+    /// turn starts and `Idle` when it settles, so the session list lights up
+    /// without subscribing to this session's full event stream.
+    status: StatusHub,
+    /// The workspace this session belongs to, stamped on every status the actor
+    /// publishes (so a workspace-scoped list can filter). Derived once from the
+    /// session's meta at spawn — a session's workspace is immutable.
+    workspace_id: WorkspaceId,
+    /// The latest committed event `seq`, kept live by the event forwarder (which
+    /// already observes every committed event) so `publish_status` reads it in
+    /// O(1) — instead of re-reading and deserializing the whole event log at every
+    /// turn boundary just to find the last seq. Shared with the forwarder task.
+    latest_seq: Arc<AtomicU64>,
     inbox: mpsc::Receiver<Command>,
     idle_timeout: std::time::Duration,
     /// Commands received while a turn was running, replayed in order once it
@@ -185,7 +202,9 @@ impl SessionActor {
     ///
     /// `system` is the system-prompt seed used to rebuild the runtime if a turn
     /// is cancelled mid-flight. `mcp_clients` are held alive for the actor's
-    /// lifetime (per-session MCP isolation).
+    /// lifetime (per-session MCP isolation). `status` is the process-wide status
+    /// hub the actor publishes running/idle transitions to; the session's
+    /// `workspace_id` (immutable, from its meta) is stamped on each.
     pub fn spawn(
         agent: Arc<Agent>,
         store: SessionStore,
@@ -193,12 +212,26 @@ impl SessionActor {
         session: Session,
         idle_timeout: std::time::Duration,
         mcp_clients: Vec<Arc<crate::mcp::McpClient>>,
+        status: StatusHub,
     ) -> ActorHandle {
         let (inbox_tx, inbox_rx) = mpsc::channel(INBOX_CAPACITY);
         let (outbound, _) = broadcast::channel(OUTBOUND_CAPACITY);
 
         let bus = EventBus::new();
         let session_id = session.0.session_id().clone();
+        // The session's workspace is immutable, recorded in its meta (written
+        // before the actor spawns). Derive its id once; an unreadable meta (should
+        // not happen for a session we just opened) degrades to the `"none"` group.
+        let workspace_id = store
+            .read_meta(&session_id)
+            .ok()
+            .and_then(|m| m.workspace)
+            .as_deref()
+            .map_or_else(WorkspaceId::none, WorkspaceId::from_path);
+        // Seed the cached tail seq from the writer's next-seq (O(1), in-memory):
+        // the last committed seq is `next_seq - 1`, or 0 for an empty log. The
+        // forwarder keeps it current from there as events commit.
+        let latest_seq = Arc::new(AtomicU64::new(session.0.next_seq().saturating_sub(1)));
         // Attach the actor's bus to the writer so every appended event is
         // published; the forwarder below turns those into outbound `Event`s.
         let session = (session.0.with_bus(bus.clone()), session.1);
@@ -210,14 +243,18 @@ impl SessionActor {
             session_id,
             bus: bus.clone(),
             outbound: outbound.clone(),
+            status,
+            workspace_id,
+            latest_seq: Arc::clone(&latest_seq),
             inbox: inbox_rx,
             idle_timeout,
             deferred: VecDeque::new(),
             _mcp_clients: mcp_clients,
         };
 
-        // Forward committed events from the session bus onto the outbound stream.
-        spawn_event_forwarder(&bus, outbound.clone());
+        // Forward committed events from the session bus onto the outbound stream,
+        // tracking the latest committed seq for O(1) status publishing.
+        spawn_event_forwarder(&bus, outbound.clone(), latest_seq);
 
         tokio::spawn(actor.run(session));
 
@@ -225,6 +262,25 @@ impl SessionActor {
             inbox: inbox_tx,
             outbound,
         }
+    }
+
+    /// The session's latest committed `seq` (the SSE resume cursor), read O(1)
+    /// from the cache the event forwarder keeps current. `0` for an empty log — a
+    /// benign floor for the front-end's unseen compare.
+    fn tail_seq(&self) -> u64 {
+        self.latest_seq.load(Ordering::Relaxed)
+    }
+
+    /// Publish the current session's activity `status` to the process-wide hub,
+    /// stamped with its workspace and latest committed seq. Called at turn
+    /// boundaries (not per token), so this is off the hot path.
+    fn publish_status(&self, status: ActivityStatus) {
+        self.status.publish(SessionStatus {
+            session_id: self.session_id.clone(),
+            workspace_id: self.workspace_id.clone(),
+            status,
+            latest_seq: self.tail_seq(),
+        });
     }
 
     /// The actor loop. Owns `session` between turns; transitions to a busy phase
@@ -278,6 +334,10 @@ impl SessionActor {
         let agent = Arc::clone(&self.agent);
         let outbound = self.outbound.clone();
 
+        // A turn is starting: light the session up in the list. Published before
+        // the turn task spawns so the transition races nothing.
+        self.publish_status(ActivityStatus::Running);
+
         let mut handle: JoinHandle<TurnResult> = tokio::spawn(async move {
             let mut writer = writer;
             let mut runtime = runtime;
@@ -326,6 +386,10 @@ impl SessionActor {
         &mut self,
         res: Result<TurnResult, tokio::task::JoinError>,
     ) -> Option<Session> {
+        // The turn has settled (cleanly, hard-error, or panic) — the session is no
+        // longer running. Publish before the match so every outcome path (incl.
+        // auto-compact below) leaves the list showing `Idle` for this session.
+        self.publish_status(ActivityStatus::Idle);
         match res {
             Ok(Ok((writer, runtime, outcome))) => {
                 let incomplete = outcome.incomplete.as_ref().map(|r| format!("{r:?}"));
@@ -375,6 +439,9 @@ impl SessionActor {
             message: "turn cancelled".to_owned(),
         });
         self.record_interrupted();
+        // The turn is over. Publish after `record_interrupted` so the status'
+        // `latest_seq` includes the committed Interrupted terminator.
+        self.publish_status(ActivityStatus::Idle);
         self.reopen_after_abort()
     }
 
@@ -400,7 +467,7 @@ impl SessionActor {
         // Reopen to append: the aborted task already released the writer lock.
         if let Ok(writer) = self.store.open(&self.session_id) {
             let mut writer = writer.with_bus(self.bus.clone());
-            let _ = writer.append(
+            if let Ok(seq) = writer.append(
                 EventSource {
                     kind: SourceKind::Runtime,
                     id: "ominiforge".to_owned(),
@@ -411,7 +478,12 @@ impl SessionActor {
                 }),
                 None,
                 Some(turn_id),
-            );
+            ) {
+                // Advance the cached tail synchronously, so the `Idle` status that
+                // `cancel_turn` publishes right after carries this terminator's seq
+                // without waiting on the async forwarder to catch up.
+                self.latest_seq.fetch_max(seq, Ordering::Relaxed);
+            }
         }
         // A reopen failure is surfaced by the reopen_after_abort that follows.
     }
@@ -484,15 +556,36 @@ impl SessionActor {
     }
 }
 
+/// Publish a terminal `Idle` when the actor task ends, on *every* exit path
+/// (turn settled, idle-eviction, all-handles-dropped, `Shutdown`). `run` owns
+/// `self`, so this drops exactly when the loop returns; it reads the *current*
+/// `session_id` (correct after a compaction follow). `mark_idle` is a no-op when
+/// the session is already `Idle`, so a clean settle-then-exit publishes at most
+/// one `Idle` — this only fires the safety-net transition when an actor dies
+/// mid-turn, so the list never shows a stuck spinner for a session with no actor.
+impl Drop for SessionActor {
+    fn drop(&mut self) {
+        self.status.mark_idle(&self.session_id);
+    }
+}
+
 /// Forward every committed [`CoreEvent`] from the session bus onto the outbound
-/// [`GatewayEvent`] stream, tagged with its seq for SSE resume. Runs until the
-/// bus has no more senders (the actor and its writer dropped).
-fn spawn_event_forwarder(bus: &EventBus, outbound: broadcast::Sender<GatewayEvent>) {
+/// [`GatewayEvent`] stream, tagged with its seq for SSE resume, and keep
+/// `latest_seq` current (the tail seq the actor stamps on published statuses).
+/// Runs until the bus has no more senders (the actor and its writer dropped).
+fn spawn_event_forwarder(
+    bus: &EventBus,
+    outbound: broadcast::Sender<GatewayEvent>,
+    latest_seq: Arc<AtomicU64>,
+) {
     let mut rx = bus.subscribe();
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
                 Ok(event) => {
+                    // Seqs are monotonic per session, so `max` is defensive against
+                    // any out-of-order delivery — it never regresses the tail.
+                    latest_seq.fetch_max(event.seq, Ordering::Relaxed);
                     let _ = outbound.send(GatewayEvent::Event {
                         event: Box::new(event),
                     });
@@ -664,8 +757,127 @@ mod tests {
             (writer, runtime),
             std::time::Duration::from_secs(3600),
             Vec::new(),
+            StatusHub::new(),
         );
         (handle, dir)
+    }
+
+    /// Like [`spawn_test_actor`] but with an explicit idle timeout and a shared
+    /// [`StatusHub`], so a test can subscribe to the actor's status transitions
+    /// and (with a short timeout) exercise idle-eviction.
+    fn spawn_test_actor_with_status(
+        rounds: Vec<Vec<StreamEvent>>,
+        idle_timeout: std::time::Duration,
+        status: StatusHub,
+    ) -> (ActorHandle, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let provider = Arc::new(ScriptedProvider {
+            rounds: Mutex::new(rounds.into_iter().collect()),
+        });
+        let agent = Agent::new(
+            provider,
+            ToolRegistry::new(),
+            AgentConfig {
+                model: "mock".to_owned(),
+                ..AgentConfig::default()
+            },
+        );
+        let system = vec![Message::System {
+            content: "sys".to_owned(),
+        }];
+        let writer = store.create_new(None, None, vec![]).unwrap();
+        let runtime = SessionRuntime::new(system.clone());
+        let handle = SessionActor::spawn(
+            Arc::new(agent),
+            store,
+            system,
+            (writer, runtime),
+            idle_timeout,
+            Vec::new(),
+            status,
+        );
+        (handle, dir)
+    }
+
+    /// A turn publishes `Running` then `Idle` to the status hub, and the `Idle`
+    /// carries the session's tail seq. This is the session list's whole signal:
+    /// a spinner while the turn runs, resting after — asserted independently of
+    /// the outbound event stream that drives the open-conversation view.
+    #[tokio::test]
+    async fn turn_publishes_running_then_idle_status() {
+        let hub = StatusHub::new();
+        let mut rx = hub.subscribe();
+        let (handle, _dir) = spawn_test_actor_with_status(
+            vec![answer("hello")],
+            std::time::Duration::from_secs(3600),
+            hub,
+        );
+        handle
+            .send(Command::Send {
+                text: "hi".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let mut saw_running = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(s)) if s.status == ActivityStatus::Running => saw_running = true,
+                Ok(Ok(s)) if s.status == ActivityStatus::Idle => {
+                    assert!(saw_running, "Running must precede Idle");
+                    // A committed turn (Started..Completed) advanced the seq past 0.
+                    assert!(s.latest_seq > 0, "Idle carries the committed tail seq");
+                    return;
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        panic!("did not observe Running→Idle status");
+    }
+
+    /// Dropping the actor (idle-eviction, all-handles-dropped, shutdown) publishes
+    /// a terminal `Idle` via the Drop guard, so a session whose actor is gone never
+    /// stays stuck showing `Running` in the list. Here a very short idle timeout
+    /// evicts the actor after its turn; we assert the hub ends on `Idle`.
+    #[tokio::test]
+    async fn dropped_actor_publishes_terminal_idle() {
+        let hub = StatusHub::new();
+        let sid = {
+            // Run one turn, then let the short idle timeout evict the actor.
+            let (handle, _dir) = spawn_test_actor_with_status(
+                vec![answer("bye")],
+                std::time::Duration::from_millis(50),
+                hub.clone(),
+            );
+            handle
+                .send(Command::Send {
+                    text: "hi".to_owned(),
+                })
+                .await
+                .unwrap();
+            // Give the turn time to settle and the idle timeout to fire (evicting
+            // the actor → Drop → terminal Idle).
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            hub.snapshot()
+                .into_iter()
+                .next()
+                .expect("the actor published at least one status")
+                .session_id
+        };
+
+        let snap = hub.snapshot();
+        let entry = snap
+            .iter()
+            .find(|s| s.session_id == sid)
+            .expect("session status present after eviction");
+        assert_eq!(
+            entry.status,
+            ActivityStatus::Idle,
+            "an evicted actor must leave the session Idle, not stuck Running"
+        );
     }
 
     /// A `Send` runs a turn: the outbound stream carries committed events and a
@@ -795,6 +1007,7 @@ mod tests {
             (writer, runtime),
             std::time::Duration::from_secs(3600),
             Vec::new(),
+            StatusHub::new(),
         );
 
         let mut rx = handle.subscribe();

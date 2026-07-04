@@ -41,6 +41,7 @@ use crate::session::{SessionMeta, SessionStore};
 
 use super::actor::{ActorHandle, SessionActor};
 use super::config::GatewayConfig;
+use super::status::StatusHub;
 
 /// Default model/profile selection a new session is assembled with.
 ///
@@ -164,6 +165,9 @@ struct RegistryInner {
     /// The persisted `hash → path` workspace map, guarded by a std mutex (all its
     /// operations are synchronous filesystem reads/writes — no await is held).
     workspaces: std::sync::Mutex<super::workspace::WorkspaceRegistry>,
+    /// Process-wide session activity status, fanned out to the session list. Every
+    /// spawned actor gets a clone so it can publish its running/idle transitions.
+    status_hub: StatusHub,
 }
 
 impl SessionRegistry {
@@ -188,8 +192,16 @@ impl SessionRegistry {
                 idle_timeout: config.idle_timeout(),
                 actors: Mutex::new(HashMap::new()),
                 workspaces,
+                status_hub: StatusHub::new(),
             }),
         }
+    }
+
+    /// The process-wide session activity status hub — the session list's live
+    /// read source (the gateway-wide `/status/events` SSE subscribes to it).
+    #[must_use]
+    pub fn status_hub(&self) -> StatusHub {
+        self.inner.status_hub.clone()
     }
 
     /// The session store rooted at the configured workspace.
@@ -406,6 +418,7 @@ impl SessionRegistry {
             (writer, runtime),
             self.inner.idle_timeout,
             assembled.mcp_clients,
+            self.inner.status_hub.clone(),
         );
         actors.insert(id.clone(), handle.clone());
         Ok(handle)
@@ -461,6 +474,7 @@ impl SessionRegistry {
             (writer, runtime),
             self.inner.idle_timeout,
             assembled.mcp_clients,
+            self.inner.status_hub.clone(),
         );
         self.inner
             .actors
@@ -519,6 +533,7 @@ impl SessionRegistry {
             (writer, runtime),
             self.inner.idle_timeout,
             assembled.mcp_clients,
+            self.inner.status_hub.clone(),
         );
         self.inner
             .actors
@@ -588,6 +603,7 @@ impl SessionRegistry {
             (writer, runtime),
             self.inner.idle_timeout,
             assembled.mcp_clients,
+            self.inner.status_hub.clone(),
         );
         self.inner
             .actors

@@ -1,0 +1,117 @@
+// Shared, app-level session activity status — one SSE subscription for the whole
+// app, consumed by every session-list instance. Backend owns the machine status
+// (running / awaiting_approval / idle); this layer adds the client-only
+// seen/unseen split by comparing each idle session's latest committed seq against
+// a locally-remembered "acknowledged" seq (persisted to localStorage), because
+// the gateway cannot know what a user has actually looked at.
+//
+// `.svelte.ts` so the `$state` runes below are reactive when imported into
+// components (Svelte 5 universal reactivity).
+
+import { client } from '$lib/client';
+import type { SessionStatus } from '$lib/types/SessionStatus';
+import type { EventSubscription } from '$lib/client-core';
+
+/** What a session-list row should render. `unseen`/`seen` are the two client-side
+ *  refinements of the backend's `idle`. */
+export type ViewState = 'running' | 'awaiting' | 'unseen' | 'seen';
+
+const ACK_KEY = 'ominiforge.seen.v1';
+
+/** Last-known status per session, keyed by session id, last-write-wins from the
+ *  status stream. Reactive: reads in components re-run on update. */
+const statuses = $state<Record<string, SessionStatus>>({});
+
+/** Acknowledged (seen-up-to) seq per session, persisted to localStorage. A row is
+ *  "unseen" only when its latest committed seq exceeds this. */
+const acked = $state<Record<string, number>>(loadAcked());
+
+let sub: EventSubscription | null = null;
+let refCount = 0;
+
+function loadAcked(): Record<string, number> {
+	if (typeof localStorage === 'undefined') return {};
+	try {
+		const raw = localStorage.getItem(ACK_KEY);
+		return raw ? (JSON.parse(raw) as Record<string, number>) : {};
+	} catch {
+		return {};
+	}
+}
+
+function persistAcked() {
+	if (typeof localStorage === 'undefined') return;
+	try {
+		localStorage.setItem(ACK_KEY, JSON.stringify(acked));
+	} catch {
+		// storage full / disabled — the in-memory map still works for this session.
+	}
+}
+
+/** Start the shared status subscription if it isn't already running, and return a
+ *  disposer. Ref-counted so multiple list instances share ONE SSE connection; the
+ *  stream closes when the last consumer disposes. Call from a component's
+ *  `onMount` and invoke the returned disposer on cleanup. */
+export function connectStatus(): () => void {
+	refCount += 1;
+	if (!sub) {
+		sub = client.subscribeStatus({
+			onStatus(s) {
+				// Last-write-wins by session id; `latest_seq` arrives as a JS number
+				// over the wire (ts-rs types it bigint, but serde_json emits a number).
+				statuses[s.session_id] = s;
+			}
+			// onError omitted: the transport reconnects (and re-snapshots) on its own;
+			// a dropped stream simply leaves the last-known statuses in place until it
+			// resumes — no stuck spinner because the backend re-publishes on reconnect.
+		});
+	}
+	return () => {
+		refCount -= 1;
+		if (refCount <= 0 && sub) {
+			sub.close();
+			sub = null;
+			refCount = 0;
+		}
+	};
+}
+
+/** Mark a session seen up to `seq` (the latest committed event the user has now
+ *  viewed). Bumps the persisted ack so the row flips unseen→seen. Monotonic — a
+ *  smaller seq never lowers the watermark. Called by the conversation view as its
+ *  `lastSeq` advances while focused. */
+export function markSeen(sessionId: string, seq: number): void {
+	if (!Number.isFinite(seq)) return;
+	const cur = acked[sessionId] ?? -1;
+	if (seq > cur) {
+		acked[sessionId] = seq;
+		persistAcked();
+	}
+}
+
+/** The view state for one session row.
+ *
+ *  `seed` is the row's own latest known seq, used so a session that hasn't
+ *  streamed a status this run — but whose log has advanced past what the user
+ *  acked — can still read as unseen. **Currently every caller passes `seed = 0`**:
+ *  neither `SessionSummary` nor `SessionMeta` carries a latest seq, so there is no
+ *  per-row seed source yet. The consequence is deliberate and bounded: unseen only
+ *  lights for a session that actually transitions to `idle` *while the app is
+ *  open* (the live status carries `latest_seq`); a turn that finished before this
+ *  run reads as `seen`. The `seed` path is wired and ready — the day the summary
+ *  endpoint gains a `latest_seq`, passing it here makes unseen robust across
+ *  reloads with no other change. A session absent from both the status map and any
+ *  seed is `seen` (a resting session with no live actor is never running, and
+ *  unseen needs a known latest seq to mean anything). */
+export function viewState(sessionId: string, seed = 0): ViewState {
+	const s = statuses[sessionId];
+	if (s) {
+		if (s.status === 'running') return 'running';
+		if (s.status === 'awaiting_approval') return 'awaiting';
+		// idle → seen/unseen by seq compare.
+		const latest = Math.max(Number(s.latest_seq) || 0, seed);
+		return latest > (acked[sessionId] ?? 0) ? 'unseen' : 'seen';
+	}
+	// No live status this run: fall back to the seeded seq compare.
+	return seed > (acked[sessionId] ?? 0) ? 'unseen' : 'seen';
+}

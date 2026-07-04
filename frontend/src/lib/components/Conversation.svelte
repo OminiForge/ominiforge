@@ -21,6 +21,7 @@
 	} from '$lib/conversation';
 	import ToolBlock from '$lib/components/tools/ToolBlock.svelte';
 	import { num, statLabel, formatCost, cacheLabel, topTools } from '$lib/stats';
+	import { markSeen } from '$lib/status.svelte';
 
 	/** Props: the workspace this conversation lives under (its path-derived id,
 	 *  used to build session URLs) and the session id to show (`'new'` for a
@@ -266,6 +267,16 @@
 		// The picker is persistent (live sessions can reconfigure), so load its
 		// profile/model options here too, not only on a draft.
 		void loadConfigOptions();
+	});
+
+	// Mark this session seen up to the latest committed event, while it's the open
+	// conversation. As its stream advances `convo.lastSeq`, ack it so the session
+	// list flips this row unseen→seen (and a turn that finishes while it's focused
+	// never shows as unseen). Drafts have no persisted session to ack.
+	$effect(() => {
+		const id = sessionId;
+		const seq = convo.lastSeq;
+		if (id !== DRAFT_ID && seq !== undefined) markSeen(id, seq);
 	});
 
 	/** Load the profile + model lists for the config picker. Fetched once
