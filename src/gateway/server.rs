@@ -1535,11 +1535,7 @@ default = "openai-main/gpt-4o"
         std::fs::create_dir_all(&ws_b).unwrap();
 
         for _ in 0..2 {
-            drop(
-                store
-                    .create_new(None, Some(ws_a.clone()), vec![])
-                    .unwrap(),
-            );
+            drop(store.create_new(None, Some(ws_a.clone()), vec![]).unwrap());
         }
         drop(store.create_new(None, Some(ws_b.clone()), vec![]).unwrap());
 
@@ -1599,13 +1595,12 @@ default = "openai-main/gpt-4o"
         };
         let base = serve_test(state).await;
 
-        let body: serde_json::Value =
-            reqwest::get(format!("{base}/api/workspaces/{wid}/sessions"))
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
+        let body: serde_json::Value = reqwest::get(format!("{base}/api/workspaces/{wid}/sessions"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
         let sessions = body["sessions"].as_array().unwrap();
         assert_eq!(sessions.len(), 1, "only workspace A's session");
         assert_eq!(sessions[0]["id"], in_a.0);

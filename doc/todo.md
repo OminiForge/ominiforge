@@ -188,6 +188,42 @@
 当前阶段各 server 完全独立，客户端手动切换。此 Phase 是高级 feature，需独立研究后设计。
 见 [`feature-requests.md`](./feature-requests.md) FR-3。
 
+### Phase 12 — Eval 系统
+
+**目标**：可复现地评估 agent 行为——固定 case 集 + scorer 打分 + 跨 run 对比，
+作为质量回归门，并为 Phase 8 Evolution 的 `evaluated` 步骤提供可信度量。设计见
+[`doc/eval.md`](./eval.md)。
+
+**与 Phase 8 的关系**：`architecture.md §19` 进化生命周期
+`observed → proposed → approved → applied → evaluated` 的最后一步，需要 eval suite 对比
+提案应用前后的 pass rate。反过来，Evolution worker 也能从失败 session 自动提取候选 case
+并入 suite（"提取 case" 是与 skill/profile/patch 并列的一种 proposal kind）。二者互为对方的
+基础设施，形成双向闭环——没有 eval，evolution 的"有没有变好"无从量化。因此 Eval 应在
+Phase 8 之前或同期落地。
+
+已决策（见 `doc/eval.md`）：
+- 集成为 `ominiforge eval` 子命令，不额外启动进程（与 `inspect` 同形态）。
+- 判分四桶：精确/模糊匹配、测试执行、world-state diff、LLM judge。Deterministic 优先，
+  judge 是后期选项且需人工标注校准（TPR/TNR）才可用于 gate。
+- Scorer 是对 event stream 的 fold（借 Monitor 模式），但独立于 Monitor：需要 case 作为期望。
+- **新增聚合层级 `run`**（1 run = N case = N 个隔离 session），score 落盘为一等数据
+  （`.omini/eval/runs/<run_id>/scores.jsonl`），因为跨 run diff 兜不住在 per-session 的
+  `events.jsonl` 里。
+- Case 来源：手工从真实失败积累（主线）+ GAIA/SWE-bench 风格 bootstrap（降冷启动）+
+  从运行历史**自动并入**（ingested，与 Evolution 结合）。
+- **自动并入分三档**：只有确定性 checker 场景（如 coding 任务测试已绿）能全自动；主观场景
+  只能产出候选，checker 需人审。自动提取的 case `status = "proposed"`，人审转 `approved`
+  才进回归门；优先提取失败/边界 case，设去重与审批门防自我确认与 reward hacking。
+
+待后续深入（实施前拆分，见下方"接下来的实施计划"）：
+- **Workspace 初始快照能力** —— 自动并入的前置依赖：把一次运行变成可复现 case 需重建初始
+  workspace 状态，当前只存 events 不存初始文件（git 仓库靠 commit hash，非 git 需新快照能力）。
+- 自动提取的信号筛选策略 + 去重/去饱和算法。
+- Case schema 版本控制（case 改动后与历史 run 的可比性）。
+- 并发/rate-limit 配置（`eval.toml`）。
+- LLM judge 校准基础设施（人工标注管理、TPR/TNR 报告）。
+- Web dashboard 对接（run 列表、diff 视图、趋势图，Phase 6 实施时设计）。
+
 ## 开放项
 
 ### 9. Memory 系统 — 延后，需独立研究

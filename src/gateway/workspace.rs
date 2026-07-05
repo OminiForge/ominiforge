@@ -162,15 +162,14 @@ impl WorkspaceRegistry {
     /// Persist the map to `store_path`, creating the parent directory if needed.
     fn save(&self) -> Result<()> {
         if let Some(parent) = self.store_path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create {}", parent.display())
-            })?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
         }
         let file = WorkspacesFile {
             workspaces: self.map.clone(),
         };
-        let json = serde_json::to_string_pretty(&file)
-            .context("failed to serialize workspaces.json")?;
+        let json =
+            serde_json::to_string_pretty(&file).context("failed to serialize workspaces.json")?;
         std::fs::write(&self.store_path, json)
             .with_context(|| format!("failed to write {}", self.store_path.display()))
     }
@@ -211,9 +210,7 @@ pub fn group_sessions(metas: Vec<SessionMeta>) -> Vec<WorkspaceSummary> {
     let mut summaries: Vec<WorkspaceSummary> = groups
         .into_iter()
         .map(|(id, sessions)| {
-            let path = sessions
-                .first()
-                .and_then(|s| s.workspace.clone());
+            let path = sessions.first().and_then(|s| s.workspace.clone());
             let session_count = sessions.len();
             let latest_session_time = sessions
                 .iter()
@@ -248,9 +245,9 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-    use chrono::{TimeZone, Utc};
     use crate::core::SessionId;
     use crate::session::Origin;
+    use chrono::{TimeZone, Utc};
 
     fn meta(id: &str, workspace: Option<&str>, created_at: i64) -> SessionMeta {
         SessionMeta {
@@ -301,7 +298,10 @@ mod tests {
             .find(|g| g.path.as_deref() == Some(std::path::Path::new("/home/user/proj1")))
             .unwrap();
         assert_eq!(proj1.session_count, 2);
-        assert_eq!(&proj1.latest_session_time.as_deref().unwrap()[..10], "1970-01-01");
+        assert_eq!(
+            &proj1.latest_session_time.as_deref().unwrap()[..10],
+            "1970-01-01"
+        );
 
         // None group should be last
         assert_eq!(groups.last().unwrap().id.0, "none");
@@ -316,9 +316,18 @@ mod tests {
         ];
 
         let groups = group_sessions(metas);
-        assert_eq!(groups[0].path.as_deref(), Some(std::path::Path::new("/recent")));
-        assert_eq!(groups[1].path.as_deref(), Some(std::path::Path::new("/middle")));
-        assert_eq!(groups[2].path.as_deref(), Some(std::path::Path::new("/old")));
+        assert_eq!(
+            groups[0].path.as_deref(),
+            Some(std::path::Path::new("/recent"))
+        );
+        assert_eq!(
+            groups[1].path.as_deref(),
+            Some(std::path::Path::new("/middle"))
+        );
+        assert_eq!(
+            groups[2].path.as_deref(),
+            Some(std::path::Path::new("/old"))
+        );
     }
 
     #[test]
@@ -330,7 +339,10 @@ mod tests {
 
         let groups = group_sessions(metas);
         assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].path.as_deref(), Some(std::path::Path::new("/proj")));
+        assert_eq!(
+            groups[0].path.as_deref(),
+            Some(std::path::Path::new("/proj"))
+        );
         assert_eq!(groups[1].id.0, "none");
     }
 
@@ -365,10 +377,7 @@ mod tests {
         };
         // Reload from disk — the entry survives.
         let reg = WorkspaceRegistry::load(store);
-        assert_eq!(
-            reg.path_for(&id),
-            Some(std::fs::canonicalize(&ws).unwrap())
-        );
+        assert_eq!(reg.path_for(&id), Some(std::fs::canonicalize(&ws).unwrap()));
     }
 
     /// `record` on a path that does not exist is an error (canonicalize fails) —
@@ -442,6 +451,9 @@ mod tests {
             reg.path_for(&WorkspaceId(valid_id)),
             Some(PathBuf::from(valid_path))
         );
-        assert_eq!(reg.path_for(&WorkspaceId("deadbeefdeadbeef".to_owned())), None);
+        assert_eq!(
+            reg.path_for(&WorkspaceId("deadbeefdeadbeef".to_owned())),
+            None
+        );
     }
 }

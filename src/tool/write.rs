@@ -199,7 +199,10 @@ mod tests {
         assert!(out.contains("+B"), "expected added line: {out}");
         // The `\ No newline` metadata line must be suppressed so the frontend
         // diff parser never sees a `\`-prefixed row.
-        assert!(!out.contains('\\'), "no-newline hint must be suppressed: {out}");
+        assert!(
+            !out.contains('\\'),
+            "no-newline hint must be suppressed: {out}"
+        );
     }
 
     /// Rewriting identical content is a no-op the reader should see as such, not
