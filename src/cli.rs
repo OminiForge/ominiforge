@@ -134,8 +134,36 @@ struct InspectArgs {
 }
 
 /// Arguments for `ominiforge eval`.
+///
+/// `eval <suite_path>` runs a suite (the default, no subcommand); `eval diff`
+/// and `eval report` operate on already-persisted runs (`doc/eval.md` §7). The
+/// clap attributes give git-stash-style dispatch: the bare form keeps its
+/// positional `suite_path`, and naming a subcommand negates that requirement.
 #[derive(Debug, Parser)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 struct EvalArgs {
+    /// Analysis subcommand; absent means "run the suite".
+    #[command(subcommand)]
+    command: Option<EvalCommand>,
+
+    /// Arguments for the default run form (`eval <suite_path> ...`).
+    #[command(flatten)]
+    run: EvalRunArgs,
+}
+
+/// The analysis subcommands over persisted runs (`doc/eval.md` §6–7).
+#[derive(Debug, Subcommand)]
+enum EvalCommand {
+    /// Diff two runs (A2) and detect regressions (A3). Exit non-zero on any
+    /// pass→fail regression, so it gates CI.
+    Diff(EvalDiffArgs),
+    /// Print the single-run aggregate report (A1) for one run.
+    Report(EvalReportArgs),
+}
+
+/// Arguments for the default `ominiforge eval <suite_path>` run form.
+#[derive(Debug, Parser)]
+struct EvalRunArgs {
     /// Path to eval suite directory (contains case TOML files).
     suite_path: PathBuf,
 
@@ -154,6 +182,23 @@ struct EvalArgs {
     /// Do not auto-load a `.env` file; use only the existing environment.
     #[arg(long)]
     no_dotenv: bool,
+}
+
+/// Arguments for `ominiforge eval diff <baseline> <candidate>`.
+#[derive(Debug, Parser)]
+struct EvalDiffArgs {
+    /// Baseline (older/reference) run id.
+    baseline: String,
+
+    /// Candidate (newer) run id being gated.
+    candidate: String,
+}
+
+/// Arguments for `ominiforge eval report <run_id>`.
+#[derive(Debug, Parser)]
+struct EvalReportArgs {
+    /// Run id to report on (a directory under `.omini/eval/runs`).
+    run_id: String,
 }
 
 /// Parse arguments and dispatch. The binary entry point calls this.
@@ -252,12 +297,34 @@ async fn tui_main(config_dir: Option<PathBuf>, resume: bool) -> Result<()> {
 
 // __APPEND_MARKER__
 
+/// Dispatch `ominiforge eval`: no subcommand runs a suite; `diff`/`report`
+/// operate on already-persisted runs (`doc/eval.md` §6–7).
 async fn eval_cmd(config_dir: Option<PathBuf>, args: EvalArgs) -> Result<()> {
+    match args.command {
+        None => eval_run(config_dir, args.run).await,
+        Some(EvalCommand::Diff(diff_args)) => eval_diff(&diff_args),
+        Some(EvalCommand::Report(report_args)) => eval_report(&report_args),
+    }
+}
+
+/// Resolve a run id to its directory under `.omini/eval/runs/<run_id>/`, rooted
+/// at the launch cwd (where the session data lives).
+fn eval_run_dir(run_id: &str) -> Result<PathBuf> {
+    let launch_cwd = std::env::current_dir().context("cannot determine current directory")?;
+    Ok(launch_cwd
+        .join(".omini")
+        .join("eval")
+        .join("runs")
+        .join(run_id))
+}
+
+/// The default form: load a suite, run its approved cases, persist scores +
+/// manifest, and gate on the aggregate (`doc/eval.md` §4, §7). Exits non-zero if
+/// any case failed.
+async fn eval_run(config_dir: Option<PathBuf>, args: EvalRunArgs) -> Result<()> {
     use std::sync::Arc;
 
-    use chrono::Utc;
-    use serde_json::json;
-
+    use crate::eval::analysis::RunReport;
     use crate::eval::case::load_suite;
     use crate::eval::runner::RunConfig;
     use crate::eval::{
@@ -312,47 +379,152 @@ async fn eval_cmd(config_dir: Option<PathBuf>, args: EvalArgs) -> Result<()> {
     // Run cases sequentially and collect results.
     let results = run_eval_cases(&cases, &run_config).await;
 
-    let total = results.len();
-    let passed = count_passed(&results);
+    // Flatten to persisted score rows, then aggregate (A1).
+    let rows = to_score_rows(&results);
+    let report = RunReport::from_rows(&rows);
 
     // Persist run to .omini/eval/runs/<run_id>/
     let run_id = ulid::Ulid::new().to_string();
-    let run_dir = launch_cwd
-        .join(".omini")
-        .join("eval")
-        .join("runs")
-        .join(&run_id);
+    let run_dir = eval_run_dir(&run_id)?;
     std::fs::create_dir_all(&run_dir)
         .with_context(|| format!("failed to create run dir: {}", run_dir.display()))?;
 
-    persist_run(
-        &run_dir,
-        &results,
-        &args.suite_path,
-        &args.profile,
-        total,
-        passed,
-        &json!({
-            "run_id": &run_id,
-            "created_at": Utc::now().to_rfc3339(),
-            "suite": args.suite_path.display().to_string(),
-            "profile": &args.profile,
-            "total_cases": total,
-            "passed": passed,
-            "pass_rate": pass_rate(passed, total),
-        }),
-    )?;
+    persist_run(&run_dir, &rows, &manifest_json(&run_id, &args, &report))?;
 
     eprintln!(
-        "\neval: {passed}/{total} passed — run_id: {run_id}\n  manifest: {}",
+        "\neval: {}/{} passed, {} skipped — run_id: {run_id}\n  manifest: {}",
+        report.passed,
+        report.passed + report.failed,
+        report.skipped,
         run_dir.join("manifest.json").display()
     );
 
-    if passed < total {
+    if !report.all_passed() {
         std::process::exit(1);
     }
 
     Ok(())
+}
+
+/// Print the single-run aggregate report (A1) for one persisted run.
+fn eval_report(args: &EvalReportArgs) -> Result<()> {
+    use crate::eval::analysis::{RunReport, load_scores};
+
+    let run_dir = eval_run_dir(&args.run_id)?;
+    let rows = load_scores(&run_dir)
+        .with_context(|| format!("failed to load scores for run `{}`", args.run_id))?;
+    let report = RunReport::from_rows(&rows);
+
+    println!("run {}", args.run_id);
+    println!(
+        "  cases:     {} passed, {} failed, {} skipped",
+        report.passed, report.failed, report.skipped
+    );
+    println!("  pass rate: {:.1}%", report.pass_rate * 100.0);
+    if !report.scorers.is_empty() {
+        println!("  per scorer:");
+        for (name, tally) in &report.scorers {
+            println!(
+                "    {name:<16} pass {} fail {} partial {} skip {}",
+                tally.pass, tally.fail, tally.partial, tally.skip
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Diff two persisted runs (A2) and gate on regressions (A3). Exits non-zero
+/// when any case regressed (pass→fail).
+fn eval_diff(args: &EvalDiffArgs) -> Result<()> {
+    use crate::eval::analysis::{RunDiff, load_scores};
+
+    let baseline_dir = eval_run_dir(&args.baseline)?;
+    let candidate_dir = eval_run_dir(&args.candidate)?;
+    let baseline = load_scores(&baseline_dir)
+        .with_context(|| format!("failed to load baseline run `{}`", args.baseline))?;
+    let candidate = load_scores(&candidate_dir)
+        .with_context(|| format!("failed to load candidate run `{}`", args.candidate))?;
+
+    let diff = RunDiff::from_rows(&baseline, &candidate);
+
+    println!("diff {} -> {}", args.baseline, args.candidate);
+    print_case_list("regressions (pass->fail)", &diff.regressions);
+    print_case_list("fixes (fail->pass)", &diff.fixes);
+    print_case_list("added", &diff.added);
+    print_case_list("removed", &diff.removed);
+    for change in &diff.other_changes {
+        println!(
+            "  changed: {} {} -> {}",
+            change.case_id,
+            change.from.label(),
+            change.to.label()
+        );
+    }
+
+    if diff.has_regression() {
+        eprintln!(
+            "\neval diff: {} regression(s) — gate FAILED",
+            diff.regressions.len()
+        );
+        std::process::exit(1);
+    }
+    eprintln!("\neval diff: no regressions — gate passed");
+    Ok(())
+}
+
+/// Print a labeled list of case ids, omitting the section when empty.
+fn print_case_list(label: &str, ids: &[String]) {
+    if ids.is_empty() {
+        return;
+    }
+    println!("  {label}:");
+    for id in ids {
+        println!("    {id}");
+    }
+}
+
+/// Flatten case results into the persisted flat row form (`doc/eval.md` §5.3):
+/// one row per (case, scorer), sharing the case's wall-clock duration.
+fn to_score_rows(
+    results: &[crate::eval::runner::CaseResult],
+) -> Vec<crate::eval::analysis::ScoreRow> {
+    use crate::eval::analysis::ScoreRow;
+
+    let mut rows = Vec::new();
+    for result in results {
+        for (scorer_name, score) in &result.scores {
+            rows.push(ScoreRow::new(
+                &result.case_id,
+                &result.session_id,
+                scorer_name,
+                score,
+                result.duration_ms,
+            ));
+        }
+    }
+    rows
+}
+
+/// Build the run manifest (`doc/eval.md` §5.2) from the run args and aggregate.
+fn manifest_json(
+    run_id: &str,
+    args: &EvalRunArgs,
+    report: &crate::eval::analysis::RunReport,
+) -> serde_json::Value {
+    use chrono::Utc;
+    use serde_json::json;
+
+    json!({
+        "run_id": run_id,
+        "created_at": Utc::now().to_rfc3339(),
+        "suite": args.suite_path.display().to_string(),
+        "profile": &args.profile,
+        "total_cases": report.passed + report.failed + report.skipped,
+        "passed": report.passed,
+        "failed": report.failed,
+        "skipped": report.skipped,
+        "pass_rate": report.pass_rate,
+    })
 }
 
 async fn run_eval_cases(
@@ -391,33 +563,13 @@ async fn run_eval_cases(
     results
 }
 
-fn count_passed(results: &[crate::eval::runner::CaseResult]) -> usize {
-    results
-        .iter()
-        .filter(|r| {
-            r.scores
-                .values()
-                .all(|s| !matches!(s.value, crate::eval::ScoreValue::Fail))
-        })
-        .count()
-}
-
-#[allow(clippy::cast_precision_loss)]
-fn pass_rate(passed: usize, total: usize) -> f64 {
-    if total == 0 {
-        0.0
-    } else {
-        passed as f64 / total as f64
-    }
-}
-
+/// Write `scores.jsonl` (one [`ScoreRow`](crate::eval::analysis::ScoreRow) per
+/// line) and `manifest.json` into `run_dir`. The rows share their type with the
+/// analysis-layer reader ([`load_scores`](crate::eval::analysis::load_scores)),
+/// so writer and reader can never drift.
 fn persist_run(
     run_dir: &std::path::Path,
-    results: &[crate::eval::runner::CaseResult],
-    _suite_path: &std::path::Path,
-    _profile: &str,
-    _total: usize,
-    _passed: usize,
+    rows: &[crate::eval::analysis::ScoreRow],
     manifest: &serde_json::Value,
 ) -> Result<()> {
     use std::io::Write;
@@ -430,19 +582,9 @@ fn persist_run(
     let mut scores_file =
         std::fs::File::create(&scores_path).context("failed to create scores.jsonl")?;
 
-    for result in results {
-        for (scorer_name, score) in &result.scores {
-            let line = serde_json::json!({
-                "case_id": result.case_id,
-                "session_id": result.session_id,
-                "scorer": scorer_name,
-                "value": score.value,
-                "explanation": score.explanation,
-                "duration_ms": result.duration_ms,
-            });
-            writeln!(scores_file, "{}", serde_json::to_string(&line)?)
-                .context("failed to write scores.jsonl")?;
-        }
+    for row in rows {
+        writeln!(scores_file, "{}", serde_json::to_string(row)?)
+            .context("failed to write scores.jsonl")?;
     }
 
     Ok(())

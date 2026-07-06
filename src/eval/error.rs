@@ -28,6 +28,16 @@ pub enum EvalError {
         source: toml::de::Error,
     },
 
+    /// A run's `scores.jsonl` or `manifest.json` could not be parsed as JSON.
+    /// Guards the cross-run analysis layer (`doc/eval.md` §6) against silent
+    /// history loss when the on-disk score format drifts.
+    #[error("failed to parse eval json at {path}: {source}")]
+    Json {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+
     /// A case is structurally valid TOML but violates a schema invariant
     /// (empty id/input, missing target for a match checker, etc.).
     #[error("invalid case in {path}: {reason}")]
