@@ -616,7 +616,10 @@ command = "echo ok"
     #[test]
     fn load_suite_returns_not_found_for_missing_dir() {
         let err = load_suite(Path::new("/nonexistent/suite/dir")).unwrap_err();
-        assert!(matches!(err, EvalError::NotFound(_)), "expected NotFound, got {err:?}");
+        assert!(
+            matches!(err, EvalError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
     }
 
     // ── test helpers ─────────────────────────────────────────────────────────
