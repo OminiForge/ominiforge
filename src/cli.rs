@@ -159,6 +159,9 @@ enum EvalCommand {
     Diff(EvalDiffArgs),
     /// Print the single-run aggregate report (A1) for one run.
     Report(EvalReportArgs),
+    /// Load a public Q&A dataset (JSONL) as bootstrap cases and run them
+    /// (`doc/eval.md` §8.2). Read from a local path; nothing is downloaded.
+    Bootstrap(EvalBootstrapArgs),
 }
 
 /// Arguments for the default `ominiforge eval <suite_path>` run form.
@@ -199,6 +202,37 @@ struct EvalDiffArgs {
 struct EvalReportArgs {
     /// Run id to report on (a directory under `.omini/eval/runs`).
     run_id: String,
+}
+
+/// Arguments for `ominiforge eval bootstrap <dataset>`.
+#[derive(Debug, Parser)]
+struct EvalBootstrapArgs {
+    /// Path to a local JSONL dataset (one `{input, target}` object per line).
+    dataset: PathBuf,
+
+    /// Match checker applied to every case: `exact` or `fuzzy`.
+    #[arg(long, default_value = "exact")]
+    checker: String,
+
+    /// Tag added to every loaded case (for later dimension slicing).
+    #[arg(long, default_value = "bootstrap")]
+    tag: String,
+
+    /// Profile to run (default: coding).
+    #[arg(long, default_value = "coding")]
+    profile: String,
+
+    /// Optional model override.
+    #[arg(long)]
+    model: Option<String>,
+
+    /// Optional temperature override.
+    #[arg(long)]
+    temperature: Option<f32>,
+
+    /// Do not auto-load a `.env` file; use only the existing environment.
+    #[arg(long)]
+    no_dotenv: bool,
 }
 
 /// Parse arguments and dispatch. The binary entry point calls this.
@@ -304,6 +338,9 @@ async fn eval_cmd(config_dir: Option<PathBuf>, args: EvalArgs) -> Result<()> {
         None => eval_run(config_dir, args.run).await,
         Some(EvalCommand::Diff(diff_args)) => eval_diff(&diff_args),
         Some(EvalCommand::Report(report_args)) => eval_report(&report_args),
+        Some(EvalCommand::Bootstrap(bootstrap_args)) => {
+            eval_bootstrap(config_dir, bootstrap_args).await
+        }
     }
 }
 
@@ -322,16 +359,7 @@ fn eval_run_dir(run_id: &str) -> Result<PathBuf> {
 /// manifest, and gate on the aggregate (`doc/eval.md` §4, §7). Exits non-zero if
 /// any case failed.
 async fn eval_run(config_dir: Option<PathBuf>, args: EvalRunArgs) -> Result<()> {
-    use std::sync::Arc;
-
-    use crate::eval::analysis::RunReport;
     use crate::eval::case::load_suite;
-    use crate::eval::runner::RunConfig;
-    use crate::eval::{
-        CostUnder, ExactMatch, FuzzyMatch, NoToolError, Scorer, TestsPass, TurnCompleted,
-        WorkspaceDiff,
-    };
-    use crate::monitor::PricingTable;
 
     let launch_cwd = std::env::current_dir().context("cannot determine current directory")?;
     let config = ConfigStore::discover_with(config_dir.as_deref(), &launch_cwd);
@@ -352,11 +380,41 @@ async fn eval_run(config_dir: Option<PathBuf>, args: EvalRunArgs) -> Result<()> 
         return Ok(());
     }
 
-    eprintln!(
-        "eval: running {} case(s) from {}",
-        cases.len(),
-        args.suite_path.display()
-    );
+    run_and_persist(
+        &config,
+        &cases,
+        &args.suite_path.display().to_string(),
+        &args.profile,
+        args.model.as_deref(),
+        args.temperature,
+    )
+    .await
+}
+
+/// Run a set of cases through the full scorer stack, persist scores + manifest
+/// under `.omini/eval/runs/<run_id>/`, and gate on the aggregate. Shared by the
+/// suite runner (`eval_run`) and the bootstrap loader (`eval_bootstrap`) so both
+/// use one scorer set and one persistence path. Exits non-zero if any case
+/// failed (`doc/eval.md` §7).
+async fn run_and_persist(
+    config: &ConfigStore,
+    cases: &[crate::eval::EvalCase],
+    suite_label: &str,
+    profile: &str,
+    model: Option<&str>,
+    temperature: Option<f32>,
+) -> Result<()> {
+    use std::sync::Arc;
+
+    use crate::eval::analysis::RunReport;
+    use crate::eval::runner::RunConfig;
+    use crate::eval::{
+        CostUnder, ExactMatch, FuzzyMatch, NoToolError, Scorer, TestsPass, TurnCompleted,
+        WorkspaceDiff,
+    };
+    use crate::monitor::PricingTable;
+
+    eprintln!("eval: running {} case(s) from {suite_label}", cases.len());
 
     let scorers: Vec<Arc<dyn Scorer>> = vec![
         Arc::new(TurnCompleted),
@@ -369,15 +427,15 @@ async fn eval_run(config_dir: Option<PathBuf>, args: EvalRunArgs) -> Result<()> 
     ];
 
     let run_config = RunConfig {
-        config: &config,
-        profile: &args.profile,
-        model: args.model.as_deref(),
-        temperature: args.temperature,
+        config,
+        profile,
+        model,
+        temperature,
         scorers: &scorers,
     };
 
     // Run cases sequentially and collect results.
-    let results = run_eval_cases(&cases, &run_config).await;
+    let results = run_eval_cases(cases, &run_config).await;
 
     // Flatten to persisted score rows, then aggregate (A1).
     let rows = to_score_rows(&results);
@@ -389,7 +447,11 @@ async fn eval_run(config_dir: Option<PathBuf>, args: EvalRunArgs) -> Result<()> 
     std::fs::create_dir_all(&run_dir)
         .with_context(|| format!("failed to create run dir: {}", run_dir.display()))?;
 
-    persist_run(&run_dir, &rows, &manifest_json(&run_id, &args, &report))?;
+    persist_run(
+        &run_dir,
+        &rows,
+        &manifest_json(&run_id, suite_label, profile, &report),
+    )?;
 
     eprintln!(
         "\neval: {}/{} passed, {} skipped — run_id: {run_id}\n  manifest: {}",
@@ -404,6 +466,49 @@ async fn eval_run(config_dir: Option<PathBuf>, args: EvalRunArgs) -> Result<()> 
     }
 
     Ok(())
+}
+
+/// The `bootstrap` form: load a public Q&A dataset (JSONL) into bootstrap cases
+/// (`doc/eval.md` §8.2) and run them through the same scorer + persistence path
+/// as a normal suite. Entries needing an attachment are reported and skipped.
+async fn eval_bootstrap(config_dir: Option<PathBuf>, args: EvalBootstrapArgs) -> Result<()> {
+    use crate::eval::bootstrap::{MatchKind, load_bootstrap};
+
+    let launch_cwd = std::env::current_dir().context("cannot determine current directory")?;
+    let config = ConfigStore::discover_with(config_dir.as_deref(), &launch_cwd);
+
+    let match_kind = MatchKind::parse(&args.checker, &args.dataset)?;
+    let load = load_bootstrap(&args.dataset, match_kind, &args.tag).with_context(|| {
+        format!(
+            "failed to load bootstrap dataset: {}",
+            args.dataset.display()
+        )
+    })?;
+
+    if !load.skipped.is_empty() {
+        eprintln!("eval bootstrap: skipped {} entr(ies):", load.skipped.len());
+        for reason in &load.skipped {
+            eprintln!("  {reason}");
+        }
+    }
+
+    if load.cases.is_empty() {
+        eprintln!(
+            "eval bootstrap: no runnable cases in {}",
+            args.dataset.display()
+        );
+        return Ok(());
+    }
+
+    run_and_persist(
+        &config,
+        &load.cases,
+        &format!("bootstrap:{}", args.dataset.display()),
+        &args.profile,
+        args.model.as_deref(),
+        args.temperature,
+    )
+    .await
 }
 
 /// Print the single-run aggregate report (A1) for one persisted run.
@@ -505,10 +610,12 @@ fn to_score_rows(
     rows
 }
 
-/// Build the run manifest (`doc/eval.md` §5.2) from the run args and aggregate.
+/// Build the run manifest (`doc/eval.md` §5.2) from the run metadata and
+/// aggregate.
 fn manifest_json(
     run_id: &str,
-    args: &EvalRunArgs,
+    suite_label: &str,
+    profile: &str,
     report: &crate::eval::analysis::RunReport,
 ) -> serde_json::Value {
     use chrono::Utc;
@@ -517,8 +624,8 @@ fn manifest_json(
     json!({
         "run_id": run_id,
         "created_at": Utc::now().to_rfc3339(),
-        "suite": args.suite_path.display().to_string(),
-        "profile": &args.profile,
+        "suite": suite_label,
+        "profile": profile,
         "total_cases": report.passed + report.failed + report.skipped,
         "passed": report.passed,
         "failed": report.failed,

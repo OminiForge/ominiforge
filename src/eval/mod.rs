@@ -5,6 +5,7 @@
 //! runner (Step 3).
 
 pub mod analysis;
+pub mod bootstrap;
 pub mod case;
 pub mod error;
 pub mod runner;
@@ -15,6 +16,7 @@ pub use analysis::{
     CaseVerdict, RunDiff, RunReport, ScoreRow, ScorerTally, VerdictChange, case_verdicts,
     fold_case_verdict, load_scores, pass_rate,
 };
+pub use bootstrap::{BootstrapLoad, MatchKind, load_bootstrap};
 pub use case::{CaseFile, CaseSource, CaseStatus, Checker, Difficulty, EvalCase, ExpectedFile};
 pub use error::{EvalError, Result};
 pub use runner::{CaseResult, RunConfig, run_case};
