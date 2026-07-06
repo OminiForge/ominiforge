@@ -257,6 +257,153 @@ impl Scorer for CostUnder {
     }
 }
 
+// ── TestsPass ──────────────────────────────────────────────────────────────────
+
+/// Passes when the scratch workspace's test command exits 0 and every
+/// `pass_pattern` appears in the combined output.
+///
+/// Only meaningful with `checker.kind = "tests"`. Skips for all other checker
+/// kinds and when `ctx.workspace` is `None`.
+pub struct TestsPass;
+
+#[async_trait]
+impl Scorer for TestsPass {
+    fn name(&self) -> &'static str {
+        "TestsPass"
+    }
+
+    async fn score(&self, ctx: &EvalContext<'_>) -> Score {
+        use crate::eval::case::Checker;
+
+        let Checker::Tests {
+            command,
+            pass_patterns,
+        } = &ctx.case.checker
+        else {
+            return Score::skip("not a tests checker");
+        };
+
+        let Some(workspace) = ctx.workspace else {
+            return Score::skip("no workspace available");
+        };
+
+        // Run the command in the scratch workspace.
+        let output = match std::process::Command::new("sh")
+            .args(["-c", command])
+            .current_dir(workspace)
+            .output()
+        {
+            Ok(out) => out,
+            Err(e) => {
+                return Score::fail(format!("failed to spawn command `{command}`: {e}"));
+            }
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let combined = format!("{stdout}{stderr}");
+
+        if !output.status.success() {
+            let code = output.status.code().unwrap_or(-1);
+            return Score::fail(format!("command `{command}` exited {code}\n{combined}"));
+        }
+
+        // Check that every pass_pattern appears in the combined output.
+        let missing: Vec<&str> = pass_patterns
+            .iter()
+            .filter(|p| !combined.contains(p.as_str()))
+            .map(String::as_str)
+            .collect();
+
+        if missing.is_empty() {
+            Score::pass(format!(
+                "command `{command}` passed ({} pattern(s) matched)",
+                pass_patterns.len()
+            ))
+        } else {
+            Score::fail(format!(
+                "command `{command}` passed but missing patterns: {missing:?}"
+            ))
+        }
+    }
+}
+
+// ── WorkspaceDiff ──────────────────────────────────────────────────────────────
+
+/// Verifies the scratch workspace state matches the case's `state` checker
+/// expectations: each expected file must exist (or be absent) with the right
+/// content.
+///
+/// Only meaningful with `checker.kind = "state"`. Skips for all other checker
+/// kinds and when `ctx.workspace` is `None`.
+pub struct WorkspaceDiff;
+
+#[async_trait]
+impl Scorer for WorkspaceDiff {
+    fn name(&self) -> &'static str {
+        "WorkspaceDiff"
+    }
+
+    async fn score(&self, ctx: &EvalContext<'_>) -> Score {
+        use crate::eval::case::Checker;
+
+        let Checker::State { expect } = &ctx.case.checker else {
+            return Score::skip("not a state checker");
+        };
+
+        let Some(workspace) = ctx.workspace else {
+            return Score::skip("no workspace available");
+        };
+
+        let mut failures: Vec<String> = Vec::new();
+
+        for entry in expect {
+            let path = workspace.join(&entry.path);
+
+            if entry.absent {
+                if path.exists() {
+                    failures.push(format!(
+                        "{}: expected absent but exists",
+                        entry.path.display()
+                    ));
+                }
+                continue;
+            }
+
+            // File must exist.
+            match std::fs::read_to_string(&path) {
+                Err(e) => {
+                    failures.push(format!(
+                        "{}: expected to exist but cannot read: {e}",
+                        entry.path.display()
+                    ));
+                }
+                Ok(actual) => {
+                    if entry
+                        .content
+                        .as_deref()
+                        .is_some_and(|exp| actual.trim() != exp.trim())
+                    {
+                        let exp = entry.content.as_deref().unwrap_or("");
+                        failures.push(format!(
+                            "{}: content mismatch\n  expected: {:?}\n  actual:   {:?}",
+                            entry.path.display(),
+                            exp.trim(),
+                            actual.trim()
+                        ));
+                    }
+                }
+            }
+        }
+
+        if failures.is_empty() {
+            Score::pass(format!("{} file expectation(s) satisfied", expect.len()))
+        } else {
+            Score::fail(failures.join("\n"))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::float_cmp)]

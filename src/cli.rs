@@ -54,6 +54,8 @@ enum Command {
     /// Run the gateway server (HTTP/SSE/WebSocket) in the foreground.
     #[cfg(feature = "gateway")]
     Serve(ServeArgs),
+    /// Run an eval suite (TOML case files) and persist scores.
+    Eval(EvalArgs),
 }
 
 /// Arguments for `ominiforge serve`.
@@ -131,6 +133,29 @@ struct InspectArgs {
     no_dotenv: bool,
 }
 
+/// Arguments for `ominiforge eval`.
+#[derive(Debug, Parser)]
+struct EvalArgs {
+    /// Path to eval suite directory (contains case TOML files).
+    suite_path: PathBuf,
+
+    /// Profile to run (default: coding).
+    #[arg(long, default_value = "coding")]
+    profile: String,
+
+    /// Optional model override.
+    #[arg(long)]
+    model: Option<String>,
+
+    /// Optional temperature override.
+    #[arg(long)]
+    temperature: Option<f32>,
+
+    /// Do not auto-load a `.env` file; use only the existing environment.
+    #[arg(long)]
+    no_dotenv: bool,
+}
+
 /// Parse arguments and dispatch. The binary entry point calls this.
 ///
 /// # Errors
@@ -145,6 +170,7 @@ pub async fn run() -> Result<()> {
         Some(Command::Init(args)) => init(&args),
         #[cfg(feature = "gateway")]
         Some(Command::Serve(args)) => serve_cmd(config_dir, args).await,
+        Some(Command::Eval(args)) => eval_cmd(config_dir, args).await,
     }
 }
 
@@ -225,6 +251,202 @@ async fn tui_main(config_dir: Option<PathBuf>, resume: bool) -> Result<()> {
 }
 
 // __APPEND_MARKER__
+
+async fn eval_cmd(config_dir: Option<PathBuf>, args: EvalArgs) -> Result<()> {
+    use std::sync::Arc;
+
+    use chrono::Utc;
+    use serde_json::json;
+
+    use crate::eval::case::load_suite;
+    use crate::eval::runner::RunConfig;
+    use crate::eval::{
+        CostUnder, ExactMatch, FuzzyMatch, NoToolError, Scorer, TestsPass, TurnCompleted,
+        WorkspaceDiff,
+    };
+    use crate::monitor::PricingTable;
+
+    let launch_cwd = std::env::current_dir().context("cannot determine current directory")?;
+    let config = ConfigStore::discover_with(config_dir.as_deref(), &launch_cwd);
+
+    // Load suite (only approved cases by default).
+    let all_cases = load_suite(&args.suite_path)
+        .with_context(|| format!("failed to load suite: {}", args.suite_path.display()))?;
+    let cases: Vec<_> = all_cases
+        .into_iter()
+        .filter(|c| matches!(c.status, crate::eval::CaseStatus::Approved))
+        .collect();
+
+    if cases.is_empty() {
+        eprintln!(
+            "eval: no approved cases found in {}",
+            args.suite_path.display()
+        );
+        return Ok(());
+    }
+
+    eprintln!(
+        "eval: running {} case(s) from {}",
+        cases.len(),
+        args.suite_path.display()
+    );
+
+    let scorers: Vec<Arc<dyn Scorer>> = vec![
+        Arc::new(TurnCompleted),
+        Arc::new(NoToolError),
+        Arc::new(ExactMatch),
+        Arc::new(FuzzyMatch),
+        Arc::new(TestsPass),
+        Arc::new(WorkspaceDiff),
+        Arc::new(CostUnder::new(1.0, PricingTable::new())),
+    ];
+
+    let run_config = RunConfig {
+        config: &config,
+        profile: &args.profile,
+        model: args.model.as_deref(),
+        temperature: args.temperature,
+        scorers: &scorers,
+    };
+
+    // Run cases sequentially and collect results.
+    let results = run_eval_cases(&cases, &run_config).await;
+
+    let total = results.len();
+    let passed = count_passed(&results);
+
+    // Persist run to .omini/eval/runs/<run_id>/
+    let run_id = ulid::Ulid::new().to_string();
+    let run_dir = launch_cwd
+        .join(".omini")
+        .join("eval")
+        .join("runs")
+        .join(&run_id);
+    std::fs::create_dir_all(&run_dir)
+        .with_context(|| format!("failed to create run dir: {}", run_dir.display()))?;
+
+    persist_run(
+        &run_dir,
+        &results,
+        &args.suite_path,
+        &args.profile,
+        total,
+        passed,
+        &json!({
+            "run_id": &run_id,
+            "created_at": Utc::now().to_rfc3339(),
+            "suite": args.suite_path.display().to_string(),
+            "profile": &args.profile,
+            "total_cases": total,
+            "passed": passed,
+            "pass_rate": pass_rate(passed, total),
+        }),
+    )?;
+
+    eprintln!(
+        "\neval: {passed}/{total} passed — run_id: {run_id}\n  manifest: {}",
+        run_dir.join("manifest.json").display()
+    );
+
+    if passed < total {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+async fn run_eval_cases(
+    cases: &[crate::eval::EvalCase],
+    run_config: &crate::eval::runner::RunConfig<'_>,
+) -> Vec<crate::eval::runner::CaseResult> {
+    use crate::eval::runner::run_case;
+
+    let mut results = Vec::with_capacity(cases.len());
+    for case in cases {
+        eprint!("  {} ... ", case.id);
+        match run_case(case, run_config).await {
+            Ok(result) => {
+                let pass = result
+                    .scores
+                    .values()
+                    .filter(|s| matches!(s.value, crate::eval::ScoreValue::Pass))
+                    .count();
+                let fail = result
+                    .scores
+                    .values()
+                    .filter(|s| matches!(s.value, crate::eval::ScoreValue::Fail))
+                    .count();
+                if fail == 0 {
+                    eprintln!("PASS ({pass} scorer(s))");
+                } else {
+                    eprintln!("FAIL ({fail} failed, {pass} passed)");
+                }
+                results.push(result);
+            }
+            Err(e) => {
+                eprintln!("ERROR: {e:#}");
+            }
+        }
+    }
+    results
+}
+
+fn count_passed(results: &[crate::eval::runner::CaseResult]) -> usize {
+    results
+        .iter()
+        .filter(|r| {
+            r.scores
+                .values()
+                .all(|s| !matches!(s.value, crate::eval::ScoreValue::Fail))
+        })
+        .count()
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn pass_rate(passed: usize, total: usize) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        passed as f64 / total as f64
+    }
+}
+
+fn persist_run(
+    run_dir: &std::path::Path,
+    results: &[crate::eval::runner::CaseResult],
+    _suite_path: &std::path::Path,
+    _profile: &str,
+    _total: usize,
+    _passed: usize,
+    manifest: &serde_json::Value,
+) -> Result<()> {
+    use std::io::Write;
+
+    let manifest_path = run_dir.join("manifest.json");
+    std::fs::write(&manifest_path, serde_json::to_string_pretty(manifest)?)
+        .context("failed to write manifest.json")?;
+
+    let scores_path = run_dir.join("scores.jsonl");
+    let mut scores_file =
+        std::fs::File::create(&scores_path).context("failed to create scores.jsonl")?;
+
+    for result in results {
+        for (scorer_name, score) in &result.scores {
+            let line = serde_json::json!({
+                "case_id": result.case_id,
+                "session_id": result.session_id,
+                "scorer": scorer_name,
+                "value": score.value,
+                "explanation": score.explanation,
+                "duration_ms": result.duration_ms,
+            });
+            writeln!(scores_file, "{}", serde_json::to_string(&line)?)
+                .context("failed to write scores.jsonl")?;
+        }
+    }
+
+    Ok(())
+}
 
 /// Everything `run` and the TUI need once config is resolved. This is just
 /// [`app::Assembled`] — the model/provider/tool selection lives in the
