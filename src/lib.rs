@@ -16,6 +16,7 @@ pub mod app;
 pub mod cli;
 pub mod config;
 pub mod context;
+pub mod eval;
 pub mod evolution;
 #[cfg(feature = "gateway")]
 pub mod gateway;

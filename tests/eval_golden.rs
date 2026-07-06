@@ -1,7 +1,8 @@
 //! Golden event-log regression tests (eval Step 0).
+#![allow(clippy::unwrap_used)]
 //!
 //! Each test loads a frozen `events.jsonl` fixture through the real
-//! `SessionStore::read_events` path (parse + session_id restore) and asserts
+//! `SessionStore::read_events` path (parse + `session_id` restore) and asserts
 //! structural invariants that would break if the agent loop, event schema, or
 //! Monitor fold were changed incorrectly.
 //!
@@ -40,7 +41,7 @@ fn fixture_store() -> (SessionStore, SessionId) {
 #[test]
 fn golden_starts_with_session_created() {
     let (store, id) = fixture_store();
-    let events = store.read_events(&id).expect("fixture readable");
+    let events = store.read_events(&id).unwrap();
     assert!(
         matches!(
             events.first().map(|e| &e.payload),
@@ -56,7 +57,7 @@ fn golden_starts_with_session_created() {
 #[test]
 fn golden_seqs_are_contiguous() {
     let (store, id) = fixture_store();
-    let events = store.read_events(&id).expect("fixture readable");
+    let events = store.read_events(&id).unwrap();
     for (i, e) in events.iter().enumerate() {
         assert_eq!(
             e.seq, i as u64,
@@ -71,7 +72,7 @@ fn golden_seqs_are_contiguous() {
 #[test]
 fn golden_turn_started_and_completed_once() {
     let (store, id) = fixture_store();
-    let events = store.read_events(&id).expect("fixture readable");
+    let events = store.read_events(&id).unwrap();
 
     let started = events
         .iter()
@@ -92,7 +93,7 @@ fn golden_turn_started_and_completed_once() {
 #[test]
 fn golden_two_tool_calls_both_completed_no_failures() {
     let (store, id) = fixture_store();
-    let events = store.read_events(&id).expect("fixture readable");
+    let events = store.read_events(&id).unwrap();
 
     let started = events
         .iter()
@@ -112,18 +113,21 @@ fn golden_two_tool_calls_both_completed_no_failures() {
     assert_eq!(failed, 0, "expected 0 ToolEvent::Failed");
 }
 
-/// Monitor::summarize folds the fixture into expected aggregates.
+/// `Monitor::summarize` folds the fixture into expected aggregates.
 /// This pins the Monitor fold logic against the real log format — if
-/// RequestCompleted parsing or token accounting changes, this fails.
+/// `RequestCompleted` parsing or token accounting changes, this fails.
 ///
 /// Token sources (from fixture seq 6 + seq 13):
-///   r1: input=100, output=20, cache_read=64
-///   r2: input=200, output=40, cache_read=64
-///   totals: input=300, output=60, cache_read=128
+///
+/// ```text
+/// r1: input=100, output=20, cache_read=64
+/// r2: input=200, output=40, cache_read=64
+/// totals: input=300, output=60, cache_read=128
+/// ```
 #[test]
 fn golden_monitor_summary_aggregates_correctly() {
     let (store, id) = fixture_store();
-    let events = store.read_events(&id).expect("fixture readable");
+    let events = store.read_events(&id).unwrap();
     let summary = summarize(&events, PricingTable::new());
 
     assert_eq!(summary.total_turns, 1);
@@ -142,7 +146,7 @@ fn golden_monitor_summary_aggregates_correctly() {
 #[test]
 fn golden_first_user_input_captured() {
     let (store, id) = fixture_store();
-    let events = store.read_events(&id).expect("fixture readable");
+    let events = store.read_events(&id).unwrap();
     let summary = summarize(&events, PricingTable::new());
 
     assert_eq!(
