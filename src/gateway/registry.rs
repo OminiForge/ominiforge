@@ -39,9 +39,9 @@ use crate::core::SessionId;
 use crate::llm::Message;
 use crate::session::{SessionMeta, SessionStore};
 
-use super::actor::{ActorHandle, SessionActor};
+use super::actor::{ActorHandle, Command, SessionActor};
 use super::config::GatewayConfig;
-use super::status::StatusHub;
+use super::status::{ActivityStatus, StatusHub};
 
 /// Default model/profile selection a new session is assembled with.
 ///
@@ -168,13 +168,30 @@ struct RegistryInner {
     /// Process-wide session activity status, fanned out to the session list. Every
     /// spawned actor gets a clone so it can publish its running/idle transitions.
     status_hub: StatusHub,
+    /// Per-session sandboxes (`doc/sandbox.md` §3.2): owns each session's
+    /// execution environment, decoupled from the (ephemeral) actor that drives
+    /// it. Backend is chosen once here as a deployment property.
+    sandbox_manager: crate::sandbox::manager::SandboxManager,
+    /// Fallback sandbox network policy for sessions whose profile does not set
+    /// one (`doc/sandbox.md` §6.2). Resolved once from `gateway.toml` at boot so
+    /// a malformed default fails loud here, not per session.
+    default_network: crate::sandbox::NetworkPolicy,
 }
 
 impl SessionRegistry {
     /// Build a registry over `defaults`, with actors evicted after the config's
-    /// idle timeout.
-    #[must_use]
-    pub fn new(defaults: SessionDefaults, config: &GatewayConfig) -> Self {
+    /// idle timeout. Non-fatal diagnostics (e.g. an `auto` sandbox fallback) go
+    /// to `on_warn`.
+    ///
+    /// # Errors
+    /// Fails if the configured sandbox backend is `boxlite` but boxlite cannot
+    /// start on this host (`doc/sandbox.md` §3.2) — an explicit isolation
+    /// request must not silently degrade.
+    pub fn new(
+        defaults: SessionDefaults,
+        config: &GatewayConfig,
+        on_warn: &(dyn Fn(&str) + Sync),
+    ) -> Result<Self> {
         // The workspace map lives beside the session store, under `.omini`.
         let workspaces_path = defaults
             .workspace
@@ -186,15 +203,23 @@ impl SessionRegistry {
             );
         let workspaces =
             std::sync::Mutex::new(super::workspace::WorkspaceRegistry::load(workspaces_path));
-        Self {
+        let sandbox_manager =
+            crate::sandbox::manager::SandboxManager::from_choice(config.sandbox_backend, on_warn)
+                .context("failed to initialize sandbox backend")?;
+        let default_network = config
+            .default_network_policy()
+            .map_err(|e| anyhow::anyhow!("invalid gateway.toml default_network: {e}"))?;
+        Ok(Self {
             inner: Arc::new(RegistryInner {
                 defaults,
                 idle_timeout: config.idle_timeout(),
                 actors: Mutex::new(HashMap::new()),
                 workspaces,
                 status_hub: StatusHub::new(),
+                sandbox_manager,
+                default_network,
             }),
-        }
+        })
     }
 
     /// The process-wide session activity status hub — the session list's live
@@ -319,6 +344,74 @@ impl SessionRegistry {
             .with_context(|| format!("failed to read session `{}`", id.0))
     }
 
+    /// Archive `id`: retire it from the active session list while keeping its
+    /// files for later inspection (`doc/session-storage.md` §9). This is the
+    /// **release trigger** for the sandbox lifecycle (`doc/sandbox.md` §9 Q5) —
+    /// the first path that actually ends a session:
+    ///
+    /// 1. refuse if a turn is running (surfaced as a 409 to the caller);
+    /// 2. stop the live actor, freeing the event-log lock;
+    /// 3. release the session's sandbox (boxlite reclaims the `CoW` disk if no
+    ///    fork child still depends on it; passthrough is a no-op);
+    /// 4. write the archive marker.
+    ///
+    /// A sandbox-release failure aborts the archive (fail loud) rather than
+    /// leaking the environment; the actor simply respawns on next access.
+    ///
+    /// # Errors
+    /// [`SessionError::NotFound`] (as a context) for an unknown session, a
+    /// "locked" error if a turn is running, or a sandbox/filesystem failure.
+    pub async fn archive(&self, id: &SessionId) -> Result<()> {
+        // 404 before touching anything: don't stop an actor for a ghost.
+        let _ = self.meta(id)?;
+
+        // Don't retire a session out from under a running turn. "locked" in the
+        // message maps to a 409 via the server's `conflict_or_not_found`.
+        if self.inner.status_hub.status_of(id) == Some(ActivityStatus::Running) {
+            return Err(anyhow!(
+                "session `{}` is locked: a turn is running; cancel it before archiving",
+                id.0
+            ));
+        }
+
+        self.stop_actor(id).await;
+        self.inner
+            .sandbox_manager
+            .release(id)
+            .await
+            .with_context(|| format!("failed to release sandbox for `{}`", id.0))?;
+        self.store()
+            .archive(id)
+            .with_context(|| format!("failed to archive session `{}`", id.0))
+    }
+
+    /// Permanently delete `id`'s files (`doc/session-storage.md` §9).
+    /// **Irreversible.** Requires the session to be **archived first** — that
+    /// two-step is the confirmation gate; a non-archived session is refused
+    /// (surfaced as a 409). Since archiving already stopped the actor and released
+    /// the sandbox, this is a pure `rm -rf` of the session directory.
+    ///
+    /// # Errors
+    /// [`SessionError::NotFound`] for an unknown session,
+    /// [`SessionError::NotArchived`] if it was never archived, or a filesystem
+    /// failure removing the directory.
+    pub fn delete(&self, id: &SessionId) -> Result<()> {
+        self.store()
+            .delete(id)
+            .with_context(|| format!("failed to delete session `{}`", id.0))
+    }
+
+    /// Stop `id`'s live actor if one is registered: drop it from the actor map
+    /// and send `Shutdown` so its loop exits and releases the event-log lock. A
+    /// no-op if no actor is live (already idle-evicted, or never spawned).
+    async fn stop_actor(&self, id: &SessionId) {
+        let handle = self.inner.actors.lock().await.remove(id);
+        if let Some(handle) = handle {
+            // Best-effort: a `send` failure just means the actor already exited.
+            let _ = handle.send(Command::Shutdown).await;
+        }
+    }
+
     /// Resolve the config-layer provider/model for `profile_id` (the gateway's
     /// default profile when `None`), plus the environment tags detected at
     /// `workspace`. This is the *configured* selection the RUNTIME panel
@@ -387,6 +480,19 @@ impl SessionRegistry {
     // exactly that race.
     #[allow(clippy::significant_drop_tightening)]
     pub async fn get_or_spawn(&self, id: &SessionId) -> Result<ActorHandle> {
+        // Archived sessions are retired for good (`doc/session-storage.md` §9):
+        // refuse to bring one back to run. Every run/stream path routes through
+        // here, so this single gate covers them all; read-only paths (`meta`,
+        // `read_events`) bypass it, keeping the session inspectable. Checked
+        // before the actor lock — a plain filesystem stat needs no lock, and
+        // `archive` stops any live actor itself, so there is nothing to race.
+        if self.store().is_archived(id) {
+            return Err(anyhow!(
+                "session `{}` is archived and cannot be run; it is retired permanently",
+                id.0
+            ));
+        }
+
         let mut actors = self.inner.actors.lock().await;
 
         // Live and still alive? Reuse it.
@@ -410,6 +516,16 @@ impl SessionRegistry {
             .with_context(|| format!("session `{}` is unavailable (locked or missing)", id.0))?;
         let system = Self::system_seed(&assembled);
         let runtime = crate::agent::rebuild_runtime(&events, system.clone());
+
+        // Register the (freshly assembled) sandbox so `fork` can reach a resumed
+        // session by id. With passthrough this fresh host sandbox is equivalent
+        // to the original; re-attaching a *stateful* backend's environment from
+        // the persisted descriptor lands when boxlite is wired (`doc/sandbox.md`
+        // §3.5, Step 4 boxlite / Step 5).
+        self.inner
+            .sandbox_manager
+            .register(id, Arc::clone(&assembled.sandbox))
+            .await;
 
         let handle = SessionActor::spawn(
             Arc::new(assembled.agent),
@@ -454,7 +570,7 @@ impl SessionRegistry {
         model: Option<&str>,
         workspace: Option<PathBuf>,
     ) -> Result<(SessionId, ActorHandle)> {
-        let assembled = self.assemble_with(profile, model, workspace).await?;
+        let assembled = self.assemble_with(profile, model, workspace, None).await?;
         let writer = self
             .store()
             .create_new(
@@ -464,6 +580,16 @@ impl SessionRegistry {
             )
             .context("failed to create session")?;
         let id = writer.session_id().clone();
+        // Bind the session to its sandbox: persist the descriptor for restart
+        // re-attach, and register the live handle so `fork` can reach it by id
+        // (`doc/sandbox.md` §3.2).
+        self.store()
+            .bind_sandbox(&id, assembled.sandbox_descriptor.clone())
+            .context("failed to persist sandbox descriptor")?;
+        self.inner
+            .sandbox_manager
+            .register(&id, Arc::clone(&assembled.sandbox))
+            .await;
         let system = Self::system_seed(&assembled);
         let runtime = SessionRuntime::new(system.clone());
 
@@ -491,7 +617,17 @@ impl SessionRegistry {
     /// # Errors
     /// Parent not found/unreadable, or agent assembly / fork-creation failure.
     pub async fn fork(&self, parent: &SessionId, at_seq: u64) -> Result<(SessionId, ActorHandle)> {
-        let assembled = self.assemble().await?;
+        // Fork the parent's sandbox up front so it can be injected into the child
+        // agent (`doc/sandbox.md` §4.2). A snapshot-capable backend yields an
+        // isolated CoW child; passthrough cannot snapshot, so `fork_from` returns
+        // `Unsupported` and the child falls back to a fresh sandbox on the
+        // inherited workspace (assemble builds it when `injected` is `None`).
+        let injected = match self.inner.sandbox_manager.fork_from(parent).await {
+            Ok(pair) => Some(pair),
+            Err(crate::sandbox::SandboxError::Unsupported(_)) => None,
+            Err(e) => return Err(anyhow!("sandbox fork failed: {e}")),
+        };
+        let assembled = self.assemble_with(None, None, None, injected).await?;
         let system = Self::system_seed(&assembled);
 
         // Rebuild the parent's context up to (and including) `at_seq` as the
@@ -524,6 +660,17 @@ impl SessionRegistry {
             )
             .context("failed to create fork")?;
         let id = writer.session_id().clone();
+
+        // Register and persist the child's sandbox — the injected CoW fork on a
+        // snapshot-capable backend, or the freshly assembled fallback sandbox on
+        // passthrough. Uniform either way (`doc/sandbox.md` §3.2, §4.2).
+        self.inner
+            .sandbox_manager
+            .register(&id, Arc::clone(&assembled.sandbox))
+            .await;
+        self.store()
+            .bind_sandbox(&id, assembled.sandbox_descriptor.clone())
+            .context("failed to persist fork sandbox descriptor")?;
         let runtime = SessionRuntime::new(snapshot);
 
         let handle = SessionActor::spawn(
@@ -569,7 +716,7 @@ impl SessionRegistry {
         // The reconfigured session runs in the parent's workspace (immutable);
         // only profile/model change.
         let assembled = self
-            .assemble_with(profile, model, meta.workspace.clone())
+            .assemble_with(profile, model, meta.workspace.clone(), None)
             .await?;
         let system = Self::system_seed(&assembled);
 
@@ -617,7 +764,7 @@ impl SessionRegistry {
     /// subprocesses), on the gateway defaults. Diagnostics go to stderr (the
     /// server's log).
     async fn assemble(&self) -> Result<Assembled> {
-        self.assemble_with(None, None, None).await
+        self.assemble_with(None, None, None, None).await
     }
 
     /// Like [`assemble`](Self::assemble) but with per-session overrides: `profile`
@@ -631,6 +778,10 @@ impl SessionRegistry {
         profile: Option<&str>,
         model: Option<&str>,
         workspace: Option<PathBuf>,
+        injected_sandbox: Option<(
+            Arc<dyn crate::sandbox::Sandbox>,
+            crate::session::SandboxDescriptor,
+        )>,
     ) -> Result<Assembled> {
         let d = &self.inner.defaults;
         let workspace = workspace.unwrap_or_else(|| d.workspace.clone());
@@ -642,6 +793,9 @@ impl SessionRegistry {
             model,
             None,
             d.no_dotenv,
+            self.inner.sandbox_manager.backend(),
+            injected_sandbox,
+            self.inner.default_network.clone(),
             &|msg| eprintln!("gateway: {msg}"),
         )
         .await

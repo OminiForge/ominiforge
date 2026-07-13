@@ -306,7 +306,7 @@ async fn serve_cmd(config_dir: Option<PathBuf>, args: ServeArgs) -> Result<()> {
         profile: args.profile,
         no_dotenv: args.no_dotenv,
     };
-    let registry = SessionRegistry::new(defaults, &gateway_config);
+    let registry = SessionRegistry::new(defaults, &gateway_config, &|msg| eprintln!("{msg}"))?;
     serve(registry, &gateway_config, pricing).await
 }
 
@@ -725,6 +725,12 @@ async fn prepare(
         model,
         temperature,
         no_dotenv,
+        std::sync::Arc::new(crate::sandbox::passthrough::PassthroughBackend::new()),
+        None,
+        // CLI runs on the passthrough backend (host, no isolation), which ignores
+        // the network policy; pass Open so the field is meaningful if a CLI run is
+        // ever pointed at an isolating backend (`doc/sandbox.md` §6.2).
+        crate::sandbox::NetworkPolicy::Open,
         &|msg| eprintln!("{msg}"),
     )
     .await

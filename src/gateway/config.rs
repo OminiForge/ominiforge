@@ -21,6 +21,12 @@ const DEFAULT_BIND: &str = "127.0.0.1:7878";
 /// event-log lock so the CLI/TUI can reopen it). 30 minutes.
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 1800;
 
+/// Default sandbox network policy when neither the profile nor this file names
+/// one. `open` (unrestricted egress) so a fresh boxlite session can reach the
+/// package registries / APIs an agent normally needs; a deployment that wants a
+/// locked-down default sets `default_network` explicitly (`doc/sandbox.md` §6.2).
+const DEFAULT_NETWORK_POLICY: &str = "open";
+
 /// Parsed `gateway.toml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
@@ -37,6 +43,23 @@ pub struct GatewayConfig {
 
     /// Idle seconds before an inactive session actor is shut down and evicted.
     pub idle_timeout_secs: u64,
+
+    /// Which sandbox backend sessions run in (`doc/sandbox.md` §3.2). A
+    /// host-level, OS-agnostic choice; `passthrough` (no isolation) by default so
+    /// no deployment silently believes it is isolated. `boxlite` requires the
+    /// microVM backend and fails loud if it cannot start; `auto` prefers boxlite
+    /// and warns on fallback.
+    pub sandbox_backend: crate::sandbox::manager::SandboxBackendChoice,
+
+    /// Fallback sandbox network policy for sessions whose profile does not set
+    /// `[network].policy` (`doc/sandbox.md` §6.2). One of `isolated` /
+    /// `allowlist` / `open`; `open` by default. The profile always wins when it
+    /// names a policy — this is only the bottom of the resolution chain.
+    pub default_network: String,
+
+    /// Hosts reachable when `default_network = "allowlist"`; ignored otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub default_network_allow: Vec<String>,
 }
 
 impl Default for GatewayConfig {
@@ -45,6 +68,9 @@ impl Default for GatewayConfig {
             bind: DEFAULT_BIND.to_owned(),
             api_key_env: None,
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
+            sandbox_backend: crate::sandbox::manager::SandboxBackendChoice::default(),
+            default_network: DEFAULT_NETWORK_POLICY.to_owned(),
+            default_network_allow: Vec::new(),
         }
     }
 }
@@ -93,6 +119,20 @@ impl GatewayConfig {
     #[must_use]
     pub const fn idle_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.idle_timeout_secs)
+    }
+
+    /// Resolve the fallback network policy sessions inherit when their profile
+    /// does not name one (`doc/sandbox.md` §6.2).
+    ///
+    /// # Errors
+    /// A malformed `default_network` name fails loud (Karpathy §12): the gateway
+    /// must not boot with an unparseable security default that silently becomes
+    /// open or isolated.
+    pub fn default_network_policy(&self) -> Result<crate::sandbox::NetworkPolicy, String> {
+        crate::sandbox::NetworkPolicy::from_policy_name(
+            &self.default_network,
+            &self.default_network_allow,
+        )
     }
 }
 
@@ -152,5 +192,36 @@ mod tests {
     fn no_api_key_env_resolves_to_none() {
         let config = GatewayConfig::default();
         assert!(config.resolve_api_key().is_none());
+    }
+
+    /// The bottom of the network resolution chain: absent everywhere, sessions
+    /// get `Open` egress, not `Isolated` — a fresh boxlite session must reach the
+    /// registries an agent needs unless a policy is set on purpose.
+    #[test]
+    fn default_network_is_open() {
+        let config = GatewayConfig::default();
+        assert_eq!(
+            config.default_network_policy().unwrap(),
+            crate::sandbox::NetworkPolicy::Open
+        );
+    }
+
+    /// A configured allowlist default parses into the concrete policy + hosts.
+    #[test]
+    fn configured_allowlist_default_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_dir = dir.path().join("config");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("gateway.toml"),
+            "default_network = \"allowlist\"\ndefault_network_allow = [\"crates.io\"]\n",
+        )
+        .unwrap();
+
+        let config = GatewayConfig::load(&[dir.path().to_owned()]).unwrap();
+        assert_eq!(
+            config.default_network_policy().unwrap(),
+            crate::sandbox::NetworkPolicy::AllowList(vec!["crates.io".to_owned()])
+        );
     }
 }

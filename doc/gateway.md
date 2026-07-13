@@ -125,7 +125,15 @@ TLS（§18.1）。理由：少代码、标准运维、证书续期归代理。`b
 bind = "127.0.0.1:7878"          # 默认 loopback
 api_key_env = "OMINI_GATEWAY_KEY" # 可选；不设=开放网关
 idle_timeout_secs = 1800          # 默认 30 分钟无活动逐出 actor（释放锁）
+sandbox_backend = "passthrough"   # 会话执行环境后端（见下）
 ```
+
+**`sandbox_backend`**（`doc/sandbox.md` §3.2）——宿主级、跨平台的选择，同一取值在各系统语义一致：
+- `passthrough`（默认）：宿主直跑、零隔离、全平台。默认即此，避免部署误以为有隔离。
+- `boxlite`：要求 microVM 后端；起不来（无 KVM / jailer 依赖缺失 / feature 未编译）则**响亮报错**，不静默降级。
+- `auto`：优先 boxlite，起不来则 WARN 日志后退回 passthrough。异构机群的「尽力隔离」opt-in。
+
+`boxlite` 需 `--features sandbox-boxlite` 编译（生产 flake `packages.default` 已开），且宿主需 KVM。
 
 ## 8. 部署
 

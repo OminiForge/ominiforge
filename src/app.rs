@@ -51,12 +51,34 @@ pub struct Assembled {
     pub tool_names: Vec<String>,
     /// Canonical workspace path (tool sandbox root).
     pub workspace: PathBuf,
+    /// The session's sandbox (its shell execution environment). The `shell` tool
+    /// runs in it; the session layer owns its lifecycle (`doc/sandbox.md` §3.2).
+    pub sandbox: Arc<dyn crate::sandbox::Sandbox>,
+    /// The sandbox's persisted descriptor (backend + durable id), stamped on the
+    /// session's meta so its environment can be re-attached after a restart.
+    pub sandbox_descriptor: crate::session::SandboxDescriptor,
     /// The resolved model (provider/model/window/pricing) for display + config.
     pub resolved: ResolvedModel,
     /// Live MCP subprocess clients; hold these for the session's lifetime.
     pub mcp_clients: Vec<Arc<crate::mcp::McpClient>>,
 }
 
+/// Resolve a session's sandbox network policy: the profile's `[network].policy`
+/// when set, otherwise the gateway `fallback` (`doc/sandbox.md` §6.2,
+/// `doc/profile.md` §7). Kept separate from [`assemble`] so the precedence rule
+/// is unit-testable without standing up providers/MCP.
+///
+/// # Errors
+/// An unrecognized profile policy name — the caller must fail the session start,
+/// not silently open or isolate the sandbox (Karpathy §12).
+fn resolve_network(
+    section: &crate::config::NetworkSection,
+    fallback: crate::sandbox::NetworkPolicy,
+) -> Result<crate::sandbox::NetworkPolicy, String> {
+    section.policy.as_ref().map_or(Ok(fallback), |name| {
+        crate::sandbox::NetworkPolicy::from_policy_name(name, &section.allow)
+    })
+}
 /// Resolve config and build an [`Agent`] for `profile_name`, with optional model
 /// and temperature overrides.
 ///
@@ -73,6 +95,7 @@ pub struct Assembled {
 /// Fatal configuration problems surface as [`anyhow::Error`]: no providers
 /// configured, an unresolvable profile or model, a provider type with no
 /// adapter, or an explicitly-named compaction model that cannot be resolved.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn assemble(
     config: &ConfigStore,
     workspace: PathBuf,
@@ -80,6 +103,12 @@ pub async fn assemble(
     model: Option<&str>,
     temperature: Option<f32>,
     no_dotenv: bool,
+    sandbox_backend: Arc<dyn crate::sandbox::SandboxBackend>,
+    injected_sandbox: Option<(
+        Arc<dyn crate::sandbox::Sandbox>,
+        crate::session::SandboxDescriptor,
+    )>,
+    default_network: crate::sandbox::NetworkPolicy,
     on_warn: &(dyn Fn(&str) + Sync),
 ) -> Result<Assembled> {
     let workspace = resolve_workspace(&workspace)?;
@@ -118,7 +147,38 @@ pub async fn assemble(
         .context("provider type has no adapter (only openai-chat is wired)")?;
 
     let mut tools = ToolRegistry::new();
-    register_profile_tools(&mut tools, &profile, workspace.clone(), env_overlay.clone());
+
+    // The session's sandbox: either injected (a fork's CoW child of its parent's
+    // sandbox — `doc/sandbox.md` §4.2) or freshly built from the selected backend,
+    // honouring the workspace (as cwd) and the activated env overlay (§3.2). The
+    // same handle is wired into `shell` and returned for the session layer to own
+    // (register into the SandboxManager, persist its descriptor).
+    let (sandbox, sandbox_descriptor) = if let Some(pair) = injected_sandbox {
+        pair
+    } else {
+        // Resolve the session's network egress: the profile's `[network].policy`
+        // wins, else the gateway default passed in (`doc/sandbox.md` §6.2,
+        // `doc/profile.md` §7). A malformed policy name fails loud rather than
+        // silently opening or isolating the sandbox (Karpathy §12).
+        let network = resolve_network(&profile.network, default_network)
+            .map_err(|e| anyhow::anyhow!("profile `{profile_name}` has an invalid [network]: {e}"))?;
+        let sandbox = sandbox_backend
+            .create(crate::sandbox::SandboxConfig {
+                workspace: workspace.clone(),
+                env: env_overlay.clone(),
+                network,
+                ..crate::sandbox::SandboxConfig::default()
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to create sandbox: {e}"))?;
+        let descriptor = crate::session::SandboxDescriptor {
+            backend: sandbox_backend.name().to_owned(),
+            id: None,
+        };
+        (sandbox, descriptor)
+    };
+
+    register_profile_tools(&mut tools, &profile, workspace.clone(), Arc::clone(&sandbox));
 
     // Connect configured MCP servers and register their tools alongside the
     // built-ins (`doc/tool-protocol.md` §5). A broken server is logged and
@@ -200,19 +260,22 @@ pub async fn assemble(
         profile_name: profile.profile.name.clone(),
         tool_names,
         workspace,
+        sandbox,
+        sandbox_descriptor,
         resolved,
         mcp_clients,
     })
 }
 
-/// Register the built-in filesystem/shell tools the profile allows, sandboxed to
-/// `workspace`. `read` and `edit` share one [`SnapshotStore`] so an `edit` patch
-/// is verified against the snapshot the preceding `read` recorded.
+/// Register the built-in filesystem/shell tools the profile allows. `read` and
+/// `edit` share one [`SnapshotStore`] so an `edit` patch is verified against the
+/// snapshot the preceding `read` recorded. The filesystem tools are rooted at
+/// `workspace`; `shell` runs in the session's `sandbox` (`doc/sandbox.md` §3.2).
 fn register_profile_tools(
     registry: &mut ToolRegistry,
     profile: &crate::config::Profile,
     workspace: PathBuf,
-    env_overlay: BTreeMap<String, Option<String>>,
+    sandbox: Arc<dyn crate::sandbox::Sandbox>,
 ) {
     let snapshots = SnapshotStore::new();
     if profile.tools.allows("read") {
@@ -225,10 +288,10 @@ fn register_profile_tools(
         registry.register(Arc::new(WriteTool::new(workspace.clone())));
     }
     if profile.tools.allows("edit") {
-        registry.register(Arc::new(EditTool::new(workspace.clone(), snapshots)));
+        registry.register(Arc::new(EditTool::new(workspace, snapshots)));
     }
     if profile.tools.allows("shell") {
-        registry.register(Arc::new(ShellTool::new(workspace, env_overlay)));
+        registry.register(Arc::new(ShellTool::new(sandbox)));
     }
 }
 
@@ -440,7 +503,10 @@ mod tests {
             &mut reg,
             &profile,
             PathBuf::from("/tmp/ws"),
-            BTreeMap::new(),
+            Arc::new(crate::sandbox::passthrough::PassthroughSandbox::new(
+                PathBuf::from("/tmp/ws"),
+                BTreeMap::new(),
+            )),
         );
         let names: Vec<String> = reg.descriptors().into_iter().map(|d| d.name).collect();
         assert_eq!(names, vec!["edit", "read", "shell", "write"]);
@@ -457,9 +523,47 @@ mod tests {
             &mut reg,
             &profile,
             PathBuf::from("/tmp/ws"),
-            BTreeMap::new(),
+            Arc::new(crate::sandbox::passthrough::PassthroughSandbox::new(
+                PathBuf::from("/tmp/ws"),
+                BTreeMap::new(),
+            )),
         );
         let names: Vec<String> = reg.descriptors().into_iter().map(|d| d.name).collect();
         assert_eq!(names, vec!["read", "write"]);
+    }
+
+    /// Network precedence (`doc/sandbox.md` §6.2): a profile that names a policy
+    /// overrides the gateway fallback; one that does not inherits it. The test
+    /// pins the *override direction* — a regression that ignored the profile and
+    /// always used the fallback would pass a weaker "is it a valid policy" check
+    /// but fail this one.
+    #[test]
+    fn profile_network_overrides_gateway_fallback() {
+        use crate::config::NetworkSection;
+        use crate::sandbox::NetworkPolicy;
+
+        // Profile sets isolated → wins over an Open fallback.
+        let isolating = NetworkSection {
+            policy: Some("isolated".to_owned()),
+            allow: Vec::new(),
+        };
+        assert_eq!(
+            resolve_network(&isolating, NetworkPolicy::Open).unwrap(),
+            NetworkPolicy::Isolated
+        );
+
+        // Profile silent → inherits the fallback verbatim.
+        let silent = NetworkSection::default();
+        assert_eq!(
+            resolve_network(&silent, NetworkPolicy::Open).unwrap(),
+            NetworkPolicy::Open
+        );
+
+        // A typo in the profile fails loud, not silently to the fallback.
+        let bad = NetworkSection {
+            policy: Some("opne".to_owned()),
+            allow: Vec::new(),
+        };
+        assert!(resolve_network(&bad, NetworkPolicy::Open).is_err());
     }
 }

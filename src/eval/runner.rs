@@ -66,6 +66,10 @@ pub async fn run_case(case: &EvalCase, config: &RunConfig<'_>) -> Result<CaseRes
         config.model,
         config.temperature,
         false,
+        std::sync::Arc::new(crate::sandbox::passthrough::PassthroughBackend::new()),
+        None,
+        // Eval runs on the passthrough backend, which ignores the network policy.
+        crate::sandbox::NetworkPolicy::Open,
         &|_msg| {},
     )
     .await

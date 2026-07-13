@@ -255,6 +255,7 @@ mod tests {
             profile_id: None,
             created_at: Utc.timestamp_opt(created_at, 0).unwrap(),
             workspace: workspace.map(PathBuf::from),
+            sandbox: None,
             origin: Origin::new(),
         }
     }
