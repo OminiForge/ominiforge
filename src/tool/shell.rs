@@ -1,24 +1,23 @@
-//! The `shell` built-in tool: run a command in the workspace.
+//! The `shell` built-in tool: run a command through a [`Sandbox`].
 //!
-//! Phase 1 has no sandbox (`doc/sandbox.md` §3): the command runs via the
-//! system shell with the workspace as its working directory, bounded only by a
-//! timeout. Container isolation and resource limits are Phase 2.
+//! The tool itself is backend-agnostic: it hands the command line to
+//! [`Sandbox::exec`] and renders the result. Which sandbox it runs in (host
+//! passthrough today, `BoxLite` microVM when enabled) is decided at
+//! construction (`doc/sandbox.md` §7, Step 3). Resource limits and network
+//! policy travel with the sandbox's `SandboxConfig`, not this tool.
 
-use std::collections::BTreeMap;
-use std::path::PathBuf;
-use std::process::Stdio;
+use std::sync::Arc;
 
 use serde::Deserialize;
 
 use super::{Tool, ToolDescriptor, ToolError, ToolInput, ToolResult};
 use crate::core::payload::{Content, ToolOutput};
-use crate::process_env::apply_env_overlay;
+use crate::sandbox::{ExecOutput, Sandbox, SandboxError};
 
-/// Runs a shell command with the workspace as the working directory.
-#[derive(Debug, Clone)]
+/// Runs a shell command inside a [`Sandbox`].
+#[derive(Clone)]
 pub struct ShellTool {
-    workspace: PathBuf,
-    env_overlay: BTreeMap<String, Option<String>>,
+    sandbox: Arc<dyn Sandbox>,
 }
 
 #[derive(Deserialize)]
@@ -27,14 +26,10 @@ struct ShellArgs {
 }
 
 impl ShellTool {
-    /// Create a `shell` tool rooted at `workspace`.
+    /// Create a `shell` tool that executes commands in `sandbox`.
     #[must_use]
-    #[allow(clippy::missing_const_for_fn)]
-    pub fn new(workspace: PathBuf, env_overlay: BTreeMap<String, Option<String>>) -> Self {
-        Self {
-            workspace,
-            env_overlay,
-        }
+    pub fn new(sandbox: Arc<dyn Sandbox>) -> Self {
+        Self { sandbox }
     }
 }
 
@@ -64,49 +59,34 @@ impl Tool for ShellTool {
         let args: ShellArgs = serde_json::from_value(input.input)
             .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
 
-        let mut command = tokio::process::Command::new("sh");
-        command
-            .arg("-c")
-            .arg(&args.command)
-            .current_dir(&self.workspace);
-        apply_env_overlay(&mut command, &self.env_overlay);
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let child = command
-            .spawn()
-            .map_err(|e| ToolError::Execution(format!("failed to spawn shell: {e}")))?;
-
-        let output = match tokio::time::timeout(input.timeout, child.wait_with_output()).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(e)) => return Err(ToolError::Execution(e.to_string())),
-            Err(_) => return Err(ToolError::Timeout(input.timeout)),
-        };
+        let output = self
+            .sandbox
+            .exec(&args.command, input.timeout)
+            .await
+            .map_err(|e| match e {
+                SandboxError::Timeout(d) => ToolError::Timeout(d),
+                other => ToolError::Execution(other.to_string()),
+            })?;
 
         Ok(render_output(&output))
     }
 }
 
-/// Combine a finished process's streams into a tool output, flagging non-zero
+/// Combine a finished command's streams into a tool output, flagging non-zero
 /// exits as business errors.
-fn render_output(output: &std::process::Output) -> ToolOutput {
-    let mut text = String::new();
-    text.push_str(&String::from_utf8_lossy(&output.stdout));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !stderr.is_empty() {
+fn render_output(output: &ExecOutput) -> ToolOutput {
+    let mut text = output.stdout.clone();
+    if !output.stderr.is_empty() {
         if !text.is_empty() && !text.ends_with('\n') {
             text.push('\n');
         }
-        text.push_str(&stderr);
+        text.push_str(&output.stderr);
     }
 
-    let success = output.status.success();
+    let success = output.success();
     let error_code = (!success).then(|| {
         output
-            .status
-            .code()
+            .exit_code
             .map_or_else(|| "signal".to_owned(), |c| format!("exit_{c}"))
     });
 
@@ -122,7 +102,15 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
     use std::time::Duration;
+
+    use crate::sandbox::passthrough::PassthroughSandbox;
+
+    fn shell(workspace: PathBuf, env: BTreeMap<String, Option<String>>) -> ShellTool {
+        ShellTool::new(Arc::new(PassthroughSandbox::new(workspace, env)))
+    }
 
     fn input(command: &str, timeout: Duration) -> ToolInput {
         ToolInput {
@@ -135,7 +123,7 @@ mod tests {
     #[tokio::test]
     async fn captures_stdout_on_success() {
         let dir = tempfile::tempdir().unwrap();
-        let tool = ShellTool::new(dir.path().to_path_buf(), BTreeMap::new());
+        let tool = shell(dir.path().to_path_buf(), BTreeMap::new());
 
         let out = tool
             .invoke(input("echo hello", Duration::from_secs(5)))
@@ -148,7 +136,7 @@ mod tests {
     #[tokio::test]
     async fn nonzero_exit_is_business_error() {
         let dir = tempfile::tempdir().unwrap();
-        let tool = ShellTool::new(dir.path().to_path_buf(), BTreeMap::new());
+        let tool = shell(dir.path().to_path_buf(), BTreeMap::new());
 
         let out = tool
             .invoke(input("exit 3", Duration::from_secs(5)))
@@ -162,7 +150,7 @@ mod tests {
     async fn runs_in_workspace_directory() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("marker.txt"), "").unwrap();
-        let tool = ShellTool::new(dir.path().to_path_buf(), BTreeMap::new());
+        let tool = shell(dir.path().to_path_buf(), BTreeMap::new());
 
         let out = tool
             .invoke(input("ls", Duration::from_secs(5)))
@@ -177,7 +165,7 @@ mod tests {
     #[tokio::test]
     async fn env_overlay_is_visible_to_shell() {
         let dir = tempfile::tempdir().unwrap();
-        let tool = ShellTool::new(
+        let tool = shell(
             dir.path().to_path_buf(),
             BTreeMap::from([("OMINI_SHELL_TEST".to_owned(), Some("active".to_owned()))]),
         );
@@ -196,7 +184,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_is_protocol_error() {
         let dir = tempfile::tempdir().unwrap();
-        let tool = ShellTool::new(dir.path().to_path_buf(), BTreeMap::new());
+        let tool = shell(dir.path().to_path_buf(), BTreeMap::new());
 
         let result = tool
             .invoke(input("sleep 5", Duration::from_millis(50)))

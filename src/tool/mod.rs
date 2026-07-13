@@ -183,7 +183,9 @@ pub fn register_builtin(registry: &mut ToolRegistry, workspace: PathBuf) {
     )));
     registry.register(Arc::new(WriteTool::new(workspace.clone())));
     registry.register(Arc::new(EditTool::new(workspace.clone(), snapshots)));
-    registry.register(Arc::new(ShellTool::new(workspace, BTreeMap::new())));
+    registry.register(Arc::new(ShellTool::new(Arc::new(
+        crate::sandbox::passthrough::PassthroughSandbox::new(workspace, BTreeMap::new()),
+    ))));
 }
 
 #[cfg(test)]

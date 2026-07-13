@@ -31,7 +31,12 @@ reqwest = { version = "0.12", default-features = false, features = [
 # nix sandboxed build stays offline/hermetic. Keys live here — never in
 # providers.toml and never in the process environment — so a shell/MCP
 # subprocess the agent spawns cannot read them via `env`.
-rusqlite = { version = "0.32", features = ["bundled"] }
+#
+# Pinned to 0.39 to match boxlite's rusqlite: both link the `sqlite3` native lib
+# (`links = "sqlite3"`), and cargo forbids two versions of a `links` crate in one
+# graph. Our usage is the stable core API (Connection/execute/query_row/prepare/
+# query_map/Error/ffi), so aligning versions is low-risk.
+rusqlite = { version = "0.39", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 similar = "2"
@@ -52,6 +57,16 @@ crossterm = "0.28"
 unicode-width = "=0.2.0"
 catppuccin = "2.8.0"
 git2 = "0.21.0"
+
+# Sandbox backend (feature `sandbox-boxlite`, doc/sandbox.md §4): libkrun microVM
+# runtime for isolated per-session execution. Optional and OFF by default —
+# libkrun only targets Linux + Apple Silicon (§8) and pulls a heavy vendored
+# native stack, so a default build ships only the passthrough backend and stays
+# fast/portable. Pre-1.0 and bus-factor≈1 (§4.2), so every boxlite dependency is
+# confined to src/sandbox/boxlite.rs behind `trait Sandbox` — swapping backends
+# touches that one file. v0.9.7 carries the fixes for RUSTSEC-2026-0147/0148
+# (both sandbox-escape CVEs, patched >= 0.9.0).
+boxlite = { version = "0.9.7", optional = true }
 
 # Gateway (feature `gateway`): HTTP/SSE/WS server for Web/desktop/mobile.
 # Optional so a `--no-default-features` build (e.g. an embedded CLI-only target)
@@ -74,6 +89,10 @@ ts-rs = { version = "12", optional = true, features = [
 # `--no-default-features`.
 default = ["gateway"]
 gateway = ["dep:axum", "dep:tokio-stream"]
+# BoxLite microVM sandbox backend (doc/sandbox.md §4). OFF by default: libkrun is
+# Linux + Apple-Silicon only and heavy. Enable on a supported host with
+# `--features sandbox-boxlite`.
+sandbox-boxlite = ["dep:boxlite"]
 # Enables ts-rs derives on the wire types so `cargo test --features ts-export`
 # regenerates frontend/src/lib/types/*.ts. Off by default; CI runs it to gate
 # type drift (doc/frontend.md §6).
