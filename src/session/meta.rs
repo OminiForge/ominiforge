@@ -30,8 +30,34 @@ pub struct SessionMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<PathBuf>,
 
+    /// The sandbox this session's execution environment is bound to. Records
+    /// which backend created it and (for backends with persistent identity, e.g.
+    /// boxlite) the id needed to re-attach the environment after a process
+    /// restart (`doc/sandbox.md` §3.5). `None` for sessions created before the
+    /// sandbox subsystem, or with no execution environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SandboxDescriptor>,
+
     /// How this session came to exist.
     pub origin: Origin,
+}
+
+/// A session's bound sandbox, persisted so its environment survives a process
+/// restart (`doc/sandbox.md` §3.2, §3.5).
+///
+/// The `backend` names which [`crate::sandbox::SandboxBackend`] produced it;
+/// `id` is the backend's persistent handle (a boxlite box id), absent for
+/// backends that carry no durable identity (passthrough shares the host
+/// workspace and is rebuilt from scratch on re-attach).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
+pub struct SandboxDescriptor {
+    /// Backend name, e.g. `"passthrough"` or `"boxlite"`.
+    pub backend: String,
+
+    /// Backend-specific persistent id, if the backend has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
 /// How a session was born. `kind` carries the semantics; `parent_id` and
@@ -131,6 +157,10 @@ mod tests {
             profile_id: Some("coding-agent".to_owned()),
             created_at: Utc.with_ymd_and_hms(2026, 6, 11, 10, 0, 0).unwrap(),
             workspace: Some(PathBuf::from("/home/user/project/foo")),
+            sandbox: Some(SandboxDescriptor {
+                backend: "boxlite".to_owned(),
+                id: Some("box-01J5M3HKEA".to_owned()),
+            }),
             origin: Origin::new(),
         };
 
@@ -146,6 +176,7 @@ mod tests {
             profile_id: None,
             created_at: Utc.with_ymd_and_hms(2026, 6, 11, 10, 0, 0).unwrap(),
             workspace: None,
+            sandbox: None,
             origin: Origin::new(),
         };
 
@@ -154,5 +185,19 @@ mod tests {
         assert!(!text.contains("parent_id"));
         assert!(!text.contains("fork_at_seq"));
         assert!(!text.contains("profile_id"));
+    }
+
+    #[test]
+    fn meta_without_sandbox_field_deserializes() {
+        // A `session.toml` written before the sandbox subsystem existed has no
+        // `[sandbox]` table; it must still load, with `sandbox == None`.
+        let text = r#"
+            id = "01J5M3HKEA7V2X3P1YKRN9C4WG"
+            created_at = "2026-06-11T10:00:00Z"
+            [origin]
+            kind = "new"
+        "#;
+        let meta: SessionMeta = toml::from_str(text).unwrap();
+        assert_eq!(meta.sandbox, None);
     }
 }
