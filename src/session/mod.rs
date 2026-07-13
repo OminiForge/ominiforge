@@ -24,7 +24,7 @@ mod meta;
 pub use bus::EventBus;
 pub use error::{Result, SessionError};
 pub use event_log::EventLog;
-pub use meta::{Origin, OriginKind, SessionMeta};
+pub use meta::{Origin, OriginKind, SandboxDescriptor, SessionMeta};
 
 use std::path::PathBuf;
 
@@ -38,6 +38,12 @@ use crate::core::{
 const META_FILE: &str = "session.toml";
 const EVENTS_FILE: &str = "events.jsonl";
 const SNAPSHOT_FILE: &str = "context_snapshot.json";
+/// Marker file that flags a session as archived (`doc/session-storage.md` §9).
+/// A sidecar — not a `session.toml` field — deliberately keeps that metadata
+/// free of lifecycle state (its §2 "no status field" rule); archiving is an
+/// out-of-band retirement flag, not part of the session's identity. Its presence
+/// is the whole signal; contents are unused.
+const ARCHIVED_MARKER: &str = ".archived";
 
 /// Owns the root directory under which all session directories live, and mints,
 /// opens, and reads sessions.
@@ -93,6 +99,7 @@ impl SessionStore {
             profile_id: profile_id.clone(),
             created_at: Utc::now(),
             workspace: workspace.clone(),
+            sandbox: None,
             origin: Origin::new(),
         };
         self.write_meta(&meta)?;
@@ -173,6 +180,12 @@ impl SessionStore {
             if !entry.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
             }
+            // An archived session (`doc/session-storage.md` §9) is retired from the
+            // active list — every caller here (resume picker, workspace grouping)
+            // wants live sessions. Its files stay put and are still readable by id.
+            if entry.path().join(ARCHIVED_MARKER).exists() {
+                continue;
+            }
             if let Ok(name) = entry.file_name().into_string() {
                 ids.push(name);
             }
@@ -199,6 +212,23 @@ impl SessionStore {
         Ok(toml::from_str(&text)?)
     }
 
+    /// Persist `session`'s bound sandbox descriptor into its `session.toml`
+    /// (`doc/sandbox.md` §3.5), so the environment can be re-attached after a
+    /// restart. Read-modify-write of the meta; the session must already exist.
+    ///
+    /// # Errors
+    /// [`SessionError::NotFound`] if the session has no meta, otherwise a
+    /// filesystem or serialization error.
+    pub fn bind_sandbox(
+        &self,
+        session_id: &SessionId,
+        descriptor: SandboxDescriptor,
+    ) -> Result<()> {
+        let mut meta = self.read_meta(session_id)?;
+        meta.sandbox = Some(descriptor);
+        self.write_meta(&meta)
+    }
+
     /// Read the full event stream for a session, with `session_id` restored on
     /// every event.
     ///
@@ -206,6 +236,65 @@ impl SessionStore {
     /// Filesystem or parse errors surface as [`SessionError`].
     pub fn read_events(&self, session_id: &SessionId) -> Result<Vec<CoreEvent>> {
         event_log::read_events(&self.events_path(session_id), session_id)
+    }
+
+    fn archived_marker_path(&self, session_id: &SessionId) -> PathBuf {
+        self.session_dir(session_id).join(ARCHIVED_MARKER)
+    }
+
+    /// Whether `session_id` is archived (`doc/session-storage.md` §9): retired —
+    /// permanently — from the active list. A pure existence check on the sidecar
+    /// marker; a missing session reads as not archived (there is nothing to hide
+    /// from a list that already omits it).
+    #[must_use]
+    pub fn is_archived(&self, session_id: &SessionId) -> bool {
+        self.archived_marker_path(session_id).exists()
+    }
+
+    /// Mark `session_id` archived by writing its sidecar marker. Idempotent —
+    /// re-archiving an already-archived session is a no-op success. The session
+    /// must exist; its files are untouched beyond the marker.
+    ///
+    /// Archiving is **one-way** (`doc/session-storage.md` §9): it retires the
+    /// session for good. The files stay for read-only inspection, but the session
+    /// cannot be brought back to run — its sandbox environment was released and
+    /// there is no path to reconstruct it. There is deliberately no `unarchive`.
+    ///
+    /// # Errors
+    /// [`SessionError::NotFound`] if the session has no directory, otherwise the
+    /// filesystem error writing the marker.
+    pub fn archive(&self, session_id: &SessionId) -> Result<()> {
+        // Confirm the session exists before flagging it — an archive marker for a
+        // non-existent session would be an invisible orphan.
+        let _ = self.read_meta(session_id)?;
+        let path = self.archived_marker_path(session_id);
+        std::fs::write(&path, b"").map_err(|source| SessionError::Io { path, source })
+    }
+
+    /// Permanently delete `session_id`'s entire directory (`rm -rf`) — its
+    /// `session.toml`, `events.jsonl`, snapshot, and artifacts. **Irreversible.**
+    ///
+    /// Guarded: the session must **already be archived** (`doc/session-storage.md`
+    /// §9). That two-step (archive → delete) is the deliberate confirmation for
+    /// this destructive op, and it also means an archived session has already had
+    /// its actor stopped and sandbox released — so delete is a pure filesystem
+    /// removal here, not a lifecycle teardown. Deleting a parent is safe: child
+    /// sessions are self-contained (§7), so no cascade or dependency check.
+    ///
+    /// # Errors
+    /// [`SessionError::NotFound`] if the session does not exist,
+    /// [`SessionError::NotArchived`] if it exists but was never archived,
+    /// otherwise the filesystem error removing the directory.
+    pub fn delete(&self, session_id: &SessionId) -> Result<()> {
+        // Existence first: deleting a ghost is NotFound, not a silent success.
+        let _ = self.read_meta(session_id)?;
+        // Refuse to hard-delete a live session — archiving is the required
+        // confirmation gate for an irreversible removal.
+        if !self.is_archived(session_id) {
+            return Err(SessionError::NotArchived(session_id.clone()));
+        }
+        let dir = self.session_dir(session_id);
+        std::fs::remove_dir_all(&dir).map_err(|source| SessionError::Io { path: dir, source })
     }
 
     /// Create a compaction session: mint an id, write `session.toml` with a
@@ -236,6 +325,7 @@ impl SessionStore {
             profile_id: profile_id.clone(),
             created_at: Utc::now(),
             workspace: workspace.clone(),
+            sandbox: None,
             origin: Origin::compaction(parent_id),
         };
         self.write_meta(&meta)?;
@@ -299,6 +389,7 @@ impl SessionStore {
             profile_id: profile_id.clone(),
             created_at: Utc::now(),
             workspace: workspace.clone(),
+            sandbox: None,
             origin: Origin::fork(parent_id, fork_at_seq),
         };
         self.write_meta(&meta)?;
@@ -357,6 +448,7 @@ impl SessionStore {
             profile_id: profile_id.clone(),
             created_at: Utc::now(),
             workspace: workspace.clone(),
+            sandbox: None,
             origin: Origin::reconfiguration(parent_id),
         };
         self.write_meta(&meta)?;
@@ -586,6 +678,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bind_sandbox_persists_descriptor_into_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let writer = store.create_new(None, None, vec![]).unwrap();
+        let sid = writer.session_id().clone();
+        // A fresh session records no sandbox until it is bound.
+        assert_eq!(store.read_meta(&sid).unwrap().sandbox, None);
+
+        store
+            .bind_sandbox(
+                &sid,
+                SandboxDescriptor {
+                    backend: "boxlite".to_owned(),
+                    id: Some("box-1".to_owned()),
+                },
+            )
+            .unwrap();
+
+        let bound = store.read_meta(&sid).unwrap().sandbox.unwrap();
+        assert_eq!(bound.backend, "boxlite");
+        assert_eq!(bound.id.as_deref(), Some("box-1"));
+    }
+
     /// Reopening a session for append continues the seq from where it left off,
     /// and the combined stream reads back contiguous. This is the storage half of
     /// session resume (`--resume` / `--continue`).
@@ -668,6 +784,90 @@ mod tests {
         assert!(second_id.0 > first_id.0, "ULIDs sort in creation order");
         // Newest first.
         assert_eq!(store.list().unwrap(), vec![second_id, first_id]);
+    }
+
+    /// Archiving hides a session from the active `list` yet leaves its files
+    /// readable by id. This is the whole point of archive vs. delete
+    /// (`doc/session-storage.md` §9): retire from view — permanently — without
+    /// losing the data, so a user or agent can still analyze it afterward.
+    #[test]
+    fn archive_hides_from_list_but_keeps_files_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let writer = store.create_new(Some("p".to_owned()), None, vec![]).unwrap();
+        let sid = writer.session_id().clone();
+        drop(writer);
+
+        assert!(!store.is_archived(&sid));
+        assert_eq!(store.list().unwrap(), vec![sid.clone()]);
+
+        store.archive(&sid).unwrap();
+        assert!(store.is_archived(&sid));
+        // Gone from the active list, for good...
+        assert!(store.list().unwrap().is_empty());
+        // ...but its metadata (and events) stay readable by id (the analysis
+        // path) — archive keeps data, it does not delete it.
+        assert_eq!(store.read_meta(&sid).unwrap().profile_id.as_deref(), Some("p"));
+    }
+
+    /// Archiving is idempotent and archiving a non-existent session is `NotFound`
+    /// — so a double-archive (or a stale client retry) can't corrupt state or
+    /// panic.
+    #[test]
+    fn archive_is_idempotent_and_guards_existence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let writer = store.create_new(None, None, vec![]).unwrap();
+        let sid = writer.session_id().clone();
+        drop(writer);
+
+        // Double archive succeeds without changing the outcome.
+        store.archive(&sid).unwrap();
+        store.archive(&sid).unwrap();
+        assert!(store.is_archived(&sid));
+
+        let missing = SessionId("01J5M3HKEA7V2X3P1YKRN9C4WG".to_owned());
+        match store.archive(&missing) {
+            Err(SessionError::NotFound(_)) => {}
+            other => panic!("expected NotFound archiving a ghost, got {other:?}"),
+        }
+    }
+
+    /// Hard-delete requires the session to be archived first, then removes its
+    /// whole directory. This encodes the confirmation gate (`doc/session-storage.md`
+    /// §9): a live (non-archived) session must NOT be destroyable in one step, and
+    /// a ghost is `NotFound` — so an errant delete can't nuke an active session or
+    /// mask a typo'd id.
+    #[test]
+    fn delete_requires_archived_then_removes_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let writer = store.create_new(None, None, vec![]).unwrap();
+        let sid = writer.session_id().clone();
+        drop(writer);
+
+        // Not archived → refused, and the files are untouched.
+        match store.delete(&sid) {
+            Err(SessionError::NotArchived(_)) => {}
+            other => panic!("expected NotArchived deleting a live session, got {other:?}"),
+        }
+        assert!(store.read_meta(&sid).is_ok(), "refused delete left files intact");
+
+        // Deleting a ghost is NotFound, not a silent success.
+        let ghost = SessionId("01J5M3HKEA7V2X3P1YKRN9C4WG".to_owned());
+        match store.delete(&ghost) {
+            Err(SessionError::NotFound(_)) => {}
+            other => panic!("expected NotFound deleting a ghost, got {other:?}"),
+        }
+
+        // Archive → now delete succeeds and the directory is gone entirely.
+        store.archive(&sid).unwrap();
+        store.delete(&sid).unwrap();
+        assert!(!store.session_dir(&sid).exists(), "delete removed the directory");
+        match store.read_meta(&sid) {
+            Err(SessionError::NotFound(_)) => {}
+            other => panic!("deleted session should be NotFound, got {other:?}"),
+        }
     }
 
     /// Compaction creates a new session with origin.kind=compaction, writes the

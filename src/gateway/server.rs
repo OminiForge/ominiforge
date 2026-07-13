@@ -100,11 +100,12 @@ fn router(state: AppState) -> Router {
             get(list_workspace_sessions).post(create_workspace_session),
         )
         .route("/sessions", get(list_sessions).post(create_session))
-        .route("/sessions/{id}", get(get_session))
+        .route("/sessions/{id}", get(get_session).delete(delete_session))
         .route("/sessions/{id}/fork", post(fork_session))
         .route("/sessions/{id}/reconfigure", post(reconfigure_session))
         .route("/sessions/{id}/message", post(post_message))
         .route("/sessions/{id}/cancel", post(cancel_turn))
+        .route("/sessions/{id}/archive", post(archive_session))
         .route("/sessions/{id}/compact", post(compact_session))
         .route("/sessions/{id}/summary", get(session_summary))
         .route("/sessions/{id}/runtime", get(session_runtime))
@@ -598,6 +599,33 @@ async fn cancel_turn(State(state): State<AppState>, Path(id): Path<String>) -> R
     }
 }
 
+/// `POST /sessions/{id}/archive` — retire a session for good: drop it from the
+/// active list while keeping its files for read-only inspection
+/// (`doc/session-storage.md` §9). Stops the actor and releases its sandbox
+/// (`doc/sandbox.md` §9 Q5). One-way — an archived session cannot be run again
+/// (its run paths return 410). A running turn is a 409 (cancel first); an unknown
+/// session is a 404.
+async fn archive_session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let sid = SessionId(id);
+    match state.registry.archive(&sid).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => conflict_or_not_found(&e),
+    }
+}
+
+/// `DELETE /sessions/{id}` — permanently remove a session's files.
+/// **Irreversible.** Requires the session to be **archived first**
+/// (`doc/session-storage.md` §9): a non-archived session is a 409 ("archive it
+/// first"), which is the deliberate two-step confirmation. An unknown session is
+/// a 404.
+async fn delete_session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let sid = SessionId(id);
+    match state.registry.delete(&sid) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => conflict_or_not_found(&e),
+    }
+}
+
 /// Body of a compact request.
 #[derive(Debug, Default, Deserialize)]
 struct CompactBody {
@@ -844,13 +872,30 @@ async fn ws_loop(socket: WebSocket, handle: ActorHandle) {
     }
 }
 
-/// Map a registry error to 404 (not found) or 409 (locked) heuristically. The
-/// registry surfaces a "locked or missing" context for `open` failures; a clean
-/// `NotFound` from metadata reads is a 404.
+/// Map a registry error to 410 (archived), 404 (not found) or 409 (locked)
+/// heuristically. An archived session is `Gone` — it existed but is retired for
+/// good (`doc/session-storage.md` §9). The registry surfaces a "locked or
+/// missing" context for `open` failures; a clean `NotFound` from metadata reads
+/// is a 404.
+/// Map a registry error to a status heuristically, from the messages in its
+/// whole source chain (the registry wraps the typed store error in an `anyhow`
+/// context, so the distinguishing phrase is often a *cause*, not the outermost
+/// message):
+/// - "not archived" → 409 (must `archive` before `DELETE`, `doc/session-storage.md` §9);
+/// - "archived" (retired) → 410 Gone — it existed but is retired for good;
+/// - "locked" → 409 (a turn is running / another writer holds it);
+/// - otherwise a clean `NotFound` → 404.
+///
+/// The "not archived" test runs first because its message also contains the
+/// substring "archived".
 fn conflict_or_not_found(e: &anyhow::Error) -> Response {
-    let msg = e.to_string();
-    if msg.contains("locked") {
-        (StatusCode::CONFLICT, Json(json!({ "error": msg }))).into_response()
+    let full = e.chain().map(ToString::to_string).collect::<Vec<_>>().join("; ");
+    if full.contains("not archived") {
+        (StatusCode::CONFLICT, Json(json!({ "error": full }))).into_response()
+    } else if full.contains("archived") {
+        (StatusCode::GONE, Json(json!({ "error": full }))).into_response()
+    } else if full.contains("locked") {
+        (StatusCode::CONFLICT, Json(json!({ "error": full }))).into_response()
     } else {
         not_found(e)
     }
@@ -898,7 +943,8 @@ mod tests {
             profile: "default".to_owned(),
             no_dotenv: true,
         };
-        let registry = SessionRegistry::new(defaults, &GatewayConfig::default());
+        let registry =
+            SessionRegistry::new(defaults, &GatewayConfig::default(), &|_| {}).unwrap();
         (registry, dir)
     }
 
@@ -948,7 +994,8 @@ default = "openai-main/gpt-4o"
             profile: "coding".to_owned(),
             no_dotenv: true,
         };
-        let registry = SessionRegistry::new(defaults, &GatewayConfig::default());
+        let registry =
+            SessionRegistry::new(defaults, &GatewayConfig::default(), &|_| {}).unwrap();
         (registry, dir)
     }
 
@@ -1046,7 +1093,8 @@ default = "openai-main/gpt-4o"
             profile: "default".to_owned(),
             no_dotenv: true,
         };
-        let registry = SessionRegistry::new(defaults, &GatewayConfig::default());
+        let registry =
+            SessionRegistry::new(defaults, &GatewayConfig::default(), &|_| {}).unwrap();
 
         // Create a session with a few events (Created = seq 0, plus appends).
         let store = registry.store();
@@ -1336,6 +1384,187 @@ default = "openai-main/gpt-4o"
             .await
             .unwrap();
         assert_eq!(resp.status(), 404);
+    }
+
+    /// Archive over HTTP: a session drops out of the active list on archive
+    /// (204), stays readable by id (the analysis path), and — being retired for
+    /// good — refuses to run again (410 on `POST .../message`). This is the
+    /// session-lifecycle close (`doc/session-storage.md` §9) and the sandbox
+    /// `release` trigger (`doc/sandbox.md` §9 Q5).
+    #[tokio::test]
+    async fn archive_retires_session_one_way() {
+        let (registry, _dir) = test_registry();
+        // Create a session directly on the store (no turn ⇒ never `Running`, so
+        // archive is allowed). Drop the writer to release its lock.
+        let sid = {
+            let writer = registry.store().create_new(None, None, vec![]).unwrap();
+            let id = writer.session_id().clone();
+            drop(writer);
+            id
+        };
+        let state = AppState {
+            registry,
+            api_key: None,
+            pricing: Arc::new(PricingTable::default()),
+        };
+        let base = serve_test(state).await;
+        let client = reqwest::Client::new();
+
+        let listed = |base: String| async move {
+            reqwest::get(format!("{base}/api/sessions"))
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()["sessions"]
+                .as_array()
+                .unwrap()
+                .len()
+        };
+
+        assert_eq!(listed(base.clone()).await, 1, "session is active initially");
+
+        // Archive → 204, gone from the active list for good...
+        let resp = client
+            .post(format!("{base}/api/sessions/{}/archive", sid.0))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204);
+        assert_eq!(listed(base.clone()).await, 0, "archived → not in active list");
+
+        // ...but still readable by id (the analysis path).
+        let resp = reqwest::get(format!("{base}/api/sessions/{}", sid.0))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "archived session still readable by id");
+
+        // ...yet cannot be run again — a run path is 410 Gone, not a silent
+        // respawn. This is the one-way guarantee: no reviving a retired session.
+        let resp = client
+            .post(format!("{base}/api/sessions/{}/message", sid.0))
+            .json(&json!({ "text": "hello" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 410, "archived session refuses to run");
+
+        // Archiving an unknown session is a 404, not a silent success.
+        let resp = client
+            .post(format!("{base}/api/sessions/does-not-exist/archive"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+    }
+
+    /// Archiving a session whose turn is running is a 409, not a silent retire:
+    /// tearing an actor down mid-turn would drop uncommitted work, so the guard
+    /// forces a `cancel` first (`doc/session-storage.md` §9). We simulate the
+    /// running state by publishing `Running` to the shared status hub — the same
+    /// signal a live turn raises — rather than driving a real model turn.
+    #[tokio::test]
+    async fn archive_running_session_is_conflict() {
+        let (registry, _dir) = test_registry();
+        let sid = {
+            let writer = registry.store().create_new(None, None, vec![]).unwrap();
+            let id = writer.session_id().clone();
+            drop(writer);
+            id
+        };
+        // Mark it running on the hub the registry reads through `archive`.
+        registry.status_hub().publish(crate::gateway::SessionStatus {
+            session_id: sid.clone(),
+            workspace_id: WorkspaceId::none(),
+            status: crate::gateway::ActivityStatus::Running,
+            latest_seq: 0,
+        });
+        let state = AppState {
+            registry,
+            api_key: None,
+            pricing: Arc::new(PricingTable::default()),
+        };
+        let base = serve_test(state).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/api/sessions/{}/archive", sid.0))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409, "a running turn blocks archive");
+
+        // And it is still active (not archived) after the rejected attempt.
+        let count = reqwest::get(format!("{base}/api/sessions"))
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()["sessions"]
+            .as_array()
+            .unwrap()
+            .len();
+        assert_eq!(count, 1, "rejected archive left the session active");
+    }
+
+    /// Hard-delete over HTTP is gated on archive-first: a live session's `DELETE`
+    /// is a 409 ("archive it first"), and only after archiving does `DELETE`
+    /// remove it (204), after which it is gone entirely (a second `DELETE` is a
+    /// 404). This is the irreversible-op confirmation (`doc/session-storage.md`
+    /// §9) — a one-step delete of a live session must be impossible.
+    #[tokio::test]
+    async fn delete_requires_archive_first_then_removes() {
+        let (registry, _dir) = test_registry();
+        let sid = {
+            let writer = registry.store().create_new(None, None, vec![]).unwrap();
+            let id = writer.session_id().clone();
+            drop(writer);
+            id
+        };
+        let state = AppState {
+            registry,
+            api_key: None,
+            pricing: Arc::new(PricingTable::default()),
+        };
+        let base = serve_test(state).await;
+        let client = reqwest::Client::new();
+
+        // Deleting a live (non-archived) session is refused: 409, files intact.
+        let resp = client
+            .delete(format!("{base}/api/sessions/{}", sid.0))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409, "cannot hard-delete before archiving");
+        let resp = reqwest::get(format!("{base}/api/sessions/{}", sid.0))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "refused delete left the session readable");
+
+        // Archive, then delete → 204, and it is gone for real.
+        let resp = client
+            .post(format!("{base}/api/sessions/{}/archive", sid.0))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204);
+        let resp = client
+            .delete(format!("{base}/api/sessions/{}", sid.0))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204, "archived session deletes cleanly");
+
+        // Gone: reading it and re-deleting are both 404.
+        let resp = reqwest::get(format!("{base}/api/sessions/{}", sid.0))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404, "deleted session is gone");
+        let resp = client
+            .delete(format!("{base}/api/sessions/{}", sid.0))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404, "second delete is a 404");
     }
 
     /// A no-arg `POST /sessions` (no query string) still creates a session on the

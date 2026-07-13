@@ -21,6 +21,12 @@ pub enum SessionError {
     #[error("session not found: {0}")]
     NotFound(SessionId),
 
+    /// The session exists but is not archived, so it cannot be hard-deleted.
+    /// Archive it first (`doc/session-storage.md` §9) — the two-step
+    /// archive→delete is the deliberate confirmation for an irreversible op.
+    #[error("session is not archived: {0} (archive it before deleting)")]
+    NotArchived(SessionId),
+
     /// An underlying filesystem error.
     #[error("session io error at {path}: {source}")]
     Io {

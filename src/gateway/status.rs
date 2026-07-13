@@ -152,6 +152,19 @@ impl StatusHub {
             .unwrap_or_default()
     }
 
+    /// The last-known activity status for one session, or `None` if it has never
+    /// published one (no actor has run a turn for it this process). Used to gate
+    /// destructive lifecycle ops (`archive`): a `Running` session must not be
+    /// retired out from under a live turn (`doc/session-storage.md` §9).
+    #[must_use]
+    pub fn status_of(&self, session_id: &SessionId) -> Option<ActivityStatus> {
+        self.inner
+            .map
+            .read()
+            .ok()
+            .and_then(|map| map.get(session_id).map(|s| s.status))
+    }
+
     /// Subscribe to status deltas published from now on. A receiver that falls
     /// more than the channel capacity behind gets a `Lagged` error and should
     /// resync via [`snapshot`](Self::snapshot).
@@ -253,5 +266,22 @@ mod tests {
             rx.try_recv().is_err(),
             "no delta when the session is already idle"
         );
+    }
+
+    /// `status_of` reflects the current per-session status (or `None` when
+    /// unknown) — the read the archive guard depends on to reject retiring a
+    /// `Running` session while letting an `Idle` (or never-run) one through.
+    #[test]
+    fn status_of_reads_current_or_none() {
+        let hub = StatusHub::new();
+        let s1 = SessionId("s1".to_owned());
+
+        assert_eq!(hub.status_of(&s1), None, "never published → unknown");
+
+        hub.publish(status("s1", ActivityStatus::Running, 1));
+        assert_eq!(hub.status_of(&s1), Some(ActivityStatus::Running));
+
+        hub.publish(status("s1", ActivityStatus::Idle, 3));
+        assert_eq!(hub.status_of(&s1), Some(ActivityStatus::Idle), "latest wins");
     }
 }

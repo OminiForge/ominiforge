@@ -40,7 +40,7 @@ fork_at_seq = 42           # 仅 fork 时存在
 
 设计决策：
 
-- **无 status 字段**。Session 不需要显式生命周期状态。Session 存在即可用，任何 session 随时可被 fork。UI 需要区分"当前在用"与"历史"时，从 `last_event_at`（索引数据库缓存）或是否有子 session 派生判断。
+- **无 status 字段**。Session 不需要显式生命周期状态。Session 存在即可用，任何 session 随时可被 fork。UI 需要区分"当前在用"与"历史"时，从 `last_event_at`（索引数据库缓存）或是否有子 session 派生判断。**例外：归档标记不进 `session.toml`**，而是 session 目录下的 sidecar 文件 `.archived`（§9），刻意让元数据保持无生命周期状态——归档是带外的"退役"信号，不是 session 身份的一部分。
 - **无 reason 字段**。Kind 已足够表达来源语义。
 - **parent_id 统一**。Fork、compaction、reconfiguration 都用同一个 parent_id 字段，kind 区分语义。
 - **workspace 可选**。CLI 默认填 CWD，Web/Gateway 由用户显式选择，研究/聊天类 session 可不设置。workspace = None 时 filesystem tools 不可用或受限。
@@ -136,8 +136,44 @@ Gateway 是 tokio async 运行时，多请求并发到达：
 - 同一 session 的请求串行化（per-session Mutex 或 actor model）。
 - 不同 session 完全并行，无竞争。
 
-## 9. 待后续讨论
+## 9. Session 生命周期：归档与删除
+
+Session 的退役分两级——**archive（归档，安全、日常）** 与 **hard delete（硬删除，危险、罕用）**——两者都是沙箱 `release` 的触发点（`doc/sandbox.md` §9 Q5：session 被退役才 release，不绑 thread）。
+
+### Archive（已实现）
+
+`POST /sessions/{id}/archive`：把 session **永久退役**——从活跃列表移除、释放沙箱，但**保留全部文件**供用户或 agent 之后只读分析。步骤：
+
+1. **拒绝运行中**：若该 session 有 turn 正在跑（StatusHub 报 `Running`），返回 409——不把正在写的 turn 从底下抽走。调用方先 `cancel` 再归档。
+2. **停 actor**：从 actor map 移除并发 `Shutdown`，释放 event-log 锁。
+3. **release 沙箱**：`SandboxManager::release(id)`。boxlite 的 `try_gc_base` 自查——若父快照仍被 fork 子依赖则不真删（CoW 盘安全），passthrough 为 no-op。
+4. **写标记**：session 目录下创建 sidecar 文件 `.archived`。
+
+**Archive 是单向终态，没有 unarchive。** 理由:归档时沙箱环境已被 release,而它无法重建——`events.jsonl` 能重放对话流、workspace 文件本就在用户外部目录(app 从不 CoW,§3.3)完好无损,但**沙箱内部状态**(装的包、guest 的 `/tmp` `/root` `/etc`、运行态,在 boxlite 的 CoW 盘里)随 release 一并回收。所以"恢复"只能给出一个全新空沙箱,不是当时那个装好环境的 microVM——提供一个名不副实的 `unarchive` 是误导,故不提供。archived session 的全部运行/流入口(`get_or_spawn` 单点门控)返回 **410 Gone**;只读入口(`GET /sessions/{id}` meta、`/summary` replay events)照常;基于其内容 fork 出**新** session 分析也照常(fork 产生新 session,不复活旧的)。
+
+设计决策：
+
+- **归档标记 = sidecar 文件，不是 `session.toml` 字段**（§2 例外）。保住"无 status 字段"原则，schema 零改、向后兼容天然。标记的**存在**即信号，内容不用。
+- **`list()` 过滤 archived**。三个活跃枚举入口（`GET /sessions`、workspace 分组、CLI/TUI resume 选择器）都不再返回 archived；但按 id 读 `session.toml` / `events.jsonl` 仍可用——这正是"保留供分析"。
+- **单点运行门控**。archived 的运行拦截只加在 `get_or_spawn`(所有 run/stream 路径的唯一入口),覆盖全部、且不误伤只读路径。文件系统是唯一真相源(每次 `list()`/门控都重新 stat,无缓存),外部手动增删 `.archived` 下次即生效——但注意手动 `touch` 只切换"列表可见性 + 运行门控",不触发 release;完整退役须走 API。
+- **release 失败则中止归档**（fail loud），不泄漏沙箱环境。
+- **幂等**。重复 archive 是 no-op 成功。
+
+### Hard delete（已实现）
+
+`DELETE /sessions/{id}`：物理 `rm -rf` 整个 session 目录（`session.toml` + `events.jsonl` + snapshot + artifacts），**不可逆**。
+
+**确认机制 = 必须先 archive。** 未归档的 session 直接 DELETE 返回 **409**（"archive it first"）——这个两步屏障（先 archive 再 delete）就是不可逆操作的显式确认,不需要单独的 confirm token。而且因为 archived session **已经**停了 actor、释放了沙箱(archive 的前序),delete 本身退化成**纯文件系统删除**,不重复 stop/release 逻辑。
+
+设计决策：
+
+- **授权门放在 store 原语层**。`SessionStore::delete` 自身检查 `is_archived`,未归档返回 typed `SessionError::NotArchived`——一个能 `rm` 掉活 session 的原语是灾难级 footgun,不可逆 fs 操作值得纵深防御,不把安全性只押在上层 handler。
+- **删父 session 安全,无级联**。子 session 完全自包含(§7),删父不影响子,故不需要依赖图/引用计数检查。
+- **ghost → 404**(先 `read_meta` 存在性检查),二次 delete 自然是 404。
+
+## 10. 待后续讨论
 
 - 索引数据库字段设计（sessions.sqlite schema）。
 - Artifact 与 event log 的引用关系细节。
-- Session 清理策略（自动过期、容量限制）。
+- Session 清理策略（自动过期、容量限制）——archive/delete 是手动退役，自动 GC 是另一回事。
+- Delete 的前端暴露方式（当前仅 HTTP `DELETE`,前端是否加二次确认弹窗由 UI 层定）。
