@@ -21,7 +21,9 @@ mod profile;
 mod providers;
 
 pub use error::{ConfigError, Result};
-pub use profile::{DEFAULT_SYSTEM_PROMPT, Profile, ProfileMeta, PromptSection, ToolsSection};
+pub use profile::{
+    DEFAULT_SYSTEM_PROMPT, NetworkSection, Profile, ProfileMeta, PromptSection, ToolsSection,
+};
 pub use providers::{ModelConfig, Pricing, ProviderConfig, ProviderType, ProvidersFile};
 
 use crate::secrets::SecretStore;

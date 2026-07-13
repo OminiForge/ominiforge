@@ -138,6 +138,10 @@ warn_at_percent = 80
 
 [hooks]
 before_tool = ["security-guard"]     # 额外绑定的 hook
+
+[network]
+policy = "allowlist"                 # isolated | allowlist | open；缺省继承 gateway 兜底
+allow = ["crates.io", "pypi.org"]    # 仅 allowlist 生效的可达主机
 ```
 
 ### 3.1 Profile 字段说明
@@ -158,6 +162,8 @@ before_tool = ["security-guard"]     # 额外绑定的 hook
 | memory.* | ✗ | 默认 scopes=["user","project"], auto_write=true |
 | budget.* | ✗ | 默认无限制 |
 | hooks.* | ✗ | 默认无额外 hook |
+| network.policy | ✗ | 沙箱网络策略 `isolated`/`allowlist`/`open`；缺省继承 gateway `default_network`（兜底 = `open`）。见 `doc/sandbox.md` §6.2 |
+| network.allow | ✗ | `allowlist` 下的可达主机；其他策略忽略 |
 
 ### 3.2 Model 引用格式
 
@@ -236,6 +242,7 @@ session_max_usd = 10.00  # 覆盖
 | tool set | Profile | agent 能力 |
 | skill set | Profile | agent 能力 |
 | memory scope | Profile | agent 知识范围 |
+| network policy | Profile（gateway 兜底） | agent 能力（能否联网、可达哪些主机）；同 tool set 归 agent 身份，缺省下沉到 gateway `default_network`。未来可再下沉到 workspace 级 |
 
 ## 8. 文件系统布局
 

@@ -39,6 +39,8 @@ pub struct Profile {
     pub budget: BudgetSection,
     #[serde(default)]
     pub hooks: HooksSection,
+    #[serde(default)]
+    pub network: NetworkSection,
 }
 
 /// `[profile]`: identity and inheritance.
@@ -166,6 +168,23 @@ pub struct HooksSection {
     pub after_tool: Vec<String>,
 }
 
+/// `[network]`: the sandbox network egress policy for sessions on this profile.
+///
+/// (`doc/sandbox.md` §6.2). Wired: `assemble` derives the sandbox's
+/// [`NetworkPolicy`](crate::sandbox::NetworkPolicy) from this section, falling
+/// back to the gateway default when `policy` is unset (`doc/profile.md` §7).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
+pub struct NetworkSection {
+    /// Egress policy: `isolated` (no network), `allowlist` (only `allow` hosts),
+    /// or `open` (unrestricted). `None` inherits the gateway default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
+    /// Hosts reachable under the `allowlist` policy; ignored otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+}
+
 impl Profile {
     /// The built-in default profile used when no profile file exists and none
     /// is inherited (`doc/profile.md` §4: "无 `extends` 时使用硬编码默认值").
@@ -191,6 +210,7 @@ impl Profile {
             memory: MemorySection::default(),
             budget: BudgetSection::default(),
             hooks: HooksSection::default(),
+            network: NetworkSection::default(),
         }
     }
 
@@ -213,6 +233,7 @@ impl Profile {
             memory: pick_memory(self.memory, parent.memory),
             budget: pick_budget(self.budget, parent.budget),
             hooks: pick_hooks(self.hooks, parent.hooks),
+            network: pick_network(self.network, parent.network),
         }
     }
 }
@@ -300,6 +321,16 @@ fn pick_hooks(child: HooksSection, parent: HooksSection) -> HooksSection {
     }
 }
 
+fn pick_network(child: NetworkSection, parent: NetworkSection) -> NetworkSection {
+    // A child that names no policy inherits the parent's whole section; one that
+    // does replaces it wholesale (§4 field-level override, no list merge).
+    if child.policy.is_none() {
+        parent
+    } else {
+        child
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -347,6 +378,10 @@ warn_at_percent = 80
 
 [hooks]
 before_tool = ["security-guard"]
+
+[network]
+policy = "allowlist"
+allow = ["crates.io", "pypi.org"]
 "#;
         let p: Profile = toml::from_str(toml_src).unwrap();
         assert_eq!(p.profile.name, "coding");
@@ -361,6 +396,8 @@ before_tool = ["security-guard"]
             p.context.compaction_model.as_deref(),
             Some("openai-main/gpt-4o-mini")
         );
+        assert_eq!(p.network.policy.as_deref(), Some("allowlist"));
+        assert_eq!(p.network.allow, ["crates.io", "pypi.org"]);
     }
 
     #[test]
@@ -375,6 +412,8 @@ name = "tiny"
         assert!(p.tools.builtin.is_none());
         // builtin unset → every tool allowed.
         assert!(p.tools.allows("shell"));
+        // network policy unset → inherits the gateway default downstream.
+        assert!(p.network.policy.is_none());
     }
 
     #[test]
