@@ -70,7 +70,7 @@
 		{/if}
 		<span class="tool-name">{item.name}</span>
 		<span class="tool-status-badge">{item.status}</span>
-		{#if !expanded && preview}
+		{#if preview}
 			<span class="tool-preview">{preview}</span>
 		{/if}
 		<svg
@@ -87,18 +87,17 @@
 	</button>
 	{#if expanded}
 		<div class="tool-detail">
-			{#if item.result || item.status !== 'running'}
-				<Body
-					name={item.name}
-					args={item.args}
-					result={item.result}
-					status={item.status}
-					error_code={item.error_code}
-				/>
-			{:else}
-				<div class="running-placeholder">
+			<Body
+				name={item.name}
+				args={item.args}
+				result={item.result}
+				status={item.status}
+				error_code={item.error_code}
+			/>
+			{#if item.status === 'running'}
+				<div class="running-indicator">
 					<span class="tool-spinner"></span>
-					正在执行…
+					<span>正在执行…</span>
 				</div>
 			{/if}
 		</div>
@@ -264,14 +263,15 @@
 		border-top: 1px solid var(--border-subtle);
 	}
 
-	.running-placeholder {
+	.running-indicator {
 		display: flex;
 		align-items: center;
 		gap: var(--space-2);
 		font-size: 12px;
 		color: var(--text-tertiary);
 		font-family: var(--font-chinese);
-		padding: var(--space-3) var(--space-4);
+		padding: var(--space-2) var(--space-4);
+		border-top: 1px solid var(--border-subtle);
 	}
 
 	@media (prefers-reduced-motion: reduce) {

@@ -1,16 +1,18 @@
 <script lang="ts">
 	import Diff from './Diff.svelte';
 	import RawArgs from './RawArgs.svelte';
+	import { extractArgsPath } from '$lib/tools/utils';
 
 	/** `write` result. Three header shapes from write.rs:
 	 *  - `wrote PATH (new, N lines)` + all-`+` body → whole-file addition
 	 *  - `wrote PATH (~, +A -B)` + unified diff → overwrite
 	 *  - `wrote PATH (no change)` → identical content, no body
 	 *  An unrecognized first line is a business error (e.g. write_failed). */
-	let { args, result }: { args: string; result?: string } = $props();
+	let { args, result, status }: { args: string; result?: string; status: 'running' | 'done' | 'error' } = $props();
 
 	interface Parsed {
 		ok: boolean;
+		running?: boolean;
 		path?: string;
 		meta?: string;
 		diff: string;
@@ -19,6 +21,11 @@
 
 	const parsed = $derived.by<Parsed>(() => {
 		const text = result ?? '';
+		if (status === 'running' && !text) {
+			const p = extractArgsPath(args);
+			if (p) return { ok: true, running: true, path: p, diff: '' };
+			return { ok: false, diff: '' };
+		}
 		const nl = text.indexOf('\n');
 		const head = nl === -1 ? text : text.slice(0, nl);
 		const body = nl === -1 ? '' : text.slice(nl + 1);
@@ -31,9 +38,9 @@
 <div class="result">
 	{#if parsed.ok}
 		<div class="sum">
-			<span class="verb">wrote</span>
+			<span class="verb" class:running={parsed.running}>{parsed.running ? 'writing' : 'wrote'}</span>
 			<span class="path">{parsed.path}</span>
-			<span class="meta">{parsed.meta}</span>
+			{#if parsed.meta}<span class="meta">{parsed.meta}</span>{/if}
 		</div>
 		{#if parsed.diff}<Diff text={parsed.diff} />{/if}
 	{:else}
@@ -70,6 +77,11 @@
 		background: var(--state-done-bg);
 		color: var(--state-done-text);
 		border: 1px solid color-mix(in srgb, var(--state-done) 25%, transparent);
+	}
+	.verb.running {
+		background: var(--state-running-bg);
+		color: var(--state-running-text);
+		border-color: color-mix(in srgb, var(--state-running) 25%, transparent);
 	}
 	.path {
 		color: var(--accent-ink);

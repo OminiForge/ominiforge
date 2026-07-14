@@ -1,12 +1,13 @@
 <script lang="ts">
 	import CodeView from './CodeView.svelte';
 	import RawArgs from './RawArgs.svelte';
+	import { extractArgsPath } from '$lib/tools/utils';
 
 	/** `read` result: a file body (path chip + numbered gutter + highlighted
 	 *  source, via CodeView) or a directory listing (entries, sub-dirs tinted).
 	 *  Both start with a `[header]` line the tool emits. Raw args are tucked into
 	 *  the debug fold. */
-	let { name, args, result }: { name: string; args: string; result?: string } = $props();
+	let { name, args, result, status }: { name: string; args: string; result?: string; status: 'running' | 'done' | 'error' } = $props();
 
 	interface Parsed {
 		kind: 'file' | 'dir' | 'plain';
@@ -17,6 +18,11 @@
 
 	const parsed = $derived.by<Parsed>(() => {
 		const text = result ?? '';
+		if (status === 'running' && !text) {
+			const p = extractArgsPath(args);
+			if (p) return { kind: 'file', path: p, body: [] };
+			return { kind: 'plain', body: [] };
+		}
 		const lines = text.split('\n');
 		const head = /^\[(.+?)(?:#([^#\]]+))?\]$/.exec(lines[0]);
 		if (!head) return { kind: 'plain', body: lines };

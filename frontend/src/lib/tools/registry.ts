@@ -8,8 +8,11 @@ import WriteResult from '$lib/components/tools/WriteResult.svelte';
 import ShellResult from '$lib/components/tools/ShellResult.svelte';
 import GenericResult from '$lib/components/tools/GenericResult.svelte';
 
-// The union of props any result component may receive. Each component reads the
-// subset it needs (Svelte ignores extra props), so ToolBlock can pass one shape.
+/** The union of props any result component may receive. Each component reads the
+ *  subset it needs (Svelte ignores extra props), so ToolBlock can pass one shape.
+ *  **Contract**: components MUST handle `result` being `undefined` (the tool is
+ *  still running) — ToolBlock renders Body during execution so the user can see
+ *  what is being done (args-derived path, command, etc.). */
 export interface ResultProps {
 	name: string;
 	args: string;
