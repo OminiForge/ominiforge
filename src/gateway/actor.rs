@@ -657,10 +657,12 @@ impl StreamSink for BroadcastSink {
         }));
     }
 
-    // Tool call args are NOT forwarded as live deltas — they arrive as a
-    // committed ContentBlock once the model finishes.  This avoids the user
-    // seeing partial JSON during streaming (direction 2: non-streaming tool calls).
-    fn on_tool_call_delta(&mut self, _index: u32, _json_delta: &str) {}
+	fn on_tool_call_delta(&mut self, index: u32, json_delta: &str) {
+		let _ = self.tx.send(GatewayEvent::Delta(Delta::ToolArgs {
+			index,
+			json: json_delta.to_owned(),
+		}));
+	}
 
     fn on_context(&mut self, tokens: u32, window: u32, threshold: f32) {
         let _ = self.tx.send(GatewayEvent::ContextUpdated {
