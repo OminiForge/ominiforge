@@ -297,9 +297,14 @@ Agent 调用 shell tool:
 
 **下发现状**：
 - **后端映射已完成**：`box_options()` 把 `SandboxConfig.network`（Isolated→无 NIC / AllowList→白名单 / Open）和 `resources.cpus`/`memory_mb` 逐字段翻译成 boxlite `BoxOptions`；passthrough 按契约忽略（宿主无隔离）。
-- **network 已接分层下发**（本步）：策略从 **profile `[network]` > gateway `default_network` 兜底 > 硬编码 `Open`** 派生，写进 `SandboxConfig.network`。profile 层归属见 `doc/profile.md` §7（network = agent 能力，同 tool set）。effective 兜底 = `Open`——一个新 boxlite session 默认能联网，锁死交给显式配置（否则 `NetworkPolicy::default()=Isolated` 会让每个未配置 session 断网）。策略名非法 **fail loud**（Karpathy §12），不静默回退。**持久化**：策略由 profile 派生、`profile_id` 已落 `session.toml`，重启 `attach` 沿同一链重新派生 → 天然还原,无需在 `SessionMeta` 另存 network 字段（§3.5）。
-- **resources（cpu/mem）下发面**：后端映射就绪，但 profile/gateway 尚未暴露配置入口——无明确需求前不做（§3.7「现在设计等于猜」）。
-- **workspace 层**：network 未来可下沉到 workspace 级配置（后续权限门控同一落点）；解析链已按 `workspace(future) > profile > gateway` 预留，当前只实现 `profile > gateway`。
+- **network 已接三档分层下发**（本步）：策略沿 **workspace `workspace.toml` > profile `[network]` > gateway `default_network` 兜底 > 硬编码 `Open`** 派生，写进 `SandboxConfig.network`（`app::resolve_network` 一处可测，`app.rs`）。
+  - **workspace 层 = 网关侧、可信**（`doc/workspace-config.md`）：配置存 `<gateway>/.omini/workspaces/<workspace_id>.toml`（`workspace_id` = 路径哈希，复用 `WorkspaceId`），**不放项目目录**——项目目录 agent 可写（§3.3），从那读安全策略 = 提权，撞 secret-store 威胁模型。网关侧由部署者掌控。
+  - **profile 层**归属见 `doc/profile.md` §7（network = agent 能力，同 tool set）。
+  - effective 兜底 = `Open`——一个新 boxlite session 默认能联网，锁死交给显式配置（否则 `NetworkPolicy::default()=Isolated` 会让每个未配置 session 断网）。
+  - 任一层策略名非法 **fail loud**（Karpathy §12），不静默回退：workspace.toml 坏 → 建 session 失败；profile 坏 → 同样硬报错。
+  - **持久化**：workspace 配置按路径哈希寻址、profile 由 `profile_id` 落盘，重启 `attach` 沿同一链重新派生 → 天然还原，无需在 `SessionMeta` 另存 network 字段（§3.5）。
+  - **生命周期/GC**：workspace 配置可比其项目活得久（项目移走/删了配置还在）。**绝不自动物理删**——路径消失可能是瞬时的（盘未挂、mid-move），静默删 = 丢用户手写策略、不可回退。`GET /workspaces/config/orphans` 只读列孤儿，`DELETE /workspaces/config/{id}` 显式删（对齐 archive 的「显式 only」）。
+- **resources（cpu/mem）下发面**：后端映射就绪，但 profile/gateway/workspace 尚未暴露配置入口——无明确需求前不做（§3.7「现在设计等于猜」）。
 
 ---
 

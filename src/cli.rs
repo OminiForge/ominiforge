@@ -729,8 +729,10 @@ async fn prepare(
         None,
         // CLI runs on the passthrough backend (host, no isolation), which ignores
         // the network policy; pass Open so the field is meaningful if a CLI run is
-        // ever pointed at an isolating backend (`doc/sandbox.md` §6.2).
+        // ever pointed at an isolating backend (`doc/sandbox.md` §6.2). No
+        // workspace-level override off the CLI (that layer is gateway-side).
         crate::sandbox::NetworkPolicy::Open,
+        None,
         &|msg| eprintln!("{msg}"),
     )
     .await

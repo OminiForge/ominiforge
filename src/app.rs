@@ -63,18 +63,29 @@ pub struct Assembled {
     pub mcp_clients: Vec<Arc<crate::mcp::McpClient>>,
 }
 
-/// Resolve a session's sandbox network policy: the profile's `[network].policy`
-/// when set, otherwise the gateway `fallback` (`doc/sandbox.md` §6.2,
-/// `doc/profile.md` §7). Kept separate from [`assemble`] so the precedence rule
-/// is unit-testable without standing up providers/MCP.
+/// Resolve a session's sandbox network policy from the precedence chain
+/// (`doc/sandbox.md` §6.2, `doc/profile.md` §7):
+///
+/// ```text
+/// workspace override  >  profile [network]  >  gateway fallback
+/// ```
+///
+/// `workspace` is the per-workspace override already parsed gateway-side (its
+/// own bad-name fail-loud happens there); when present it wins outright. Kept
+/// separate from [`assemble`] so the whole precedence rule is unit-testable
+/// without standing up providers/MCP.
 ///
 /// # Errors
-/// An unrecognized profile policy name — the caller must fail the session start,
-/// not silently open or isolate the sandbox (Karpathy §12).
+/// An unrecognized *profile* policy name — the caller must fail the session
+/// start, not silently open or isolate the sandbox (Karpathy §12).
 fn resolve_network(
+    workspace: Option<crate::sandbox::NetworkPolicy>,
     section: &crate::config::NetworkSection,
     fallback: crate::sandbox::NetworkPolicy,
 ) -> Result<crate::sandbox::NetworkPolicy, String> {
+    if let Some(policy) = workspace {
+        return Ok(policy);
+    }
     section.policy.as_ref().map_or(Ok(fallback), |name| {
         crate::sandbox::NetworkPolicy::from_policy_name(name, &section.allow)
     })
@@ -109,6 +120,7 @@ pub async fn assemble(
         crate::session::SandboxDescriptor,
     )>,
     default_network: crate::sandbox::NetworkPolicy,
+    workspace_network: Option<crate::sandbox::NetworkPolicy>,
     on_warn: &(dyn Fn(&str) + Sync),
 ) -> Result<Assembled> {
     let workspace = resolve_workspace(&workspace)?;
@@ -156,11 +168,11 @@ pub async fn assemble(
     let (sandbox, sandbox_descriptor) = if let Some(pair) = injected_sandbox {
         pair
     } else {
-        // Resolve the session's network egress: the profile's `[network].policy`
-        // wins, else the gateway default passed in (`doc/sandbox.md` §6.2,
-        // `doc/profile.md` §7). A malformed policy name fails loud rather than
+        // Resolve the session's network egress along the precedence chain
+        // (`doc/sandbox.md` §6.2): workspace override > profile [network] >
+        // gateway default. A malformed profile policy name fails loud rather than
         // silently opening or isolating the sandbox (Karpathy §12).
-        let network = resolve_network(&profile.network, default_network)
+        let network = resolve_network(workspace_network, &profile.network, default_network)
             .map_err(|e| anyhow::anyhow!("profile `{profile_name}` has an invalid [network]: {e}"))?;
         let sandbox = sandbox_backend
             .create(crate::sandbox::SandboxConfig {
@@ -532,30 +544,35 @@ mod tests {
         assert_eq!(names, vec!["read", "write"]);
     }
 
-    /// Network precedence (`doc/sandbox.md` §6.2): a profile that names a policy
-    /// overrides the gateway fallback; one that does not inherits it. The test
-    /// pins the *override direction* — a regression that ignored the profile and
-    /// always used the fallback would pass a weaker "is it a valid policy" check
-    /// but fail this one.
+    /// Network precedence (`doc/sandbox.md` §6.2): workspace override > profile >
+    /// gateway fallback. The test pins the *override direction* at each tier — a
+    /// regression that ignored a higher tier would pass a weaker "is it a valid
+    /// policy" check but fail this one.
     #[test]
-    fn profile_network_overrides_gateway_fallback() {
+    fn network_precedence_workspace_then_profile_then_fallback() {
         use crate::config::NetworkSection;
         use crate::sandbox::NetworkPolicy;
 
-        // Profile sets isolated → wins over an Open fallback.
+        // Workspace override wins over BOTH a set profile and the fallback.
         let isolating = NetworkSection {
             policy: Some("isolated".to_owned()),
             allow: Vec::new(),
         };
         assert_eq!(
-            resolve_network(&isolating, NetworkPolicy::Open).unwrap(),
+            resolve_network(Some(NetworkPolicy::Open), &isolating, NetworkPolicy::Isolated).unwrap(),
+            NetworkPolicy::Open
+        );
+
+        // No workspace override: profile sets isolated → wins over an Open fallback.
+        assert_eq!(
+            resolve_network(None, &isolating, NetworkPolicy::Open).unwrap(),
             NetworkPolicy::Isolated
         );
 
-        // Profile silent → inherits the fallback verbatim.
+        // No workspace, profile silent → inherits the fallback verbatim.
         let silent = NetworkSection::default();
         assert_eq!(
-            resolve_network(&silent, NetworkPolicy::Open).unwrap(),
+            resolve_network(None, &silent, NetworkPolicy::Open).unwrap(),
             NetworkPolicy::Open
         );
 
@@ -564,6 +581,6 @@ mod tests {
             policy: Some("opne".to_owned()),
             allow: Vec::new(),
         };
-        assert!(resolve_network(&bad, NetworkPolicy::Open).is_err());
+        assert!(resolve_network(None, &bad, NetworkPolicy::Open).is_err());
     }
 }

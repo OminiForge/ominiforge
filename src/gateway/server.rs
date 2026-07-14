@@ -96,6 +96,14 @@ fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/workspaces", get(list_workspaces).post(create_workspace))
         .route(
+            "/workspaces/config/orphans",
+            get(list_workspace_config_orphans),
+        )
+        .route(
+            "/workspaces/config/{id}",
+            axum::routing::delete(delete_workspace_config),
+        )
+        .route(
             "/workspaces/{id}/sessions",
             get(list_workspace_sessions).post(create_workspace_session),
         )
@@ -248,9 +256,34 @@ async fn create_workspace(
     }
 }
 
-/// Optional per-session overrides for [`create_workspace_session`], as query
-/// params (`?profile=&model=`). Workspace is absent — it is fixed by the path
-/// the workspace id resolves to, never chosen by the client.
+/// `GET /workspaces/config/orphans` — per-workspace configs whose workspace path
+/// no longer resolves (`doc/workspace-config.md` GC). Read-only: lists orphans a
+/// human or ops tool can then explicitly delete; never removes anything. Each
+/// entry is `{ workspace_id, path }` (`path` null when it can't be recovered).
+async fn list_workspace_config_orphans(State(state): State<AppState>) -> Response {
+    let orphans: Vec<_> = state
+        .registry
+        .list_config_orphans()
+        .into_iter()
+        .map(|(id, path)| json!({ "workspace_id": id.0, "path": path }))
+        .collect();
+    Json(json!({ "orphans": orphans })).into_response()
+}
+
+/// `DELETE /workspaces/config/{id}` — remove one per-workspace config
+/// (`doc/workspace-config.md` GC). The only path that deletes a config file — GC
+/// is always explicit. Idempotent: a missing config is still 204.
+async fn delete_workspace_config(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    match state
+        .registry
+        .delete_workspace_config(&WorkspaceId(id))
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => internal_error(&e),
+    }
+}
+
+
 #[derive(Debug, Default, Deserialize)]
 struct WorkspaceSessionParams {
     /// Profile name to bind; gateway default when absent.
@@ -1588,6 +1621,77 @@ default = "openai-main/gpt-4o"
         assert_eq!(resp.status(), 201);
         let body: serde_json::Value = resp.json().await.unwrap();
         assert!(body["session_id"].is_string());
+    }
+
+    /// Workspace-config GC (`doc/workspace-config.md`): a config whose workspace
+    /// path is gone lists as an orphan and can be explicitly deleted; the delete
+    /// is idempotent. Pins the "never auto-delete, only explicit" contract.
+    #[tokio::test]
+    async fn workspace_config_orphan_lists_then_deletes() {
+        let (registry, dir) = test_registry();
+        // Register a real workspace so its id -> path is known, then plant a
+        // config file for it under the gateway's trusted config dir.
+        let ws = dir.path().join("proj");
+        std::fs::create_dir_all(&ws).unwrap();
+        let id = registry.record_workspace(&ws).unwrap();
+        let cfg_dir = dir.path().join(".omini").join("workspaces");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join(format!("{}.toml", id.0)),
+            "[network]\npolicy = \"isolated\"\n",
+        )
+        .unwrap();
+
+        let state = AppState {
+            registry,
+            api_key: None,
+            pricing: Arc::new(PricingTable::default()),
+        };
+        let base = serve_test(state).await;
+        let client = reqwest::Client::new();
+
+        // Workspace still exists → not an orphan.
+        let resp = client
+            .get(format!("{base}/api/workspaces/config/orphans"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["orphans"].as_array().unwrap().len(), 0);
+
+        // Remove the workspace dir → the config is now an orphan.
+        std::fs::remove_dir_all(&ws).unwrap();
+        let body: serde_json::Value = client
+            .get(format!("{base}/api/workspaces/config/orphans"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let orphans = body["orphans"].as_array().unwrap();
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0]["workspace_id"], id.0);
+
+        // Explicit delete → 204, and the orphan is gone (idempotent second call).
+        for _ in 0..2 {
+            let resp = client
+                .delete(format!("{base}/api/workspaces/config/{}", id.0))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 204);
+        }
+        let body: serde_json::Value = client
+            .get(format!("{base}/api/workspaces/config/orphans"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body["orphans"].as_array().unwrap().len(), 0);
     }
 
     /// A `?model=` override that names no configured model is a CLIENT error

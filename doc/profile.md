@@ -242,7 +242,7 @@ session_max_usd = 10.00  # 覆盖
 | tool set | Profile | agent 能力 |
 | skill set | Profile | agent 能力 |
 | memory scope | Profile | agent 知识范围 |
-| network policy | Profile（gateway 兜底） | agent 能力（能否联网、可达哪些主机）；同 tool set 归 agent 身份，缺省下沉到 gateway `default_network`。未来可再下沉到 workspace 级 |
+| network policy | Profile（workspace 覆盖 / gateway 兜底） | agent 能力（能否联网、可达哪些主机）；解析链 `workspace.toml > profile > gateway default_network > Open`，见 `doc/workspace-config.md` |
 
 ## 8. 文件系统布局
 

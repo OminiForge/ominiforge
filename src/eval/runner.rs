@@ -70,6 +70,7 @@ pub async fn run_case(case: &EvalCase, config: &RunConfig<'_>) -> Result<CaseRes
         None,
         // Eval runs on the passthrough backend, which ignores the network policy.
         crate::sandbox::NetworkPolicy::Open,
+        None,
         &|_msg| {},
     )
     .await

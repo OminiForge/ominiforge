@@ -176,6 +176,10 @@ struct RegistryInner {
     /// one (`doc/sandbox.md` §6.2). Resolved once from `gateway.toml` at boot so
     /// a malformed default fails loud here, not per session.
     default_network: crate::sandbox::NetworkPolicy,
+    /// Per-workspace sandbox config overrides (`doc/workspace-config.md`), keyed
+    /// by workspace path hash, read from the gateway's trusted `.omini/workspaces/`
+    /// — the top tier of the network resolution chain.
+    workspace_config: super::workspace_config::WorkspaceConfigStore,
 }
 
 impl SessionRegistry {
@@ -192,17 +196,19 @@ impl SessionRegistry {
         config: &GatewayConfig,
         on_warn: &(dyn Fn(&str) + Sync),
     ) -> Result<Self> {
-        // The workspace map lives beside the session store, under `.omini`.
-        let workspaces_path = defaults
+        // The workspace map + per-workspace config dir live beside the session
+        // store, under `.omini` (the gateway's trusted config root, not the
+        // agent-writable project dir — `doc/workspace-config.md`).
+        let omini_dir = defaults
             .workspace
             .join(app::SESSIONS_SUBDIR)
             .parent()
-            .map_or_else(
-                || defaults.workspace.join("workspaces.json"),
-                |omini| omini.join("workspaces.json"),
-            );
-        let workspaces =
-            std::sync::Mutex::new(super::workspace::WorkspaceRegistry::load(workspaces_path));
+            .map_or_else(|| defaults.workspace.clone(), Path::to_path_buf);
+        let workspaces = std::sync::Mutex::new(super::workspace::WorkspaceRegistry::load(
+            omini_dir.join("workspaces.json"),
+        ));
+        let workspace_config =
+            super::workspace_config::WorkspaceConfigStore::new(omini_dir.join("workspaces"));
         let sandbox_manager =
             crate::sandbox::manager::SandboxManager::from_choice(config.sandbox_backend, on_warn)
                 .context("failed to initialize sandbox backend")?;
@@ -218,6 +224,7 @@ impl SessionRegistry {
                 status_hub: StatusHub::new(),
                 sandbox_manager,
                 default_network,
+                workspace_config,
             }),
         })
     }
@@ -309,6 +316,34 @@ impl SessionRegistry {
         // Miss: seed from session metadata (scans the store), then retry once.
         let _ = self.list_metas();
         self.inner.workspaces.lock().ok()?.path_for(id)
+    }
+
+    /// List per-workspace configs whose workspace path no longer resolves
+    /// (`doc/workspace-config.md` GC). Read-only — surfaces orphans for an
+    /// explicit [`delete_workspace_config`](Self::delete_workspace_config); never
+    /// deletes on its own. Each orphan carries the path it *was* for, when known.
+    #[must_use]
+    pub fn list_config_orphans(&self) -> Vec<(super::workspace::WorkspaceId, Option<PathBuf>)> {
+        // Seed first so an orphan known only through old sessions still has a path
+        // to show; a lock failure degrades to an empty (best-effort) list.
+        let _ = self.list_metas();
+        self.inner.workspaces.lock().map_or_else(
+            |_| Vec::new(),
+            |ws| self.inner.workspace_config.list_orphans(&ws),
+        )
+    }
+
+    /// Delete one per-workspace config by id (`doc/workspace-config.md` GC).
+    /// Idempotent: a missing config is `Ok`. This is the only path that removes a
+    /// config file — GC is always explicit.
+    ///
+    /// # Errors
+    /// An io error removing the file.
+    pub fn delete_workspace_config(&self, id: &super::workspace::WorkspaceId) -> Result<()> {
+        self.inner
+            .workspace_config
+            .delete(id)
+            .with_context(|| format!("failed to delete workspace config `{}`", id.0))
     }
 
     /// Create a new session **in the workspace identified by `id`**, resolving the
@@ -786,6 +821,24 @@ impl SessionRegistry {
         let d = &self.inner.defaults;
         let workspace = workspace.unwrap_or_else(|| d.workspace.clone());
         let profile = profile.unwrap_or(&d.profile);
+        // Top tier of the network chain (`doc/sandbox.md` §6.2): a per-workspace
+        // override from the gateway's trusted config dir. A present-but-broken
+        // file fails the session start (fail-loud) rather than silently dropping
+        // to the profile/gateway default. A section without a `policy` key is not
+        // an override — it falls through to the profile/gateway tiers.
+        let workspace_network = self
+            .inner
+            .workspace_config
+            .load(&workspace)
+            .with_context(|| format!("failed to load workspace config for {}", workspace.display()))?
+            .and_then(|cfg| cfg.network)
+            .and_then(|section| {
+                section
+                    .policy
+                    .map(|name| crate::sandbox::NetworkPolicy::from_policy_name(&name, &section.allow))
+            })
+            .transpose()
+            .map_err(|e| anyhow!("invalid workspace network policy: {e}"))?;
         app::assemble(
             &d.config,
             workspace,
@@ -796,6 +849,7 @@ impl SessionRegistry {
             self.inner.sandbox_manager.backend(),
             injected_sandbox,
             self.inner.default_network.clone(),
+            workspace_network,
             &|msg| eprintln!("gateway: {msg}"),
         )
         .await

@@ -27,6 +27,7 @@ mod registry;
 mod server;
 mod status;
 mod workspace;
+mod workspace_config;
 
 pub use config::GatewayConfig;
 pub use registry::{RuntimeInfo, SessionDefaults, SessionRegistry};
