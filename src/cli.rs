@@ -733,6 +733,8 @@ async fn prepare(
         // workspace-level override off the CLI (that layer is gateway-side).
         crate::sandbox::NetworkPolicy::Open,
         None,
+        // No workspace-level mounts off the CLI (that layer is gateway-side).
+        Vec::new(),
         &|msg| eprintln!("{msg}"),
     )
     .await

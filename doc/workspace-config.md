@@ -27,15 +27,33 @@ workspace.toml  >  profile [network]  >  gateway default_network  >  Open（硬�
 
 ## 3. 结构
 
+workspace.toml 是一个 **workspace 命名空间**——不止网络策略,还承载共享挂载,以后 workspace memory 也放这。
+
 ```toml
 # <gateway>/.omini/workspaces/<workspace_id>.toml
 [network]
 policy = "allowlist"                 # isolated | allowlist | open
 allow  = ["crates.io", "pypi.org"]   # 仅 allowlist 生效
+
+[[mounts]]
+anchor = "workspace"                 # session | workspace | gateway
+path   = "cache"                     # 锚点根内相对子路径(可空=根本身)
+guest  = "/cache"                    # guest 内绝对挂载点
+ro     = false                       # 只读挂载,默认 false(RW)
 ```
 
 - `[network]` 缺省或无 `policy` 键 → 不构成覆盖，落到 profile/gateway 档。
-- 记录整体对**未来权限门控**开放（同文件加 section），但当前只定义 `[network]`——需求未落地前不设具体权限字段（现在设计=猜）。
+- `[[mounts]]`:命名锚点辅助挂载(`doc/sandbox.md` §3.7)。锚点命名**共享范围**,不是用途:
+
+  | anchor | host 根 | 共享范围 |
+  |---|---|---|
+  | `session` | `<gateway>/.omini/sessions/<session_id>/work/` | session 私有 |
+  | `workspace` | `<gateway>/.omini/workspaces/<workspace_id>/shared/` | 同 workspace 跨 session |
+  | `gateway` | `<gateway>/.omini/shared/` | 全局 |
+
+  - `path` 禁 `..`/绝对(逃逸 fail-loud);`guest` 必须绝对(否则 fail-loud);host 目录按需建。
+  - 三根全在网关侧、可信;仅 boxlite 兑现,passthrough 遇 `[[mounts]]` fail-loud 拒绝(无命名空间)。
+- 记录整体对**未来权限门控 / workspace memory**开放(同文件加 section),当前定义 `[network]` + `[[mounts]]`——其余需求未落地前不设字段(现在设计=猜)。
 - 未知键忽略，向前兼容。
 
 ## 4. 生命周期与 GC

@@ -74,6 +74,16 @@ impl SessionStore {
         self.session_dir(session_id).join(EVENTS_FILE)
     }
 
+    /// Mint a fresh, unused session id without creating anything.
+    ///
+    /// Lets a caller learn the id *before* [`create_new_with_id`](Self::create_new_with_id)
+    /// so id-dependent setup (a `session`-anchored sandbox mount, §3.7) can run
+    /// against the same id the session will be persisted under.
+    #[must_use]
+    pub fn mint_id(&self) -> SessionId {
+        id::generate()
+    }
+
     /// Create a brand-new (`origin.kind = new`) session: mint an id, write
     /// `session.toml`, and emit the opening [`SessionEvent::Created`] event.
     ///
@@ -87,7 +97,26 @@ impl SessionStore {
         workspace: Option<PathBuf>,
         tools: Vec<String>,
     ) -> Result<SessionWriter> {
-        let session_id = id::generate();
+        self.create_new_with_id(id::generate(), profile_id, workspace, tools)
+    }
+
+    /// Like [`create_new`](Self::create_new) but with a caller-supplied id.
+    ///
+    /// Used when the id must be known *before* the session is created — the
+    /// gateway mints it up front so a session's sandbox (assembled before the
+    /// session row exists) can resolve a `session`-anchored mount to the right
+    /// `sessions/<id>/` directory (`doc/sandbox.md` §3.7). The id must be unique;
+    /// reusing a live session's id corrupts its directory.
+    ///
+    /// # Errors
+    /// Filesystem or serialization failures surface as [`SessionError`].
+    pub fn create_new_with_id(
+        &self,
+        session_id: SessionId,
+        profile_id: Option<String>,
+        workspace: Option<PathBuf>,
+        tools: Vec<String>,
+    ) -> Result<SessionWriter> {
         let dir = self.session_dir(&session_id);
         std::fs::create_dir_all(&dir).map_err(|source| SessionError::Io {
             path: dir.clone(),
@@ -368,8 +397,10 @@ impl SessionStore {
     ///
     /// # Errors
     /// Filesystem or serialization failures surface as [`SessionError`].
+    #[allow(clippy::too_many_arguments)]
     pub fn create_fork(
         &self,
+        session_id: SessionId,
         parent_id: SessionId,
         fork_at_seq: u64,
         profile_id: Option<String>,
@@ -377,7 +408,6 @@ impl SessionStore {
         tools: Vec<String>,
         snapshot: &[crate::llm::Message],
     ) -> Result<SessionWriter> {
-        let session_id = id::generate();
         let dir = self.session_dir(&session_id);
         std::fs::create_dir_all(&dir).map_err(|source| SessionError::Io {
             path: dir.clone(),
@@ -428,15 +458,16 @@ impl SessionStore {
     ///
     /// # Errors
     /// Filesystem or serialization failures surface as [`SessionError`].
+    #[allow(clippy::too_many_arguments)]
     pub fn create_reconfiguration(
         &self,
+        session_id: SessionId,
         parent_id: SessionId,
         profile_id: Option<String>,
         workspace: Option<PathBuf>,
         tools: Vec<String>,
         snapshot: &[crate::llm::Message],
     ) -> Result<SessionWriter> {
-        let session_id = id::generate();
         let dir = self.session_dir(&session_id);
         std::fs::create_dir_all(&dir).map_err(|source| SessionError::Io {
             path: dir.clone(),

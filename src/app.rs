@@ -121,6 +121,7 @@ pub async fn assemble(
     )>,
     default_network: crate::sandbox::NetworkPolicy,
     workspace_network: Option<crate::sandbox::NetworkPolicy>,
+    mounts: Vec<crate::sandbox::VolumeMount>,
     on_warn: &(dyn Fn(&str) + Sync),
 ) -> Result<Assembled> {
     let workspace = resolve_workspace(&workspace)?;
@@ -179,6 +180,7 @@ pub async fn assemble(
                 workspace: workspace.clone(),
                 env: env_overlay.clone(),
                 network,
+                volumes: mounts,
                 ..crate::sandbox::SandboxConfig::default()
             })
             .await

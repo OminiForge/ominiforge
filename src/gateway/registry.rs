@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use tokio::sync::Mutex;
 
@@ -180,6 +180,97 @@ struct RegistryInner {
     /// by workspace path hash, read from the gateway's trusted `.omini/workspaces/`
     /// — the top tier of the network resolution chain.
     workspace_config: super::workspace_config::WorkspaceConfigStore,
+    /// Resolves `[[mounts]]` anchors (`doc/sandbox.md` §3.7) to host directories
+    /// under the gateway's trusted `.omini` tree.
+    mount_anchors: MountAnchors,
+}
+
+/// Resolves a workspace's named mount anchors (`doc/sandbox.md` §3.7) into
+/// concrete [`VolumeMount`]s. An anchor names a *sharing scope* rooted under the
+/// gateway's trusted `.omini` tree — never the agent-writable project dir:
+///
+/// - `session`   → `<omini>/sessions/<session_id>/work/`   (per-session private)
+/// - `workspace` → `<omini>/workspaces/<workspace_id>/shared/` (shared across a
+///   workspace's sessions)
+/// - `gateway`   → `<omini>/shared/`                        (global)
+///
+/// The user composes what goes in each — the anchor fixes only the scope, not a
+/// purpose. Host directories are created on demand (all three roots are app-owned).
+#[derive(Debug, Clone)]
+struct MountAnchors {
+    /// The gateway's `.omini` directory (holds `sessions/`, `workspaces/`, `shared/`).
+    omini: PathBuf,
+}
+
+impl MountAnchors {
+    /// Resolve every `[[mounts]]` entry to a [`VolumeMount`], creating the host
+    /// directory for each. `session_id`/`workspace` key the `session`/`workspace`
+    /// anchors.
+    ///
+    /// # Errors
+    /// Fails loud (`doc/sandbox.md` §3.7, Karpathy §12) on: an unknown anchor
+    /// name, a `path` that escapes its anchor root (`..` / absolute), a non-absolute
+    /// `guest` mount point, or a host-directory creation failure — a misdeclared
+    /// mount must break the session, not silently bind the wrong directory.
+    fn resolve(
+        &self,
+        specs: &[super::workspace_config::MountSpec],
+        session_id: &SessionId,
+        workspace: &Path,
+    ) -> Result<Vec<crate::sandbox::VolumeMount>> {
+        specs
+            .iter()
+            .map(|spec| self.resolve_one(spec, session_id, workspace))
+            .collect()
+    }
+
+    fn resolve_one(
+        &self,
+        spec: &super::workspace_config::MountSpec,
+        session_id: &SessionId,
+        workspace: &Path,
+    ) -> Result<crate::sandbox::VolumeMount> {
+        let root = match spec.anchor.as_str() {
+            "session" => self.omini.join("sessions").join(&session_id.0).join("work"),
+            "workspace" => {
+                let ws_id = super::workspace::WorkspaceId::from_path(workspace);
+                self.omini.join("workspaces").join(&ws_id.0).join("shared")
+            }
+            "gateway" => self.omini.join("shared"),
+            other => {
+                bail!("unknown mount anchor `{other}`; expected `session`, `workspace`, or `gateway`")
+            }
+        };
+
+        // Join the optional subpath, rejecting any escape from the anchor root.
+        let host_path = match &spec.path {
+            None => root,
+            Some(rel) => {
+                let candidate = Path::new(rel);
+                if candidate.is_absolute()
+                    || candidate
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    bail!("mount path `{rel}` must be a relative subpath without `..`");
+                }
+                root.join(candidate)
+            }
+        };
+
+        if !Path::new(&spec.guest).is_absolute() {
+            bail!("mount guest path `{}` must be absolute", spec.guest);
+        }
+
+        std::fs::create_dir_all(&host_path)
+            .with_context(|| format!("failed to create mount dir {}", host_path.display()))?;
+
+        Ok(crate::sandbox::VolumeMount {
+            host_path,
+            guest_path: PathBuf::from(&spec.guest),
+            read_only: spec.ro,
+        })
+    }
 }
 
 impl SessionRegistry {
@@ -209,6 +300,7 @@ impl SessionRegistry {
         ));
         let workspace_config =
             super::workspace_config::WorkspaceConfigStore::new(omini_dir.join("workspaces"));
+        let mount_anchors = MountAnchors { omini: omini_dir };
         let sandbox_manager =
             crate::sandbox::manager::SandboxManager::from_choice(config.sandbox_backend, on_warn)
                 .context("failed to initialize sandbox backend")?;
@@ -225,6 +317,7 @@ impl SessionRegistry {
                 sandbox_manager,
                 default_network,
                 workspace_config,
+                mount_anchors,
             }),
         })
     }
@@ -540,7 +633,7 @@ impl SessionRegistry {
         }
 
         // Cold: assemble an isolated agent and open the session (takes the lock).
-        let assembled = self.assemble().await?;
+        let assembled = self.assemble(id).await?;
         let events = self
             .store()
             .read_events(id)
@@ -605,16 +698,23 @@ impl SessionRegistry {
         model: Option<&str>,
         workspace: Option<PathBuf>,
     ) -> Result<(SessionId, ActorHandle)> {
-        let assembled = self.assemble_with(profile, model, workspace, None).await?;
+        // Mint the id up front so the sandbox (assembled before the session row
+        // exists) can resolve a `session`-anchored mount to `sessions/<id>/`
+        // (`doc/sandbox.md` §3.7); the same id is then persisted below.
+        let id = self.store().mint_id();
+        let assembled = self
+            .assemble_with(&id, profile, model, workspace, None)
+            .await?;
         let writer = self
             .store()
-            .create_new(
+            .create_new_with_id(
+                id.clone(),
                 Some(assembled.profile_name.clone()),
                 Some(assembled.workspace.clone()),
                 assembled.tool_names.clone(),
             )
             .context("failed to create session")?;
-        let id = writer.session_id().clone();
+        debug_assert_eq!(writer.session_id(), &id);
         // Bind the session to its sandbox: persist the descriptor for restart
         // re-attach, and register the live handle so `fork` can reach it by id
         // (`doc/sandbox.md` §3.2).
@@ -662,7 +762,10 @@ impl SessionRegistry {
             Err(crate::sandbox::SandboxError::Unsupported(_)) => None,
             Err(e) => return Err(anyhow!("sandbox fork failed: {e}")),
         };
-        let assembled = self.assemble_with(None, None, None, injected).await?;
+        // Mint the child's id up front for the same reason as `create_with`: a
+        // `session`-anchored mount must resolve to the child's own directory.
+        let id = self.store().mint_id();
+        let assembled = self.assemble_with(&id, None, None, None, injected).await?;
         let system = Self::system_seed(&assembled);
 
         // Rebuild the parent's context up to (and including) `at_seq` as the
@@ -686,6 +789,7 @@ impl SessionRegistry {
         let writer = self
             .store()
             .create_fork(
+                id.clone(),
                 parent.clone(),
                 at_seq,
                 meta.profile_id,
@@ -694,7 +798,7 @@ impl SessionRegistry {
                 &snapshot,
             )
             .context("failed to create fork")?;
-        let id = writer.session_id().clone();
+        debug_assert_eq!(writer.session_id(), &id);
 
         // Register and persist the child's sandbox — the injected CoW fork on a
         // snapshot-capable backend, or the freshly assembled fallback sandbox on
@@ -749,9 +853,11 @@ impl SessionRegistry {
     ) -> Result<(SessionId, ActorHandle)> {
         let meta = self.meta(parent)?;
         // The reconfigured session runs in the parent's workspace (immutable);
-        // only profile/model change.
+        // only profile/model change. Mint the id up front for `session`-anchored
+        // mount resolution (`doc/sandbox.md` §3.7).
+        let id = self.store().mint_id();
         let assembled = self
-            .assemble_with(profile, model, meta.workspace.clone(), None)
+            .assemble_with(&id, profile, model, meta.workspace.clone(), None)
             .await?;
         let system = Self::system_seed(&assembled);
 
@@ -768,6 +874,7 @@ impl SessionRegistry {
         let writer = self
             .store()
             .create_reconfiguration(
+                id.clone(),
                 parent.clone(),
                 Some(assembled.profile_name.clone()),
                 Some(assembled.workspace.clone()),
@@ -775,7 +882,7 @@ impl SessionRegistry {
                 &snapshot,
             )
             .context("failed to create reconfiguration session")?;
-        let id = writer.session_id().clone();
+        debug_assert_eq!(writer.session_id(), &id);
         let runtime = SessionRuntime::new(snapshot);
 
         let handle = SessionActor::spawn(
@@ -798,8 +905,8 @@ impl SessionRegistry {
     /// Assemble a fresh, isolated agent for one session (its own provider + MCP
     /// subprocesses), on the gateway defaults. Diagnostics go to stderr (the
     /// server's log).
-    async fn assemble(&self) -> Result<Assembled> {
-        self.assemble_with(None, None, None, None).await
+    async fn assemble(&self, session_id: &SessionId) -> Result<Assembled> {
+        self.assemble_with(session_id, None, None, None, None).await
     }
 
     /// Like [`assemble`](Self::assemble) but with per-session overrides: `profile`
@@ -810,6 +917,7 @@ impl SessionRegistry {
     /// config. Diagnostics go to stderr (the server's log).
     async fn assemble_with(
         &self,
+        session_id: &SessionId,
         profile: Option<&str>,
         model: Option<&str>,
         workspace: Option<PathBuf>,
@@ -821,24 +929,36 @@ impl SessionRegistry {
         let d = &self.inner.defaults;
         let workspace = workspace.unwrap_or_else(|| d.workspace.clone());
         let profile = profile.unwrap_or(&d.profile);
-        // Top tier of the network chain (`doc/sandbox.md` §6.2): a per-workspace
-        // override from the gateway's trusted config dir. A present-but-broken
-        // file fails the session start (fail-loud) rather than silently dropping
-        // to the profile/gateway default. A section without a `policy` key is not
-        // an override — it falls through to the profile/gateway tiers.
-        let workspace_network = self
+        // Load the per-workspace config once: it carries both the network
+        // override (top of the §6.2 chain) and the auxiliary mounts (§3.7). A
+        // present-but-broken file fails the session start (fail-loud) rather than
+        // silently dropping to a weaker default.
+        let workspace_config = self
             .inner
             .workspace_config
             .load(&workspace)
             .with_context(|| format!("failed to load workspace config for {}", workspace.display()))?
-            .and_then(|cfg| cfg.network)
+            .unwrap_or_default();
+        // Network: a `[network].policy` wins outright; a section without a
+        // `policy` key is not an override and falls through to profile/gateway.
+        let workspace_network = workspace_config
+            .network
+            .as_ref()
             .and_then(|section| {
                 section
                     .policy
-                    .map(|name| crate::sandbox::NetworkPolicy::from_policy_name(&name, &section.allow))
+                    .as_ref()
+                    .map(|name| crate::sandbox::NetworkPolicy::from_policy_name(name, &section.allow))
             })
             .transpose()
             .map_err(|e| anyhow!("invalid workspace network policy: {e}"))?;
+        // Auxiliary mounts (§3.7): resolve each named anchor to a host dir under
+        // the gateway's trusted tree, keyed by this session's id and workspace.
+        let mounts = self
+            .inner
+            .mount_anchors
+            .resolve(&workspace_config.mounts, session_id, &workspace)
+            .context("failed to resolve workspace mounts")?;
         app::assemble(
             &d.config,
             workspace,
@@ -850,6 +970,7 @@ impl SessionRegistry {
             injected_sandbox,
             self.inner.default_network.clone(),
             workspace_network,
+            mounts,
             &|msg| eprintln!("gateway: {msg}"),
         )
         .await
@@ -1076,5 +1197,88 @@ mod tests {
             BTreeMap::from([("DIRENV_FILE".to_owned(), Some("/tmp/.envrc".to_owned()))]),
         );
         assert_eq!(detect_env(&env), vec!["dev shell: impure"]);
+    }
+
+    mod mount_anchors {
+        #![allow(clippy::unwrap_used)]
+
+        use super::super::MountAnchors;
+        use crate::core::SessionId;
+        use crate::gateway::workspace_config::MountSpec;
+        use std::path::PathBuf;
+        fn anchors(omini: PathBuf) -> MountAnchors {
+            MountAnchors { omini }
+        }
+
+        fn spec(anchor: &str, path: Option<&str>, guest: &str, ro: bool) -> MountSpec {
+            MountSpec {
+                anchor: anchor.to_owned(),
+                path: path.map(ToOwned::to_owned),
+                guest: guest.to_owned(),
+                ro,
+            }
+        }
+
+        /// Each anchor resolves under a distinct gateway-owned root and the host
+        /// dir is created. Pins the sharing-scope → path mapping (§3.7).
+        #[test]
+        fn three_anchors_resolve_to_distinct_roots() {
+            let tmp = tempfile::tempdir().unwrap();
+            let a = anchors(tmp.path().to_path_buf());
+            let sid = SessionId("SESS1".to_owned());
+            let ws = tmp.path().join("proj");
+
+            let specs = vec![
+                spec("session", Some("cache"), "/s", false),
+                spec("workspace", None, "/w", true),
+                spec("gateway", Some("dl"), "/g", false),
+            ];
+            let mounts = a.resolve(&specs, &sid, &ws).unwrap();
+            assert_eq!(mounts.len(), 3);
+
+            // session → sessions/<id>/work/cache, RW.
+            assert!(mounts[0].host_path.ends_with("sessions/SESS1/work/cache"));
+            assert_eq!(mounts[0].guest_path, PathBuf::from("/s"));
+            assert!(!mounts[0].read_only);
+            // workspace → workspaces/<ws_id>/shared, RO, path absent = root itself.
+            assert!(mounts[1].host_path.ends_with("shared"));
+            assert!(mounts[1].host_path.to_string_lossy().contains("workspaces/"));
+            assert!(mounts[1].read_only);
+            // gateway → shared/dl (global).
+            assert!(mounts[2].host_path.ends_with("shared/dl"));
+
+            // Host dirs were created (not just computed).
+            assert!(mounts.iter().all(|m| m.host_path.is_dir()));
+        }
+
+        /// A `..` in the subpath escapes the anchor root → fail loud (§3.7).
+        #[test]
+        fn parent_dir_escape_is_rejected() {
+            let tmp = tempfile::tempdir().unwrap();
+            let a = anchors(tmp.path().to_path_buf());
+            let sid = SessionId("S".to_owned());
+            let specs = vec![spec("gateway", Some("../../etc"), "/x", false)];
+            assert!(a.resolve(&specs, &sid, tmp.path()).is_err());
+        }
+
+        /// A non-absolute guest mount point → fail loud.
+        #[test]
+        fn relative_guest_is_rejected() {
+            let tmp = tempfile::tempdir().unwrap();
+            let a = anchors(tmp.path().to_path_buf());
+            let sid = SessionId("S".to_owned());
+            let specs = vec![spec("session", None, "relative/guest", false)];
+            assert!(a.resolve(&specs, &sid, tmp.path()).is_err());
+        }
+
+        /// An unknown anchor name → fail loud, not a silent skip.
+        #[test]
+        fn unknown_anchor_is_rejected() {
+            let tmp = tempfile::tempdir().unwrap();
+            let a = anchors(tmp.path().to_path_buf());
+            let sid = SessionId("S".to_owned());
+            let specs = vec![spec("bogus", None, "/x", false)];
+            assert!(a.resolve(&specs, &sid, tmp.path()).is_err());
+        }
     }
 }

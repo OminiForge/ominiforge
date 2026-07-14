@@ -165,17 +165,29 @@ session 落盘不再只是 jsonl + toml，多出它**自己拥有**的工作目�
 
 > **实现约束**：日志须把**工具结果**（read 的内容 / write 的 diff / shell 输出）持久化到足够保真度——这是让日志成为自进化底料的前提，实现阶段须确认；且不论自进化与否都是该保证的正确方向。
 
-### 3.7 挂载策略 = Future feature
+### 3.7 挂载策略 = 命名锚点系统（已落地）
 
-以下明确推迟（当前不确定要挂什么，现在设计等于猜）：
+**模型:不给文件定死用途(会限制表达),提供命名锚点(挂载根),用户/agent 自由组合,每挂载配 RO/RW。** 锚点命名的是**共享范围**,不是用途:
 
-- **session 私有 temp / delivery 目录**的具体内容与 guest 路径。
-- **跨 session 共享目录 / delivery 交接**机制。
-- **挂载统一面**：passthrough 无独立命名空间，做不到「同名绝对路径」（把 host 目录搬到 `/workspace` 需要 root/namespace）。统一须靠 **cwd + 命名环境变量**（名字可移植、值随后端不同），配**命名挂载集**模型。此为落地时的既定方向，但具体挂载清单待需求明确再定。
-- **公共依赖挂什么进 boxlite guest**：flake 用户可只读挂 `/nix/store` + `.envrc`；非 flake 用户走 base image 或显式 host bind。配置继承一律显式 opt-in、默认不继承敏感项（对齐 secret-store 威胁模型）。
-- `SandboxConfig` 的**资源限制下发**（§6.2）与挂载同批接（无明确需求前推迟）。**网络策略下发已单独落地**（不再与挂载同批）：见 §6.2「下发现状」，从 profile `[network]` > gateway 兜底派生。
+| anchor | host 根 | 共享范围 |
+|---|---|---|
+| `session` | `<gateway>/.omini/sessions/<session_id>/work/` | session 私有 |
+| `workspace` | `<gateway>/.omini/workspaces/<workspace_id>/shared/` | 同 workspace 跨 session 共享 |
+| `gateway` | `<gateway>/.omini/shared/` | 全局共享 |
 
-**当前已兑现的挂载只有 workspace——两后端一致且已在真机验证**（passthrough=host cwd；boxlite=RW bind→`/workspace`+`working_dir`，`#[ignore]` 集成测试 `workspace_is_cwd_and_passes_through_to_host` 在 KVM 上确认 `pwd==/workspace`、宿主文件可见、guest 写回宿主）。
+- 配置住 **workspace.toml** 的 `[[mounts]]`(`doc/workspace-config.md`)。根全在**网关侧、可信**——不放 agent 可写的项目目录。
+- 每条 `{ anchor, path?, guest, ro }`:`path` 是锚点根内相对子路径(缺省=根本身;禁 `..`/绝对逃逸,fail-loud);`guest` 必须绝对路径(否则 fail-loud);`ro` 默认 false(RW)。host 目录按需创建(三根都是 app 拥有的)。
+- **锚点解析在 `SessionRegistry::MountAnchors`**(它才有网关根 + session/workspace id),产出 `Vec<VolumeMount>` 喂给 `SandboxConfig.volumes`。
+- **id 时序**:`session` 锚点需 session id,而沙箱在 `create_new` 之前建 → 网关**提前 mint id**(`SessionStore::mint_id` → `create_new_with_id`),同一 id 既解析锚点又落盘。
+- **passthrough 拒绝**:passthrough 无命名空间,做不到把 host 挂到任意 guest 绝对路径 → `config.volumes` 非空时 **fail-loud `Unsupported`**(不静默丢;声明了挂载却不兑现比拒绝更危险)。仅 boxlite 兑现 `[[mounts]]`。
+
+**仍推迟**(依赖未建的子系统或无明确需求):
+
+- **delivery 交接机制**:依赖尚未建的 artifact 子系统(`session/mod.rs` 落盘布局 `artifacts/ # later phase`)。锚点系统已足够手工做共享目录,自动 delivery 待 artifact 落地。
+- **公共依赖挂什么进 boxlite guest**:flake 用户可只读挂 `/nix/store` + `.envrc`;非 flake 走 base image 或显式 host bind。配置继承一律显式 opt-in、默认不继承敏感项(对齐 secret-store 威胁模型)。
+- `SandboxConfig` 的**资源限制下发**(§6.2)——后端映射就绪,profile/gateway/workspace 尚无入口,无明确需求前推迟。
+
+**当前已兑现的挂载:workspace(§3.3,两后端一致、真机验证)+ 命名锚点辅助挂载(§3.7,本节,boxlite)。**
 
 ---
 

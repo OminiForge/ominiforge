@@ -49,6 +49,16 @@ impl SandboxBackend for PassthroughBackend {
     async fn create(&self, config: SandboxConfig) -> Result<Arc<dyn Sandbox>, SandboxError> {
         // The passthrough backend runs on the host: it honours `workspace` (as
         // cwd) and `env`, and ignores rootfs/resources/network (no isolation).
+        // Auxiliary mounts (§3.7) it *cannot* honour — with no namespace there is
+        // no way to bind a host dir onto an arbitrary guest absolute path. Fail
+        // loud rather than silently drop them: a session that declared a mount and
+        // silently didn't get it is worse than one that refused to start.
+        if !config.volumes.is_empty() {
+            return Err(SandboxError::Unsupported(
+                "passthrough backend cannot honour auxiliary mounts (no namespace); \
+                 use the boxlite backend for [[mounts]]",
+            ));
+        }
         Ok(Arc::new(PassthroughSandbox::new(config.workspace, config.env)))
     }
 
@@ -240,5 +250,27 @@ mod tests {
         let out = sb.exec("echo ok", Duration::from_secs(5)).await.unwrap();
         assert_eq!(out.stdout, "ok\n");
         assert!(sb.release().await.is_ok());
+    }
+
+    /// Passthrough cannot honour auxiliary mounts (no namespace), so a config
+    /// carrying `[[mounts]]` must fail loud, not silently drop them (§3.7). A
+    /// session that declared a mount and silently didn't get it is the danger.
+    #[tokio::test]
+    async fn backend_create_rejects_non_empty_volumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = PassthroughBackend::new();
+        let cfg = SandboxConfig {
+            workspace: dir.path().to_path_buf(),
+            volumes: vec![crate::sandbox::VolumeMount {
+                host_path: dir.path().to_path_buf(),
+                guest_path: PathBuf::from("/cache"),
+                read_only: false,
+            }],
+            ..SandboxConfig::default()
+        };
+        assert!(matches!(
+            backend.create(cfg).await,
+            Err(SandboxError::Unsupported(_))
+        ));
     }
 }

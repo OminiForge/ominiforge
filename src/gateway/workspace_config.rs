@@ -41,10 +41,10 @@ use super::workspace::{WorkspaceId, WorkspaceRegistry};
 
 /// The on-disk shape of `<gateway>/.omini/workspaces/<id>.toml`.
 ///
-/// Only `[network]` is defined today; the record is intentionally open for a
-/// future permission-gating section (`doc/workspace-config.md`) without a schema
-/// change forcing every file to be rewritten. Unknown keys are ignored for
-/// forward compatibility.
+/// Only `[network]` and `[[mounts]]` are defined today; the record is
+/// intentionally open for a future permission-gating section and workspace
+/// memory (`doc/workspace-config.md`) without a schema change forcing every file
+/// to be rewritten. Unknown keys are ignored for forward compatibility.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WorkspaceConfig {
@@ -52,6 +52,32 @@ pub struct WorkspaceConfig {
     /// (section absent) falls through to the profile / gateway default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkSection>,
+    /// Auxiliary sandbox mounts (`doc/sandbox.md` §3.7): each binds a named
+    /// anchor's host directory into the guest. Empty (section absent) = only the
+    /// workspace mount (§3.3).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<MountSpec>,
+}
+
+/// One entry in a workspace's `[[mounts]]`: bind a named anchor's host directory
+/// into the guest (`doc/sandbox.md` §3.7). The anchor names a *sharing scope*
+/// (session-private / workspace-shared / gateway-global) rather than a fixed
+/// purpose — the user composes what to put there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MountSpec {
+    /// Sharing scope: `session` (per-session private), `workspace` (shared across
+    /// sessions in this workspace), or `gateway` (global). Resolved to a host
+    /// root in the registry, which owns the ids and gateway root.
+    pub anchor: String,
+    /// Relative subpath under the anchor root. Absent = the anchor root itself.
+    /// A `..` escape is rejected at resolution (fail-loud).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Absolute mount point inside the guest.
+    pub guest: String,
+    /// Mount read-only. Defaults to `false` (read-write).
+    #[serde(default)]
+    pub ro: bool,
 }
 
 /// Loads and removes per-workspace configs under a gateway directory.
@@ -194,6 +220,31 @@ mod tests {
         let store = WorkspaceConfigStore::new(dir);
         let cfg = store.load(&ws).unwrap().unwrap();
         assert_eq!(cfg.network.unwrap().policy.as_deref(), Some("isolated"));
+    }
+
+    #[test]
+    fn load_reads_mounts_with_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let dir = tmp.path().join("workspaces");
+        // Two mounts: one full spec, one minimal (path absent, ro defaults false).
+        write_config(
+            &dir,
+            &ws,
+            "[[mounts]]\nanchor = \"workspace\"\npath = \"cache\"\nguest = \"/cache\"\nro = true\n\n\
+             [[mounts]]\nanchor = \"session\"\nguest = \"/work\"\n",
+        );
+        let store = WorkspaceConfigStore::new(dir);
+        let cfg = store.load(&ws).unwrap().unwrap();
+        assert_eq!(cfg.mounts.len(), 2);
+        assert_eq!(cfg.mounts[0].anchor, "workspace");
+        assert_eq!(cfg.mounts[0].path.as_deref(), Some("cache"));
+        assert!(cfg.mounts[0].ro);
+        // Minimal entry: path absent, ro defaults to read-write.
+        assert_eq!(cfg.mounts[1].anchor, "session");
+        assert_eq!(cfg.mounts[1].path, None);
+        assert!(!cfg.mounts[1].ro);
     }
 
     #[test]
