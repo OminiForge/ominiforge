@@ -193,6 +193,7 @@
 	// choice survives reloads/navigation; defaults open. On narrow screens the
 	// user can collapse it to give the conversation the full width.
 	let detailOpen = $state(true);
+	let copied = $state(false);
 	// Whether we're in the initial event-replay phase (loading existing history
 	// from the durable log). During replay, events arrive in rapid bursts and we
 	// use instant scroll instead of `behavior: 'smooth'` to avoid the visually
@@ -704,6 +705,16 @@
 		return id.length > 14 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id;
 	}
 
+	async function copyId() {
+		try {
+			navigator.clipboard.writeText(sessionId);
+			copied = true;
+			setTimeout(() => (copied = false), 2000);
+		} catch {
+			/* clipboard unavailable */
+		}
+	}
+
 	/** Short workspace label for the INFO panel: last two path segments, full
 	 *  path on hover. */
 	function wsLabel(ws: string): string {
@@ -810,7 +821,10 @@
 				{#if isDraft}
 					<span class="mono draft-hint">draft · 发送后创建</span>
 				{:else}
-					<span class="mono">{shortId(sessionId)}</span>
+					<button class="session-id-btn" onclick={copyId} title={copied ? '已复制!' : sessionId}>
+						{shortId(sessionId)}
+						{#if copied}<span class="copy-toast">Copied!</span>{/if}
+					</button>
 					{#if incomplete}
 						<span class="topbar-badge badge-running">incomplete</span>
 					{/if}
@@ -1845,6 +1859,42 @@
 		font-variant-numeric: tabular-nums;
 	}
 
+
+	/* ---- SESSION ID COPY BUTTON ---- */
+	.session-id-btn {
+		all: unset;
+		cursor: pointer;
+		font-family: var(--font-mono);
+		font-variant-numeric: tabular-nums;
+		font-size: 11.5px;
+		color: var(--text-tertiary);
+		padding: 2px 6px;
+		border-radius: var(--radius-sm);
+		position: relative;
+		transition: color var(--dur-fast) var(--ease-out),
+			background var(--dur-fast) var(--ease-out);
+	}
+	.session-id-btn:hover {
+		color: var(--text-primary);
+		background: var(--surface-hover);
+	}
+	.copy-toast {
+		position: absolute;
+		left: 50%;
+		top: calc(100% + 4px);
+		transform: translateX(-50%);
+		font-size: 10px;
+		white-space: nowrap;
+		background: var(--canvas-overlay);
+		border: 1px solid var(--border-default);
+		color: var(--text-secondary);
+		padding: 2px 6px;
+		border-radius: var(--radius-sm);
+		box-shadow: var(--shadow-md);
+		font-family: var(--font-mono);
+		pointer-events: none;
+		z-index: 10;
+	}
 	.draft-hint {
 		color: var(--text-tertiary);
 		font-family: var(--font-chinese);
