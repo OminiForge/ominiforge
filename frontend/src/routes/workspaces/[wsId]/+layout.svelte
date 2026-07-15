@@ -6,7 +6,7 @@
 	import type { SessionMeta } from '$lib/types/SessionMeta';
 	import type { SessionSummary } from '$lib/types/SessionSummary';
 	import SessionStatusIcon from '$lib/components/SessionStatusIcon.svelte';
-	import { connectStatus, viewState } from '$lib/status.svelte';
+	import { connectStatus, viewState, latestSeqOf } from '$lib/status.svelte';
 
 	let { children } = $props();
 
@@ -30,6 +30,21 @@
 	const activeSessionId = $derived(page.params.id);
 
 	let rows = $state<Row[]>([]);
+
+	/** Rows ordered most-recently-active first. Activity is the last real user
+	 *  message (`summary.last_user_message_at`), falling back to `created_at` for
+	 *  a session whose summary hasn't backfilled yet (or that has no user turn).
+	 *  So a session messaged moments ago floats to the top even if it was created
+	 *  long before its neighbours. Non-destructive (sorts a copy) — the backfill /
+	 *  insert logic keeps mutating `rows`, and this view re-derives. Rows may
+	 *  reshuffle slightly as summaries stream in; that self-corrects to the true
+	 *  order once each summary lands. */
+	const sortedRows = $derived([...rows].sort((a, b) => activityTime(b) - activityTime(a)));
+
+	function activityTime(row: Row): number {
+		return new Date(row.summary?.last_user_message_at ?? row.meta.created_at).getTime();
+	}
+
 	let loading = $state(true);
 	let error = $state<string | null>(null);
 	// The workspace's absolute path, taken from the first session's meta — only
@@ -38,6 +53,9 @@
 	// Generation counter: bumped on every workspace switch so a slow summary
 	// backfill from a previous workspace can't write into the current list.
 	let gen = 0;
+	// Last activity seq we've already fetched a summary for, per session. Lets the
+	// live-refresh effect fire only on a real advance, not on every status re-emit.
+	let refreshedAt = new Map<string, number>();
 
 	async function refresh(wsId: string) {
 		loading = true;
@@ -73,6 +91,9 @@
 			const summary = await client.getSummary(row.meta.id).catch(() => null);
 			if (myGen !== gen) return;
 			if (summary) {
+				// Record the seq this summary reflects so the live-refresh effect
+				// doesn't immediately refetch it; it fires only on a later advance.
+				refreshedAt.set(row.meta.id, latestSeqOf(row.meta.id));
 				// Replace the row in place so the title reactively updates.
 				rows = rows.map((r) => (r.meta.id === row.meta.id ? { ...r, summary } : r));
 			}
@@ -118,6 +139,30 @@
 				await new Promise((resolve) => setTimeout(resolve, 400));
 			}
 		})();
+	});
+
+	// Keep the list order live: when a session's committed seq advances on the
+	// status stream (a new turn ran — i.e. a new user message landed), refetch
+	// that one session's summary so its `last_user_message_at` sort key and title
+	// update without a page reload. Reads each row's `latestSeqOf` reactively, so
+	// this re-runs whenever any tracked session's status advances. Only rows that
+	// ALREADY have a summary are refreshed — the initial fetch stays owned by the
+	// sequential `backfillSummaries`, so this never fans out N concurrent requests
+	// on load; it's purely the live-update path (one fetch per real advance).
+	$effect(() => {
+		const myGen = gen;
+		for (const row of rows) {
+			const id = row.meta.id;
+			const seq = latestSeqOf(id); // reactive dependency
+			if (!row.summary) continue; // let backfill own the first fetch
+			if (seq <= (refreshedAt.get(id) ?? 0)) continue;
+			refreshedAt.set(id, seq);
+			void (async () => {
+				const summary = await client.getSummary(id).catch(() => null);
+				if (myGen !== gen || !summary) return;
+				rows = rows.map((r) => (r.meta.id === id ? { ...r, summary } : r));
+			})();
+		}
 	});
 
 	/** Open a fresh draft in this workspace. The workspace is fixed by the route
@@ -214,7 +259,7 @@
 			{:else if rows.length === 0}
 				<p class="list-muted">还没有会话</p>
 			{:else}
-				{#each rows as row (row.meta.id)}
+				{#each sortedRows as row (row.meta.id)}
 					{@const badge = originBadge(row.meta)}
 					{@const vs = viewState(row.meta.id)}
 					<a
@@ -228,7 +273,7 @@
 						</div>
 						<div class="row-sub">
 							<SessionStatusIcon state={vs} />
-							<span class="row-time">{formatTime(row.meta.created_at)}</span>
+							<span class="row-time">{formatTime(row.summary?.last_user_message_at ?? row.meta.created_at)}</span>
 							{#if badge}<span class="row-badge">{badge}</span>{/if}
 						</div>
 					</a>

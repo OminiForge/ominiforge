@@ -136,7 +136,8 @@
 			skills: { enabled: [] },
 			memory: { scopes: [], auto_write: null },
 			budget: { session_max_usd: null, daily_max_usd: null, warn_at_percent: null },
-			hooks: { before_tool: [], after_tool: [] }
+			hooks: { before_tool: [], after_tool: [] },
+			network: { policy: null, allow: [] }
 		};
 	}
 

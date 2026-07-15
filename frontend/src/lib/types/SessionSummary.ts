@@ -23,6 +23,16 @@ cost_usd: number | null,
  */
 first_user_input: string | null, 
 /**
+ * The timestamp of the *last* turn whose user input was non-empty — the
+ * session's "last activity" for list ordering (`doc/frontend.md`). Unlike
+ * [`first_user_input`](Self::first_user_input) (first-write-wins as a stable
+ * title), this is last-write-wins so the list surfaces recently-touched
+ * sessions. Deliberately keyed on the *user* message, not any event, so a
+ * long-running agent turn does not churn the ordering. `None` for a session
+ * with no real user turn (the UI falls back to `created_at`).
+ */
+last_user_message_at: string | null, 
+/**
  * `tool_name → call count` (includes failures).
  */
 tools_used: { [key in string]: bigint }, 

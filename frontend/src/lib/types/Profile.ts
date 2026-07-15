@@ -4,6 +4,7 @@ import type { ContextSection } from "./ContextSection";
 import type { HooksSection } from "./HooksSection";
 import type { MemorySection } from "./MemorySection";
 import type { ModelSection } from "./ModelSection";
+import type { NetworkSection } from "./NetworkSection";
 import type { ProfileMeta } from "./ProfileMeta";
 import type { PromptSection } from "./PromptSection";
 import type { SkillsSection } from "./SkillsSection";
@@ -13,4 +14,4 @@ import type { ToolsSection } from "./ToolsSection";
  * A parsed profile. Optional sections default so partial files load; unknown
  * keys are ignored for forward compatibility.
  */
-export type Profile = { profile: ProfileMeta, prompt: PromptSection, model: ModelSection, tools: ToolsSection, context: ContextSection, skills: SkillsSection, memory: MemorySection, budget: BudgetSection, hooks: HooksSection, };
+export type Profile = { profile: ProfileMeta, prompt: PromptSection, model: ModelSection, tools: ToolsSection, context: ContextSection, skills: SkillsSection, memory: MemorySection, budget: BudgetSection, hooks: HooksSection, network: NetworkSection, };

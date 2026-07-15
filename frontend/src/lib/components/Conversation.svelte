@@ -22,6 +22,14 @@
 	import ToolBlock from '$lib/components/tools/ToolBlock.svelte';
 	import { num, statLabel, formatCost, cacheLabel, topTools } from '$lib/stats';
 	import { markSeen } from '$lib/status.svelte';
+	import {
+		loadQueue,
+		saveQueue,
+		enqueue,
+		removeFromQueue,
+		type QueuedMessage
+	} from '$lib/queue';
+	import { activeTick, jumpTarget } from '$lib/minimap';
 
 	/** Props: the workspace this conversation lives under (its path-derived id,
 	 *  used to build session URLs) and the session id to show (`'new'` for a
@@ -48,6 +56,10 @@
 	let convo = $state<ConversationState>(emptyState());
 	let input = $state('');
 	let sending = $state(false);
+	// Messages the user sent while a turn was running: held here (and mirrored to
+	// localStorage per session) as pending chips instead of hitting the gateway,
+	// which would defer them invisibly. Flushed one-at-a-time on `turn_settled`.
+	let queued = $state<QueuedMessage[]>([]);
 	let error = $state<string | null>(null);
 	// Draft-only session config: profile / model override / workspace, chosen
 	// before the first send. Populated from the gateway when a draft opens; the
@@ -88,6 +100,93 @@
 	let streamEl = $state<HTMLElement | null>(null);
 	// Whether the user is scrolled to (or near) the bottom – controls auto-scroll.
 	let shouldAutoScroll = $state(true);
+	// User-message minimap: one tick per user turn on the scroll rail, for
+	// jump-to-message (click or Ctrl+↑/↓). Positions are FRACTIONS of the scroll
+	// content (0..1), measured from the DOM because item heights vary with content
+	// and streaming; re-measured on resize + item changes. `scrollFrac` is the
+	// viewport's own position, used to highlight the tick the user is currently at.
+	let ticks = $state<{ index: number; top: number; preview: string }[]>([]);
+	let scrollFrac = $state(0);
+	let measureRaf = 0;
+
+	/** Re-measure tick positions on the next frame (coalesces bursts of resize /
+	 *  item-change triggers into one layout read). */
+	function scheduleMeasure() {
+		if (!browser) return;
+		cancelAnimationFrame(measureRaf);
+		measureRaf = requestAnimationFrame(measureTicks);
+	}
+
+	/** Read each user message's position within the scroll content. Uses
+	 *  bounding-rect math (not offsetTop) so it's correct regardless of the
+	 *  offset-parent chain. */
+	function measureTicks() {
+		const el = streamEl;
+		if (!el) {
+			ticks = [];
+			return;
+		}
+		const total = el.scrollHeight;
+		if (total <= 0) {
+			ticks = [];
+			return;
+		}
+		const elTop = el.getBoundingClientRect().top;
+		const nodes = el.querySelectorAll<HTMLElement>('[data-user-anchor]');
+		const next: { index: number; top: number; preview: string }[] = [];
+		nodes.forEach((node) => {
+			const rel = node.getBoundingClientRect().top - elTop + el.scrollTop;
+			next.push({
+				index: Number(node.dataset.userAnchor),
+				top: rel / total,
+				preview: (node.textContent ?? '').trim().split('\n')[0].slice(0, 60)
+			});
+		});
+		ticks = next;
+	}
+
+	/** The tick the viewport top currently sits at/after, for the active-tick
+	 *  highlight. Delegates to the pure `activeTick` geometry (unit-tested). */
+	const activeTickIndex = $derived.by(() => activeTick(ticks, scrollFrac));
+
+	/** Scroll a specific user message (by its items index) to the top of the view. */
+	function scrollToUserMessage(index: number) {
+		const el = streamEl;
+		if (!el) return;
+		const node = el.querySelector<HTMLElement>(`[data-user-anchor="${index}"]`);
+		if (!node) return;
+		const top = node.getBoundingClientRect().top - el.getBoundingClientRect().top + el.scrollTop;
+		el.scrollTo({ top, behavior: 'smooth' });
+	}
+
+	/** Jump to the previous/next user message relative to the current scroll
+	 *  position. Target geometry is the pure `jumpTarget` (unit-tested); this just
+	 *  applies it to the live element. Downward past the last message continues to
+	 *  the very bottom, so a final Ctrl+↓ lands on the latest content (agent reply,
+	 *  tools) rather than dead-ending on the last user turn. */
+	function jumpUserMessage(dir: 1 | -1) {
+		const el = streamEl;
+		if (!el) return;
+		const target = jumpTarget(ticks, el.scrollTop, el.scrollHeight, dir);
+		if (target !== null) {
+			el.scrollTo({ top: target, behavior: 'smooth' });
+		} else if (dir === 1) {
+			// No next message below: fall through to the bottom and re-arm follow.
+			scrollToBottom();
+		}
+	}
+
+	/** Ctrl+↑/↓ jumps between user messages. A bare Ctrl chord (no meta/alt/shift)
+	 *  so it doesn't clash with word-nav or browser shortcuts; a no-op with no
+	 *  ticks, so it never swallows the keys on an empty conversation. */
+	function onWindowKeydown(e: KeyboardEvent) {
+		if (!e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+		if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+		if (ticks.length === 0) return;
+		e.preventDefault();
+		jumpUserMessage(e.key === 'ArrowDown' ? 1 : -1);
+	}
+
 	// Track collapsed state for reasoning items separately (index → collapsed)
 	let collapsed = $state<Record<number, boolean>>({});
 	// Whether the right detail rail (INFO + STATS) is shown. Persisted so the
@@ -100,6 +199,12 @@
 	// uncomfortable rapid-scrolling animation through the entire conversation.
 	let isReplaying = $state(false);
 	let replayDebounce: ReturnType<typeof setTimeout> | undefined;
+	/** Cached conversation state per session. Preserves streaming content
+	 *  (e.g. in-progress reasoning) across session switches. Live deltas are
+	 *  not replayed on re-subscribe (gateway-transport.ts §reconnect), so without
+	 *  this cache, switching away during a stream and back would truncate it. */
+	const sessionCache = new Map<string, { convo: ConversationState; collapsed: Record<number, boolean> }>();
+	let prevSessionId: string | undefined;
 
 	function toggleDetail() {
 		detailOpen = !detailOpen;
@@ -109,6 +214,25 @@
 	onMount(() => {
 		// Restore the persisted rail state; default open when unset.
 		detailOpen = localStorage.getItem('detailOpen') !== '0';
+
+		// Re-measure minimap ticks whenever the scroll content resizes (new
+		// messages, streaming growth, window resize, font load). One observer for
+		// the lifetime of the component.
+		const ro = new ResizeObserver(() => scheduleMeasure());
+		if (streamEl) ro.observe(streamEl);
+		window.addEventListener('keydown', onWindowKeydown);
+		return () => {
+			ro.disconnect();
+			cancelAnimationFrame(measureRaf);
+			window.removeEventListener('keydown', onWindowKeydown);
+		};
+	});
+
+	// Re-measure when the item list changes (covers content that grows without a
+	// size change the observer would catch, e.g. a new user turn appended).
+	$effect(() => {
+		void convo.items.length;
+		scheduleMeasure();
 	});
 
 	const isDraft = $derived(sessionId === DRAFT_ID);
@@ -119,12 +243,36 @@
 	}
 
 	/** Called whenever the user scrolls inside the stream container.
-	 *  Updates `shouldAutoScroll` so that we only auto-scroll when the
-	 *  user hasn't deliberately scrolled up to read history. */
+	 *  `shouldAutoScroll` models the user's INTENT to follow the live tail, so it
+	 *  is only disarmed when the user scrolls UP (away from the bottom) — never by
+	 *  the intermediate frames of a programmatic smooth scroll (which momentarily
+	 *  read as "not at bottom" and would otherwise cancel following mid-animation,
+	 *  the "clicked to bottom but new content stopped following" bug). Scrolling
+	 *  down that reaches the bottom re-arms it. */
+	let lastScrollTop = 0;
 	function onStreamScroll() {
-		if (streamEl) {
-			shouldAutoScroll = isNearBottom(streamEl);
+		if (!streamEl) return;
+		const st = streamEl.scrollTop;
+		if (st < lastScrollTop && !isNearBottom(streamEl)) {
+			// Deliberate upward scroll away from the tail: stop following.
+			shouldAutoScroll = false;
+		} else if (isNearBottom(streamEl)) {
+			// Back at (or scrolled down to) the bottom: follow the tail again.
+			shouldAutoScroll = true;
 		}
+		lastScrollTop = st;
+		// Track viewport-top position as a fraction of the FULL content height
+		// (same basis as each tick's `top`), so the active-tick compare lines up.
+		const total = streamEl.scrollHeight;
+		scrollFrac = total > 0 ? st / total : 0;
+	}
+
+	/** Jump to the newest message and re-arm auto-scroll. Backs the "scroll to
+	 *  bottom" affordance shown while the user is reading history. */
+	function scrollToBottom() {
+		if (!streamEl) return;
+		shouldAutoScroll = true;
+		streamEl.scrollTo({ top: streamEl.scrollHeight, behavior: 'smooth' });
 	}
 
 	/** Load session meta + config-layer runtime + summary snapshot for the right
@@ -175,9 +323,21 @@
 
 	function subscribe(id: string) {
 		sub?.close();
-		convo = emptyState();
-		collapsed = {};
+		// Restore cached state if available (preserves streaming content across
+		// session switches); otherwise start fresh.
+		const cached = sessionCache.get(id);
+		if (cached) {
+			convo = cached.convo;
+			collapsed = cached.collapsed;
+			sessionCache.delete(id);
+		} else {
+			convo = emptyState();
+			collapsed = {};
+		}
 		context = null;
+		// Restore this session's persisted pending queue (survives a mid-turn
+		// refresh). Keyed by id, so switching sessions swaps the right queue in.
+		queued = loadQueue(id);
 		// A new subscription means fresh content – start auto-scrolling.
 		shouldAutoScroll = true;
 		// Enter replay mode: the gateway will replay committed events in rapid
@@ -200,6 +360,10 @@
 				// STATS snapshot so turns/cost/tokens track the live conversation.
 				if (ev.type === 'turn_settled') {
 					void refreshSummary(id);
+					// The turn is done: release the next queued message (if any). One
+					// per settle keeps the gateway's own defer-queue empty, so every
+					// still-pending message stays here — visible and cancellable.
+					void flushQueue(id);
 				}
 				// Live context occupancy (per round): drive the STATS context bar.
 				if (ev.type === 'context_updated') {
@@ -242,11 +406,18 @@
 			onError: (e) => {
 				error = e instanceof Error ? e.message : String(e);
 			}
-		});
+		}, cached ? convo.lastSeq : undefined);
 	}
 
 	$effect(() => {
 		const id = sessionId;
+		// Save previous session's conversation state before switching.
+		// Preserves streaming content (e.g. in-progress reasoning) that would
+		// otherwise be lost — live deltas are not replayed on re-subscribe.
+		if (prevSessionId !== undefined && prevSessionId !== DRAFT_ID && prevSessionId !== id) {
+			sessionCache.set(prevSessionId, { convo, collapsed });
+		}
+		prevSessionId = id;
 		// Draft: show an empty conversation, don't subscribe or load meta. The
 		// real session doesn't exist yet — it's created on the first send().
 		if (id === DRAFT_ID) {
@@ -257,6 +428,9 @@
 			runtime = null;
 			summary = null;
 			context = null;
+			// A draft has no persisted queue (nothing to key on, and its first send
+			// creates the session); clear any carried over from the previous session.
+			queued = [];
 			// Populate the config picker options (profiles + models). Best-effort:
 			// a failure leaves the dropdowns empty and send still works on defaults.
 			void loadConfigOptions();
@@ -311,6 +485,17 @@
 	async function send() {
 		const text = input.trim();
 		if (!text || sending) return;
+		// A turn is already running on this (real) session: queue the message
+		// locally instead of POSTing. The gateway would accept it but defer it in
+		// an invisible in-memory queue; holding it here keeps it visible as a
+		// pending chip the user can cancel, and it flushes on the next settle.
+		// Drafts never have a running turn, so they always fall through to send.
+		if (!isDraft && turnRunning) {
+			queued = enqueue(queued, text);
+			persistQueue();
+			input = '';
+			return;
+		}
 		sending = true;
 		error = null;
 		try {
@@ -341,6 +526,50 @@
 		} finally {
 			sending = false;
 		}
+	}
+
+	/** Persist the current pending queue for this session. A no-op key-clear when
+	 *  empty (see queue.ts), so a drained session leaves no dead entry. Skipped
+	 *  for drafts, which have no real id to key on yet. */
+	function persistQueue() {
+		if (sessionId !== DRAFT_ID) saveQueue(sessionId, queued);
+	}
+
+	/** Release the oldest pending message now that the turn settled: POST it and
+	 *  drop it from the queue. Only one per settle — the next flushes when this
+	 *  message's own turn settles, so the gateway's invisible defer-queue stays
+	 *  empty and every still-pending message remains a cancellable chip. Guarded
+	 *  on `id` matching the live session so a settle from a session we just left
+	 *  can't flush into the wrong conversation. */
+	async function flushQueue(id: string) {
+		if (id !== sessionId || sending) return;
+		const next = queued[0];
+		if (!next) return;
+		queued = removeFromQueue(queued, next.id);
+		persistQueue();
+		sending = true;
+		error = null;
+		try {
+			await client.sendMessage(id, next.text);
+		} catch (e) {
+			// Re-queue at the FRONT on failure so nothing is silently dropped
+			// (fail loud): the message stays visible and retries on the next settle.
+			queued = [next, ...queued];
+			persistQueue();
+			error = e instanceof Error ? e.message : String(e);
+		} finally {
+			sending = false;
+		}
+	}
+
+	/** Cancel a pending message: remove it and drop its text back into the input
+	 *  so the user can edit and resend (cancelling is often "let me add more"
+	 *  rather than "discard"). Appends to any half-typed input rather than
+	 *  clobbering it. */
+	function cancelQueued(item: QueuedMessage) {
+		queued = removeFromQueue(queued, item.id);
+		persistQueue();
+		input = input.trim() ? `${input.trimEnd()}\n${item.text}` : item.text;
 	}
 
 	async function cancel() {
@@ -618,11 +847,12 @@
 		{/if}
 
 		<!-- CONVERSATION SCROLL -->
-		<div class="conv-scroll" bind:this={streamEl} onscroll={onStreamScroll}>
-			<div class="conv-inner">
+		<div class="conv-viewport">
+			<div class="conv-scroll" bind:this={streamEl} onscroll={onStreamScroll}>
+				<div class="conv-inner">
 				{#each convo.items as item, i (i)}
 					{#if item.kind === 'user'}
-						<div class="item item-user">
+						<div class="item item-user" data-user-anchor={i}>
 							<div class="user-bubble">{item.text}</div>
 						</div>
 					{:else if item.kind === 'text'}
@@ -800,7 +1030,53 @@
 				{#if convo.items.length === 0}
 					<p class="empty">{isDraft ? '输入消息，开始一段新对话' : '发送消息开始对话'}</p>
 				{/if}
+				</div>
 			</div>
+			{#if ticks.length > 1}
+				<!-- User-message minimap: a tick per user turn on the scroll rail.
+				     Hover previews the message; click (or Ctrl+↑/↓) jumps to it.
+				     Shown only with >1 user message — a single tick is noise. -->
+				<div class="minimap" aria-hidden="true">
+					{#each ticks as tick (tick.index)}
+						<button
+							class="minimap-tick"
+							class:active={tick.index === activeTickIndex}
+							style="top: {tick.top * 100}%"
+							onclick={() => scrollToUserMessage(tick.index)}
+							tabindex="-1"
+						>
+							<span class="minimap-preview">{tick.preview}</span>
+						</button>
+					{/each}
+				</div>
+			{/if}
+
+			{#if !shouldAutoScroll && convo.items.length > 0}
+				<!-- Scroll-to-bottom: shown only while the user has scrolled up to read
+				     history. Neutral surface (canvas-float), deliberately NOT the lime
+				     accent — that's reserved for the user bubble + the one Send CTA. -->
+				<button
+					class="to-bottom"
+					onclick={scrollToBottom}
+					title="回到底部"
+					aria-label="Scroll to latest"
+				>
+					<svg
+						width="16"
+						height="16"
+						viewBox="0 0 16 16"
+						fill="none"
+						stroke="currentColor"
+						stroke-width="1.6"
+						stroke-linecap="round"
+						stroke-linejoin="round"
+						aria-hidden="true"
+					>
+						<path d="M8 3v8" />
+						<path d="M4.5 7.5 8 11l3.5-3.5" />
+					</svg>
+				</button>
+			{/if}
 		</div>
 
 		<!-- ACTIVE PLAN (sticky above input) — the latest plan stays docked (running
@@ -914,6 +1190,38 @@
 		<!-- INPUT AREA -->
 		<div class="input-area" class:seamless={dockPlan}>
 			<div class="input-inner">
+				{#if queued.length > 0}
+					<!-- Pending queue: messages the user sent while a turn was running.
+					     They flush one-at-a-time on each settle; until then each is a
+					     cancellable chip (× drops it back into the input to edit/resend). -->
+					<div class="queue" aria-label="待发送消息">
+						{#each queued as item (item.id)}
+							<div class="queue-chip">
+								<span class="queue-dot" aria-hidden="true"></span>
+								<span class="queue-text" title={item.text}>{item.text}</span>
+								<button
+									class="queue-cancel"
+									onclick={() => cancelQueued(item)}
+									title="取消并放回输入框"
+									aria-label="Cancel queued message"
+								>
+									<svg
+										width="10"
+										height="10"
+										viewBox="0 0 10 10"
+										fill="none"
+										stroke="currentColor"
+										stroke-width="1.5"
+										stroke-linecap="round"
+									>
+										<line x1="1" y1="1" x2="9" y2="9" />
+										<line x1="9" y1="1" x2="1" y2="9" />
+									</svg>
+								</button>
+							</div>
+						{/each}
+					</div>
+				{/if}
 				<div class="input-box">
 					<textarea
 						class="input-field"
@@ -1011,9 +1319,38 @@
 								Cancel
 							</button>
 						{/if}
-						<button class="input-btn primary" disabled={sending} onclick={send}>
-							{sending ? 'Sending…' : 'Send'}
-							<kbd>↵</kbd>
+						<button
+							class="send-btn"
+							disabled={sending || !input.trim()}
+							onclick={send}
+							title={!isDraft && turnRunning
+								? '排队发送（当前回合结束后自动发出）· Enter'
+								: '发送 · Enter'}
+							aria-label="Send message"
+						>
+							{#if sending}
+								<span class="send-spinner" aria-hidden="true"></span>
+							{:else}
+								<!-- Original monoline "send" glyph: an upward stroke rising from a
+								     base line — a launch/submit metaphor drawn from scratch (not a
+								     borrowed paper-plane icon set). -->
+								<svg
+									class="send-icon"
+									width="16"
+									height="16"
+									viewBox="0 0 16 16"
+									fill="none"
+									stroke="currentColor"
+									stroke-width="1.6"
+									stroke-linecap="round"
+									stroke-linejoin="round"
+									aria-hidden="true"
+								>
+									<path d="M8 12.5V4" />
+									<path d="M4.5 7.5 8 4l3.5 3.5" />
+									<path d="M4 13.5h8" />
+								</svg>
+							{/if}
 						</button>
 					</div>
 				</div>
@@ -1537,6 +1874,15 @@
 	}
 
 	/* ---- CONVERSATION ---- */
+	/* Positioning context for the minimap overlay; owns the flex height so the
+	   inner scroll area and the pinned minimap share the same box. */
+	.conv-viewport {
+		flex: 1;
+		position: relative;
+		min-height: 0;
+		display: flex;
+	}
+
 	.conv-scroll {
 		flex: 1;
 		overflow-y: auto;
@@ -1547,6 +1893,119 @@
 	.conv-inner {
 		max-width: 740px;
 		margin: 0 auto;
+	}
+
+	/* ---- USER-MESSAGE MINIMAP (jump-to-message rail) ---- */
+	.minimap {
+		position: absolute;
+		top: var(--space-2);
+		bottom: var(--space-2);
+		right: 3px;
+		width: 10px;
+		z-index: var(--z-sticky);
+		pointer-events: none;
+	}
+
+	.minimap-tick {
+		position: absolute;
+		right: 0;
+		/* Center the tick on its target fraction. */
+		transform: translateY(-50%);
+		display: flex;
+		align-items: center;
+		justify-content: flex-end;
+		height: 12px;
+		padding: 0;
+		border: none;
+		background: transparent;
+		cursor: pointer;
+		pointer-events: auto;
+	}
+
+	/* The visible dash. Widens + takes the accent on hover / when active. */
+	.minimap-tick::after {
+		content: '';
+		width: 8px;
+		height: 2px;
+		border-radius: 1px;
+		background: var(--text-disabled);
+		transition:
+			width var(--dur-fast) var(--ease-out),
+			background var(--dur-fast) var(--ease-out);
+	}
+
+	.minimap-tick:hover::after,
+	.minimap-tick.active::after {
+		width: 10px;
+		background: var(--accent);
+	}
+
+	/* Hover preview: the message's first line, floated to the left of the rail. */
+	.minimap-preview {
+		position: absolute;
+		right: 16px;
+		top: 50%;
+		transform: translateY(-50%);
+		max-width: 260px;
+		padding: 4px 8px;
+		border-radius: var(--radius-sm);
+		background: var(--canvas-float);
+		border: 1px solid var(--border-default);
+		box-shadow: var(--shadow-md);
+		color: var(--text-secondary);
+		font-size: 11px;
+		font-family: var(--font-chinese);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		opacity: 0;
+		pointer-events: none;
+		transition: opacity var(--dur-fast) var(--ease-out);
+	}
+
+	.minimap-tick:hover .minimap-preview {
+		opacity: 1;
+	}
+
+	@media (max-width: 900px) {
+		/* The rail overlaps content on narrow screens; hide it there (keyboard nav
+		   still works). */
+		.minimap {
+			display: none;
+		}
+	}
+
+	/* ---- SCROLL-TO-BOTTOM (floats over the stream while reading history) ---- */
+	.to-bottom {
+		position: absolute;
+		bottom: var(--space-4);
+		left: 50%;
+		transform: translateX(-50%);
+		z-index: var(--z-sticky);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		width: 32px;
+		height: 32px;
+		border-radius: 50%;
+		/* Neutral surface — NOT the lime accent (reserved for user bubble + Send). */
+		background: var(--canvas-float);
+		border: 1px solid var(--border-default);
+		color: var(--text-secondary);
+		box-shadow: var(--shadow-md);
+		cursor: pointer;
+		transition:
+			background var(--dur-fast) var(--ease-out),
+			color var(--dur-fast) var(--ease-out),
+			border-color var(--dur-fast) var(--ease-out),
+			transform var(--dur-fast) var(--ease-out);
+	}
+
+	.to-bottom:hover {
+		background: var(--canvas-overlay);
+		color: var(--text-primary);
+		border-color: var(--border-strong);
+		transform: translateX(-50%) translateY(1px);
 	}
 
 	.item {
@@ -2142,6 +2601,67 @@
 		margin: 0 auto;
 	}
 
+	/* ---- PENDING QUEUE (messages sent mid-turn, awaiting flush) ---- */
+	.queue {
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-1);
+		margin-bottom: var(--space-2);
+	}
+
+	.queue-chip {
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+		padding: 5px var(--space-2) 5px var(--space-3);
+		border: 1px dashed var(--border-default);
+		border-radius: var(--radius-md);
+		background: var(--canvas-overlay);
+	}
+
+	/* Pulsing dot marks "waiting to send" — distinct from the accent Send CTA. */
+	.queue-dot {
+		width: 5px;
+		height: 5px;
+		border-radius: 50%;
+		background: var(--state-running);
+		flex-shrink: 0;
+		animation: pulse 1.4s ease-in-out infinite;
+	}
+
+	.queue-text {
+		flex: 1;
+		min-width: 0;
+		font-size: 12px;
+		color: var(--text-secondary);
+		font-family: var(--font-chinese);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+
+	.queue-cancel {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		width: 18px;
+		height: 18px;
+		border: none;
+		border-radius: var(--radius-sm);
+		background: transparent;
+		color: var(--text-tertiary);
+		cursor: pointer;
+		flex-shrink: 0;
+		transition:
+			color var(--dur-fast) var(--ease-out),
+			background var(--dur-fast) var(--ease-out);
+	}
+
+	.queue-cancel:hover {
+		color: var(--state-error-text);
+		background: var(--state-error-bg);
+	}
+
 	.input-box {
 		background: var(--canvas-overlay);
 		border: 1px solid var(--border-default);
@@ -2237,6 +2757,54 @@
 	.input-btn.primary:disabled {
 		opacity: 0.55;
 		cursor: not-allowed;
+	}
+
+	/* ---- SEND BUTTON (accent circular icon) ---- */
+	.send-btn {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		width: 30px;
+		height: 30px;
+		flex-shrink: 0;
+		border: none;
+		border-radius: 50%;
+		background: var(--accent);
+		color: var(--accent-fg);
+		cursor: pointer;
+		transition:
+			background var(--dur-fast) var(--ease-out),
+			transform var(--dur-fast) var(--ease-out),
+			opacity var(--dur-fast) var(--ease-out);
+	}
+
+	.send-btn:hover:not(:disabled) {
+		background: var(--accent-hover);
+		/* A small lift echoing the upward "send" motion. */
+		transform: translateY(-1px);
+	}
+
+	.send-btn:active:not(:disabled) {
+		transform: translateY(0);
+	}
+
+	.send-btn:disabled {
+		opacity: 0.4;
+		cursor: not-allowed;
+	}
+
+	.send-icon {
+		display: block;
+	}
+
+	/* In-flight spinner, tinted onto the accent fill. */
+	.send-spinner {
+		width: 13px;
+		height: 13px;
+		border: 1.6px solid color-mix(in srgb, var(--accent-fg) 30%, transparent);
+		border-top-color: var(--accent-fg);
+		border-radius: 50%;
+		animation: spin 700ms linear infinite;
 	}
 
 	.input-btn.cancel {
@@ -2351,16 +2919,6 @@
 		padding: 4px 10px;
 	}
 
-	kbd {
-		font-family: var(--font-mono);
-		font-size: 10px;
-		background: var(--canvas-float);
-		border: 1px solid var(--border-strong);
-		border-radius: 3px;
-		padding: 1px 4px;
-		color: var(--text-tertiary);
-	}
-
 	.input-hint {
 		font-size: 10.5px;
 		color: var(--text-disabled);
@@ -2377,6 +2935,12 @@
 			animation: none;
 		}
 		.plan-spinner {
+			animation: none;
+		}
+		.send-spinner {
+			animation: none;
+		}
+		.queue-dot {
 			animation: none;
 		}
 	}

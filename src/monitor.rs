@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::config::Pricing;
@@ -46,6 +47,14 @@ pub struct SessionSummary {
     /// (e.g. an empty draft that was never sent). Not truncated server-side; the
     /// UI clips it for display.
     pub first_user_input: Option<String>,
+    /// The timestamp of the *last* turn whose user input was non-empty — the
+    /// session's "last activity" for list ordering (`doc/frontend.md`). Unlike
+    /// [`first_user_input`](Self::first_user_input) (first-write-wins as a stable
+    /// title), this is last-write-wins so the list surfaces recently-touched
+    /// sessions. Deliberately keyed on the *user* message, not any event, so a
+    /// long-running agent turn does not churn the ordering. `None` for a session
+    /// with no real user turn (the UI falls back to `created_at`).
+    pub last_user_message_at: Option<DateTime<Utc>>,
     /// `tool_name → call count` (includes failures).
     pub tools_used: HashMap<String, u64>,
     /// One entry per error code, with how many times it occurred.
@@ -87,11 +96,15 @@ impl Monitor {
                 // Keep the first non-empty input as the session's title. Later
                 // turns don't overwrite it — the opening message is the most
                 // recognizable label.
-                if self.summary.first_user_input.is_none()
-                    && let Some(text) = input
+                if let Some(text) = input
                     && !text.trim().is_empty()
                 {
-                    self.summary.first_user_input = Some(text.clone());
+                    if self.summary.first_user_input.is_none() {
+                        self.summary.first_user_input = Some(text.clone());
+                    }
+                    // Track the LAST real user message's time for list ordering
+                    // (last-write-wins), so a busy session floats to the top.
+                    self.summary.last_user_message_at = Some(event.timestamp);
                 }
             }
             EventPayload::Model(ModelEvent::RequestStarted {
@@ -202,6 +215,7 @@ mod tests {
     use crate::core::{
         CoreEvent, EventId, EventSource, SCHEMA_VERSION, SessionId, SourceKind, TurnId,
     };
+    use chrono::TimeZone;
 
     fn sid() -> SessionId {
         SessionId("01J5M3HKEA7V2X3P1YKRN9C4WG".to_owned())
@@ -364,6 +378,50 @@ mod tests {
         let summary = summarize(&events, PricingTable::new());
         assert_eq!(summary.total_turns, 1);
         assert_eq!(summary.first_user_input, None);
+    }
+
+    /// `last_user_message_at` tracks the *latest* real user turn (last-write-wins),
+    /// unlike `first_user_input` which pins the opening one. This is what lets the
+    /// session list sort by recent activity: a follow-up message moves the session
+    /// to the top. Built with explicit timestamps so the "last, not first" choice
+    /// is asserted deterministically (the `ev` helper stamps `now`).
+    #[test]
+    fn last_user_message_at_tracks_the_latest_user_turn() {
+        let t0 = Utc.with_ymd_and_hms(2026, 7, 15, 9, 0, 0).unwrap();
+        let t2 = Utc.with_ymd_and_hms(2026, 7, 15, 10, 30, 0).unwrap();
+        let at = |seq: u64, ts: DateTime<Utc>, payload: EventPayload| CoreEvent {
+            timestamp: ts,
+            ..ev(seq, runtime_src(), payload)
+        };
+        let events = vec![
+            at(0, t0, started("fix the auth bug")),
+            at(1, t0, request_started("r1", "gpt-4o")),
+            at(2, t2, started("now add a test")),
+        ];
+        let summary = summarize(&events, PricingTable::new());
+        // Title stays the opening message; activity time is the latest user turn.
+        assert_eq!(summary.first_user_input.as_deref(), Some("fix the auth bug"));
+        assert_eq!(summary.last_user_message_at, Some(t2));
+    }
+
+    /// A blank follow-up turn does not advance `last_user_message_at`: activity
+    /// ordering keys on *real* user messages only, so an empty send can't reorder
+    /// the list. Mirrors the `first_user_input` empty-input skip.
+    #[test]
+    fn last_user_message_at_ignores_blank_input() {
+        let t0 = Utc.with_ymd_and_hms(2026, 7, 15, 9, 0, 0).unwrap();
+        let t1 = Utc.with_ymd_and_hms(2026, 7, 15, 9, 5, 0).unwrap();
+        let blank = EventPayload::Turn(TurnEvent::Started {
+            turn_id: TurnId("t".to_owned()),
+            input: Some("   ".to_owned()),
+        });
+        let at = |seq: u64, ts: DateTime<Utc>, payload: EventPayload| CoreEvent {
+            timestamp: ts,
+            ..ev(seq, runtime_src(), payload)
+        };
+        let events = vec![at(0, t0, started("real message")), at(1, t1, blank)];
+        let summary = summarize(&events, PricingTable::new());
+        assert_eq!(summary.last_user_message_at, Some(t0));
     }
 
     /// A representative two-turn stream aggregates into the expected counts, and

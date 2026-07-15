@@ -145,3 +145,13 @@ export function viewState(sessionId: string, seed?: number): ViewState {
 	// No live status this run: fall back to the persisted seed.
 	return effectiveSeed > (acked[sessionId] ?? 0) ? 'unseen' : 'seen';
 }
+
+/** The latest committed `seq` seen for a session on the live status stream (0 if
+ *  none yet). Reactive — a component reading this in an `$effect`/`$derived`
+ *  re-runs when the session's status advances. The session list uses it as an
+ *  activity signal to refresh a row's summary (and hence its sort position)
+ *  without a page reload. */
+export function latestSeqOf(sessionId: string): number {
+	return latestSeqs[sessionId] ?? 0;
+}
+
