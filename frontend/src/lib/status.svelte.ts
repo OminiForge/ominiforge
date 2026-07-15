@@ -17,6 +17,7 @@ import type { EventSubscription } from '$lib/client-core';
 export type ViewState = 'running' | 'awaiting' | 'unseen' | 'seen';
 
 const ACK_KEY = 'ominiforge.seen.v1';
+const SEQ_KEY = 'ominiforge.latestSeq.v1';
 
 /** Last-known status per session, keyed by session id, last-write-wins from the
  *  status stream. Reactive: reads in components re-run on update. */
@@ -25,6 +26,12 @@ const statuses = $state<Record<string, SessionStatus>>({});
 /** Acknowledged (seen-up-to) seq per session, persisted to localStorage. A row is
  *  "unseen" only when its latest committed seq exceeds this. */
 const acked = $state<Record<string, number>>(loadAcked());
+
+/** Last-known `latest_seq` per session, persisted to localStorage. Survives page
+ *  refreshes and gateway restarts so the unseen→seen split works even when the SSE
+ *  status snapshot doesn't include a given session (cold session, restarted hub).
+ *  Updated on every status delta; monotonic (a smaller seq never lowers it). */
+const latestSeqs = $state<Record<string, number>>(loadLatestSeqs());
 
 let sub: EventSubscription | null = null;
 let refCount = 0;
@@ -48,6 +55,25 @@ function persistAcked() {
 	}
 }
 
+function loadLatestSeqs(): Record<string, number> {
+	if (typeof localStorage === 'undefined') return {};
+	try {
+		const raw = localStorage.getItem(SEQ_KEY);
+		return raw ? (JSON.parse(raw) as Record<string, number>) : {};
+	} catch {
+		return {};
+	}
+}
+
+function persistLatestSeqs() {
+	if (typeof localStorage === 'undefined') return;
+	try {
+		localStorage.setItem(SEQ_KEY, JSON.stringify(latestSeqs));
+	} catch {
+		// storage full / disabled — the in-memory map still works for this session.
+	}
+}
+
 /** Start the shared status subscription if it isn't already running, and return a
  *  disposer. Ref-counted so multiple list instances share ONE SSE connection; the
  *  stream closes when the last consumer disposes. Call from a component's
@@ -60,6 +86,13 @@ export function connectStatus(): () => void {
 				// Last-write-wins by session id; `latest_seq` arrives as a JS number
 				// over the wire (ts-rs types it bigint, but serde_json emits a number).
 				statuses[s.session_id] = s;
+
+				// Persist latest_seq so the unseen→seen split survives page refreshes.
+				const seq = Number(s.latest_seq) || 0;
+				if (seq > (latestSeqs[s.session_id] ?? 0)) {
+					latestSeqs[s.session_id] = seq;
+					persistLatestSeqs();
+				}
 			}
 			// onError omitted: the transport reconnects (and re-snapshots) on its own;
 			// a dropped stream simply leaves the last-known statuses in place until it
@@ -93,25 +126,22 @@ export function markSeen(sessionId: string, seq: number): void {
  *
  *  `seed` is the row's own latest known seq, used so a session that hasn't
  *  streamed a status this run — but whose log has advanced past what the user
- *  acked — can still read as unseen. **Currently every caller passes `seed = 0`**:
- *  neither `SessionSummary` nor `SessionMeta` carries a latest seq, so there is no
- *  per-row seed source yet. The consequence is deliberate and bounded: unseen only
- *  lights for a session that actually transitions to `idle` *while the app is
- *  open* (the live status carries `latest_seq`); a turn that finished before this
- *  run reads as `seen`. The `seed` path is wired and ready — the day the summary
- *  endpoint gains a `latest_seq`, passing it here makes unseen robust across
- *  reloads with no other change. A session absent from both the status map and any
- *  seed is `seen` (a resting session with no live actor is never running, and
- *  unseen needs a known latest seq to mean anything). */
-export function viewState(sessionId: string, seed = 0): ViewState {
+ *  acked — can still read as unseen. When callers don't supply a seed, the
+ *  persisted `latestSeqs` map (fed by the live status stream across app runs)
+ *  provides a fallback. A session absent from both maps is `seen` (a resting
+ *  session with no live actor is never running, and unseen needs a known latest
+ *  seq to mean anything). */
+export function viewState(sessionId: string, seed?: number): ViewState {
 	const s = statuses[sessionId];
+	const persistedSeed = latestSeqs[sessionId] ?? 0;
+	const effectiveSeed = seed ?? persistedSeed;
 	if (s) {
 		if (s.status === 'running') return 'running';
 		if (s.status === 'awaiting_approval') return 'awaiting';
 		// idle → seen/unseen by seq compare.
-		const latest = Math.max(Number(s.latest_seq) || 0, seed);
+		const latest = Math.max(Number(s.latest_seq) || 0, effectiveSeed);
 		return latest > (acked[sessionId] ?? 0) ? 'unseen' : 'seen';
 	}
-	// No live status this run: fall back to the seeded seq compare.
-	return seed > (acked[sessionId] ?? 0) ? 'unseen' : 'seen';
+	// No live status this run: fall back to the persisted seed.
+	return effectiveSeed > (acked[sessionId] ?? 0) ? 'unseen' : 'seen';
 }

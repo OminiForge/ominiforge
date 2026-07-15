@@ -62,8 +62,8 @@
 	}
 
 	.dot {
-		width: 8px;
-		height: 8px;
+		width: 5px;
+		height: 5px;
 		border-radius: 50%;
 	}
 

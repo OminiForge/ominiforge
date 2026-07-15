@@ -216,16 +216,18 @@
 			{:else}
 				{#each rows as row (row.meta.id)}
 					{@const badge = originBadge(row.meta)}
+					{@const vs = viewState(row.meta.id)}
 					<a
 						href={`/workspaces/${workspaceId}/sessions/${row.meta.id}`}
 						class="session-row"
 						class:active={row.meta.id === activeSessionId}
+						class:unseen={vs === 'unseen'}
 					>
 						<div class="row-title" class:untitled={!row.summary?.first_user_input}>
 							{title(row)}
 						</div>
 						<div class="row-sub">
-							<SessionStatusIcon state={viewState(row.meta.id)} />
+							<SessionStatusIcon state={vs} />
 							<span class="row-time">{formatTime(row.meta.created_at)}</span>
 							{#if badge}<span class="row-badge">{badge}</span>{/if}
 						</div>
@@ -243,7 +245,7 @@
 <style>
 	.panel {
 		display: grid;
-		grid-template-columns: 232px 1fr;
+   	grid-template-columns: var(--sidebar-width) 1fr;
 		height: 100%;
 		overflow: hidden;
 		min-width: 0;
@@ -391,6 +393,15 @@
 
 	.session-row.active .row-title {
 		font-weight: 510;
+	}
+
+	/* unseen: heavier title weight so "unread" rows pop at a glance.
+	   Redundant with the status-icon dot (DESIGN.md §1.3: color+shape+motion). */
+	.session-row.unseen .row-title {
+  	font-weight: 500;
+	}
+	.session-row.active.unseen .row-title {
+		font-weight: 590;
 	}
 
 	.row-title.untitled {
