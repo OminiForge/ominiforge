@@ -345,6 +345,33 @@ layout 的 `main` **不带 padding**（对话页要全屏）。每个内容页�
 
 内容页层级按 surface ladder 决策：页面背景用 `--canvas-base`，一级卡片用 `--canvas-raised`，弹层/卡片内输入用 `--canvas-overlay`，代码/最浮层用 `--canvas-float`。hover 通常只提升一级或增强到 `--border-default`，不要同时加亮背景、粗边框、大阴影。
 
+### 4.7 轮操作层（turn actions）
+
+挂在**用户消息**上的低频操作入口（用户消息 = 一轮对话的起点）。首个动作是 **Fork**（从该轮分支出新会话，父会话保留）；这一行是 flex 容器，预留后续「用户评价」等每轮操作的位置。
+
+- **克制第一**：低频功能，绝不与对话本身抢注意力。默认态**极弱可见**（图标 `--text-disabled`，容器 `opacity: ~0.4`），仅当**该轮被 hover**（`.item-user:hover`）时提亮到 `--text-secondary`。
+- **纯图标，无可见文字**：静止与 hover 都只是一个 12px 单色描边图标，语义靠图标本身 + `title` tooltip 承载，不放行内 label（低频功能加文字反而是噪声）。
+- **surface**：hover 背景提升到 `--canvas-float` + `--border-default` hairline，符合 §4.6 的「只提升一级」。
+- **不碰 acid-lime**：轮操作永远不用 accent（accent 只留给 Send / 当前 nav，见 §1.2）。图标为原创描边字形，不借用 git-branch 等现成图标集（§5）。
+- **降级**：`prefers-reduced-motion` 下 transition 关掉，直接显示。
+- **首轮 + draft 例外**：第一条用户消息不渲染 fork（在它之前分支 = 空上下文 = 等同 new session，无意义）；draft 态的乐观 user 消息还没有 committed seq，也不渲染。
+
+**Fork 的惰性语义（关键）**：点 fork **不立即建会话**——它跳到工作区 draft 路由、把这条消息原文预填进输入框、并记住「父会话 + 分支点（该消息**之前**一个 seq）」。只有 draft 的**首次发送**才真正 `forkSession(parent, atSeq)` + `sendMessage`。这与 new session 的惰性建库同源：随手点一下没发送就不会多出空会话。分支继承「这条消息**之前**」的完整上下文，这条消息本身作为可编辑的首轮重新发出（经典「编辑并重开分支」）。
+
+### 4.8 继承上下文（inherited context）
+
+分支会话（`origin.kind` 为 `fork`/`compaction`/`reconfiguration`）继承了父会话的一段对话，这段上下文存在 `context_snapshot.json` 里、**不进事件流**，所以默认前端看不到。为避免「fork 后像凭空开始、完全不知道之前发生了什么」，在对话流**顶部**把这段继承历史以**变暗**样式渲染出来。
+
+- **数据源**：`GET /sessions/{id}/snapshot` 返回快照 `Message[]`（`new` 会话无快照 → 404，前端当作「无继承上下文」静默略过，不报错）。快照存在分支会话自己目录里，**父会话被删也不受影响**（自包含，见 `doc/architecture.md` §6.2）。
+- **草稿预览（fork 未落地时）**：fork 是惰性的（§4.7），发送首轮前还没有会话、也就没有 `context_snapshot.json`。为了让草稿阶段也能看到将继承什么，草稿从 `GET /sessions/{id}/fork-preview?at_seq=N` 取预览——网关用 `rebuild_runtime(events ≤ at_seq)` 现算父会话截至分支点的上下文（**与真 fork 落地时的 seeding 同一函数**，故预览与实际继承逐字一致），**只读、不建会话、不写盘**。System 种子留空即可：渲染层本就丢弃 System，用户可见内容不受影响。发送后转为真会话，改回走 `snapshot` 端点。
+- **渲染映射**：仿 `src/tui/mod.rs` 的 `seed_history`——System 消息（身份，非对话）丢弃；User→气泡；Assistant 文本→markdown；tool call→紧凑单行 trace（名+参数，**不用**三态 ToolBlock，历史不需要 live affordance）；Tool 结果折叠到对应 call 上。
+- **变暗**：整块 `opacity: ~0.62`，读作「之前发生的」，绝不与 live 对话抢注意力。复用正常 item 类（气泡、markdown），只是整体压暗——分支历史看起来是真的历史，只是安静。
+- **分隔线**：继承块末尾一条 hairline + 居中 mono label（`分支自此处 · inherited context above`），呼应 TUI 的 `resumed; continue below` 分隔符。
+- **token 化 / 不碰 acid-lime**：分隔线用 `--border-subtle`，文字用 `--text-tertiary/secondary`，无 accent。
+- **切换清理**：切到 draft 或别的会话时 `inherited` 重置为 `[]`，避免上下文泄漏。
+
+> 这也顺带覆盖了 compaction / reconfiguration 会话——它们同样有 `context_snapshot.json`，此前也一样看不到继承历史，现在一并显示。
+
 ---
 
 ## 5. 反 AI slop 禁令（硬清单）

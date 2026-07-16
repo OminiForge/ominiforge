@@ -116,6 +116,8 @@ fn router(state: AppState) -> Router {
         .route("/sessions/{id}/archive", post(archive_session))
         .route("/sessions/{id}/compact", post(compact_session))
         .route("/sessions/{id}/summary", get(session_summary))
+        .route("/sessions/{id}/snapshot", get(session_snapshot))
+        .route("/sessions/{id}/fork-preview", get(fork_preview))
         .route("/sessions/{id}/runtime", get(session_runtime))
         .route("/sessions/{id}/events", get(sse_events))
         .route("/sessions/{id}/ws", get(ws_events))
@@ -701,6 +703,60 @@ async fn session_summary(State(state): State<AppState>, Path(id): Path<String>) 
         }
         Err(e) => not_found(&e),
     }
+}
+
+/// `GET /sessions/{id}/snapshot` — the inherited context a non-`new` session was
+/// seeded with: the `context_snapshot.json` (`Vec<Message>`) materialized at
+/// fork / compaction / reconfiguration (`doc/architecture.md` §6.1, §7). The
+/// frontend renders it as dimmed history above the live conversation so a
+/// branched session shows what came before. A `new` session has no snapshot, so
+/// this is a 404 the client treats as "no inherited context" — not an error.
+async fn session_snapshot(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let sid = SessionId(id);
+    match state.registry.store().read_snapshot(&sid) {
+        Ok(messages) => Json(messages).into_response(),
+        Err(e) => not_found(&anyhow::Error::new(e)),
+    }
+}
+
+/// Query for [`fork_preview`]: the parent seq to branch at.
+#[derive(Debug, Deserialize)]
+struct ForkPreviewParams {
+    at_seq: u64,
+}
+
+/// `GET /sessions/{id}/fork-preview?at_seq=N` — the context a fork at `at_seq`
+/// WOULD inherit, computed WITHOUT creating a session. The draft branch view
+/// fetches this so a fork shows its inherited history before the first send
+/// (until then no real session — hence no `context_snapshot.json` — exists).
+///
+/// Mirrors the real fork's seeding exactly: both rebuild the parent's context
+/// from events up to (and including) `at_seq` via [`rebuild_runtime`]. The
+/// system prompt is omitted here (an empty seed) because the client drops System
+/// messages when rendering inherited history, so the user-visible content is
+/// identical to what `fork` will persist — and this stays read-only, skipping
+/// the heavy agent assembly a real fork does. An `at_seq` before any event is a
+/// 404 the client treats as "no inherited context".
+async fn fork_preview(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(params): Query<ForkPreviewParams>,
+) -> Response {
+    let parent = SessionId(id);
+    let all = match state.registry.store().read_events(&parent) {
+        Ok(events) => events,
+        Err(e) => return not_found(&anyhow::Error::new(e)),
+    };
+    let upto: Vec<_> = all.into_iter().filter(|e| e.seq <= params.at_seq).collect();
+    if upto.is_empty() {
+        return not_found(&anyhow::anyhow!(
+            "session `{}` has no event at or before seq {}",
+            parent.0,
+            params.at_seq
+        ));
+    }
+    let runtime = crate::agent::rebuild_runtime(&upto, Vec::new());
+    Json(runtime.context).into_response()
 }
 
 /// `GET /sessions/{id}/runtime` — the config-layer provider/model the gateway

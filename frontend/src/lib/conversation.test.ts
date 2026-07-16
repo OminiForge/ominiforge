@@ -277,6 +277,16 @@ describe('conversation fold', () => {
 		expect(items[0].kind).toBe('user');
 	});
 
+	it('user item carries the Turn.Started seq as its fork point', () => {
+		// The seq is what a "fork from this turn" affordance passes as `at_seq` to
+		// POST /sessions/{id}/fork. Without it the UI can't branch at a specific
+		// user turn, so this asserts the fold threads the committed event's seq
+		// through to the item — not merely that a user item exists.
+		const items = fold([turnStarted(7, 'branch here')]).items;
+		const user = items.find((i) => i.kind === 'user');
+		expect(user?.kind === 'user' && user.seq).toBe(7);
+	});
+
 	// ── Race condition: deltas before RequestStarted ───────────────────
 
 	it('no duplication when deltas arrive before RequestStarted', () => {

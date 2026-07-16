@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onDestroy, onMount } from 'svelte';
+	import { onDestroy, onMount, tick } from 'svelte';
 	import { browser } from '$app/environment';
 	import { goto } from '$app/navigation';
 	import { Marked } from 'marked';
@@ -9,6 +9,7 @@
 	import type { EventSubscription } from '$lib/client-core';
 	import type { SessionMeta } from '$lib/types/SessionMeta';
 	import type { RuntimeInfo } from '$lib/types/RuntimeInfo';
+	import type { Message } from '$lib/types/Message';
 	import type { SessionSummary } from '$lib/types/SessionSummary';
 	import type { ProfileSummary } from '$lib/types/ProfileSummary';
 	import type { ModelSummary } from '$lib/types/ModelSummary';
@@ -30,6 +31,7 @@
 		type QueuedMessage
 	} from '$lib/queue';
 	import { activeTick, jumpTarget } from '$lib/minimap';
+	import { setPendingFork, takePendingFork, type PendingFork } from '$lib/fork';
 
 	/** Props: the workspace this conversation lives under (its path-derived id,
 	 *  used to build session URLs) and the session id to show (`'new'` for a
@@ -79,6 +81,12 @@
 	// every route change with no chance of local state fighting the prop.
 	const sessionId = $derived(routeSessionId);
 	let meta = $state<SessionMeta | null>(null);
+	// Inherited context for a branched session (origin != new): the parent's
+	// conversation the fork/compaction/reconfiguration was seeded with, loaded
+	// from `context_snapshot.json` via getSnapshot and rendered as dimmed history
+	// above the live turns so the user sees what came before (issue: a fork must
+	// not look like it started from nothing). Empty = none/failed/`new` session.
+	let inherited = $state<InheritedItem[]>([]);
 	// Config-layer provider/model for the RUNTIME panel; null until loaded or on
 	// a failed lookup. Local to this page now (the panel moved off the global
 	// sidebar into this page's right detail column).
@@ -216,6 +224,24 @@
 		// Restore the persisted rail state; default open when unset.
 		detailOpen = localStorage.getItem('detailOpen') !== '0';
 
+		// Consume a pending fork (set by a fork click that navigated here) exactly
+		// once. A fork always goes live-session -> draft route, which remounts this
+		// component, so onMount is the right once-per-arrival hook. It must NOT live
+		// in the sync $effect: that effect re-runs on tracked-dep changes and
+		// takePendingFork() is one-shot, so a re-run would null the intent and send()
+		// would open a plain new session instead of a fork. Only a draft can carry a
+		// fork; a live-session mount just gets null and no-ops.
+		if (routeSessionId === DRAFT_ID) {
+			const pending = takePendingFork();
+			forkIntent = pending;
+			if (pending) {
+				input = pending.draftText;
+				// Show what this fork will inherit BEFORE the first send materializes the
+				// session (until then there's no id, so no snapshot). Same dimmed render.
+				void loadForkPreview(pending);
+			}
+		}
+
 		// Re-measure minimap ticks whenever the scroll content resizes (new
 		// messages, streaming growth, window resize, font load). One observer for
 		// the lifetime of the component.
@@ -302,6 +328,86 @@
 		selProfile = curProfile;
 		selModel = curModel;
 		await refreshSummary(id);
+		await loadInherited(id);
+	}
+
+	/** One rendered line of inherited context: the parent conversation a branched
+	 *  session carries, flattened from the snapshot's `Message[]` into the few
+	 *  kinds we display (system prompt is identity, not conversation, so skipped —
+	 *  mirroring the TUI's seed_history). Tool results are folded onto their call. */
+	type InheritedItem =
+		| { kind: 'user'; text: string }
+		| { kind: 'text'; text: string }
+		| { kind: 'tool'; name: string; args: string; result?: string };
+
+	/** Map a snapshot `Message[]` into `InheritedItem[]` for dimmed display.
+	 *  Mirrors `src/tui/mod.rs` seed_history: System is dropped; Assistant text and
+	 *  each tool call become items; a Tool result attaches to the most recent tool
+	 *  item (by call id) so it renders under the call that produced it. */
+	function mapInherited(messages: Message[]): InheritedItem[] {
+		const items: InheritedItem[] = [];
+		// call id → tool item, so a later Tool message finds the call it answers.
+		const byCallId = new Map<string, InheritedItem & { kind: 'tool' }>();
+		for (const msg of messages) {
+			if ('System' in msg) continue;
+			if ('User' in msg) {
+				items.push({ kind: 'user', text: msg.User.content });
+			} else if ('Assistant' in msg) {
+				const text = msg.Assistant.content?.trim();
+				if (text) items.push({ kind: 'text', text });
+				for (const call of msg.Assistant.tool_calls ?? []) {
+					const item = { kind: 'tool' as const, name: call.name, args: call.arguments };
+					items.push(item);
+					byCallId.set(call.id, item);
+				}
+			} else if ('Tool' in msg) {
+				const call = byCallId.get(msg.Tool.tool_call_id);
+				if (call) call.result = msg.Tool.content;
+			}
+		}
+		return items;
+	}
+
+	/** Load a branched session's inherited context (dimmed history). Best-effort:
+	 *  a `new` session has no snapshot (the endpoint 404s), and any failure just
+	 *  leaves the header off — the live conversation still renders. Only fetched
+	 *  when the origin says this session derives from a parent, so a plain new
+	 *  session never makes the request. */
+	async function loadInherited(id: string) {
+		if (!meta || meta.origin.kind === 'new') {
+			inherited = [];
+			return;
+		}
+		try {
+			inherited = mapInherited(await client.getSnapshot(id));
+		} catch {
+			inherited = []; // no snapshot / read failure → just omit the header
+		}
+	}
+
+	/** Load a PENDING fork's inherited context for the draft view, before any
+	 *  session exists. The gateway rebuilds the parent's context up to the branch
+	 *  point (same computation the real fork uses to seed the child), so the draft
+	 *  previews exactly what the branch will carry. Best-effort: any failure leaves
+	 *  the header off — the draft still sends and forks normally. */
+	async function loadForkPreview(p: PendingFork) {
+		try {
+			inherited = mapInherited(await client.getForkPreview(p.parentId, p.atSeq));
+			// The preview renders ABOVE the input, so a fresh draft would otherwise sit
+			// scrolled to the oldest inherited line. Wait for the DOM to grow with the
+			// inherited block, then jump to the bottom — the branch point ("分支自此处")
+			// and the pre-filled input, which is what the user acts on.
+			await tick();
+			// Land at the bottom instantly (no smooth animation): a fresh draft opening
+			// should already BE at the branch point, not animate a long scroll down
+			// through the history — same reasoning as the replay path's instant scroll.
+			if (streamEl) {
+				shouldAutoScroll = true;
+				streamEl.scrollTo({ top: streamEl.scrollHeight, behavior: 'instant' });
+			}
+		} catch {
+			inherited = []; // preview unavailable → just omit the header
+		}
 	}
 
 	/** Pull the folded summary snapshot for the STATS panel. Best-effort: a fold
@@ -428,10 +534,19 @@
 			meta = null;
 			runtime = null;
 			summary = null;
+			// Keep a fork preview that onMount kicked off: this effect re-runs (see the
+			// note below) and its async load may still be in flight, so an unconditional
+			// clear would race-stomp it. A plain draft (no forkIntent) still clears.
+			if (!forkIntent) inherited = [];
 			context = null;
 			// A draft has no persisted queue (nothing to key on, and its first send
 			// creates the session); clear any carried over from the previous session.
 			queued = [];
+			// NOTE: the pending fork is consumed once in onMount, NOT here. This effect
+			// re-runs whenever a tracked dep changes (e.g. loadConfigOptions below reads
+			// profiles/models, then writes them after its await), and takePendingFork()
+			// is one-shot — a second run would return null and clobber forkIntent, so
+			// send() would create a plain new session instead of a fork.
 			// Populate the config picker options (profiles + models). Best-effort:
 			// a failure leaves the dropdowns empty and send still works on defaults.
 			void loadConfigOptions();
@@ -501,13 +616,20 @@
 		error = null;
 		try {
 			if (sessionId === DRAFT_ID) {
-				// Lazily create the real session on first send. The workspace is fixed
-				// by `workspaceId` (its path is resolved server-side, never sent), so
-				// only the picker's profile/model ride along.
-				const realId = await client.createWorkspaceSession(workspaceId, {
-					profile: selProfile || undefined,
-					model: selModel || undefined
-				});
+				// Lazily create the real session on first send. A pending fork branches
+				// from its parent at the recorded seq (inheriting that context); an
+				// ordinary draft creates a fresh session. Either way the workspace is
+				// fixed by `workspaceId` (path resolved server-side, never sent), so
+				// only the picker's profile/model ride along on the plain path.
+				const realId = forkIntent
+					? await client.forkSession(forkIntent.parentId, forkIntent.atSeq)
+					: await client.createWorkspaceSession(workspaceId, {
+							profile: selProfile || undefined,
+							model: selModel || undefined
+						});
+				// The fork is materialized; drop the intent so a later send can't reuse
+				// it (defensive — we navigate away immediately after).
+				forkIntent = null;
 				// Send the first turn (committed to the log), then navigate to the real
 				// session route. The draft and a real session are DIFFERENT routes
 				// (`/workspaces/[wsId]` vs `.../sessions/[id]`), so a shallow
@@ -727,6 +849,16 @@
 	// when idle), so the button is shown only then — see ConversationState.turnRunning.
 	const turnRunning = $derived(convo.turnRunning === true);
 
+	// The seq of the FIRST user message in the view. Forking before it would
+	// inherit an empty context (identical to a plain new session), so that first
+	// message alone gets no fork affordance — every later user turn does.
+	const firstUserSeq = $derived.by<number | null>(() => {
+		for (const it of convo.items) {
+			if (it.kind === 'user' && it.seq != null) return it.seq;
+		}
+		return null;
+	});
+
 	// The plan shown in the sticky dock: the latest committed plan card (running
 	// OR finished). Once any plan exists it stays docked, so a later plan swaps in
 	// place rather than the dock vanishing and a new one popping in abruptly.
@@ -794,6 +926,30 @@
 		} finally {
 			reconfiguring = false;
 		}
+	}
+
+	// Fork: branch a new session from a chosen user turn. Like "new session", the
+	// branch is created LAZILY — clicking fork navigates to the workspace draft
+	// carrying a pending-fork intent (parent + branch point + the message text to
+	// edit), and only the draft's first send materializes it (forkSession +
+	// sendMessage). So a stray click that's never sent leaves no empty session.
+	// The branch inherits the parent's context up to (but NOT including) the
+	// chosen message — that message's text is pre-filled into the input to edit
+	// and resend as the branch's first turn. `forkIntent`, when set on a draft,
+	// is what makes send() fork instead of creating a plain session.
+	let forkIntent = $state<PendingFork | null>(null);
+
+	/** Start a fork from the user message at `msgSeq` (its committed Turn::Started
+	 *  seq). Records the intent (parent = this session; branch point = the event
+	 *  just before the message, so the chosen turn itself is excluded; text = the
+	 *  message, to edit + resend) and navigates to the workspace draft. No-op on a
+	 *  draft (nothing committed to branch from). The draft's send() does the work.
+	 *  The first user turn (`msgSeq` at/near 0) is not offered a fork button, so we
+	 *  never compute a negative branch point here. */
+	function fork(msgSeq: number, text: string) {
+		if (isDraft) return;
+		setPendingFork({ parentId: sessionId, atSeq: msgSeq - 1, draftText: text });
+		void goto(`/workspaces/${workspaceId}`);
 	}
 </script>
 
@@ -864,9 +1020,75 @@
 		<div class="conv-viewport">
 			<div class="conv-scroll" bind:this={streamEl} onscroll={onStreamScroll}>
 				<div class="conv-inner">
+				<!-- Inherited context: the parent conversation this branched session was
+				     seeded with (fork/compaction/reconfiguration), rendered dimmed above the
+				     live turns so the branch shows what came before. See DESIGN.md §4.8. -->
+				{#if inherited.length > 0}
+					<div class="inherited" aria-label="继承的上下文">
+						{#each inherited as it, k (k)}
+							{#if it.kind === 'user'}
+								<div class="item item-user">
+									<div class="user-bubble">{it.text}</div>
+								</div>
+							{:else if it.kind === 'text'}
+								<div class="item item-text inherited-text">
+									{#if browser}
+										<!-- eslint-disable-next-line svelte/no-at-html-tags -->
+										{@html renderMarkdown(it.text)}
+									{:else}
+										{it.text}
+									{/if}
+								</div>
+							{:else if it.kind === 'tool'}
+								<div class="item inherited-tool">
+									<span class="inherited-tool-name">{it.name}</span>
+									{#if it.args && it.args !== '{}'}<span class="inherited-tool-args">{it.args}</span>{/if}
+								</div>
+							{/if}
+						{/each}
+						<div class="inherited-sep"><span>分支自此处 · inherited context above</span></div>
+					</div>
+				{/if}
 				{#each convo.items as item, i (i)}
 					{#if item.kind === 'user'}
 						<div class="item item-user" data-user-anchor={i}>
+							{#if item.seq != null && !isDraft && item.seq !== firstUserSeq}
+								<!-- Turn actions: low-frequency per-turn operations, anchored to
+								     the user message that starts the turn. Faint by default
+								     (--text-disabled), brightens when the turn is hovered. Icon +
+								     tooltip only — no visible label (the glyph carries the meaning).
+								     Fork is the only action today; the row is a flex container so a
+								     future rating control slots in beside it. See DESIGN.md §4.7.
+								     Excluded on the first user turn: branching before it inherits an
+								     empty context, i.e. just a new session. -->
+								<div class="turn-actions">
+									<button
+										class="turn-action-btn"
+										onclick={() => fork(item.seq!, item.text)}
+										title="从这条消息处分支（继承之前的对话，另开一个会话）"
+										aria-label="Fork a new session from this message"
+									>
+									<!-- Original divergence glyph: a single stem splitting into
+									     two branches — drawn from scratch, not a borrowed
+									     git-branch icon (DESIGN §5). Round caps read as soft
+									     nodes at the three tips. -->
+									<svg
+										class="turn-action-icon"
+										viewBox="0 0 14 14"
+										fill="none"
+										stroke="currentColor"
+										stroke-width="1.5"
+										stroke-linecap="round"
+										stroke-linejoin="round"
+										aria-hidden="true"
+									>
+										<path d="M7 12V7.2" />
+										<path d="M7 7.2 3.8 4" />
+										<path d="M7 7.2 10.2 4" />
+									</svg>
+								</button>
+								</div>
+							{/if}
 							<div class="user-bubble">{item.text}</div>
 						</div>
 					{:else if item.kind === 'text'}
@@ -2058,6 +2280,67 @@
 		transform: translateX(-50%) translateY(1px);
 	}
 
+	/* ---- INHERITED CONTEXT (dimmed parent history above a branch) ---- */
+	/* The whole block sits back: reduced opacity + a muted wash so it reads as
+	   "what came before", never competing with the live conversation. Reuses the
+	   normal item classes (user bubble, markdown text) so branched history looks
+	   like the real thing, just quieter. DESIGN.md §4.8. */
+	.inherited {
+		opacity: 0.62;
+	}
+
+	/* Live turns already carry full color; only lift the inherited text's own
+	   emphasis down a notch so it stays secondary even at full markdown. */
+	.inherited-text {
+		color: var(--text-secondary);
+	}
+
+	/* Inherited tool call: a compact one-line trace (name + args), not the full
+	   three-state ToolBlock — history doesn't need live affordances. */
+	.inherited-tool {
+		display: flex;
+		align-items: baseline;
+		gap: var(--space-2);
+		font-family: var(--font-mono);
+		font-size: 11.5px;
+		color: var(--text-tertiary);
+		min-width: 0;
+	}
+	.inherited-tool-name {
+		color: var(--text-secondary);
+		flex-shrink: 0;
+	}
+	.inherited-tool-args {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		color: var(--text-tertiary);
+	}
+
+	/* Separator marking the branch point: a hairline rule with a centered mono
+	   label, echoing the TUI's "resumed; continue below" divider. */
+	.inherited-sep {
+		display: flex;
+		align-items: center;
+		gap: var(--space-3);
+		margin: var(--space-4) 0;
+		color: var(--text-tertiary);
+		font-family: var(--font-mono);
+		font-size: 10px;
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+	}
+	.inherited-sep::before,
+	.inherited-sep::after {
+		content: '';
+		flex: 1;
+		height: 1px;
+		background: var(--border-subtle);
+	}
+	.inherited-sep span {
+		flex-shrink: 0;
+	}
+
 	.item {
 		margin-bottom: var(--space-4);
 	}
@@ -2073,7 +2356,9 @@
 	/* ---- USER ---- */
 	.item-user {
 		display: flex;
-		justify-content: flex-end;
+		flex-direction: column;
+		align-items: flex-end;
+		gap: var(--space-1);
 	}
 
 	.user-bubble {
@@ -2088,6 +2373,60 @@
 		font-family: var(--font-chinese);
 		text-wrap: pretty;
 		word-break: break-word;
+	}
+
+	/* ---- TURN ACTIONS (fork today; reserved slot for a future rating control,
+	   DESIGN.md §4.7) ---- */
+	/* Faint, low-frequency affordance: dim by default so it never competes with
+	   the conversation, brightening only when its turn is hovered. Icon-only —
+	   the meaning rides on the glyph + tooltip, no visible label. */
+	.turn-actions {
+		display: flex;
+		align-items: center;
+		opacity: 0.4;
+		transition: opacity var(--dur-fast) var(--ease-out);
+	}
+
+	.item-user:hover .turn-actions,
+	.turn-actions:focus-within {
+		opacity: 1;
+	}
+
+	.turn-action-btn {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		width: 22px;
+		height: 20px;
+		padding: 0;
+		border: 1px solid transparent;
+		border-radius: var(--radius-sm);
+		background: transparent;
+		color: var(--text-disabled);
+		cursor: pointer;
+		transition:
+			color var(--dur-fast) var(--ease-out),
+			background var(--dur-fast) var(--ease-out),
+			border-color var(--dur-fast) var(--ease-out);
+	}
+
+	.turn-action-btn:hover {
+		color: var(--text-secondary);
+		background: var(--canvas-float);
+		border-color: var(--border-default);
+	}
+
+	.turn-action-icon {
+		width: 12px;
+		height: 12px;
+		flex-shrink: 0;
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		.turn-actions,
+		.turn-action-btn {
+			transition: none;
+		}
 	}
 
 	/* ---- AGENT TEXT ---- */
@@ -2629,6 +2968,14 @@
 		}
 		50% {
 			opacity: 0.3;
+		}
+	}
+
+	/* Spinner rotation. Referenced by .plan-spinner and .send-spinner; scoped to
+	   this component like the other keyframes above. */
+	@keyframes spin {
+		to {
+			transform: rotate(360deg);
 		}
 	}
 

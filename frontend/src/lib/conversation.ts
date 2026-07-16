@@ -21,7 +21,11 @@ export interface PlanStep {
 }
 
 export type Item =
-	| { kind: 'user'; text: string }
+	/** `seq` is the committed `Turn::Started` event seq — the fork point for
+	 *  branching a new session at this turn (`POST /sessions/{id}/fork`). Absent on
+	 *  a draft's optimistic user item (no committed event yet), so fork affordances
+	 *  gate on `seq != null`. */
+	| { kind: 'user'; text: string; seq?: number }
 	| { kind: 'text'; text: string; streaming: boolean }
 	| { kind: 'reasoning'; text: string; streaming: boolean }
 	| {
@@ -126,7 +130,7 @@ function applyCommitted(
 		if ('Started' in t) {
 			const started = { ...next, turnRunning: true };
 			return t.Started.input
-				? push(started, { kind: 'user', text: t.Started.input })
+				? push(started, { kind: 'user', text: t.Started.input, seq: Number(core.seq) })
 				: started;
 		}
 		if ('Resumed' in t) return { ...next, turnRunning: true };

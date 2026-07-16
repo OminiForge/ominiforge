@@ -5,6 +5,7 @@
 import type { SessionMeta } from '$lib/types/SessionMeta';
 import type { GatewayEvent } from '$lib/types/GatewayEvent';
 import type { SessionSummary } from '$lib/types/SessionSummary';
+import type { Message } from '$lib/types/Message';
 import type { RuntimeInfo } from '$lib/types/RuntimeInfo';
 import type { ProfileSummary } from '$lib/types/ProfileSummary';
 import type { ModelSummary } from '$lib/types/ModelSummary';
@@ -104,6 +105,17 @@ export interface SessionClient {
 	compact(id: string, keepLast?: number): Promise<void>;
 	/** Derived monitor metrics for one session (folded from its committed event log). */
 	getSummary(id: string): Promise<SessionSummary>;
+	/** The inherited context a forked/compacted/reconfigured session was seeded
+	 *  with (its `context_snapshot.json` as a message array), for rendering as
+	 *  dimmed history above the live conversation. Rejects (404) for a `new`
+	 *  session, which has no snapshot — callers treat that as "no inherited
+	 *  context", not an error. */
+	getSnapshot(id: string): Promise<Message[]>;
+	/** The context a fork at `atSeq` WOULD inherit, computed without creating a
+	 *  session. Backs the draft branch view so a fork shows its inherited history
+	 *  before the first send (no real session, hence no snapshot, exists yet).
+	 *  Rejects (404) when `atSeq` precedes any event — treated as "no context". */
+	getForkPreview(parentId: string, atSeq: number): Promise<Message[]>;
 	/** Config-layer provider/model the gateway resolves for this session (RUNTIME panel). */
 	getRuntime(id: string): Promise<RuntimeInfo>;
 	/** The full provider set plus which providers have a stored API key (settings UI). */
