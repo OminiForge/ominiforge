@@ -282,6 +282,10 @@ mod tests {
         assert_eq!(hub.status_of(&s1), Some(ActivityStatus::Running));
 
         hub.publish(status("s1", ActivityStatus::Idle, 3));
-        assert_eq!(hub.status_of(&s1), Some(ActivityStatus::Idle), "latest wins");
+        assert_eq!(
+            hub.status_of(&s1),
+            Some(ActivityStatus::Idle),
+            "latest wins"
+        );
     }
 }

@@ -273,16 +273,15 @@ async fn list_workspace_config_orphans(State(state): State<AppState>) -> Respons
 /// `DELETE /workspaces/config/{id}` — remove one per-workspace config
 /// (`doc/workspace-config.md` GC). The only path that deletes a config file — GC
 /// is always explicit. Idempotent: a missing config is still 204.
-async fn delete_workspace_config(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    match state
-        .registry
-        .delete_workspace_config(&WorkspaceId(id))
-    {
+async fn delete_workspace_config(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.registry.delete_workspace_config(&WorkspaceId(id)) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => internal_error(&e),
     }
 }
-
 
 #[derive(Debug, Default, Deserialize)]
 struct WorkspaceSessionParams {
@@ -922,7 +921,11 @@ async fn ws_loop(socket: WebSocket, handle: ActorHandle) {
 /// The "not archived" test runs first because its message also contains the
 /// substring "archived".
 fn conflict_or_not_found(e: &anyhow::Error) -> Response {
-    let full = e.chain().map(ToString::to_string).collect::<Vec<_>>().join("; ");
+    let full = e
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
     if full.contains("not archived") {
         (StatusCode::CONFLICT, Json(json!({ "error": full }))).into_response()
     } else if full.contains("archived") {
@@ -976,8 +979,7 @@ mod tests {
             profile: "default".to_owned(),
             no_dotenv: true,
         };
-        let registry =
-            SessionRegistry::new(defaults, &GatewayConfig::default(), &|_| {}).unwrap();
+        let registry = SessionRegistry::new(defaults, &GatewayConfig::default(), &|_| {}).unwrap();
         (registry, dir)
     }
 
@@ -1027,8 +1029,7 @@ default = "openai-main/gpt-4o"
             profile: "coding".to_owned(),
             no_dotenv: true,
         };
-        let registry =
-            SessionRegistry::new(defaults, &GatewayConfig::default(), &|_| {}).unwrap();
+        let registry = SessionRegistry::new(defaults, &GatewayConfig::default(), &|_| {}).unwrap();
         (registry, dir)
     }
 
@@ -1126,8 +1127,7 @@ default = "openai-main/gpt-4o"
             profile: "default".to_owned(),
             no_dotenv: true,
         };
-        let registry =
-            SessionRegistry::new(defaults, &GatewayConfig::default(), &|_| {}).unwrap();
+        let registry = SessionRegistry::new(defaults, &GatewayConfig::default(), &|_| {}).unwrap();
 
         // Create a session with a few events (Created = seq 0, plus appends).
         let store = registry.store();
@@ -1464,7 +1464,11 @@ default = "openai-main/gpt-4o"
             .await
             .unwrap();
         assert_eq!(resp.status(), 204);
-        assert_eq!(listed(base.clone()).await, 0, "archived → not in active list");
+        assert_eq!(
+            listed(base.clone()).await,
+            0,
+            "archived → not in active list"
+        );
 
         // ...but still readable by id (the analysis path).
         let resp = reqwest::get(format!("{base}/api/sessions/{}", sid.0))
@@ -1506,12 +1510,14 @@ default = "openai-main/gpt-4o"
             id
         };
         // Mark it running on the hub the registry reads through `archive`.
-        registry.status_hub().publish(crate::gateway::SessionStatus {
-            session_id: sid.clone(),
-            workspace_id: WorkspaceId::none(),
-            status: crate::gateway::ActivityStatus::Running,
-            latest_seq: 0,
-        });
+        registry
+            .status_hub()
+            .publish(crate::gateway::SessionStatus {
+                session_id: sid.clone(),
+                workspace_id: WorkspaceId::none(),
+                status: crate::gateway::ActivityStatus::Running,
+                latest_seq: 0,
+            });
         let state = AppState {
             registry,
             api_key: None,
@@ -1571,7 +1577,11 @@ default = "openai-main/gpt-4o"
         let resp = reqwest::get(format!("{base}/api/sessions/{}", sid.0))
             .await
             .unwrap();
-        assert_eq!(resp.status(), 200, "refused delete left the session readable");
+        assert_eq!(
+            resp.status(),
+            200,
+            "refused delete left the session readable"
+        );
 
         // Archive, then delete → 204, and it is gone for real.
         let resp = client

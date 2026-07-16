@@ -174,7 +174,9 @@ pub async fn assemble(
         // gateway default. A malformed profile policy name fails loud rather than
         // silently opening or isolating the sandbox (Karpathy §12).
         let network = resolve_network(workspace_network, &profile.network, default_network)
-            .map_err(|e| anyhow::anyhow!("profile `{profile_name}` has an invalid [network]: {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!("profile `{profile_name}` has an invalid [network]: {e}")
+            })?;
         let sandbox = sandbox_backend
             .create(crate::sandbox::SandboxConfig {
                 workspace: workspace.clone(),
@@ -192,7 +194,12 @@ pub async fn assemble(
         (sandbox, descriptor)
     };
 
-    register_profile_tools(&mut tools, &profile, workspace.clone(), Arc::clone(&sandbox));
+    register_profile_tools(
+        &mut tools,
+        &profile,
+        workspace.clone(),
+        Arc::clone(&sandbox),
+    );
 
     // Connect configured MCP servers and register their tools alongside the
     // built-ins (`doc/tool-protocol.md` §5). A broken server is logged and
@@ -561,7 +568,12 @@ mod tests {
             allow: Vec::new(),
         };
         assert_eq!(
-            resolve_network(Some(NetworkPolicy::Open), &isolating, NetworkPolicy::Isolated).unwrap(),
+            resolve_network(
+                Some(NetworkPolicy::Open),
+                &isolating,
+                NetworkPolicy::Isolated
+            )
+            .unwrap(),
             NetworkPolicy::Open
         );
 

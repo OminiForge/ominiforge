@@ -144,7 +144,10 @@ impl WorkspaceConfigStore {
     /// Read-only: this never deletes. A missing/unreadable directory yields an
     /// empty list.
     #[must_use]
-    pub fn list_orphans(&self, registry: &WorkspaceRegistry) -> Vec<(WorkspaceId, Option<PathBuf>)> {
+    pub fn list_orphans(
+        &self,
+        registry: &WorkspaceRegistry,
+    ) -> Vec<(WorkspaceId, Option<PathBuf>)> {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return Vec::new();
         };
@@ -212,11 +215,7 @@ mod tests {
         let ws = tmp.path().join("ws");
         std::fs::create_dir_all(&ws).unwrap();
         let dir = tmp.path().join("workspaces");
-        write_config(
-            &dir,
-            &ws,
-            "[network]\npolicy = \"isolated\"\n",
-        );
+        write_config(&dir, &ws, "[network]\npolicy = \"isolated\"\n");
         let store = WorkspaceConfigStore::new(dir);
         let cfg = store.load(&ws).unwrap().unwrap();
         assert_eq!(cfg.network.unwrap().policy.as_deref(), Some("isolated"));

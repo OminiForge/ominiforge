@@ -238,7 +238,9 @@ impl MountAnchors {
             }
             "gateway" => self.omini.join("shared"),
             other => {
-                bail!("unknown mount anchor `{other}`; expected `session`, `workspace`, or `gateway`")
+                bail!(
+                    "unknown mount anchor `{other}`; expected `session`, `workspace`, or `gateway`"
+                )
             }
         };
 
@@ -937,7 +939,12 @@ impl SessionRegistry {
             .inner
             .workspace_config
             .load(&workspace)
-            .with_context(|| format!("failed to load workspace config for {}", workspace.display()))?
+            .with_context(|| {
+                format!(
+                    "failed to load workspace config for {}",
+                    workspace.display()
+                )
+            })?
             .unwrap_or_default();
         // Network: a `[network].policy` wins outright; a section without a
         // `policy` key is not an override and falls through to profile/gateway.
@@ -945,10 +952,9 @@ impl SessionRegistry {
             .network
             .as_ref()
             .and_then(|section| {
-                section
-                    .policy
-                    .as_ref()
-                    .map(|name| crate::sandbox::NetworkPolicy::from_policy_name(name, &section.allow))
+                section.policy.as_ref().map(|name| {
+                    crate::sandbox::NetworkPolicy::from_policy_name(name, &section.allow)
+                })
             })
             .transpose()
             .map_err(|e| anyhow!("invalid workspace network policy: {e}"))?;
@@ -1242,7 +1248,12 @@ mod tests {
             assert!(!mounts[0].read_only);
             // workspace → workspaces/<ws_id>/shared, RO, path absent = root itself.
             assert!(mounts[1].host_path.ends_with("shared"));
-            assert!(mounts[1].host_path.to_string_lossy().contains("workspaces/"));
+            assert!(
+                mounts[1]
+                    .host_path
+                    .to_string_lossy()
+                    .contains("workspaces/")
+            );
             assert!(mounts[1].read_only);
             // gateway → shared/dl (global).
             assert!(mounts[2].host_path.ends_with("shared/dl"));

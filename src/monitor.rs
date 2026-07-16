@@ -400,7 +400,10 @@ mod tests {
         ];
         let summary = summarize(&events, PricingTable::new());
         // Title stays the opening message; activity time is the latest user turn.
-        assert_eq!(summary.first_user_input.as_deref(), Some("fix the auth bug"));
+        assert_eq!(
+            summary.first_user_input.as_deref(),
+            Some("fix the auth bug")
+        );
         assert_eq!(summary.last_user_message_at, Some(t2));
     }
 

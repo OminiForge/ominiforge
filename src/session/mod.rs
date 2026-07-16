@@ -825,7 +825,9 @@ mod tests {
     fn archive_hides_from_list_but_keeps_files_readable() {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::new(dir.path());
-        let writer = store.create_new(Some("p".to_owned()), None, vec![]).unwrap();
+        let writer = store
+            .create_new(Some("p".to_owned()), None, vec![])
+            .unwrap();
         let sid = writer.session_id().clone();
         drop(writer);
 
@@ -838,7 +840,10 @@ mod tests {
         assert!(store.list().unwrap().is_empty());
         // ...but its metadata (and events) stay readable by id (the analysis
         // path) — archive keeps data, it does not delete it.
-        assert_eq!(store.read_meta(&sid).unwrap().profile_id.as_deref(), Some("p"));
+        assert_eq!(
+            store.read_meta(&sid).unwrap().profile_id.as_deref(),
+            Some("p")
+        );
     }
 
     /// Archiving is idempotent and archiving a non-existent session is `NotFound`
@@ -882,7 +887,10 @@ mod tests {
             Err(SessionError::NotArchived(_)) => {}
             other => panic!("expected NotArchived deleting a live session, got {other:?}"),
         }
-        assert!(store.read_meta(&sid).is_ok(), "refused delete left files intact");
+        assert!(
+            store.read_meta(&sid).is_ok(),
+            "refused delete left files intact"
+        );
 
         // Deleting a ghost is NotFound, not a silent success.
         let ghost = SessionId("01J5M3HKEA7V2X3P1YKRN9C4WG".to_owned());
@@ -894,7 +902,10 @@ mod tests {
         // Archive → now delete succeeds and the directory is gone entirely.
         store.archive(&sid).unwrap();
         store.delete(&sid).unwrap();
-        assert!(!store.session_dir(&sid).exists(), "delete removed the directory");
+        assert!(
+            !store.session_dir(&sid).exists(),
+            "delete removed the directory"
+        );
         match store.read_meta(&sid) {
             Err(SessionError::NotFound(_)) => {}
             other => panic!("deleted session should be NotFound, got {other:?}"),

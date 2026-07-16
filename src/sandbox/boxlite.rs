@@ -163,14 +163,12 @@ impl Sandbox for BoxliteSandbox {
         let stdout = execution.stdout();
         let stderr = execution.stderr();
 
-        let drive = async {
-            tokio::join!(drain(stdout), drain(stderr), execution.wait())
-        };
+        let drive = async { tokio::join!(drain(stdout), drain(stderr), execution.wait()) };
 
         match tokio::time::timeout(timeout, drive).await {
             Ok((stdout, stderr, result)) => {
-                let result = result
-                    .map_err(|e| SandboxError::Exec(format!("boxlite wait failed: {e}")))?;
+                let result =
+                    result.map_err(|e| SandboxError::Exec(format!("boxlite wait failed: {e}")))?;
                 Ok(ExecOutput {
                     stdout,
                     stderr,
@@ -303,7 +301,10 @@ fn box_options(config: &SandboxConfig) -> BoxOptions {
     BoxOptions {
         working_dir,
         // u32 cores -> u8, saturating: BoxLite caps far below 255 in practice.
-        cpus: config.resources.cpus.map(|c| u8::try_from(c).unwrap_or(u8::MAX)),
+        cpus: config
+            .resources
+            .cpus
+            .map(|c| u8::try_from(c).unwrap_or(u8::MAX)),
         // memory_mb (MB) -> memory_mib (MiB): near-identical units; the small
         // difference is immaterial for a resource ceiling.
         memory_mib: config
@@ -490,7 +491,10 @@ mod tests {
             .find(|v| v.guest_path == WORKSPACE_GUEST_PATH)
             .unwrap();
         assert_eq!(ws.host_path, "/home/user/repo");
-        assert!(!ws.read_only, "workspace is writable (edits go to the repo)");
+        assert!(
+            !ws.read_only,
+            "workspace is writable (edits go to the repo)"
+        );
     }
 
     #[test]
@@ -499,9 +503,14 @@ mod tests {
         // would be wrong. Leave working_dir to the image and add no workspace
         // volume, so default-config boxes behave exactly as before this change.
         let opts = box_options(&SandboxConfig::default());
-        assert!(opts.working_dir.is_none(), "no workspace -> image's own cwd");
         assert!(
-            opts.volumes.iter().all(|v| v.guest_path != WORKSPACE_GUEST_PATH),
+            opts.working_dir.is_none(),
+            "no workspace -> image's own cwd"
+        );
+        assert!(
+            opts.volumes
+                .iter()
+                .all(|v| v.guest_path != WORKSPACE_GUEST_PATH),
             "no workspace volume when workspace is unset"
         );
     }
@@ -528,7 +537,10 @@ mod tests {
     async fn exec_echo_roundtrips() {
         let backend = BoxliteBackend::new().unwrap();
         let sb = backend.create(config()).await.unwrap();
-        let out = sb.exec("echo hello", Duration::from_secs(30)).await.unwrap();
+        let out = sb
+            .exec("echo hello", Duration::from_secs(30))
+            .await
+            .unwrap();
         assert!(out.success());
         assert!(out.stdout.contains("hello"));
         sb.release().await.unwrap();
@@ -645,7 +657,11 @@ mod tests {
             .await
             .unwrap();
         let on_host = std::fs::read_to_string(ws.path().join("from_guest.txt")).unwrap();
-        assert_eq!(on_host.trim(), "guest", "guest write reaches host workspace");
+        assert_eq!(
+            on_host.trim(),
+            "guest",
+            "guest write reaches host workspace"
+        );
 
         sb.release().await.unwrap();
     }

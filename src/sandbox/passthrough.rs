@@ -59,7 +59,10 @@ impl SandboxBackend for PassthroughBackend {
                  use the boxlite backend for [[mounts]]",
             ));
         }
-        Ok(Arc::new(PassthroughSandbox::new(config.workspace, config.env)))
+        Ok(Arc::new(PassthroughSandbox::new(
+            config.workspace,
+            config.env,
+        )))
     }
 
     async fn restore(&self, _id: &SnapshotId) -> Result<Arc<dyn Sandbox>, SandboxError> {
@@ -151,10 +154,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sb = sandbox(dir.path().to_path_buf());
 
-        let out = sb
-            .exec("echo hello", Duration::from_secs(5))
-            .await
-            .unwrap();
+        let out = sb.exec("echo hello", Duration::from_secs(5)).await.unwrap();
         assert!(out.success());
         assert_eq!(out.stdout, "hello\n");
         assert_eq!(out.exit_code, Some(0));

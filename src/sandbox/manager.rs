@@ -17,7 +17,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use super::passthrough::PassthroughBackend;
-use super::{fork_sandbox, Sandbox, SandboxBackend, SandboxError};
+use super::{Sandbox, SandboxBackend, SandboxError, fork_sandbox};
 use crate::core::SessionId;
 use crate::session::SandboxDescriptor;
 

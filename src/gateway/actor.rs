@@ -657,12 +657,12 @@ impl StreamSink for BroadcastSink {
         }));
     }
 
-	fn on_tool_call_delta(&mut self, index: u32, json_delta: &str) {
-		let _ = self.tx.send(GatewayEvent::Delta(Delta::ToolArgs {
-			index,
-			json: json_delta.to_owned(),
-		}));
-	}
+    fn on_tool_call_delta(&mut self, index: u32, json_delta: &str) {
+        let _ = self.tx.send(GatewayEvent::Delta(Delta::ToolArgs {
+            index,
+            json: json_delta.to_owned(),
+        }));
+    }
 
     fn on_context(&mut self, tokens: u32, window: u32, threshold: f32) {
         let _ = self.tx.send(GatewayEvent::ContextUpdated {
