@@ -76,6 +76,13 @@ export class GatewayTransport implements SessionClient {
 		return body.sessions;
 	}
 
+	async listArchivedSessions(workspaceId: string): Promise<SessionMeta[]> {
+		const body = await this.#json<{ sessions: SessionMeta[] }>(
+			endpoints.workspaceArchivedSessions(workspaceId)
+		);
+		return body.sessions;
+	}
+
 	async listWorkspaces(): Promise<WorkspaceSummary[]> {
 		const body = await this.#json<{ workspaces: WorkspaceSummary[] }>(endpoints.workspaces());
 		return body.workspaces;
@@ -139,6 +146,14 @@ export class GatewayTransport implements SessionClient {
 
 	getSession(id: string): Promise<SessionMeta> {
 		return this.#json<SessionMeta>(endpoints.session(id));
+	}
+
+	archiveSession(id: string): Promise<void> {
+		return this.#send(endpoints.archive(id), { method: 'POST' });
+	}
+
+	deleteSession(id: string): Promise<void> {
+		return this.#send(endpoints.session(id), { method: 'DELETE' });
 	}
 
 	async forkSession(id: string, atSeq: number): Promise<string> {

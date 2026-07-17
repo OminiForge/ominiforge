@@ -107,6 +107,10 @@ fn router(state: AppState) -> Router {
             "/workspaces/{id}/sessions",
             get(list_workspace_sessions).post(create_workspace_session),
         )
+        .route(
+            "/workspaces/{id}/sessions/archived",
+            get(list_archived_workspace_sessions),
+        )
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}", get(get_session).delete(delete_session))
         .route("/sessions/{id}/fork", post(fork_session))
@@ -176,18 +180,15 @@ async fn list_sessions(State(state): State<AppState>) -> Response {
     }
 }
 
-/// `GET /workspaces` — sessions grouped by workspace, most-recently-active
-/// first (the no-workspace group pinned last). This is the dashboard's read
-/// source: one call yields every workspace with its session count + latest
-/// activity, computed server-side so the frontend never groups client-side.
-async fn list_workspaces(State(state): State<AppState>) -> Response {
-    match state.registry.list_metas() {
-        Ok(metas) => {
-            let workspaces = group_sessions(metas);
-            Json(json!({ "workspaces": workspaces })).into_response()
-        }
-        Err(e) => internal_error(&e),
-    }
+/// True when the session's workspace hashes to `target` — the shared filter
+/// behind both workspace-scoped session listings (active and archived), so the
+/// two never drift apart on what "belongs to this workspace" means.
+fn in_workspace(m: &SessionMeta, target: &WorkspaceId) -> bool {
+    let wid = m
+        .workspace
+        .as_deref()
+        .map_or_else(WorkspaceId::none, WorkspaceId::from_path);
+    wid == *target
 }
 
 /// `GET /workspaces/{id}/sessions` — the session metadata for one workspace,
@@ -207,15 +208,46 @@ async fn list_workspace_sessions(
     let target = WorkspaceId(id);
     let sessions: Vec<SessionMeta> = metas
         .into_iter()
-        .filter(|m| {
-            let wid = m
-                .workspace
-                .as_deref()
-                .map_or_else(WorkspaceId::none, WorkspaceId::from_path);
-            wid == target
-        })
+        .filter(|m| in_workspace(m, &target))
         .collect();
     Json(json!({ "sessions": sessions })).into_response()
+}
+
+/// `GET /workspaces/{id}/sessions/archived` — the workspace's **archived**
+/// sessions, newest first (`doc/session-storage.md` §9). The archived section's
+/// read source: workspace-scoped like [`list_workspace_sessions`] (a panel only
+/// ever shows its own workspace's sessions, active or retired), and from here
+/// the only remaining action is a permanent `DELETE /sessions/{id}`. Returns
+/// `{ "sessions": [SessionMeta, …] }` — the same shape and empty-list semantics
+/// as `list_workspace_sessions`.
+async fn list_archived_workspace_sessions(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let metas = match state.registry.list_archived_metas() {
+        Ok(m) => m,
+        Err(e) => return internal_error(&e),
+    };
+    let target = WorkspaceId(id);
+    let sessions: Vec<SessionMeta> = metas
+        .into_iter()
+        .filter(|m| in_workspace(m, &target))
+        .collect();
+    Json(json!({ "sessions": sessions })).into_response()
+}
+
+/// `GET /workspaces` — sessions grouped by workspace, most-recently-active
+/// first (the no-workspace group pinned last). This is the dashboard's read
+/// source: one call yields every workspace with its session count + latest
+/// activity, computed server-side so the frontend never groups client-side.
+async fn list_workspaces(State(state): State<AppState>) -> Response {
+    match state.registry.list_metas() {
+        Ok(metas) => {
+            let workspaces = group_sessions(metas);
+            Json(json!({ "workspaces": workspaces })).into_response()
+        }
+        Err(e) => internal_error(&e),
+    }
 }
 
 /// Body of a create-workspace request: the absolute path to open.
@@ -787,10 +819,6 @@ async fn sse_events(
     headers: HeaderMap,
 ) -> Response {
     let sid = SessionId(id);
-    let handle = match state.registry.get_or_spawn(&sid).await {
-        Ok(h) => h,
-        Err(e) => return conflict_or_not_found(&e),
-    };
 
     // Parse Last-Event-ID (the seq the client last saw). Replay everything after
     // it from the durable log before attaching the live broadcast.
@@ -798,6 +826,24 @@ async fn sse_events(
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok());
+
+    // An archived session has no actor to spawn (`doc/session-storage.md` §9) —
+    // `get_or_spawn` would 410 it. Serve its committed history replay-only
+    // instead, holding the connection open with keep-alives: the read-only view
+    // renders the full history without a reconnect spin, and nothing live can
+    // ever arrive (a retired session produces no events).
+    if state.registry.store().is_archived(&sid) {
+        let stream = tokio_stream::iter(replay_events(&state.registry, &sid, last_seen))
+            .chain(tokio_stream::pending());
+        return Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response();
+    }
+
+    let handle = match state.registry.get_or_spawn(&sid).await {
+        Ok(h) => h,
+        Err(e) => return conflict_or_not_found(&e),
+    };
 
     let replay = replay_events(&state.registry, &sid, last_seen);
     let live = live_event_stream(handle.subscribe());
@@ -1551,6 +1597,46 @@ default = "openai-main/gpt-4o"
         assert_eq!(resp.status(), 404);
     }
 
+    /// An archived session's event stream is replay-only: 200 (not the 410 a run
+    /// path returns), streaming its committed history so the read-only view can
+    /// render it. The stream then stays open with keep-alives — no live events
+    /// can ever arrive on a retired session.
+    #[tokio::test]
+    async fn archived_session_events_stream_is_replay_only() {
+        let (registry, _dir) = test_registry();
+        let sid = {
+            let writer = registry.store().create_new(None, None, vec![]).unwrap();
+            let id = writer.session_id().clone();
+            drop(writer);
+            id
+        };
+        registry.store().archive(&sid).unwrap();
+        let state = AppState {
+            registry,
+            api_key: None,
+            pricing: Arc::new(PricingTable::default()),
+        };
+        let base = serve_test(state).await;
+
+        let mut resp = reqwest::get(format!("{base}/api/sessions/{}/events", sid.0))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "archived history stays streamable");
+
+        // The replay (the session's `Created` event) arrives promptly; the test
+        // never blocks on the open-ended keep-alive tail.
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), resp.chunk())
+            .await
+            .expect("replay frame should arrive promptly")
+            .expect("stream readable")
+            .expect("a replay frame is present");
+        let text = String::from_utf8_lossy(&chunk);
+        assert!(
+            text.contains(&sid.0),
+            "replay must carry the session's committed events, got: {text}"
+        );
+    }
+
     /// Archiving a session whose turn is running is a 409, not a silent retire:
     /// tearing an actor down mid-turn would drop uncommitted work, so the guard
     /// forces a `cancel` first (`doc/session-storage.md` §9). We simulate the
@@ -2002,6 +2088,53 @@ default = "openai-main/gpt-4o"
             .unwrap();
         let sessions = body["sessions"].as_array().unwrap();
         assert_eq!(sessions.len(), 1, "only workspace A's session");
+        assert_eq!(sessions[0]["id"], in_a.0);
+    }
+
+    /// `GET /workspaces/{id}/sessions/archived` applies the same workspace
+    /// filter as the active listing: archived sessions from other workspaces
+    /// are excluded, so a panel's archived section only ever shows its own
+    /// workspace's retired sessions.
+    #[tokio::test]
+    async fn list_archived_workspace_sessions_filters_to_the_workspace() {
+        let (registry, dir) = test_registry_with_config();
+        let store = registry.store();
+
+        let ws_a = dir.path().join("proj-a");
+        let ws_b = dir.path().join("proj-b");
+        std::fs::create_dir_all(&ws_a).unwrap();
+        std::fs::create_dir_all(&ws_b).unwrap();
+        let in_a = store
+            .create_new(None, Some(ws_a.clone()), vec![])
+            .unwrap()
+            .session_id()
+            .clone();
+        let in_b = store
+            .create_new(None, Some(ws_b.clone()), vec![])
+            .unwrap()
+            .session_id()
+            .clone();
+        store.archive(&in_a).unwrap();
+        store.archive(&in_b).unwrap();
+
+        let wid = crate::gateway::WorkspaceId::from_path(&ws_a).0;
+
+        let state = AppState {
+            registry,
+            api_key: None,
+            pricing: Arc::new(PricingTable::default()),
+        };
+        let base = serve_test(state).await;
+
+        let body: serde_json::Value =
+            reqwest::get(format!("{base}/api/workspaces/{wid}/sessions/archived"))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        let sessions = body["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1, "only workspace A's archived session");
         assert_eq!(sessions[0]["id"], in_a.0);
     }
 

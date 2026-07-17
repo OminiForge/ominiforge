@@ -40,6 +40,14 @@ pub struct SessionMeta {
 
     /// How this session came to exist.
     pub origin: Origin,
+
+    /// Whether this session is archived (`doc/session-storage.md` §9): retired
+    /// from every active listing, files kept readable. The `.archived` sidecar
+    /// marker — not this field — is the source of truth; `read_meta` stamps it
+    /// from the marker on every read so API consumers see the real state.
+    /// Skipped when false so active sessions' `session.toml` stays untouched.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
 }
 
 /// A session's bound sandbox, persisted so its environment survives a process
@@ -162,6 +170,7 @@ mod tests {
                 id: Some("box-01J5M3HKEA".to_owned()),
             }),
             origin: Origin::new(),
+            archived: false,
         };
 
         let text = toml::to_string(&meta).unwrap();
@@ -178,6 +187,7 @@ mod tests {
             workspace: None,
             sandbox: None,
             origin: Origin::new(),
+            archived: false,
         };
 
         let text = toml::to_string(&meta).unwrap();

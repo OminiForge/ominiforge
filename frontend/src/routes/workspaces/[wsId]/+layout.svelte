@@ -6,6 +6,7 @@
 	import type { SessionMeta } from '$lib/types/SessionMeta';
 	import type { SessionSummary } from '$lib/types/SessionSummary';
 	import SessionStatusIcon from '$lib/components/SessionStatusIcon.svelte';
+	import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
 	import { connectStatus, viewState, latestSeqOf } from '$lib/status.svelte';
 
 	let { children } = $props();
@@ -211,6 +212,116 @@
 		const parts = path.split('/').filter(Boolean);
 		return parts[parts.length - 1] ?? path;
 	}
+
+	// --- Archive / delete -------------------------------------------------------
+
+	// A transient message for a failed row action (e.g. archiving a session with a
+	// running turn → 409). Surfaced inline rather than swallowed.
+	let actionError = $state<string | null>(null);
+
+	// A row-action error belongs to the context it failed in — clear it on
+	// navigation rather than letting it linger over an unrelated list.
+	$effect(() => {
+		void activeSessionId;
+		actionError = null;
+	});
+
+	// The archived section: workspace-scoped like the live list above it. Loading
+	// is owned by the effect below (fires on expand and on workspace switch), so
+	// a stale list from another workspace can never show.
+	let archivedOpen = $state(false);
+	let archivedLoaded = $state(false);
+	let archivedRows = $state<Row[]>([]);
+	let archivedLoading = $state(false);
+	let archivedError = $state<string | null>(null);
+
+	$effect(() => {
+		const wsId = workspaceId;
+		if (!archivedOpen) {
+			// Closed (or workspace switched while closed): drop the cache so the
+			// count badge can't show another workspace's number.
+			archivedLoaded = false;
+			return;
+		}
+		void loadArchived(wsId);
+	});
+
+	function toggleArchived() {
+		archivedOpen = !archivedOpen;
+	}
+
+	async function loadArchived(wsId: string) {
+		archivedLoading = true;
+		archivedError = null;
+		try {
+			const metas = await client.listArchivedSessions(wsId);
+			archivedRows = metas.map((meta) => ({ meta, summary: null }));
+			archivedLoaded = true;
+		} catch (err) {
+			archivedError = err instanceof Error ? err.message : String(err);
+		} finally {
+			archivedLoading = false;
+		}
+		// Backfill titles (first user message) one at a time, like the live list;
+		// abort if the workspace changed underfoot (`gen` moved with `refresh`).
+		const myGen = gen;
+		for (const row of archivedRows) {
+			if (myGen !== gen) return;
+			const summary = await client.getSummary(row.meta.id).catch(() => null);
+			if (myGen !== gen) return;
+			if (summary) {
+				archivedRows = archivedRows.map((r) => (r.meta.id === row.meta.id ? { ...r, summary } : r));
+			}
+		}
+	}
+
+	/** Archive a live session: retire it from this list (one-way). On success drop
+	 *  its row and refresh the archived section (if open) so the session shows up
+	 *  there; if it was the active session, fall back to the workspace root. A
+	 *  running turn returns 409 — surface it, don't silently no-op. */
+	async function archive(id: string, e: MouseEvent) {
+		// The row is an `<a>`; keep archiving from navigating into the session.
+		e.preventDefault();
+		e.stopPropagation();
+		actionError = null;
+		try {
+			await client.archiveSession(id);
+			rows = rows.filter((r) => r.meta.id !== id);
+			if (archivedOpen) await loadArchived(workspaceId);
+			if (id === activeSessionId) void goto(`/workspaces/${workspaceId}`);
+		} catch (err) {
+			actionError = err instanceof Error ? err.message : String(err);
+		}
+	}
+
+	// The session pending permanent deletion (drives the confirm dialog), a guard
+	// so a double-click can't fire two DELETEs, and the failure from the last
+	// attempt (shown inside the still-open dialog — writing it to the archived
+	// section would hide it behind the modal).
+	let pendingDelete = $state<string | null>(null);
+	let deleting = $state(false);
+	let deleteError = $state<string | null>(null);
+
+	function closeDeleteDialog() {
+		pendingDelete = null;
+		deleteError = null;
+	}
+
+	async function confirmDelete() {
+		const id = pendingDelete;
+		if (!id || deleting) return;
+		deleting = true;
+		deleteError = null;
+		try {
+			await client.deleteSession(id);
+			archivedRows = archivedRows.filter((r) => r.meta.id !== id);
+			pendingDelete = null;
+		} catch (err) {
+			deleteError = err instanceof Error ? err.message : String(err);
+		} finally {
+			deleting = false;
+		}
+	}
 </script>
 
 <div class="panel">
@@ -259,6 +370,9 @@
 			{:else if rows.length === 0}
 				<p class="list-muted">还没有会话</p>
 			{:else}
+				{#if actionError}
+					<p class="list-error">{actionError}</p>
+				{/if}
 				{#each sortedRows as row (row.meta.id)}
 					{@const badge = originBadge(row.meta)}
 					{@const vs = viewState(row.meta.id)}
@@ -268,16 +382,129 @@
 						class:active={row.meta.id === activeSessionId}
 						class:unseen={vs === 'unseen'}
 					>
-						<div class="row-title" class:untitled={!row.summary?.first_user_input}>
-							{title(row)}
+						<div class="row-main">
+							<div class="row-title" class:untitled={!row.summary?.first_user_input}>
+								{title(row)}
+							</div>
+							<div class="row-sub">
+								<SessionStatusIcon state={vs} />
+								<span class="row-time"
+									>{formatTime(row.summary?.last_user_message_at ?? row.meta.created_at)}</span
+								>
+								{#if badge}<span class="row-badge">{badge}</span>{/if}
+							</div>
 						</div>
-						<div class="row-sub">
-							<SessionStatusIcon state={vs} />
-							<span class="row-time">{formatTime(row.summary?.last_user_message_at ?? row.meta.created_at)}</span>
-							{#if badge}<span class="row-badge">{badge}</span>{/if}
-						</div>
+						<button
+							class="row-action"
+							title="归档会话"
+							aria-label="归档会话"
+							onclick={(e) => archive(row.meta.id, e)}
+						>
+							<svg
+								width="15"
+								height="15"
+								viewBox="0 0 24 24"
+								fill="none"
+								stroke="currentColor"
+								stroke-width="2"
+								stroke-linecap="round"
+								stroke-linejoin="round"
+							>
+								<rect x="2" y="4" width="20" height="5" rx="1" />
+								<path d="M4 9v9a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1V9" />
+								<path d="M10 13h4" />
+							</svg>
+						</button>
 					</a>
 				{/each}
+			{/if}
+		</div>
+
+		<!-- The archived list is a separate region from the active session list,
+		     not its last item: it lives outside the scroll container, pinned to
+		     the sidebar bottom, so the toggle stays visible no matter how long
+		     the active list grows. Collapsed by default; expanding gives it its
+		     own bounded scroll area (the active list shrinks to make room). -->
+		<div class="archived-section">
+			<button class="archived-toggle" onclick={toggleArchived} aria-expanded={archivedOpen}>
+				<svg
+					class="chevron"
+					class:open={archivedOpen}
+					width="12"
+					height="12"
+					viewBox="0 0 24 24"
+					fill="none"
+					stroke="currentColor"
+					stroke-width="2.5"
+					stroke-linecap="round"
+					stroke-linejoin="round"
+				>
+					<polyline points="9 18 15 12 9 6" />
+				</svg>
+				已归档{#if archivedLoaded && archivedRows.length > 0}<span class="archived-count"
+						>{archivedRows.length}</span
+					>{/if}
+			</button>
+			{#if archivedOpen}
+				<div class="archived-list">
+					{#if archivedLoading}
+						<p class="list-muted">加载中…</p>
+					{:else if archivedError}
+						<p class="list-error">{archivedError}</p>
+					{:else if archivedRows.length === 0}
+						<p class="list-muted archived-empty">没有已归档的会话</p>
+					{:else}
+						{#each archivedRows as row (row.meta.id)}
+							<!-- An archived session is read-only browsable: the row links
+							     to its conversation view (history replays from the log);
+							     the only action left on it is the permanent delete. -->
+							<a
+								href={`/workspaces/${workspaceId}/sessions/${row.meta.id}`}
+								class="session-row archived-row"
+								class:active={row.meta.id === activeSessionId}
+							>
+								<div class="row-main">
+									<div class="row-title" class:untitled={!row.summary?.first_user_input}>
+										{title(row)}
+									</div>
+									<div class="row-sub">
+										<span class="row-time"
+											>{formatTime(row.summary?.last_user_message_at ?? row.meta.created_at)}</span
+										>
+									</div>
+								</div>
+								<button
+									class="row-action danger"
+									title="永久删除"
+									aria-label="永久删除"
+									onclick={(e) => {
+										// The row is an `<a>`; keep deleting from navigating.
+										e.preventDefault();
+										e.stopPropagation();
+										pendingDelete = row.meta.id;
+										deleteError = null;
+									}}
+								>
+									<svg
+										width="15"
+										height="15"
+										viewBox="0 0 24 24"
+										fill="none"
+										stroke="currentColor"
+										stroke-width="2"
+										stroke-linecap="round"
+										stroke-linejoin="round"
+									>
+										<polyline points="3 6 5 6 21 6" />
+										<path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+										<path d="M10 11v6M14 11v6" />
+										<path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+									</svg>
+								</button>
+							</a>
+						{/each}
+					{/if}
+				</div>
 			{/if}
 		</div>
 	</aside>
@@ -287,10 +514,23 @@
 	</div>
 </div>
 
+{#if pendingDelete}
+	<ConfirmDialog
+		title="永久删除此会话？"
+		confirmLabel={deleting ? '删除中…' : '永久删除'}
+		error={deleteError}
+		danger
+		onconfirm={confirmDelete}
+		oncancel={closeDeleteDialog}
+	>
+		此操作不可恢复：会话的全部文件（记录、事件、快照）将被彻底删除。
+	</ConfirmDialog>
+{/if}
+
 <style>
 	.panel {
 		display: grid;
-   	grid-template-columns: var(--sidebar-width) 1fr;
+		grid-template-columns: var(--sidebar-width) 1fr;
 		height: 100%;
 		overflow: hidden;
 		min-width: 0;
@@ -404,8 +644,9 @@
 
 	.session-row {
 		display: flex;
-		flex-direction: column;
-		gap: 2px;
+		flex-direction: row;
+		align-items: center;
+		gap: var(--space-2);
 		padding: var(--space-2) var(--space-3);
 		border-radius: var(--radius-sm);
 		text-decoration: none;
@@ -413,6 +654,49 @@
 		transition:
 			background var(--dur-fast) var(--ease-out),
 			border-color var(--dur-fast) var(--ease-out);
+	}
+
+	/* The title/status stack; owns the row's flexible width so a long title
+	 * ellipsizes instead of shoving the action button off the row. */
+	.row-main {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		flex: 1;
+		min-width: 0;
+	}
+
+	/* Row action (archive / delete): hidden until the row is hovered or the
+	 * button itself is focused, matching the icon-button idiom used elsewhere. */
+	.row-action {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		width: 24px;
+		height: 24px;
+		flex-shrink: 0;
+		border-radius: var(--radius-sm);
+		color: var(--text-tertiary);
+		opacity: 0;
+		transition:
+			opacity var(--dur-fast) var(--ease-out),
+			color var(--dur-fast) var(--ease-out),
+			background var(--dur-fast) var(--ease-out);
+	}
+
+	.session-row:hover .row-action,
+	.row-action:focus-visible {
+		opacity: 1;
+	}
+
+	.row-action:hover {
+		color: var(--text-primary);
+		background: var(--surface);
+	}
+
+	.row-action.danger:hover {
+		color: var(--error-fg);
+		background: var(--error);
 	}
 
 	.session-row:hover {
@@ -443,7 +727,7 @@
 	/* unseen: heavier title weight so "unread" rows pop at a glance.
 	   Redundant with the status-icon dot (DESIGN.md §1.3: color+shape+motion). */
 	.session-row.unseen .row-title {
-  	font-weight: 500;
+		font-weight: 500;
 	}
 	.session-row.active.unseen .row-title {
 		font-weight: 590;
@@ -476,6 +760,77 @@
 		color: var(--text-tertiary);
 		background: var(--canvas-float);
 		border: 1px solid var(--border-subtle);
+	}
+
+	/* Archived list: a separate region pinned to the sidebar bottom, not part of
+	 * the active list's scroll container. flex-shrink:0 keeps the toggle visible
+	 * no matter how long the active list grows; when expanded, its own list is
+	 * height-capped and scrolls independently (the active list shrinks to make
+	 * room). */
+	.archived-section {
+		flex-shrink: 0;
+		border-top: 1px solid var(--border-subtle);
+		padding: var(--space-2) var(--space-2) var(--space-2);
+		display: flex;
+		flex-direction: column;
+		min-height: 0;
+		max-height: 45%;
+	}
+
+	.archived-list {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		overflow-y: auto;
+		min-height: 0;
+	}
+
+	.archived-toggle {
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+		width: 100%;
+		padding: var(--space-2) var(--space-3);
+		border-radius: var(--radius-sm);
+		font-size: 11.5px;
+		font-weight: 510;
+		color: var(--text-tertiary);
+		font-family: var(--font-chinese);
+		cursor: pointer;
+		transition: color var(--dur-fast) var(--ease-out);
+	}
+
+	.archived-toggle:hover {
+		color: var(--text-secondary);
+	}
+
+	.chevron {
+		flex-shrink: 0;
+		transition: transform var(--dur-fast) var(--ease-out);
+	}
+
+	.chevron.open {
+		transform: rotate(90deg);
+	}
+
+	.archived-count {
+		font-size: 10px;
+		font-variant-numeric: tabular-nums;
+		padding: 0 5px;
+		border-radius: var(--radius-lg);
+		color: var(--text-tertiary);
+		background: var(--canvas-float);
+		border: 1px solid var(--border-subtle);
+	}
+
+	.archived-empty {
+		padding: var(--space-3) var(--space-2);
+	}
+
+	/* Archived rows dim one notch; an untitled one (no first message yet) falls
+	 * back to the shared `.untitled` mono-id styling. */
+	.archived-row .row-title {
+		color: var(--text-secondary);
 	}
 
 	.ws-main {

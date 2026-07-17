@@ -23,13 +23,7 @@
 	import ToolBlock from '$lib/components/tools/ToolBlock.svelte';
 	import { num, statLabel, formatCost, cacheLabel, topTools } from '$lib/stats';
 	import { markSeen } from '$lib/status.svelte';
-	import {
-		loadQueue,
-		saveQueue,
-		enqueue,
-		removeFromQueue,
-		type QueuedMessage
-	} from '$lib/queue';
+	import { loadQueue, saveQueue, enqueue, removeFromQueue, type QueuedMessage } from '$lib/queue';
 	import { activeTick, jumpTarget } from '$lib/minimap';
 	import { setPendingFork, takePendingFork, type PendingFork } from '$lib/fork';
 
@@ -81,6 +75,12 @@
 	// every route change with no chance of local state fighting the prop.
 	const sessionId = $derived(routeSessionId);
 	let meta = $state<SessionMeta | null>(null);
+	// An archived session (`doc/session-storage.md` §9) is read-only: its history
+	// replays from the log, but no turn can ever run on it again — so the input
+	// is disabled rather than letting a send fail with a 410 after the fact. The
+	// id guard keeps a previous session's meta from leaking its archived state
+	// into the session we're switching to.
+	const isArchived = $derived(meta?.id === sessionId ? (meta?.archived ?? false) : false);
 	// Inherited context for a branched session (origin != new): the parent's
 	// conversation the fork/compaction/reconfiguration was seeded with, loaded
 	// from `context_snapshot.json` via getSnapshot and rendered as dimmed history
@@ -212,7 +212,10 @@
 	 *  (e.g. in-progress reasoning) across session switches. Live deltas are
 	 *  not replayed on re-subscribe (gateway-transport.ts §reconnect), so without
 	 *  this cache, switching away during a stream and back would truncate it. */
-	const sessionCache = new Map<string, { convo: ConversationState; collapsed: Record<number, boolean> }>();
+	const sessionCache = new Map<
+		string,
+		{ convo: ConversationState; collapsed: Record<number, boolean> }
+	>();
 	let prevSessionId: string | undefined;
 
 	function toggleDetail() {
@@ -452,68 +455,72 @@
 		// and debounce — once events stop arriving we consider replay done.
 		isReplaying = true;
 		clearTimeout(replayDebounce);
-		sub = client.subscribeEvents(id, {
-			onEvent: (ev) => {
-				convo = apply(convo, ev);
-				if (ev.type === 'compacted') {
-					// Compaction swaps the live session for a fresh one. Navigate to
-					// its route; page.params.id updates → the sync $effect re-subscribes
-					// and reloads meta for the new id (and the sidebar highlights it).
-					// The new session's committed events replay over the fresh stream,
-					// so nothing is lost in the brief gap.
-					void goto(`/workspaces/${workspaceId}/sessions/${ev.new_session_id}`);
-				}
-				// A settled turn means the fold's aggregates changed — refresh the
-				// STATS snapshot so turns/cost/tokens track the live conversation.
-				if (ev.type === 'turn_settled') {
-					void refreshSummary(id);
-					// The turn is done: release the next queued message (if any). One
-					// per settle keeps the gateway's own defer-queue empty, so every
-					// still-pending message stays here — visible and cancellable.
-					void flushQueue(id);
-				}
-				// Live context occupancy (per round): drive the STATS context bar.
-				if (ev.type === 'context_updated') {
-					context = { tokens: ev.tokens, window: ev.window, threshold: ev.threshold };
-				}
-				// Per-request STATS refresh (Q2): a committed RequestCompleted means a
-				// model round's usage landed, so the aggregates moved mid-turn. Debounced,
-				// and skipped during history replay (loadMeta already refreshed on load).
-				if (!isReplaying && ev.type === 'event') {
-					const p = ev.payload;
-					if ('Model' in p && 'RequestCompleted' in p.Model) {
-						scheduleSummaryRefresh(id);
+		sub = client.subscribeEvents(
+			id,
+			{
+				onEvent: (ev) => {
+					convo = apply(convo, ev);
+					if (ev.type === 'compacted') {
+						// Compaction swaps the live session for a fresh one. Navigate to
+						// its route; page.params.id updates → the sync $effect re-subscribes
+						// and reloads meta for the new id (and the sidebar highlights it).
+						// The new session's committed events replay over the fresh stream,
+						// so nothing is lost in the brief gap.
+						void goto(`/workspaces/${workspaceId}/sessions/${ev.new_session_id}`);
 					}
-				}
-				if (isReplaying) {
-					// During replay: snap to bottom instantly (no animation) to
-					// avoid the uncomfortable rapid smooth-scrolling visual.
-					requestAnimationFrame(() => {
-						if (streamEl) streamEl.scrollTop = streamEl.scrollHeight;
-					});
-					// Reset the debounce timer — when events stop arriving for
-					// 300 ms we consider the replay phase complete.
-					clearTimeout(replayDebounce);
-					replayDebounce = setTimeout(() => {
-						isReplaying = false;
-						// Final instant snap to ensure we're at the bottom.
+					// A settled turn means the fold's aggregates changed — refresh the
+					// STATS snapshot so turns/cost/tokens track the live conversation.
+					if (ev.type === 'turn_settled') {
+						void refreshSummary(id);
+						// The turn is done: release the next queued message (if any). One
+						// per settle keeps the gateway's own defer-queue empty, so every
+						// still-pending message stays here — visible and cancellable.
+						void flushQueue(id);
+					}
+					// Live context occupancy (per round): drive the STATS context bar.
+					if (ev.type === 'context_updated') {
+						context = { tokens: ev.tokens, window: ev.window, threshold: ev.threshold };
+					}
+					// Per-request STATS refresh (Q2): a committed RequestCompleted means a
+					// model round's usage landed, so the aggregates moved mid-turn. Debounced,
+					// and skipped during history replay (loadMeta already refreshed on load).
+					if (!isReplaying && ev.type === 'event') {
+						const p = ev.payload;
+						if ('Model' in p && 'RequestCompleted' in p.Model) {
+							scheduleSummaryRefresh(id);
+						}
+					}
+					if (isReplaying) {
+						// During replay: snap to bottom instantly (no animation) to
+						// avoid the uncomfortable rapid smooth-scrolling visual.
 						requestAnimationFrame(() => {
 							if (streamEl) streamEl.scrollTop = streamEl.scrollHeight;
 						});
-					}, 300);
-				} else if (shouldAutoScroll) {
-					// Live event: smooth scroll only when the user is already at
-					// (or near) the bottom. This prevents yanking them back to
-					// the latest message while they're reading history.
-					requestAnimationFrame(() => {
-						streamEl?.scrollTo({ top: streamEl.scrollHeight, behavior: 'smooth' });
-					});
+						// Reset the debounce timer — when events stop arriving for
+						// 300 ms we consider the replay phase complete.
+						clearTimeout(replayDebounce);
+						replayDebounce = setTimeout(() => {
+							isReplaying = false;
+							// Final instant snap to ensure we're at the bottom.
+							requestAnimationFrame(() => {
+								if (streamEl) streamEl.scrollTop = streamEl.scrollHeight;
+							});
+						}, 300);
+					} else if (shouldAutoScroll) {
+						// Live event: smooth scroll only when the user is already at
+						// (or near) the bottom. This prevents yanking them back to
+						// the latest message while they're reading history.
+						requestAnimationFrame(() => {
+							streamEl?.scrollTo({ top: streamEl.scrollHeight, behavior: 'smooth' });
+						});
+					}
+				},
+				onError: (e) => {
+					error = e instanceof Error ? e.message : String(e);
 				}
 			},
-			onError: (e) => {
-				error = e instanceof Error ? e.message : String(e);
-			}
-		}, cached ? convo.lastSeq : undefined);
+			cached ? convo.lastSeq : undefined
+		);
 	}
 
 	$effect(() => {
@@ -600,7 +607,9 @@
 
 	async function send() {
 		const text = input.trim();
-		if (!text || sending) return;
+		// Archived sessions are read-only (the input is disabled; this is the
+		// belt-and-suspenders guard for programmatic paths like Enter handlers).
+		if (!text || sending || isArchived) return;
 		// A turn is already running on this (real) session: queue the message
 		// locally instead of POSTing. The gateway would accept it but defer it in
 		// an invisible in-memory queue; holding it here keeps it visible as a
@@ -1020,40 +1029,42 @@
 		<div class="conv-viewport">
 			<div class="conv-scroll" bind:this={streamEl} onscroll={onStreamScroll}>
 				<div class="conv-inner">
-				<!-- Inherited context: the parent conversation this branched session was
+					<!-- Inherited context: the parent conversation this branched session was
 				     seeded with (fork/compaction/reconfiguration), rendered dimmed above the
 				     live turns so the branch shows what came before. See DESIGN.md §4.8. -->
-				{#if inherited.length > 0}
-					<div class="inherited" aria-label="继承的上下文">
-						{#each inherited as it, k (k)}
-							{#if it.kind === 'user'}
-								<div class="item item-user">
-									<div class="user-bubble">{it.text}</div>
-								</div>
-							{:else if it.kind === 'text'}
-								<div class="item item-text inherited-text">
-									{#if browser}
-										<!-- eslint-disable-next-line svelte/no-at-html-tags -->
-										{@html renderMarkdown(it.text)}
-									{:else}
-										{it.text}
-									{/if}
-								</div>
-							{:else if it.kind === 'tool'}
-								<div class="item inherited-tool">
-									<span class="inherited-tool-name">{it.name}</span>
-									{#if it.args && it.args !== '{}'}<span class="inherited-tool-args">{it.args}</span>{/if}
-								</div>
-							{/if}
-						{/each}
-						<div class="inherited-sep"><span>分支自此处 · inherited context above</span></div>
-					</div>
-				{/if}
-				{#each convo.items as item, i (i)}
-					{#if item.kind === 'user'}
-						<div class="item item-user" data-user-anchor={i}>
-							{#if item.seq != null && !isDraft && item.seq !== firstUserSeq}
-								<!-- Turn actions: low-frequency per-turn operations, anchored to
+					{#if inherited.length > 0}
+						<div class="inherited" aria-label="继承的上下文">
+							{#each inherited as it, k (k)}
+								{#if it.kind === 'user'}
+									<div class="item item-user">
+										<div class="user-bubble">{it.text}</div>
+									</div>
+								{:else if it.kind === 'text'}
+									<div class="item item-text inherited-text">
+										{#if browser}
+											<!-- eslint-disable-next-line svelte/no-at-html-tags -->
+											{@html renderMarkdown(it.text)}
+										{:else}
+											{it.text}
+										{/if}
+									</div>
+								{:else if it.kind === 'tool'}
+									<div class="item inherited-tool">
+										<span class="inherited-tool-name">{it.name}</span>
+										{#if it.args && it.args !== '{}'}<span class="inherited-tool-args"
+												>{it.args}</span
+											>{/if}
+									</div>
+								{/if}
+							{/each}
+							<div class="inherited-sep"><span>分支自此处 · inherited context above</span></div>
+						</div>
+					{/if}
+					{#each convo.items as item, i (i)}
+						{#if item.kind === 'user'}
+							<div class="item item-user" data-user-anchor={i}>
+								{#if item.seq != null && !isDraft && item.seq !== firstUserSeq}
+									<!-- Turn actions: low-frequency per-turn operations, anchored to
 								     the user message that starts the turn. Faint by default
 								     (--text-disabled), brightens when the turn is hovered. Icon +
 								     tooltip only — no visible label (the glyph carries the meaning).
@@ -1061,211 +1072,211 @@
 								     future rating control slots in beside it. See DESIGN.md §4.7.
 								     Excluded on the first user turn: branching before it inherits an
 								     empty context, i.e. just a new session. -->
-								<div class="turn-actions">
-									<button
-										class="turn-action-btn"
-										onclick={() => fork(item.seq!, item.text)}
-										title="从这条消息处分支（继承之前的对话，另开一个会话）"
-										aria-label="Fork a new session from this message"
-									>
-									<!-- Original divergence glyph: a single stem splitting into
+									<div class="turn-actions">
+										<button
+											class="turn-action-btn"
+											onclick={() => fork(item.seq!, item.text)}
+											title="从这条消息处分支（继承之前的对话，另开一个会话）"
+											aria-label="Fork a new session from this message"
+										>
+											<!-- Original divergence glyph: a single stem splitting into
 									     two branches — drawn from scratch, not a borrowed
 									     git-branch icon (DESIGN §5). Round caps read as soft
 									     nodes at the three tips. -->
-									<svg
-										class="turn-action-icon"
-										viewBox="0 0 14 14"
-										fill="none"
-										stroke="currentColor"
-										stroke-width="1.5"
-										stroke-linecap="round"
-										stroke-linejoin="round"
-										aria-hidden="true"
-									>
-										<path d="M7 12V7.2" />
-										<path d="M7 7.2 3.8 4" />
-										<path d="M7 7.2 10.2 4" />
-									</svg>
-								</button>
-								</div>
-							{/if}
-							<div class="user-bubble">{item.text}</div>
-						</div>
-					{:else if item.kind === 'text'}
-						{#if item.text.trim()}
-							<div class="item item-text" class:streaming={item.streaming}>
-								{#if browser}
-									<!-- eslint-disable-next-line svelte/no-at-html-tags -->
-									{@html renderMarkdown(item.text)}
-								{:else}
-									{item.text}
-								{/if}
-							</div>
-						{/if}
-					{:else if item.kind === 'reasoning'}
-						{#if item.text.trim()}
-							<div class="item item-reasoning" class:expanded={!isCollapsed(item, i)}>
-								<button
-									class="reasoning-toggle"
-									onclick={() => toggleCollapse(item, i)}
-									aria-expanded={!isCollapsed(item, i)}
-								>
-									<svg
-										class="reasoning-toggle-icon"
-										viewBox="0 0 14 14"
-										fill="none"
-										stroke="currentColor"
-										stroke-width="1.6"
-										stroke-linecap="round"
-										stroke-linejoin="round"
-									>
-										<polyline points="5,3 9,7 5,11" />
-									</svg>
-									<span class="reasoning-label">Thinking</span>
-									{#if isCollapsed(item, i)}
-										<span class="reasoning-preview">{shortPreview(item.text)}</span>
-									{/if}
-									{#if item.streaming}
-										<span class="streaming-dot"></span>
-									{/if}
-								</button>
-								{#if !isCollapsed(item, i)}
-									<div class="reasoning-body">
-										{#if browser}
-											<!-- eslint-disable-next-line svelte/no-at-html-tags -->
-											{@html renderMarkdown(item.text)}
-										{:else}
-											{item.text}
-										{/if}
+											<svg
+												class="turn-action-icon"
+												viewBox="0 0 14 14"
+												fill="none"
+												stroke="currentColor"
+												stroke-width="1.5"
+												stroke-linecap="round"
+												stroke-linejoin="round"
+												aria-hidden="true"
+											>
+												<path d="M7 12V7.2" />
+												<path d="M7 7.2 3.8 4" />
+												<path d="M7 7.2 10.2 4" />
+											</svg>
+										</button>
 									</div>
 								{/if}
+								<div class="user-bubble">{item.text}</div>
 							</div>
-						{/if}
-					{:else if item.kind === 'tool'}
-						<div class="item">
-							<ToolBlock {item} />
-						</div>
-					{:else if item.kind === 'plan'}
-						<!-- Streaming placeholders (item.streaming) render nothing: a flashing
-					     inline "planning…" card on every plan op is pure eye-strain, and
-					     the dock already shows the live plan. The docked card is shown in
-					     the dock, so skip it here too — only committed history cards render. -->
-						{#if !item.streaming && i !== dockPlan?.index}
-							{@const prog = planProgress(item.steps)}
-							<div class="item">
-								<div
-									class="plan-card"
-									class:expanded={!isCollapsed(item, i)}
-									class:done={planDone(item.steps)}
-								>
+						{:else if item.kind === 'text'}
+							{#if item.text.trim()}
+								<div class="item item-text" class:streaming={item.streaming}>
+									{#if browser}
+										<!-- eslint-disable-next-line svelte/no-at-html-tags -->
+										{@html renderMarkdown(item.text)}
+									{:else}
+										{item.text}
+									{/if}
+								</div>
+							{/if}
+						{:else if item.kind === 'reasoning'}
+							{#if item.text.trim()}
+								<div class="item item-reasoning" class:expanded={!isCollapsed(item, i)}>
 									<button
-										class="plan-head"
+										class="reasoning-toggle"
 										onclick={() => toggleCollapse(item, i)}
 										aria-expanded={!isCollapsed(item, i)}
 									>
 										<svg
-											class="plan-icon"
+											class="reasoning-toggle-icon"
 											viewBox="0 0 14 14"
-											fill="none"
-											stroke="currentColor"
-											stroke-width="1.5"
-											stroke-linecap="round"
-											stroke-linejoin="round"
-										>
-											<path d="M3 3h8M3 7h8M3 11h5" />
-										</svg>
-										<span class="plan-title">Plan</span>
-										<span class="plan-progress">{prog.done}/{prog.total}</span>
-										<span class="plan-track"
-											><span
-												class="plan-bar"
-												style="width: {prog.total ? (prog.done / prog.total) * 100 : 0}%"
-											></span></span
-										>
-										<svg
-											class="plan-chevron"
-											viewBox="0 0 12 12"
 											fill="none"
 											stroke="currentColor"
 											stroke-width="1.6"
 											stroke-linecap="round"
 											stroke-linejoin="round"
 										>
-											<polyline points="4,2 8,6 4,10" />
+											<polyline points="5,3 9,7 5,11" />
 										</svg>
+										<span class="reasoning-label">Thinking</span>
+										{#if isCollapsed(item, i)}
+											<span class="reasoning-preview">{shortPreview(item.text)}</span>
+										{/if}
+										{#if item.streaming}
+											<span class="streaming-dot"></span>
+										{/if}
 									</button>
 									{#if !isCollapsed(item, i)}
-										<ol class="plan-steps">
-											{#each item.steps as step (step.id)}
-												<li class="plan-step" data-status={step.status}>
-													<span class="plan-step-mark" aria-hidden="true">
-														{#if step.status === 'completed'}
-															<svg
-																viewBox="0 0 12 12"
-																fill="none"
-																stroke="currentColor"
-																stroke-width="2"
-																stroke-linecap="round"
-																stroke-linejoin="round"
-																><polyline points="2.5,6.5 5,9 9.5,3.5" /></svg
-															>
-														{:else if step.status === 'in_progress'}
-															<span class="plan-spinner"></span>
-														{:else if step.status === 'cancelled'}
-															<svg
-																viewBox="0 0 12 12"
-																fill="none"
-																stroke="currentColor"
-																stroke-width="1.8"
-																stroke-linecap="round"
-																><line x1="3" y1="3" x2="9" y2="9" /><line
-																	x1="9"
-																	y1="3"
-																	x2="3"
-																	y2="9"
-																/></svg
-															>
-														{:else if step.status === 'blocked'}
-															<svg
-																viewBox="0 0 12 12"
-																fill="none"
-																stroke="currentColor"
-																stroke-width="1.6"
-																><circle cx="6" cy="6" r="4.2" /><line
-																	x1="3"
-																	y1="3"
-																	x2="9"
-																	y2="9"
-																	stroke-linecap="round"
-																/></svg
-															>
-														{:else}
-															<span class="plan-dot"></span>
-														{/if}
-													</span>
-													<span class="plan-step-body">
-														<span class="plan-step-text">{step.content}</span>
-														{#if step.reason}
-															<span class="plan-step-reason">{step.reason}</span>
-														{/if}
-													</span>
-												</li>
-											{/each}
-										</ol>
+										<div class="reasoning-body">
+											{#if browser}
+												<!-- eslint-disable-next-line svelte/no-at-html-tags -->
+												{@html renderMarkdown(item.text)}
+											{:else}
+												{item.text}
+											{/if}
+										</div>
 									{/if}
 								</div>
+							{/if}
+						{:else if item.kind === 'tool'}
+							<div class="item">
+								<ToolBlock {item} />
 							</div>
+						{:else if item.kind === 'plan'}
+							<!-- Streaming placeholders (item.streaming) render nothing: a flashing
+					     inline "planning…" card on every plan op is pure eye-strain, and
+					     the dock already shows the live plan. The docked card is shown in
+					     the dock, so skip it here too — only committed history cards render. -->
+							{#if !item.streaming && i !== dockPlan?.index}
+								{@const prog = planProgress(item.steps)}
+								<div class="item">
+									<div
+										class="plan-card"
+										class:expanded={!isCollapsed(item, i)}
+										class:done={planDone(item.steps)}
+									>
+										<button
+											class="plan-head"
+											onclick={() => toggleCollapse(item, i)}
+											aria-expanded={!isCollapsed(item, i)}
+										>
+											<svg
+												class="plan-icon"
+												viewBox="0 0 14 14"
+												fill="none"
+												stroke="currentColor"
+												stroke-width="1.5"
+												stroke-linecap="round"
+												stroke-linejoin="round"
+											>
+												<path d="M3 3h8M3 7h8M3 11h5" />
+											</svg>
+											<span class="plan-title">Plan</span>
+											<span class="plan-progress">{prog.done}/{prog.total}</span>
+											<span class="plan-track"
+												><span
+													class="plan-bar"
+													style="width: {prog.total ? (prog.done / prog.total) * 100 : 0}%"
+												></span></span
+											>
+											<svg
+												class="plan-chevron"
+												viewBox="0 0 12 12"
+												fill="none"
+												stroke="currentColor"
+												stroke-width="1.6"
+												stroke-linecap="round"
+												stroke-linejoin="round"
+											>
+												<polyline points="4,2 8,6 4,10" />
+											</svg>
+										</button>
+										{#if !isCollapsed(item, i)}
+											<ol class="plan-steps">
+												{#each item.steps as step (step.id)}
+													<li class="plan-step" data-status={step.status}>
+														<span class="plan-step-mark" aria-hidden="true">
+															{#if step.status === 'completed'}
+																<svg
+																	viewBox="0 0 12 12"
+																	fill="none"
+																	stroke="currentColor"
+																	stroke-width="2"
+																	stroke-linecap="round"
+																	stroke-linejoin="round"
+																	><polyline points="2.5,6.5 5,9 9.5,3.5" /></svg
+																>
+															{:else if step.status === 'in_progress'}
+																<span class="plan-spinner"></span>
+															{:else if step.status === 'cancelled'}
+																<svg
+																	viewBox="0 0 12 12"
+																	fill="none"
+																	stroke="currentColor"
+																	stroke-width="1.8"
+																	stroke-linecap="round"
+																	><line x1="3" y1="3" x2="9" y2="9" /><line
+																		x1="9"
+																		y1="3"
+																		x2="3"
+																		y2="9"
+																	/></svg
+																>
+															{:else if step.status === 'blocked'}
+																<svg
+																	viewBox="0 0 12 12"
+																	fill="none"
+																	stroke="currentColor"
+																	stroke-width="1.6"
+																	><circle cx="6" cy="6" r="4.2" /><line
+																		x1="3"
+																		y1="3"
+																		x2="9"
+																		y2="9"
+																		stroke-linecap="round"
+																	/></svg
+																>
+															{:else}
+																<span class="plan-dot"></span>
+															{/if}
+														</span>
+														<span class="plan-step-body">
+															<span class="plan-step-text">{step.content}</span>
+															{#if step.reason}
+																<span class="plan-step-reason">{step.reason}</span>
+															{/if}
+														</span>
+													</li>
+												{/each}
+											</ol>
+										{/if}
+									</div>
+								</div>
+							{/if}
+						{:else if item.kind === 'error'}
+							<div class="item item-error">{item.message}</div>
+						{:else if item.kind === 'notice'}
+							<div class="item item-notice">{item.message}</div>
 						{/if}
-					{:else if item.kind === 'error'}
-						<div class="item item-error">{item.message}</div>
-					{:else if item.kind === 'notice'}
-						<div class="item item-notice">{item.message}</div>
-					{/if}
-				{/each}
+					{/each}
 
-				{#if convo.items.length === 0}
-					<p class="empty">{isDraft ? '输入消息，开始一段新对话' : '发送消息开始对话'}</p>
-				{/if}
+					{#if convo.items.length === 0}
+						<p class="empty">{isDraft ? '输入消息，开始一段新对话' : '发送消息开始对话'}</p>
+					{/if}
 				</div>
 			</div>
 			{#if ticks.length > 1}
@@ -1463,7 +1474,10 @@
 						class="input-field"
 						bind:value={input}
 						onkeydown={onKeydown}
-						placeholder="输入消息… Enter 发送，Shift+Enter 换行"
+						disabled={isArchived}
+						placeholder={isArchived
+							? '会话已归档，仅供查看'
+							: '输入消息… Enter 发送，Shift+Enter 换行'}
 						rows="2"
 					></textarea>
 					<div class="input-actions">
@@ -1557,11 +1571,13 @@
 						{/if}
 						<button
 							class="send-btn"
-							disabled={sending || !input.trim()}
+							disabled={isArchived || sending || !input.trim()}
 							onclick={send}
-							title={!isDraft && turnRunning
-								? '排队发送（当前回合结束后自动发出）· Enter'
-								: '发送 · Enter'}
+							title={isArchived
+								? '会话已归档，仅供查看'
+								: !isDraft && turnRunning
+									? '排队发送（当前回合结束后自动发出）· Enter'
+									: '发送 · Enter'}
 							aria-label="Send message"
 						>
 							{#if sending}
@@ -2081,7 +2097,6 @@
 		font-variant-numeric: tabular-nums;
 	}
 
-
 	/* ---- SESSION ID COPY BUTTON ---- */
 	.session-id-btn {
 		all: unset;
@@ -2093,7 +2108,8 @@
 		padding: 2px 6px;
 		border-radius: var(--radius-sm);
 		position: relative;
-		transition: color var(--dur-fast) var(--ease-out),
+		transition:
+			color var(--dur-fast) var(--ease-out),
 			background var(--dur-fast) var(--ease-out);
 	}
 	.session-id-btn:hover {
@@ -3095,6 +3111,17 @@
 
 	.input-field::placeholder {
 		color: var(--text-disabled);
+	}
+
+	/* Read-only (archived session): the box stays visible for context but reads
+	 * as inert — no caret, no text selection affordance, dimmed placeholder. */
+	.input-field:disabled {
+		cursor: not-allowed;
+		color: var(--text-tertiary);
+	}
+
+	.input-field:disabled::placeholder {
+		color: var(--text-tertiary);
 	}
 
 	.input-actions {

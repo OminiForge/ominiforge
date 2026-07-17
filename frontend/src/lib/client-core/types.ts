@@ -82,6 +82,13 @@ export interface SessionClient {
 	): Promise<string>;
 	/** Session ids, newest first. */
 	listSessions(): Promise<string[]>;
+	/** Metadata for the workspace's archived sessions, newest first — the
+	 *  archived section's read source. Workspace-scoped like
+	 *  {@link listWorkspaceSessions}: a panel only ever shows its own
+	 *  workspace's retired sessions. Archived sessions are absent from every
+	 *  active listing; the only remaining action on them is a permanent
+	 *  {@link deleteSession}. */
+	listArchivedSessions(workspaceId: string): Promise<SessionMeta[]>;
 	/** Create a fresh session; resolves to its id. `opts` chooses a per-session
 	 *  profile / model override / workspace (each optional → gateway default). */
 	createSession(opts?: CreateSessionOptions): Promise<string>;
@@ -91,6 +98,15 @@ export interface SessionClient {
 	listModels(): Promise<ModelSummary[]>;
 	/** Session metadata. */
 	getSession(id: string): Promise<SessionMeta>;
+	/** Retire a session (`doc/session-storage.md` §9): stops its actor, releases
+	 *  its sandbox, and drops it from every active listing. **One-way** — there is
+	 *  no unarchive. Its files stay readable, and it can then be permanently
+	 *  {@link deleteSession}d. Rejects with 409 if a turn is running. */
+	archiveSession(id: string): Promise<void>;
+	/** Permanently remove a session's files. **Irreversible.** Requires the
+	 *  session to be archived first (a non-archived session rejects with 409) —
+	 *  the deliberate two-step confirmation gate. */
+	deleteSession(id: string): Promise<void>;
 	/** Branch a new session from `id` at parent `atSeq`; resolves to the new id. */
 	forkSession(id: string, atSeq: number): Promise<string>;
 	/** Materialize a config change (profile / model) as a new session seeded with

@@ -35,4 +35,12 @@ sandbox?: SandboxDescriptor | null,
 /**
  * How this session came to exist.
  */
-origin: Origin, };
+origin: Origin, 
+/**
+ * Whether this session is archived (`doc/session-storage.md` §9): retired
+ * from every active listing, files kept readable. The `.archived` sidecar
+ * marker — not this field — is the source of truth; `read_meta` stamps it
+ * from the marker on every read so API consumers see the real state.
+ * Skipped when false so active sessions' `session.toml` stays untouched.
+ */
+archived?: boolean, };

@@ -375,6 +375,26 @@ impl SessionRegistry {
         Ok(metas)
     }
 
+    /// Read every **archived** session's metadata, newest first — the archived
+    /// view's read source. Mirrors [`list_metas`](Self::list_metas) but sources
+    /// ids from [`SessionStore::list_archived`], and deliberately does **not**
+    /// seed the workspace map: archived sessions are retired and must not
+    /// resurrect a workspace entry. A session whose `session.toml` is unreadable
+    /// is skipped, not fatal.
+    ///
+    /// # Errors
+    /// Filesystem errors reading the store root (listing the archived ids).
+    pub fn list_archived_metas(&self) -> Result<Vec<SessionMeta>> {
+        let store = self.store();
+        let ids = store
+            .list_archived()
+            .context("failed to list archived sessions")?;
+        Ok(ids
+            .iter()
+            .filter_map(|id| store.read_meta(id).ok())
+            .collect())
+    }
+
     /// Record a workspace by `path` and return its opaque id (the route the
     /// dashboard opens). The path is canonicalized and persisted in the workspace
     /// map so a later `create_in_workspace` can resolve it server-side — the path

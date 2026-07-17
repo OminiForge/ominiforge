@@ -7,7 +7,9 @@
 :root {
 	/* Fonts: LXGW WenKai for Chinese, Inter for Latin, mono for code/labels */
 	--font-sans: 'Inter', 'LXGW WenKai', system-ui, sans-serif;
-	--font-mono: 'Berkeley Mono', 'JetBrains Mono', 'Fira Code', 'Cascadia Code', ui-monospace, 'LXGW WenKai Mono', monospace;
+	--font-mono:
+		'Berkeley Mono', 'JetBrains Mono', 'Fira Code', 'Cascadia Code', ui-monospace,
+		'LXGW WenKai Mono', monospace;
 	--font-chinese: 'LXGW WenKai', serif;
 
 	/* Spacing: rem rhythm (legacy gap-* names, kept for existing callers) */
@@ -110,6 +112,8 @@
 	--warning: #e8a838;
 	--error: #e05252;
 	--error-bg: rgba(224, 82, 82, 0.1);
+	--error-hover: #ec6565; /* brighter on hover, like --accent-hover */
+	--error-fg: #ffffff; /* text/icon on top of error fill */
 	--info: #7878b0;
 
 	/* Reasoning — muted indigo-tinted */
@@ -138,6 +142,9 @@
 	--shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.3);
 	--shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4);
 	--shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.5);
+
+	/* Modal backdrop dim */
+	--backdrop: rgba(0, 0, 0, 0.45);
 }
 
 /* ============================================================
@@ -196,6 +203,8 @@
 	--warning: #c0851a;
 	--error: #cc3b3b;
 	--error-bg: rgba(204, 59, 59, 0.1);
+	--error-hover: #b52f2f; /* deeper on hover, like --accent-hover */
+	--error-fg: #ffffff;
 	--info: #5b5bbf;
 
 	/* Reasoning */
@@ -222,6 +231,9 @@
 	--shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.08);
 	--shadow-md: 0 4px 12px rgba(0, 0, 0, 0.1);
 	--shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.12);
+
+	/* Modal backdrop dim */
+	--backdrop: rgba(0, 0, 0, 0.24);
 }
 
 @media (prefers-reduced-motion: reduce) {

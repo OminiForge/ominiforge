@@ -257,6 +257,7 @@ mod tests {
             workspace: workspace.map(PathBuf::from),
             sandbox: None,
             origin: Origin::new(),
+            archived: false,
         }
     }
 

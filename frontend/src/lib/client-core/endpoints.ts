@@ -8,8 +8,12 @@ const API = '/api';
 export const endpoints = {
 	workspaces: () => `${API}/workspaces`,
 	workspaceSessions: (id: string) => `${API}/workspaces/${encodeURIComponent(id)}/sessions`,
+	/** The workspace's archived sessions (the archived section's read source). */
+	workspaceArchivedSessions: (id: string) =>
+		`${API}/workspaces/${encodeURIComponent(id)}/sessions/archived`,
 	sessions: () => `${API}/sessions`,
 	session: (id: string) => `${API}/sessions/${encodeURIComponent(id)}`,
+	archive: (id: string) => `${API}/sessions/${encodeURIComponent(id)}/archive`,
 	fork: (id: string) => `${API}/sessions/${encodeURIComponent(id)}/fork`,
 	reconfigure: (id: string) => `${API}/sessions/${encodeURIComponent(id)}/reconfigure`,
 	message: (id: string) => `${API}/sessions/${encodeURIComponent(id)}/message`,

@@ -10,7 +10,7 @@
 	}: {
 		onclick?: () => void;
 		disabled?: boolean;
-		variant?: 'default' | 'accent' | 'ghost';
+		variant?: 'default' | 'accent' | 'ghost' | 'danger';
 		type?: 'button' | 'submit';
 		children: Snippet;
 	} = $props();
@@ -70,5 +70,16 @@
 	.btn.ghost:hover:not(:disabled) {
 		background: var(--surface);
 		color: var(--text-primary);
+	}
+
+	.btn.danger {
+		background: var(--error);
+		border-color: var(--error);
+		color: var(--error-fg);
+	}
+
+	.btn.danger:hover:not(:disabled) {
+		background: var(--error-hover);
+		border-color: var(--error-hover);
 	}
 </style>

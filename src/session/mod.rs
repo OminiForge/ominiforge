@@ -130,6 +130,7 @@ impl SessionStore {
             workspace: workspace.clone(),
             sandbox: None,
             origin: Origin::new(),
+            archived: false,
         };
         self.write_meta(&meta)?;
 
@@ -189,6 +190,27 @@ impl SessionStore {
     /// [`SessionError::Io`] if the store root cannot be read. Returns an empty
     /// vec when the root does not exist yet or holds no sessions.
     pub fn list(&self) -> Result<Vec<SessionId>> {
+        // An archived session (`doc/session-storage.md` §9) is retired from the
+        // active list — every caller here (resume picker, workspace grouping)
+        // wants live sessions. Its files stay put and are still readable by id.
+        self.list_ids(false)
+    }
+
+    /// The archived session ids in this store, newest first — the complement of
+    /// [`list`](Self::list). These sessions are retired (`doc/session-storage.md`
+    /// §9): absent from every active listing, but their files stay readable so an
+    /// archived view can show them and permanently [`delete`](Self::delete) them.
+    ///
+    /// # Errors
+    /// [`SessionError::Io`] if the store root cannot be read.
+    pub fn list_archived(&self) -> Result<Vec<SessionId>> {
+        self.list_ids(true)
+    }
+
+    /// Shared scan behind [`list`](Self::list) / [`list_archived`](Self::list_archived):
+    /// session dirs partitioned by the presence of the `.archived` marker, newest
+    /// first. `want_archived` selects which side to return.
+    fn list_ids(&self, want_archived: bool) -> Result<Vec<SessionId>> {
         let entries = match std::fs::read_dir(&self.root) {
             Ok(entries) => entries,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -209,10 +231,7 @@ impl SessionStore {
             if !entry.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
             }
-            // An archived session (`doc/session-storage.md` §9) is retired from the
-            // active list — every caller here (resume picker, workspace grouping)
-            // wants live sessions. Its files stay put and are still readable by id.
-            if entry.path().join(ARCHIVED_MARKER).exists() {
+            if entry.path().join(ARCHIVED_MARKER).exists() != want_archived {
                 continue;
             }
             if let Ok(name) = entry.file_name().into_string() {
@@ -238,7 +257,11 @@ impl SessionStore {
             }
             Err(source) => return Err(SessionError::Io { path, source }),
         };
-        Ok(toml::from_str(&text)?)
+        let mut meta: SessionMeta = toml::from_str(&text)?;
+        // The marker file — not the toml — is the source of truth for archival;
+        // stamp it onto every read so API consumers see the real state.
+        meta.archived = self.is_archived(session_id);
+        Ok(meta)
     }
 
     /// Persist `session`'s bound sandbox descriptor into its `session.toml`
@@ -356,6 +379,7 @@ impl SessionStore {
             workspace: workspace.clone(),
             sandbox: None,
             origin: Origin::compaction(parent_id),
+            archived: false,
         };
         self.write_meta(&meta)?;
 
@@ -421,6 +445,7 @@ impl SessionStore {
             workspace: workspace.clone(),
             sandbox: None,
             origin: Origin::fork(parent_id, fork_at_seq),
+            archived: false,
         };
         self.write_meta(&meta)?;
 
@@ -481,6 +506,7 @@ impl SessionStore {
             workspace: workspace.clone(),
             sandbox: None,
             origin: Origin::reconfiguration(parent_id),
+            archived: false,
         };
         self.write_meta(&meta)?;
 
@@ -838,12 +864,50 @@ mod tests {
         assert!(store.is_archived(&sid));
         // Gone from the active list, for good...
         assert!(store.list().unwrap().is_empty());
-        // ...but its metadata (and events) stay readable by id (the analysis
+        // ...but surfaced by the archived list instead (the archived-view read
+        // path)...
+        assert_eq!(store.list_archived().unwrap(), vec![sid.clone()]);
+        // ...and its metadata (and events) stay readable by id (the analysis
         // path) — archive keeps data, it does not delete it.
         assert_eq!(
             store.read_meta(&sid).unwrap().profile_id.as_deref(),
             Some("p")
         );
+    }
+
+    /// `list` and `list_archived` partition the store: every session is in
+    /// exactly one, archiving moves it across, and delete removes it from the
+    /// archived side. This encodes the contract the archived-view UI depends on
+    /// — a session can never be in both lists or neither.
+    #[test]
+    fn list_and_list_archived_partition_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+
+        let live = store.create_new(None, None, vec![]).unwrap();
+        let live_id = live.session_id().clone();
+        drop(live);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let doomed = store.create_new(None, None, vec![]).unwrap();
+        let doomed_id = doomed.session_id().clone();
+        drop(doomed);
+
+        // Both start live; archived side empty.
+        assert_eq!(
+            store.list().unwrap(),
+            vec![doomed_id.clone(), live_id.clone()]
+        );
+        assert!(store.list_archived().unwrap().is_empty());
+
+        // Archive one → it crosses the partition, the other stays put.
+        store.archive(&doomed_id).unwrap();
+        assert_eq!(store.list().unwrap(), vec![live_id.clone()]);
+        assert_eq!(store.list_archived().unwrap(), vec![doomed_id.clone()]);
+
+        // Delete the archived one → gone from both sides.
+        store.delete(&doomed_id).unwrap();
+        assert_eq!(store.list().unwrap(), vec![live_id]);
+        assert!(store.list_archived().unwrap().is_empty());
     }
 
     /// Archiving is idempotent and archiving a non-existent session is `NotFound`
