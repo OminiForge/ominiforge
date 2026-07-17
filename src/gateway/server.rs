@@ -806,7 +806,11 @@ async fn session_runtime(State(state): State<AppState>, Path(id): Path<String>) 
     };
     match state
         .registry
-        .runtime_info(meta.profile_id.as_deref(), meta.workspace.as_deref())
+        .runtime_info(
+            meta.profile_id.as_deref(),
+            meta.model.as_deref(),
+            meta.workspace.as_deref(),
+        )
         .await
     {
         Ok(info) => Json(info).into_response(),
@@ -1110,6 +1114,11 @@ api_key_env = "PATH"
 id = "gpt-4o"
 context_window = 128000
 max_output_tokens = 16384
+
+[[providers.models]]
+id = "gpt-4o-mini"
+context_window = 128000
+max_output_tokens = 16384
 "#,
         )
         .unwrap();
@@ -1353,6 +1362,198 @@ default = "openai-main/gpt-4o"
                 .iter()
                 .any(|m| m["provider"] == "openai-main" && m["model_id"] == "gpt-4o"),
             "gpt-4o under openai-main must be listed, got {models:?}"
+        );
+    }
+
+    /// The RUNTIME panel's source (`GET /sessions/{id}/runtime`) must reflect a
+    /// per-session model *override*, not the profile default. This is the exact
+    /// bug the panel had: a session created with `?model=` still reported the
+    /// profile's default model, so the frontend flagged a spurious runtime
+    /// divergence. Creating with an override and reading runtime back must return
+    /// the overridden model.
+    #[tokio::test]
+    async fn runtime_reflects_per_session_model_override() {
+        let (registry, _dir) = test_registry_with_config();
+        let state = AppState {
+            registry,
+            api_key: None,
+            pricing: Arc::new(PricingTable::default()),
+        };
+        let base = serve_test(state).await;
+        let client = reqwest::Client::new();
+
+        // Create a session choosing a model that is NOT the profile default
+        // (profile "coding" defaults to openai-main/gpt-4o).
+        let resp = client
+            .post(format!("{base}/api/sessions?model=openai-main/gpt-4o-mini"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        let id = resp.json::<serde_json::Value>().await.unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // The runtime endpoint must now report the OVERRIDE, not the default.
+        let resp = reqwest::get(format!("{base}/api/sessions/{id}/runtime"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let rt: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            rt["model"], "gpt-4o-mini",
+            "runtime must reflect the per-session override, not the profile default"
+        );
+        assert_eq!(rt["provider"], "openai-main");
+    }
+
+    /// The complement of the override test: a session created with NO model
+    /// override must report the profile default — proving the override is
+    /// session-private and does not leak into sessions that did not ask for it
+    /// (the user's explicit constraint: changing one session's model must not
+    /// change every future session's model).
+    #[tokio::test]
+    async fn runtime_without_override_reports_profile_default() {
+        let (registry, _dir) = test_registry_with_config();
+        let state = AppState {
+            registry,
+            api_key: None,
+            pricing: Arc::new(PricingTable::default()),
+        };
+        let base = serve_test(state).await;
+        let client = reqwest::Client::new();
+
+        // Create a session with no override at all.
+        let resp = client
+            .post(format!("{base}/api/sessions"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        let id = resp.json::<serde_json::Value>().await.unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let resp = reqwest::get(format!("{base}/api/sessions/{id}/runtime"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let rt: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            rt["model"], "gpt-4o",
+            "with no override the runtime must be the profile default gpt-4o"
+        );
+    }
+
+    /// A fork must inherit the parent's per-session model override — on BOTH the
+    /// displayed runtime and the persisted meta. A fork is a branch of the same
+    /// conversation; silently switching it to the profile default would change
+    /// the model out from under the user. Complements the create/runtime tests
+    /// by covering the derived-session path the first fix left on the default.
+    #[tokio::test]
+    async fn fork_inherits_parent_model_override() {
+        let (registry, _dir) = test_registry_with_config();
+        let state = AppState {
+            registry,
+            api_key: None,
+            pricing: Arc::new(PricingTable::default()),
+        };
+        let base = serve_test(state).await;
+        let client = reqwest::Client::new();
+
+        // Parent chosen on a non-default model.
+        let parent_id = client
+            .post(format!("{base}/api/sessions?model=openai-main/gpt-4o-mini"))
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // Fork at the parent's Created event (seq 0).
+        let resp = client
+            .post(format!("{base}/api/sessions/{parent_id}/fork"))
+            .json(&serde_json::json!({ "at_seq": 0 }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201, "fork should succeed");
+        let fork_id = resp.json::<serde_json::Value>().await.unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // The fork's runtime must report the inherited override, not the default.
+        let rt: serde_json::Value =
+            reqwest::get(format!("{base}/api/sessions/{fork_id}/runtime"))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(
+            rt["model"], "gpt-4o-mini",
+            "fork must inherit the parent's model override on the runtime panel"
+        );
+    }
+
+    /// Reconfiguring a session to a new model must persist that model on the new
+    /// session (so its runtime panel and post-eviction respawn both track it),
+    /// exactly like a per-session override at creation.
+    #[tokio::test]
+    async fn reconfigure_persists_new_model_override() {
+        let (registry, _dir) = test_registry_with_config();
+        let state = AppState {
+            registry,
+            api_key: None,
+            pricing: Arc::new(PricingTable::default()),
+        };
+        let base = serve_test(state).await;
+        let client = reqwest::Client::new();
+
+        // Parent on the profile default (gpt-4o).
+        let parent_id = client
+            .post(format!("{base}/api/sessions"))
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // Reconfigure to a different model.
+        let resp = client
+            .post(format!(
+                "{base}/api/sessions/{parent_id}/reconfigure?model=openai-main/gpt-4o-mini"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201, "reconfigure should succeed");
+        let new_id = resp.json::<serde_json::Value>().await.unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let rt: serde_json::Value =
+            reqwest::get(format!("{base}/api/sessions/{new_id}/runtime"))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(
+            rt["model"], "gpt-4o-mini",
+            "reconfigured session must report and persist the new model"
         );
     }
 

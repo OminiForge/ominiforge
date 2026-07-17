@@ -16,6 +16,15 @@ id: SessionId,
  */
 profile_id?: string | null, 
 /**
+ * The per-session model override (`provider/model_id`), if one was chosen
+ * at creation instead of the profile default. Stored so the RUNTIME panel
+ * resolves the session's real model, and so an idle-evicted session respawns
+ * on the same model rather than falling back to the profile default. `None`
+ * means the profile default applies. This is session-private; it is never
+ * written back to `providers.toml` or the profile.
+ */
+model?: string | null, 
+/**
  * When the session was created.
  */
 created_at: string, 

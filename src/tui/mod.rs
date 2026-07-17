@@ -552,6 +552,7 @@ async fn do_compact(
         .create_compaction(
             old_sid,
             meta.profile_id,
+            meta.model,
             meta.workspace,
             Vec::new(),
             &snapshot,

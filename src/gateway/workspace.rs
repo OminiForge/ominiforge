@@ -253,6 +253,7 @@ mod tests {
         SessionMeta {
             id: SessionId(id.to_owned()),
             profile_id: None,
+            model: None,
             created_at: Utc.timestamp_opt(created_at, 0).unwrap(),
             workspace: workspace.map(PathBuf::from),
             sandbox: None,

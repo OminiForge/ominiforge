@@ -97,7 +97,7 @@ impl SessionStore {
         workspace: Option<PathBuf>,
         tools: Vec<String>,
     ) -> Result<SessionWriter> {
-        self.create_new_with_id(id::generate(), profile_id, workspace, tools)
+        self.create_new_with_id(id::generate(), profile_id, None, workspace, tools)
     }
 
     /// Like [`create_new`](Self::create_new) but with a caller-supplied id.
@@ -114,6 +114,7 @@ impl SessionStore {
         &self,
         session_id: SessionId,
         profile_id: Option<String>,
+        model: Option<String>,
         workspace: Option<PathBuf>,
         tools: Vec<String>,
     ) -> Result<SessionWriter> {
@@ -126,6 +127,7 @@ impl SessionStore {
         let meta = SessionMeta {
             id: session_id.clone(),
             profile_id: profile_id.clone(),
+            model,
             created_at: Utc::now(),
             workspace: workspace.clone(),
             sandbox: None,
@@ -361,6 +363,7 @@ impl SessionStore {
         &self,
         parent_id: SessionId,
         profile_id: Option<String>,
+        model: Option<String>,
         workspace: Option<PathBuf>,
         tools: Vec<String>,
         snapshot: &[crate::llm::Message],
@@ -375,6 +378,7 @@ impl SessionStore {
         let meta = SessionMeta {
             id: session_id.clone(),
             profile_id: profile_id.clone(),
+            model,
             created_at: Utc::now(),
             workspace: workspace.clone(),
             sandbox: None,
@@ -428,6 +432,7 @@ impl SessionStore {
         parent_id: SessionId,
         fork_at_seq: u64,
         profile_id: Option<String>,
+        model: Option<String>,
         workspace: Option<PathBuf>,
         tools: Vec<String>,
         snapshot: &[crate::llm::Message],
@@ -441,6 +446,7 @@ impl SessionStore {
         let meta = SessionMeta {
             id: session_id.clone(),
             profile_id: profile_id.clone(),
+            model,
             created_at: Utc::now(),
             workspace: workspace.clone(),
             sandbox: None,
@@ -489,6 +495,7 @@ impl SessionStore {
         session_id: SessionId,
         parent_id: SessionId,
         profile_id: Option<String>,
+        model: Option<String>,
         workspace: Option<PathBuf>,
         tools: Vec<String>,
         snapshot: &[crate::llm::Message],
@@ -502,6 +509,7 @@ impl SessionStore {
         let meta = SessionMeta {
             id: session_id.clone(),
             profile_id: profile_id.clone(),
+            model,
             created_at: Utc::now(),
             workspace: workspace.clone(),
             sandbox: None,
@@ -1001,6 +1009,7 @@ mod tests {
             .create_compaction(
                 parent_id.clone(),
                 Some("p".to_owned()),
+                Some("kimi/kimi-k3".to_owned()),
                 None,
                 vec!["read".to_owned()],
                 &snapshot,
@@ -1012,6 +1021,9 @@ mod tests {
         let meta = store.read_meta(&new_id).unwrap();
         assert_eq!(meta.origin.kind, OriginKind::Compaction);
         assert_eq!(meta.origin.parent_id, Some(parent_id));
+        // The per-session model override must carry into the compaction session
+        // (a compaction is transparent to the user; the model must not change).
+        assert_eq!(meta.model.as_deref(), Some("kimi/kimi-k3"));
 
         let loaded = store.read_snapshot(&new_id).unwrap();
         assert_eq!(loaded, snapshot);

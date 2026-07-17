@@ -534,6 +534,7 @@ impl SessionActor {
         match self.store.create_compaction(
             old_sid,
             meta.profile_id,
+            meta.model,
             meta.workspace,
             Vec::new(),
             &snapshot,

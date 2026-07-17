@@ -22,6 +22,15 @@ pub struct SessionMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
 
+    /// The per-session model override (`provider/model_id`), if one was chosen
+    /// at creation instead of the profile default. Stored so the RUNTIME panel
+    /// resolves the session's real model, and so an idle-evicted session respawns
+    /// on the same model rather than falling back to the profile default. `None`
+    /// means the profile default applies. This is session-private; it is never
+    /// written back to `providers.toml` or the profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
     /// When the session was created.
     pub created_at: DateTime<Utc>,
 
@@ -163,6 +172,7 @@ mod tests {
         let meta = SessionMeta {
             id: SessionId("01J5M3HKEA7V2X3P1YKRN9C4WG".to_owned()),
             profile_id: Some("coding-agent".to_owned()),
+            model: Some("kimi/kimi-k3".to_owned()),
             created_at: Utc.with_ymd_and_hms(2026, 6, 11, 10, 0, 0).unwrap(),
             workspace: Some(PathBuf::from("/home/user/project/foo")),
             sandbox: Some(SandboxDescriptor {
@@ -183,6 +193,7 @@ mod tests {
         let meta = SessionMeta {
             id: SessionId("01J5M3HKEA7V2X3P1YKRN9C4WG".to_owned()),
             profile_id: None,
+            model: None,
             created_at: Utc.with_ymd_and_hms(2026, 6, 11, 10, 0, 0).unwrap(),
             workspace: None,
             sandbox: None,
@@ -195,6 +206,7 @@ mod tests {
         assert!(!text.contains("parent_id"));
         assert!(!text.contains("fork_at_seq"));
         assert!(!text.contains("profile_id"));
+        assert!(!text.contains("model"));
     }
 
     #[test]

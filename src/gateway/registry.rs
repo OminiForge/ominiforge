@@ -580,6 +580,7 @@ impl SessionRegistry {
     pub async fn runtime_info(
         &self,
         profile_id: Option<&str>,
+        model: Option<&str>,
         workspace: Option<&Path>,
     ) -> Result<RuntimeInfo> {
         let profile_name = profile_id.unwrap_or(&self.inner.defaults.profile);
@@ -592,7 +593,7 @@ impl SessionRegistry {
             .load_profile(profile_name)
             .with_context(|| format!("failed to load profile `{profile_name}`"))?;
         let resolved = store
-            .resolve(&providers, &profile, None, None)
+            .resolve(&providers, &profile, model, None)
             .context("failed to resolve model selection")?;
 
         let mut env = current_env_overlay();
@@ -727,11 +728,23 @@ impl SessionRegistry {
         let assembled = self
             .assemble_with(&id, profile, model, workspace, None)
             .await?;
+        // Stamp the model only when the caller actually chose one (a per-session
+        // override); a `None` stays `None` so the session tracks the profile
+        // default rather than freezing today's default into `session.toml`. When
+        // set, persist the *resolved* `provider/model_id` (authoritative, and
+        // unambiguous across providers that share a bare id).
+        let model_stamp = model.map(|_| {
+            format!(
+                "{}/{}",
+                assembled.resolved.provider_name, assembled.resolved.model_id
+            )
+        });
         let writer = self
             .store()
             .create_new_with_id(
                 id.clone(),
                 Some(assembled.profile_name.clone()),
+                model_stamp,
                 Some(assembled.workspace.clone()),
                 assembled.tool_names.clone(),
             )
@@ -787,7 +800,15 @@ impl SessionRegistry {
         // Mint the child's id up front for the same reason as `create_with`: a
         // `session`-anchored mount must resolve to the child's own directory.
         let id = self.store().mint_id();
-        let assembled = self.assemble_with(&id, None, None, None, injected).await?;
+        // A fork inherits the parent's per-session model: read the parent meta up
+        // front so the child both *runs* on that model (fed to `assemble_with`)
+        // and *records* it (stamped via `create_fork` below). `None` (parent had
+        // no override) keeps the profile default. Without this the fork would
+        // silently drop to the profile default on both axes.
+        let meta = self.meta(parent)?;
+        let assembled = self
+            .assemble_with(&id, None, meta.model.as_deref(), None, injected)
+            .await?;
         let system = Self::system_seed(&assembled);
 
         // Rebuild the parent's context up to (and including) `at_seq` as the
@@ -807,7 +828,6 @@ impl SessionRegistry {
         let parent_runtime = crate::agent::rebuild_runtime(&upto, system.clone());
         let snapshot = parent_runtime.context;
 
-        let meta = self.meta(parent)?;
         let writer = self
             .store()
             .create_fork(
@@ -815,6 +835,7 @@ impl SessionRegistry {
                 parent.clone(),
                 at_seq,
                 meta.profile_id,
+                meta.model,
                 meta.workspace,
                 assembled.tool_names.clone(),
                 &snapshot,
@@ -893,12 +914,21 @@ impl SessionRegistry {
         let parent_runtime = crate::agent::rebuild_runtime(&all, system.clone());
         let snapshot = parent_runtime.context;
 
+        // Same per-session stamp rule as `create_with`: record the chosen model
+        // (resolved, qualified) only when one was passed, else `None`.
+        let model_stamp = model.map(|_| {
+            format!(
+                "{}/{}",
+                assembled.resolved.provider_name, assembled.resolved.model_id
+            )
+        });
         let writer = self
             .store()
             .create_reconfiguration(
                 id.clone(),
                 parent.clone(),
                 Some(assembled.profile_name.clone()),
+                model_stamp,
                 Some(assembled.workspace.clone()),
                 assembled.tool_names.clone(),
                 &snapshot,
@@ -928,7 +958,14 @@ impl SessionRegistry {
     /// subprocesses), on the gateway defaults. Diagnostics go to stderr (the
     /// server's log).
     async fn assemble(&self, session_id: &SessionId) -> Result<Assembled> {
-        self.assemble_with(session_id, None, None, None, None).await
+        // Respawn on the session's *stamped* model (`session.toml`), not the
+        // gateway default: a session created with a per-session model override
+        // must come back on that model after idle eviction, not silently drop to
+        // the profile default (previously a known limitation). `None` (no
+        // override stamped) still means "follow the profile default".
+        let model = self.meta(session_id).ok().and_then(|m| m.model);
+        self.assemble_with(session_id, None, model.as_deref(), None, None)
+            .await
     }
 
     /// Like [`assemble`](Self::assemble) but with per-session overrides: `profile`
