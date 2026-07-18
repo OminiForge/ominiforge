@@ -1,7 +1,10 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
+	import { fly } from 'svelte/transition';
 	import { client } from '$lib/client';
+	import { rise } from '$lib/motion';
+	import Skeleton from '$lib/components/Skeleton.svelte';
 	import type { WorkspaceSummary } from '$lib/types/WorkspaceSummary';
 
 	let workspaces = $state<WorkspaceSummary[]>([]);
@@ -51,7 +54,15 @@
 		if (e.key === 'Enter') {
 			e.preventDefault();
 			void createWorkspace();
+		} else if (e.key === 'Escape') {
+			cfgOpen = false;
 		}
+	}
+
+	/** Focus the popover's path input when it mounts (the a11y-safe equivalent
+	 *  of the autofocus attribute, which svelte-check flags). */
+	function focusOnMount(node: HTMLInputElement) {
+		node.focus();
 	}
 
 	function formatTime(iso: string | null): string {
@@ -99,7 +110,12 @@
 					New workspace
 				</button>
 				{#if cfgOpen}
-					<div class="newbtn-popover">
+					<!-- Click-away scrim: an invisible full-viewport layer behind the
+					     popover (z-30) that closes it on any outside click. Esc is handled
+					     on the path input, which takes focus on open. -->
+					<!-- svelte-ignore a11y_click_events_have_key_events -->
+					<div class="popover-scrim" role="presentation" onclick={() => (cfgOpen = false)}></div>
+					<div class="newbtn-popover" transition:fly={rise(-6)}>
 						<label class="cfg-field">
 							<span class="cfg-key">Workspace path</span>
 							<input
@@ -109,6 +125,7 @@
 								onkeydown={onPathKeydown}
 								placeholder="/absolute/path/to/project"
 								spellcheck="false"
+								use:focusOnMount
 							/>
 						</label>
 						{#if createError}
@@ -131,13 +148,45 @@
 		{/if}
 
 		{#if loading}
-			<p class="muted">加载中…</p>
+			<ul class="grid" aria-hidden="true">
+				{#each Array(6) as _}
+					<li class="skel-card">
+						<Skeleton width="55%" height="14px" />
+						<Skeleton width="38%" height="11px" />
+						<div class="skel-foot">
+							<Skeleton width="56px" height="12px" />
+							<Skeleton width="44px" height="11px" />
+						</div>
+					</li>
+				{/each}
+			</ul>
 		{:else if workspaces.length === 0}
-			<p class="muted">还没有工作区，新建一个开始吧。</p>
+			<div class="empty" in:fly={rise(8)}>
+				<svg
+					width="36"
+					height="36"
+					viewBox="0 0 36 36"
+					fill="none"
+					stroke="currentColor"
+					stroke-width="1.4"
+					stroke-linecap="round"
+					stroke-linejoin="round"
+					aria-hidden="true"
+				>
+					<path
+						d="M5 11a2 2 0 0 1 2-2h6.5l2.5 3H31a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V11z"
+					/>
+					<line x1="19" y1="17" x2="19" y2="23" />
+					<line x1="16" y1="20" x2="22" y2="20" />
+				</svg>
+				<p class="empty-title">还没有工作区</p>
+				<p class="empty-sub">工作区是一个项目目录，会话都在其中运行。</p>
+				<button class="empty-cta" onclick={() => (cfgOpen = true)}>新建工作区</button>
+			</div>
 		{:else}
 			<ul class="grid">
-				{#each workspaces as ws (ws.id)}
-					<li>
+				{#each workspaces as ws, i (ws.id)}
+					<li in:fly={rise(10, 200, Math.min(i * 40, 200))}>
 						<a href={`/workspaces/${ws.id}`} class="card">
 							<div class="card-head">
 								<div class="card-title">{wsName(ws)}</div>
@@ -214,7 +263,7 @@
 		position: absolute;
 		top: calc(100% + 6px);
 		right: 0;
-		z-index: 30;
+		z-index: var(--z-popover);
 		width: 320px;
 		max-width: min(320px, 80vw);
 		display: flex;
@@ -225,6 +274,13 @@
 		border: 1px solid var(--border-default);
 		border-radius: var(--radius-lg);
 		box-shadow: var(--shadow-md, 0 8px 24px rgba(0, 0, 0, 0.18));
+	}
+
+	.popover-scrim {
+		position: fixed;
+		inset: 0;
+		z-index: calc(var(--z-popover) - 1);
+		cursor: default;
 	}
 
 	.cfg-field {
@@ -304,11 +360,48 @@
 		font-size: 13px;
 	}
 
-	.muted {
-		color: var(--text-tertiary);
+	.empty {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: var(--space-2);
+		padding: var(--space-12) var(--space-4);
+		color: var(--text-disabled);
+	}
+
+	.empty-title {
+		font-size: 15px;
+		font-weight: 590;
+		color: var(--text-secondary);
+		font-family: var(--font-chinese);
+		margin-top: var(--space-2);
+	}
+
+	.empty-sub {
 		font-size: 13px;
-		text-align: center;
-		padding: var(--space-12);
+		color: var(--text-tertiary);
+		font-family: var(--font-chinese);
+	}
+
+	.empty-cta {
+		margin-top: var(--space-3);
+		padding: var(--space-2) var(--space-4);
+		background: var(--canvas-overlay);
+		border: 1px solid var(--border-default);
+		border-radius: var(--radius-md);
+		color: var(--text-primary);
+		font-size: 13px;
+		font-weight: 590;
+		font-family: var(--font-chinese);
+		cursor: pointer;
+		transition:
+			background var(--dur-fast) var(--ease-out),
+			border-color var(--dur-fast) var(--ease-out);
+	}
+
+	.empty-cta:hover {
+		background: var(--surface-hover);
+		border-color: var(--border-strong);
 	}
 
 	/* ---- WORKSPACE GRID ---- */
@@ -321,6 +414,24 @@
 
 	.grid li {
 		min-width: 0;
+	}
+
+	.skel-card {
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-2);
+		padding: var(--space-4);
+		border: 1px solid var(--border-subtle);
+		border-radius: var(--radius-md);
+		background: var(--canvas-raised);
+	}
+
+	.skel-foot {
+		display: flex;
+		justify-content: space-between;
+		padding-top: var(--space-3);
+		border-top: 1px solid var(--border-subtle);
+		margin-top: var(--space-2);
 	}
 
 	.card {
@@ -336,12 +447,14 @@
 		text-decoration: none;
 		transition:
 			background var(--dur-fast) var(--ease-out),
-			border-color var(--dur-fast) var(--ease-out);
+			border-color var(--dur-fast) var(--ease-out),
+			transform var(--dur-fast) var(--ease-out);
 	}
 
 	.card:hover {
 		background: var(--surface-hover);
-		border-color: var(--border-default);
+		border-color: var(--border-strong);
+		transform: translateY(-1px);
 	}
 
 	.card-head {

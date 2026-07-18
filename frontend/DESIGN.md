@@ -260,6 +260,15 @@ ominiforge Web 控制台是**开发者每天盯 8 小时的 agent 生产工具**
 - `--space-12: 48px`
 
 > 旧语义名（`--gap-xs/sm/md/lg/xl`）保留为别名，向后兼容。新代码优先用 `--space-{n}`。
+
+### 3.2 动效规则
+
+- Svelte `transition:` 的参数一律从 `lib/motion.ts` 的工厂取（`rise`/`pop`/`fadeIn`），不在组件里手写字面量。
+- 时长只用两档：`120ms`（小元素：提示、chip）和 `200ms`（面板、列表项）；缓动统一 `cubicOut`（svelte/easing 中最接近 `--ease-out` 的曲线）。
+- `prefers-reduced-motion`：工厂自动把 duration 归零，与 tokens.css 对 CSS transition 的降级对齐，组件无需各自判断。
+- 骨架屏用 `components/Skeleton.svelte`（shimmer 只扫 canvas token 色），替代纯文字「加载中…」；骨架要复刻真实布局，避免加载完成时跳动。
+- 弹层/对话框必须有进入+退出过渡；消失动画和出现同等重要，用 `transition:` 不用 `in:`。
+
 ---
 
 ## 4. 组件规范

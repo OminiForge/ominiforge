@@ -1,5 +1,7 @@
 <script lang="ts">
 	import type { Snippet } from 'svelte';
+	import { fade, scale } from 'svelte/transition';
+	import { fadeIn, pop } from '$lib/motion';
 	import Button from './Button.svelte';
 
 	let {
@@ -51,7 +53,7 @@
      dismissal via the window-level Escape handler above, so the backdrop click
      is a pointer-only convenience. -->
 <!-- svelte-ignore a11y_click_events_have_key_events -->
-<div class="backdrop" role="presentation" onclick={oncancel}>
+<div class="backdrop" role="presentation" onclick={oncancel} transition:fade={fadeIn()}>
 	<div
 		bind:this={panelEl}
 		class="panel"
@@ -60,6 +62,7 @@
 		aria-label={title}
 		tabindex="-1"
 		onclick={(e) => e.stopPropagation()}
+		transition:scale={pop()}
 	>
 		<h2 class="title">{title}</h2>
 		{#if children}

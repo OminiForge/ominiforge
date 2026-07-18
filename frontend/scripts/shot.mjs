@@ -68,6 +68,54 @@ const META = {
 	}
 };
 
+/** Dashboard workspaces (WorkspaceSummary). */
+const WORKSPACES = [
+	{
+		id: 'ws-ominiforge',
+		path: '/home/duskgrow/project/rust/ominiforge',
+		session_count: 2,
+		latest_session_time: iso(5 * 60_000)
+	},
+	{
+		id: 'ws-sideproj',
+		path: '/home/duskgrow/project/side-project',
+		session_count: 1,
+		latest_session_time: iso(26 * 3600_000)
+	},
+	{ id: 'none', path: null, session_count: 1, latest_session_time: iso(2 * 3600_000) }
+];
+
+/** Profiles/models for the conversation config picker. */
+const PROFILES = [
+	{ name: 'coding-agent', description: '默认编码 profile' },
+	{ name: 'research', description: null }
+];
+const MODELS = [
+	{ provider: 'anthropic', model_id: 'sonnet', context_window: 200000 },
+	{ provider: 'anthropic', model_id: 'haiku', context_window: 200000 }
+];
+
+/** Settings providers view (ProvidersView). */
+const PROVIDERS_VIEW = {
+	providers: [
+		{
+			name: 'anthropic',
+			type: 'anthropic',
+			base_url: 'https://api.anthropic.com',
+			api_key_env: 'ANTHROPIC_API_KEY',
+			models: [{ id: 'sonnet', context_window: 200000, max_output_tokens: 8192 }]
+		},
+		{
+			name: 'openai',
+			type: 'openai-chat',
+			base_url: 'https://api.openai.com/v1',
+			api_key_env: 'OPENAI_API_KEY',
+			models: [{ id: 'gpt-4o', context_window: 128000, max_output_tokens: 4096 }]
+		}
+	],
+	secret_names: ['anthropic']
+};
+
 /** Derived summaries, keyed by id. `first_user_input` drives the list title. */
 const SUMMARY = {
 	'01J5SESSIONAAAAAAAAAAAAAAA': {
@@ -175,6 +223,15 @@ async function mockApi(page) {
 		const json = (obj) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(obj) });
 
 		if (path === '/sessions') return json({ sessions: Object.keys(META) });
+		if (path === '/workspaces') return json({ workspaces: WORKSPACES });
+		if (path === '/workspaces/ws-ominiforge/sessions')
+			return json({ sessions: Object.values(META) });
+		if (path === '/workspaces/ws-ominiforge/sessions/archived') return json({ sessions: [] });
+		if (path === '/status/events')
+			return route.fulfill({ status: 200, contentType: 'text/event-stream', body: '' });
+		if (path === '/profiles') return json({ profiles: PROFILES });
+		if (path === '/models') return json({ models: MODELS });
+		if (path === '/providers') return json(PROVIDERS_VIEW);
 
 		const m = path.match(/^\/sessions\/([^/]+)(\/.*)?$/);
 		if (m) {
@@ -242,9 +299,11 @@ async function diagnoseOverflow(page, label) {
 			const cs = getComputedStyle(el);
 			const scrolls = cs.overflowX === 'auto' || cs.overflowX === 'scroll';
 			// A scroll container whose content is wider than its box → a horizontal
-			// scrollbar appears inside it. Tolerate code blocks (<pre>), which are
-			// *meant* to scroll horizontally.
-			if (scrolls && el.scrollWidth > el.clientWidth + 1 && el.tagName !== 'PRE') {
+			// scrollbar appears inside it. Tolerate elements *meant* to scroll
+			// horizontally: <pre> code blocks and .diff unified-diff rows (long
+			// code lines must not wrap, so the block scrolls by design).
+			const intentional = el.tagName === 'PRE' || el.classList.contains('diff');
+			if (scrolls && el.scrollWidth > el.clientWidth + 1 && !intentional) {
 				out.containers.push({
 					tag: el.tagName.toLowerCase(),
 					cls: (el.className || '').toString().slice(0, 40),
@@ -274,10 +333,11 @@ async function shoot() {
 	const browser = await chromium.launch({ executablePath: chromiumPath() });
 
 	const targets = [
-		{ name: 'sessions-list', path: '/sessions', waitFor: '.card, .muted', contentSel: '.card' },
+		{ name: 'dashboard', path: '/', waitFor: '.card, .empty', contentSel: '.card' },
+		{ name: 'settings', path: '/settings', waitFor: '.panel, .muted', contentSel: '.panel' },
 		{
 			name: 'conversation',
-			path: '/sessions/01J5SESSIONAAAAAAAAAAAAAAA',
+			path: '/workspaces/ws-ominiforge/sessions/01J5SESSIONAAAAAAAAAAAAAAA',
 			waitFor: '.item-text, .conv-inner',
 			contentSel: '.item-text'
 		}

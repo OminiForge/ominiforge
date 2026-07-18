@@ -2,6 +2,7 @@
 	import { onDestroy, onMount, tick } from 'svelte';
 	import { browser } from '$app/environment';
 	import { goto } from '$app/navigation';
+	import { fly, fade, scale } from 'svelte/transition';
 	import { Marked } from 'marked';
 	import hljs from 'highlight.js/lib/common';
 	import DOMPurify from 'dompurify';
@@ -26,6 +27,7 @@
 	import { loadQueue, saveQueue, enqueue, removeFromQueue, type QueuedMessage } from '$lib/queue';
 	import { activeTick, jumpTarget } from '$lib/minimap';
 	import { setPendingFork, takePendingFork, type PendingFork } from '$lib/fork';
+	import { rise, pop, fadeIn } from '$lib/motion';
 
 	/** Props: the workspace this conversation lives under (its path-derived id,
 	 *  used to build session URLs) and the session id to show (`'new'` for a
@@ -208,6 +210,11 @@
 	// uncomfortable rapid-scrolling animation through the entire conversation.
 	let isReplaying = $state(false);
 	let replayDebounce: ReturnType<typeof setTimeout> | undefined;
+	/** Enter animation for stream items (DESIGN.md §3.2). The replay burst pours
+	 *  history in faster than any animation, so duration collapses to 0 while
+	 *  `isReplaying`; only post-replay items (a live turn's output, a freshly
+	 *  sent bubble) get the 8px rise. Evaluated when each intro triggers. */
+	const itemEnter = $derived(isReplaying ? { duration: 0 } : rise(8, 200));
 	/** Cached conversation state per session. Preserves streaming content
 	 *  (e.g. in-progress reasoning) across session switches. Live deltas are
 	 *  not replayed on re-subscribe (gateway-transport.ts §reconnect), so without
@@ -455,6 +462,15 @@
 		// and debounce — once events stop arriving we consider replay done.
 		isReplaying = true;
 		clearTimeout(replayDebounce);
+		if (cached) {
+			// A cached restore subscribes `since` lastSeq — there is no replay
+			// burst to wait out. Close the replay window even when the gateway
+			// sends nothing, otherwise every `!isReplaying` gate (summary
+			// refresh, item enter animation) stays stuck off on an idle session.
+			replayDebounce = setTimeout(() => {
+				isReplaying = false;
+			}, 300);
+		}
 		sub = client.subscribeEvents(
 			id,
 			{
@@ -988,7 +1004,7 @@
 				{:else}
 					<button class="session-id-btn" onclick={copyId} title={copied ? '已复制!' : sessionId}>
 						{shortId(sessionId)}
-						{#if copied}<span class="copy-toast">Copied!</span>{/if}
+						{#if copied}<span class="copy-toast" transition:fade={fadeIn()}>Copied!</span>{/if}
 					</button>
 					{#if incomplete}
 						<span class="topbar-badge badge-running">incomplete</span>
@@ -1062,7 +1078,7 @@
 					{/if}
 					{#each convo.items as item, i (i)}
 						{#if item.kind === 'user'}
-							<div class="item item-user" data-user-anchor={i}>
+							<div class="item item-user" data-user-anchor={i} in:fly|local={itemEnter}>
 								{#if item.seq != null && !isDraft && item.seq !== firstUserSeq}
 									<!-- Turn actions: low-frequency per-turn operations, anchored to
 								     the user message that starts the turn. Faint by default
@@ -1104,7 +1120,11 @@
 							</div>
 						{:else if item.kind === 'text'}
 							{#if item.text.trim()}
-								<div class="item item-text" class:streaming={item.streaming}>
+								<div
+									class="item item-text"
+									class:streaming={item.streaming}
+									in:fly|local={itemEnter}
+								>
 									{#if browser}
 										<!-- eslint-disable-next-line svelte/no-at-html-tags -->
 										{@html renderMarkdown(item.text)}
@@ -1115,7 +1135,11 @@
 							{/if}
 						{:else if item.kind === 'reasoning'}
 							{#if item.text.trim()}
-								<div class="item item-reasoning" class:expanded={!isCollapsed(item, i)}>
+								<div
+									class="item item-reasoning"
+									class:expanded={!isCollapsed(item, i)}
+									in:fly|local={itemEnter}
+								>
 									<button
 										class="reasoning-toggle"
 										onclick={() => toggleCollapse(item, i)}
@@ -1153,7 +1177,7 @@
 								</div>
 							{/if}
 						{:else if item.kind === 'tool'}
-							<div class="item">
+							<div class="item" in:fly|local={itemEnter}>
 								<ToolBlock {item} />
 							</div>
 						{:else if item.kind === 'plan'}
@@ -1163,7 +1187,7 @@
 					     the dock, so skip it here too — only committed history cards render. -->
 							{#if !item.streaming && i !== dockPlan?.index}
 								{@const prog = planProgress(item.steps)}
-								<div class="item">
+								<div class="item" in:fly|local={itemEnter}>
 									<div
 										class="plan-card"
 										class:expanded={!isCollapsed(item, i)}
@@ -1268,9 +1292,9 @@
 								</div>
 							{/if}
 						{:else if item.kind === 'error'}
-							<div class="item item-error">{item.message}</div>
+							<div class="item item-error" in:fly|local={itemEnter}>{item.message}</div>
 						{:else if item.kind === 'notice'}
-							<div class="item item-notice">{item.message}</div>
+							<div class="item item-notice" in:fly|local={itemEnter}>{item.message}</div>
 						{/if}
 					{/each}
 
@@ -1307,6 +1331,7 @@
 					onclick={scrollToBottom}
 					title="回到底部"
 					aria-label="Scroll to latest"
+					transition:fly={rise(8, 120)}
 				>
 					<svg
 						width="16"
@@ -1443,7 +1468,7 @@
 					     cancellable chip (× drops it back into the input to edit/resend). -->
 					<div class="queue" aria-label="待发送消息">
 						{#each queued as item (item.id)}
-							<div class="queue-chip">
+							<div class="queue-chip" transition:scale={pop(120)}>
 								<span class="queue-dot" aria-hidden="true"></span>
 								<span class="queue-text" title={item.text}>{item.text}</span>
 								<button
@@ -1512,7 +1537,7 @@
 								<span class="cfg-label">{cfgLabel}</span>
 							</button>
 							{#if cfgOpen}
-								<div class="cfg-popover">
+								<div class="cfg-popover" transition:fly={rise(6)}>
 									<label class="cfg-field">
 										<span class="cfg-key">Profile</span>
 										<select class="cfg-select" bind:value={selProfile}>
@@ -3164,6 +3189,10 @@
 		background: var(--surface-hover);
 		color: var(--text-primary);
 		border-color: var(--border-strong);
+	}
+
+	.input-btn:active {
+		transform: translateY(1px);
 	}
 
 	.input-btn.primary {

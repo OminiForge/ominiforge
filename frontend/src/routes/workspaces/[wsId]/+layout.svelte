@@ -7,6 +7,7 @@
 	import type { SessionSummary } from '$lib/types/SessionSummary';
 	import SessionStatusIcon from '$lib/components/SessionStatusIcon.svelte';
 	import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
+	import Skeleton from '$lib/components/Skeleton.svelte';
 	import { connectStatus, viewState, latestSeqOf } from '$lib/status.svelte';
 
 	let { children } = $props();
@@ -364,7 +365,14 @@
 
 		<div class="session-list">
 			{#if loading}
-				<p class="list-muted">加载中…</p>
+				<div class="skel-rows" aria-hidden="true">
+					{#each Array(5) as _}
+						<div class="skel-row">
+							<Skeleton width="72%" height="13px" />
+							<Skeleton width="42%" height="11px" />
+						</div>
+					{/each}
+				</div>
 			{:else if error}
 				<p class="list-error">{error}</p>
 			{:else if rows.length === 0}
@@ -448,7 +456,14 @@
 			{#if archivedOpen}
 				<div class="archived-list">
 					{#if archivedLoading}
-						<p class="list-muted">加载中…</p>
+						<div class="skel-rows" aria-hidden="true">
+							{#each Array(3) as _}
+								<div class="skel-row">
+									<Skeleton width="68%" height="13px" />
+									<Skeleton width="38%" height="11px" />
+								</div>
+							{/each}
+						</div>
 					{:else if archivedError}
 						<p class="list-error">{archivedError}</p>
 					{:else if archivedRows.length === 0}
@@ -654,6 +669,19 @@
 		transition:
 			background var(--dur-fast) var(--ease-out),
 			border-color var(--dur-fast) var(--ease-out);
+	}
+
+	.skel-rows {
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-1);
+	}
+
+	.skel-row {
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-2);
+		padding: var(--space-2) var(--space-3);
 	}
 
 	/* The title/status stack; owns the row's flexible width so a long title

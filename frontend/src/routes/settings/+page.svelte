@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { client } from '$lib/client';
+	import Notice from '$lib/components/Notice.svelte';
 	import type { ProviderConfig } from '$lib/types/ProviderConfig';
 	import type { ProviderType } from '$lib/types/ProviderType';
 	import type { ModelConfig } from '$lib/types/ModelConfig';
@@ -26,6 +27,16 @@
 	let loading = $state(true);
 	let error = $state<string | null>(null);
 	let notice = $state<string | null>(null);
+
+	// Sliding pill behind the active tab: measured from the real button so it
+	// tracks text width/font loading instead of hardcoded geometry.
+	let tabsEl = $state<HTMLDivElement | null>(null);
+	let pill = $state({ x: 0, w: 0 });
+	$effect(() => {
+		void tab; // re-measure on every tab switch
+		const active = tabsEl?.querySelector<HTMLElement>('.tab.active');
+		if (active) pill = { x: active.offsetLeft, w: active.offsetWidth };
+	});
 
 	const PROVIDER_TYPES: ProviderType[] = ['openai-chat', 'openai-completion', 'anthropic', 'custom'];
 
@@ -187,7 +198,13 @@
 	<div class="page-inner">
 		<header>
 			<h1>Settings</h1>
-			<div class="tabs">
+			<div class="tabs" bind:this={tabsEl}>
+				<span
+					class="tab-pill"
+					style:transform="translateX({pill.x}px)"
+					style:width="{pill.w}px"
+					aria-hidden="true"
+				></span>
 				<button class="tab" class:active={tab === 'providers'} onclick={() => (tab = 'providers')}>
 					Providers
 				</button>
@@ -197,7 +214,7 @@
 			</div>
 		</header>
 
-		{#if notice}<p class="notice">{notice}</p>{/if}
+		{#if notice}<Notice message={notice} />{/if}
 		{#if error}<p class="error">{error}</p>{/if}
 
 		{#if loading}
@@ -384,6 +401,7 @@
 	}
 
 	.tabs {
+		position: relative;
 		display: inline-flex;
 		gap: 2px;
 		background: var(--canvas-float);
@@ -391,7 +409,21 @@
 		border-radius: var(--radius-md);
 	}
 
+	.tab-pill {
+		position: absolute;
+		top: 2px;
+		bottom: 2px;
+		left: 0;
+		background: var(--canvas-raised);
+		border-radius: var(--radius-sm);
+		transition:
+			transform var(--dur-std) var(--ease-out),
+			width var(--dur-std) var(--ease-out);
+	}
+
 	.tab {
+		position: relative;
+		z-index: 1;
 		padding: 5px var(--space-3);
 		border: none;
 		background: transparent;
@@ -400,21 +432,11 @@
 		font-weight: 500;
 		border-radius: var(--radius-sm);
 		cursor: pointer;
-		transition: all var(--dur-fast) var(--ease-out);
+		transition: color var(--dur-fast) var(--ease-out);
 	}
 
 	.tab.active {
-		background: var(--canvas-raised);
 		color: var(--text-primary);
-	}
-
-	.notice {
-		color: var(--accent-ink);
-		background: color-mix(in srgb, var(--accent) 10%, transparent);
-		padding: var(--space-2) var(--space-4);
-		border-radius: var(--radius-md);
-		margin-bottom: var(--space-4);
-		font-size: 13px;
 	}
 
 	.error {
@@ -535,8 +557,8 @@
 	}
 
 	.badge.ok {
-		color: var(--accent-ink);
-		background: color-mix(in srgb, var(--accent) 12%, transparent);
+		color: var(--state-done-text);
+		background: var(--state-done-bg);
 	}
 	/* STYLE-APPEND-3 */
 	.models {
