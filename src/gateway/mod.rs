@@ -22,15 +22,16 @@
 //! [`SessionRegistry`]: registry::SessionRegistry
 
 mod actor;
+mod approval;
 mod config;
 mod registry;
 mod server;
 mod status;
 mod workspace;
-mod workspace_config;
+pub(crate) mod workspace_config;
 
 pub use config::GatewayConfig;
-pub use registry::{RuntimeInfo, SessionDefaults, SessionRegistry};
+pub use registry::{RuntimeInfo, SessionDefaults, SessionRegistry, WorkspaceConfigError};
 pub use server::serve;
 pub use status::{ActivityStatus, SessionStatus, StatusHub};
 pub use workspace::{WorkspaceId, WorkspaceSummary, group_sessions};

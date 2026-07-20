@@ -41,22 +41,35 @@ use super::workspace::{WorkspaceId, WorkspaceRegistry};
 
 /// The on-disk shape of `<gateway>/.omini/workspaces/<id>.toml`.
 ///
-/// Only `[network]` and `[[mounts]]` are defined today; the record is
-/// intentionally open for a future permission-gating section and workspace
-/// memory (`doc/workspace-config.md`) without a schema change forcing every file
-/// to be rewritten. Unknown keys are ignored for forward compatibility.
+/// `[network]`, `[[mounts]]`, and `[permission]` are defined today; the record
+/// stays open for further sections (e.g. workspace memory,
+/// `doc/workspace-config.md`) without a schema change forcing every file to be
+/// rewritten. Unknown keys are ignored for forward compatibility.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 #[serde(default)]
 pub struct WorkspaceConfig {
     /// Sandbox network egress override for sessions in this workspace. `None`
     /// (section absent) falls through to the profile / gateway default.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkSection>,
     /// Auxiliary sandbox mounts (`doc/sandbox.md` §3.7): each binds a named
     /// anchor's host directory into the guest. Empty (section absent) = only the
     /// workspace mount (§3.3).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<MountSpec>,
+    /// Per-workspace tool-call gate (`doc/permission.md` §3), the **top** tier of
+    /// the three-tier resolution (`workspace > profile > gateway`). Layered over
+    /// the profile+gateway policy: its `deny` rules union in (a workspace can add
+    /// denials, never drop an inherited one — safe because this file is
+    /// gateway-trusted, not agent-writable), its `ask` list replaces when set.
+    /// Empty (section absent) contributes nothing.
+    ///
+    /// Safe to live here *because* the file is gateway-side and deployer-owned
+    /// (see the module header): reading a permission grant from the
+    /// agent-writable project dir would let an agent widen its own gate.
+    #[serde(default, skip_serializing_if = "crate::permission::PermissionPolicy::is_empty")]
+    pub permission: crate::permission::PermissionPolicy,
 }
 
 /// One entry in a workspace's `[[mounts]]`: bind a named anchor's host directory
@@ -64,6 +77,7 @@ pub struct WorkspaceConfig {
 /// (session-private / workspace-shared / gateway-global) rather than a fixed
 /// purpose — the user composes what to put there.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct MountSpec {
     /// Sharing scope: `session` (per-session private), `workspace` (shared across
     /// sessions in this workspace), or `gateway` (global). Resolved to a host
@@ -131,6 +145,41 @@ impl WorkspaceConfigStore {
             source,
         })?;
         Ok(Some(config))
+    }
+
+    /// Write `config` as the workspace's `<id>.toml`, creating the store
+    /// directory on demand. Serializes the whole record (network + mounts +
+    /// permission); an empty section is simply omitted (its `skip_serializing_if`).
+    ///
+    /// The path is canonicalized before hashing so the id matches the one derived
+    /// at session-create time (same rule as [`load`](Self::load)). Unlike `load`,
+    /// a non-existent workspace path is an **error** here: writing a policy for a
+    /// path that cannot be resolved would strand an un-loadable file (Karpathy
+    /// §12, fail-loud).
+    ///
+    /// # Errors
+    /// The workspace path does not resolve, the directory cannot be created, the
+    /// record cannot be serialized, or the file cannot be written.
+    pub fn save(
+        &self,
+        workspace_path: &Path,
+        config: &WorkspaceConfig,
+    ) -> Result<(), ConfigError> {
+        let canonical =
+            std::fs::canonicalize(workspace_path).map_err(|source| ConfigError::Io {
+                path: workspace_path.to_owned(),
+                source,
+            })?;
+        let id = WorkspaceId::from_path(&canonical);
+        let path = self.path_for_id(&id);
+        let text = toml::to_string_pretty(config).map_err(|source| ConfigError::Serialize {
+            path: path.clone(),
+            source,
+        })?;
+        // Atomic write (temp + rename, creates the dir): a crash mid-write must
+        // not leave a truncated policy file — same primitive as providers/profile
+        // saves (`crate::config::write_atomic`).
+        crate::config::write_atomic(&path, &text)
     }
 
     /// List configs whose workspace path no longer resolves — orphans a human or
@@ -219,6 +268,64 @@ mod tests {
         let store = WorkspaceConfigStore::new(dir);
         let cfg = store.load(&ws).unwrap().unwrap();
         assert_eq!(cfg.network.unwrap().policy.as_deref(), Some("isolated"));
+    }
+
+    #[test]
+    fn load_reads_permission_section() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let dir = tmp.path().join("workspaces");
+        write_config(
+            &dir,
+            &ws,
+            "[[permission.deny]]\ntool = \"shell\"\ncontains = [\"rm -rf\"]\n",
+        );
+        let store = WorkspaceConfigStore::new(dir);
+        let cfg = store.load(&ws).unwrap().unwrap();
+        assert!(!cfg.permission.is_empty());
+        assert_eq!(
+            cfg.permission
+                .evaluate("shell", &serde_json::json!({"command": "rm -rf /"})),
+            crate::permission::Decision::Deny
+        );
+    }
+
+    /// `save` round-trips: a written config loads back identically, including the
+    /// permission section. This guards the write path the workspace-config UI
+    /// depends on — a silent serialize/parse asymmetry would corrupt a policy.
+    #[test]
+    fn save_round_trips_through_load() {
+        use crate::permission::{PermissionPolicy, Rule};
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let dir = tmp.path().join("workspaces");
+        let store = WorkspaceConfigStore::new(dir);
+        let cfg = WorkspaceConfig {
+            network: Some(NetworkSection {
+                policy: Some("isolated".to_owned()),
+                ..NetworkSection::default()
+            }),
+            mounts: vec![],
+            permission: PermissionPolicy {
+                deny: vec![Rule::contains("shell", vec!["curl".to_owned()])],
+                ask: vec![],
+            },
+        };
+        store.save(&ws, &cfg).unwrap();
+        let loaded = store.load(&ws).unwrap().unwrap();
+        assert_eq!(loaded, cfg);
+    }
+
+    /// `save` fails loud for a path that cannot be canonicalized — writing a
+    /// policy whose id can never be re-derived would strand an un-loadable file.
+    #[test]
+    fn save_fails_loud_on_missing_workspace_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkspaceConfigStore::new(tmp.path().join("workspaces"));
+        let missing = tmp.path().join("does-not-exist");
+        assert!(store.save(&missing, &WorkspaceConfig::default()).is_err());
     }
 
     #[test]

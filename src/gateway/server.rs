@@ -43,6 +43,7 @@ use crate::monitor::{self, PricingTable};
 use crate::session::SessionMeta;
 
 use super::actor::{ActorHandle, Command, GatewayEvent};
+use crate::agent::ApprovalDecision;
 use super::config::GatewayConfig;
 use super::registry::SessionRegistry;
 use super::status::SessionStatus;
@@ -104,6 +105,11 @@ fn router(state: AppState) -> Router {
             axum::routing::delete(delete_workspace_config),
         )
         .route(
+            "/workspaces/{id}/config",
+            get(get_workspace_config).put(put_workspace_config),
+        )
+        .route("/workspaces/{id}/tools", get(list_workspace_tools))
+        .route(
             "/workspaces/{id}/sessions",
             get(list_workspace_sessions).post(create_workspace_session),
         )
@@ -117,6 +123,7 @@ fn router(state: AppState) -> Router {
         .route("/sessions/{id}/reconfigure", post(reconfigure_session))
         .route("/sessions/{id}/message", post(post_message))
         .route("/sessions/{id}/cancel", post(cancel_turn))
+        .route("/sessions/{id}/approve", post(approve_tool_call))
         .route("/sessions/{id}/archive", post(archive_session))
         .route("/sessions/{id}/compact", post(compact_session))
         .route("/sessions/{id}/summary", get(session_summary))
@@ -132,7 +139,12 @@ fn router(state: AppState) -> Router {
             get(get_profile).put(put_profile).delete(delete_profile),
         )
         .route("/models", get(list_models))
+        .route("/tools", get(list_tools))
         .route("/providers", get(get_providers).put(put_providers))
+        .route(
+            "/gateway/permission",
+            get(get_gateway_permission).put(put_gateway_permission),
+        )
         .route(
             "/secrets/{provider}",
             axum::routing::put(put_secret).delete(delete_secret),
@@ -317,6 +329,74 @@ async fn delete_workspace_config(
     }
 }
 
+/// `GET /workspaces/{id}/config` — the per-workspace config (network + mounts +
+/// permission) for editing (`doc/workspace-config.md`, `doc/permission.md` §3.1,
+/// the top tier). Returns the default (all-absent) config when none is stored,
+/// so the editor always has a shape to bind. A malformed on-disk file is a 500
+/// (fail-loud), an unknown workspace id a 404.
+async fn get_workspace_config(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    use crate::gateway::WorkspaceConfigError;
+    match state.registry.load_workspace_config(&WorkspaceId(id)) {
+        Ok(config) => Json(config).into_response(),
+        // Unknown id is the caller's fault (404); a malformed file is a server
+        // problem (500) that must not masquerade as "workspace does not exist".
+        Err(e @ WorkspaceConfigError::UnknownWorkspace(_)) => not_found(&anyhow::anyhow!(e)),
+        Err(e @ WorkspaceConfigError::Load(_)) => internal_error(&anyhow::anyhow!(e)),
+    }
+}
+
+/// `PUT /workspaces/{id}/config` — overwrite the per-workspace config (full
+/// desired state). The file lives under the gateway's trusted
+/// `.omini/workspaces/`, never the agent-writable project dir, so a workspace
+/// widening its own `deny` floor is safe (`doc/workspace-config.md`).
+async fn put_workspace_config(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(config): Json<crate::gateway::workspace_config::WorkspaceConfig>,
+) -> Response {
+    match state
+        .registry
+        .save_workspace_config(&WorkspaceId(id), &config)
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => internal_error(&e),
+    }
+}
+
+/// `GET /workspaces/{id}/tools` — the permission-config tool catalog for this
+/// workspace: the built-ins plus its MCP tools, enumerated best-effort
+/// (`doc/permission.md` §3.2). MCP failures are swallowed server-side, so this
+/// returns the built-ins even when a server is down. 404 for an unknown id.
+async fn list_workspace_tools(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    match state.registry.list_workspace_tools(&WorkspaceId(id)).await {
+        Ok(tools) => Json(json!({ "tools": tools })).into_response(),
+        Err(e) => not_found(&e),
+    }
+}
+
+/// `GET /gateway/permission` — the gateway-wide baseline permission policy
+/// (bottom tier, `doc/permission.md` §3.1) for the settings UI.
+async fn get_gateway_permission(State(state): State<AppState>) -> Response {
+    match state.registry.gateway_permission() {
+        Ok(policy) => Json(policy).into_response(),
+        Err(e) => internal_error(&e),
+    }
+}
+
+/// `PUT /gateway/permission` — replace the gateway baseline policy. Applies to
+/// **new** sessions immediately (the value is read fresh per session) and is
+/// persisted to `gateway.toml` (survives restart). Other gateway fields are
+/// preserved through the write.
+async fn put_gateway_permission(
+    State(state): State<AppState>,
+    Json(policy): Json<crate::permission::PermissionPolicy>,
+) -> Response {
+    match state.registry.set_gateway_permission(policy) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => internal_error(&e),
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct WorkspaceSessionParams {
     /// Profile name to bind; gateway default when absent.
@@ -456,6 +536,15 @@ async fn list_models(State(state): State<AppState>) -> Response {
         Ok(models) => Json(json!({ "models": models })).into_response(),
         Err(e) => internal_error(&e),
     }
+}
+
+/// `GET /tools` — the built-in tool catalog for the permission-config UI
+/// (`doc/permission.md` §3.2): each tool's friendly label + the input fields a
+/// gating rule may target. Static (no workspace / subprocess needed), so it
+/// serves the profile and gateway config surfaces. MCP tools are enumerated
+/// per-workspace elsewhere.
+async fn list_tools() -> Response {
+    Json(json!({ "tools": crate::tool::builtin_catalog() })).into_response()
 }
 
 /// `GET /providers` — the full `providers.toml` for the settings UI, plus the
@@ -648,6 +737,41 @@ async fn post_message(
         Err(e) => return conflict_or_not_found(&e),
     };
     match handle.send(Command::Send { text: body.text }).await {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(_) => internal_error(&anyhow::anyhow!("session actor is unavailable")),
+    }
+}
+
+/// Body of an approve request: which suspended tool call, and the decision.
+#[derive(Debug, Deserialize)]
+struct ApproveBody {
+    /// The `call_id` from the `ApprovalRequested` event being answered.
+    call_id: String,
+    /// `approve` runs the tool; `reject` blocks it (`denied_by_user`).
+    decision: ApprovalDecision,
+}
+
+/// `POST /sessions/{id}/approve` — deliver a human decision for a tool call the
+/// permission policy suspended (`doc/permission.md` §5). Returns `202 Accepted`;
+/// an unknown or already-resolved `call_id` is accepted and ignored by the
+/// actor (idempotent). A stopped actor is a 5xx (respawn/retry).
+async fn approve_tool_call(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<ApproveBody>,
+) -> Response {
+    let sid = SessionId(id);
+    let handle = match state.registry.get_or_spawn(&sid).await {
+        Ok(h) => h,
+        Err(e) => return conflict_or_not_found(&e),
+    };
+    match handle
+        .send(Command::Approve {
+            call_id: body.call_id,
+            decision: body.decision,
+        })
+        .await
+    {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
         Err(_) => internal_error(&anyhow::anyhow!("session actor is unavailable")),
     }
@@ -965,6 +1089,11 @@ enum WsClientMessage {
     Send { text: String },
     /// Abort the running turn.
     Cancel,
+    /// Deliver a decision for a suspended `ask` tool call.
+    Approve {
+        call_id: String,
+        decision: ApprovalDecision,
+    },
 }
 
 /// Drive one WebSocket connection: forward outbound events to the client and
@@ -995,6 +1124,9 @@ async fn ws_loop(socket: WebSocket, handle: ActorHandle) {
                         let command = match cmd {
                             WsClientMessage::Send { text } => Command::Send { text },
                             WsClientMessage::Cancel => Command::Cancel,
+                            WsClientMessage::Approve { call_id, decision } => {
+                                Command::Approve { call_id, decision }
+                            }
                         };
                         if handle.send(command).await.is_err() {
                             return;
@@ -2520,5 +2652,209 @@ default = "openai-main/gpt-4o"
             text.contains("sess-1") && text.contains("running"),
             "snapshot must carry the seeded running status, got: {text}"
         );
+    }
+
+    /// `PUT /gateway/permission` then `GET` round-trips the gateway baseline gate,
+    /// AND persists it to `gateway.toml`. The persisted-file assertion is the one
+    /// that matters: a handler that only updated memory would pass the GET but
+    /// silently lose the policy on restart (Karpathy §12).
+    #[tokio::test]
+    async fn gateway_permission_put_then_get_and_persists() {
+        let (registry, dir) = test_registry_with_config();
+        let state = AppState {
+            registry,
+            api_key: None,
+            pricing: Arc::new(PricingTable::default()),
+        };
+        let base = serve_test(state).await;
+        let http = reqwest::Client::new();
+
+        let policy = json!({ "deny": [{ "tool": "shell", "contains": ["curl"] }] });
+        let resp = http
+            .put(format!("{base}/api/gateway/permission"))
+            .json(&policy)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204);
+
+        // GET returns what we PUT.
+        let got: serde_json::Value = http
+            .get(format!("{base}/api/gateway/permission"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(got["deny"][0]["tool"], "shell");
+        assert_eq!(got["deny"][0]["contains"][0], "curl");
+
+        // Persisted to gateway.toml under the config root (survives restart).
+        let toml_text =
+            std::fs::read_to_string(dir.path().join(".omini/config/gateway.toml")).unwrap();
+        assert!(
+            toml_text.contains("default_permission") && toml_text.contains("curl"),
+            "policy must be written to gateway.toml, got: {toml_text}"
+        );
+    }
+
+    /// `PUT /workspaces/{id}/config` then `GET` round-trips a workspace config
+    /// (network + permission). Uses a recorded real workspace so the id resolves
+    /// to a path the store can key on.
+    #[tokio::test]
+    async fn workspace_config_put_then_get_round_trips() {
+        let (registry, dir) = test_registry_with_config();
+        let ws = dir.path().join("proj");
+        std::fs::create_dir_all(&ws).unwrap();
+        let id = registry.record_workspace(&ws).unwrap();
+        let state = AppState {
+            registry,
+            api_key: None,
+            pricing: Arc::new(PricingTable::default()),
+        };
+        let base = serve_test(state).await;
+        let http = reqwest::Client::new();
+
+        let config = json!({
+            "network": { "policy": "isolated" },
+            "permission": { "deny": [{ "tool": "shell", "contains": ["rm -rf"] }] }
+        });
+        let resp = http
+            .put(format!("{base}/api/workspaces/{}/config", id.0))
+            .json(&config)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204);
+
+        let got: serde_json::Value = http
+            .get(format!("{base}/api/workspaces/{}/config", id.0))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(got["network"]["policy"], "isolated");
+        assert_eq!(got["permission"]["deny"][0]["contains"][0], "rm -rf");
+    }
+
+    /// A malformed on-disk workspace config is a 500, NOT a 404: the file exists,
+    /// so reporting "workspace does not exist" would send the user chasing the
+    /// wrong problem. Regression guard for the error-mapping fix.
+    #[tokio::test]
+    async fn workspace_config_malformed_is_500_not_404() {
+        let (registry, dir) = test_registry();
+        let ws = dir.path().join("proj");
+        std::fs::create_dir_all(&ws).unwrap();
+        let id = registry.record_workspace(&ws).unwrap();
+        // Plant a broken config file for this workspace's id.
+        let cfg_dir = dir.path().join(".omini").join("workspaces");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(cfg_dir.join(format!("{}.toml", id.0)), "this is = not valid ][").unwrap();
+
+        let state = AppState {
+            registry,
+            api_key: None,
+            pricing: Arc::new(PricingTable::default()),
+        };
+        let base = serve_test(state).await;
+        let resp = reqwest::get(format!("{base}/api/workspaces/{}/config", id.0))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 500, "malformed config is a server error, not a 404");
+    }
+
+    /// `GET /workspaces/{id}/tools` returns at least the built-in catalog for a
+    /// workspace with no MCP servers — the config UI's per-workspace card source
+    /// degrades to built-ins rather than erroring.
+    #[tokio::test]
+    async fn workspace_tools_endpoint_returns_builtins() {
+        let (registry, dir) = test_registry_with_config();
+        let ws = dir.path().join("proj");
+        std::fs::create_dir_all(&ws).unwrap();
+        let id = registry.record_workspace(&ws).unwrap();
+        let state = AppState {
+            registry,
+            api_key: None,
+            pricing: Arc::new(PricingTable::default()),
+        };
+        let base = serve_test(state).await;
+        let body: serde_json::Value =
+            reqwest::get(format!("{base}/api/workspaces/{}/tools", id.0))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        let names: Vec<&str> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        // Built-ins present (MCP absent → just these).
+        assert!(names.contains(&"shell") && names.contains(&"read"));
+    }
+
+    /// `GET /tools` returns the built-in catalog with the fields the config UI
+    /// needs (shell→command, path tools→path). A test that only checked the count
+    /// would pass even if the field metadata the cards depend on were dropped.
+    #[tokio::test]
+    async fn tools_endpoint_returns_builtin_catalog() {
+        let (registry, _dir) = test_registry();
+        let state = AppState {
+            registry,
+            api_key: None,
+            pricing: Arc::new(PricingTable::default()),
+        };
+        let base = serve_test(state).await;
+        let body: serde_json::Value = reqwest::get(format!("{base}/api/tools"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let tools = body["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["read", "write", "edit", "shell"]);
+        // shell exposes a `command` field the UI scopes rules to.
+        let shell = tools.iter().find(|t| t["name"] == "shell").unwrap();
+        assert_eq!(shell["fields"][0]["key"], "command");
+        // write's path field is flagged is_path so the UI offers prefix controls.
+        let write = tools.iter().find(|t| t["name"] == "write").unwrap();
+        let path_field = write["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["key"] == "path")
+            .unwrap();
+        assert_eq!(path_field["is_path"], true);
+    }
+
+    /// `GET /workspaces/{id}/config` for a workspace with no stored config returns
+    /// the default (all-absent) shape at 200 — the editor always has something to
+    /// bind, rather than a 404 it would have to special-case.
+    #[tokio::test]
+    async fn workspace_config_get_absent_is_default() {
+        let (registry, dir) = test_registry_with_config();
+        let ws = dir.path().join("proj");
+        std::fs::create_dir_all(&ws).unwrap();
+        let id = registry.record_workspace(&ws).unwrap();
+        let state = AppState {
+            registry,
+            api_key: None,
+            pricing: Arc::new(PricingTable::default()),
+        };
+        let base = serve_test(state).await;
+
+        let resp = reqwest::get(format!("{base}/api/workspaces/{}/config", id.0))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let got: serde_json::Value = resp.json().await.unwrap();
+        // Empty policy: deny/ask omitted (skip_serializing_if), network absent.
+        assert!(got["permission"].get("deny").is_none() || got["permission"]["deny"].as_array().unwrap().is_empty());
     }
 }

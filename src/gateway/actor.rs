@@ -20,7 +20,7 @@
 //! — the same recovery the TUI uses, grounded in the log being the source of
 //! truth.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -28,12 +28,13 @@ use serde::Serialize;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::agent::{Agent, BlockKind, SessionRuntime, StreamSink, TurnOutcome};
+use crate::agent::{Agent, ApprovalDecision, BlockKind, SessionRuntime, StreamSink, TurnOutcome};
 use crate::core::payload::TurnEvent;
 use crate::core::{CoreEvent, EventId, EventPayload, EventSource, SessionId, SourceKind, TurnId};
 use crate::llm::Message;
 use crate::session::{EventBus, SessionStore, SessionWriter};
 
+use super::approval::{GatewayApprovalGate, PendingApprovals};
 use super::status::{ActivityStatus, SessionStatus, StatusHub};
 use super::workspace::WorkspaceId;
 
@@ -79,6 +80,16 @@ pub enum GatewayEvent {
         window: u32,
         threshold: f32,
     },
+    /// A tool call classified `ask` by the permission policy is suspended,
+    /// awaiting a human decision (`doc/permission.md` §5). Ephemeral like
+    /// [`Delta`]: a client that connects later learns of it from the session's
+    /// `AwaitingApproval` status, not a replay. Answer with `Command::Approve`
+    /// carrying the same `call_id`.
+    ApprovalRequested {
+        call_id: String,
+        tool_name: String,
+        input: serde_json::Value,
+    },
 }
 
 /// A live streaming delta, mirroring [`StreamSink`] callbacks.
@@ -115,6 +126,13 @@ pub enum Command {
     /// Summarize and switch to a compaction session. `keep_last` keeps the last
     /// N user turns verbatim (`doc/context-management.md` §4).
     Compact { keep_last: Option<usize> },
+    /// Deliver a human decision for a tool call the permission policy suspended
+    /// (`doc/permission.md` §5). Routed to the parked waiter by `call_id`; an
+    /// unknown id is ignored (already resolved, or the turn moved on).
+    Approve {
+        call_id: String,
+        decision: ApprovalDecision,
+    },
     /// Stop the actor and release the session lock.
     Shutdown,
 }
@@ -164,6 +182,10 @@ type TurnResult = Result<(SessionWriter, SessionRuntime, TurnOutcome), crate::ag
 /// or told to shut down.
 pub struct SessionActor {
     agent: Arc<Agent>,
+    /// Tool calls suspended awaiting a human decision, keyed by call id. The
+    /// agent's approval gate parks waiters here; the command loop delivers
+    /// decisions and clears it on cancel/shutdown (`doc/permission.md` §5).
+    pending_approvals: PendingApprovals,
     store: SessionStore,
     /// System seed for rebuilding the runtime after a cancel/abort.
     system: Vec<Message>,
@@ -206,7 +228,7 @@ impl SessionActor {
     /// hub the actor publishes running/idle transitions to; the session's
     /// `workspace_id` (immutable, from its meta) is stamped on each.
     pub fn spawn(
-        agent: Arc<Agent>,
+        agent: Agent,
         store: SessionStore,
         system: Vec<Message>,
         session: Session,
@@ -236,8 +258,23 @@ impl SessionActor {
         // published; the forwarder below turns those into outbound `Event`s.
         let session = (session.0.with_bus(bus.clone()), session.1);
 
+        // The approval gate shares the actor's pending table, outbound stream,
+        // status hub, and latest-seq cache, so an `ask` suspends the turn and a
+        // `Command::Approve` resumes it (`doc/permission.md` §5).
+        let pending_approvals: PendingApprovals = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let gate = GatewayApprovalGate::new(
+            Arc::clone(&pending_approvals),
+            outbound.clone(),
+            status.clone(),
+            session_id.clone(),
+            workspace_id.clone(),
+            Arc::clone(&latest_seq),
+        );
+        let agent = Arc::new(agent.with_approval_gate(Arc::new(gate)));
+
         let actor = Self {
             agent,
+            pending_approvals,
             store,
             system,
             session_id,
@@ -283,6 +320,32 @@ impl SessionActor {
         });
     }
 
+    /// Route a human decision to the tool call parked awaiting it. Removing the
+    /// sender and sending the decision wakes the suspended turn task. An unknown
+    /// `call_id` (already resolved, or the turn moved on) is a no-op. A dropped
+    /// receiver (the turn abandoned the wait) means the `send` fails harmlessly.
+    fn deliver_approval(&self, call_id: &str, decision: ApprovalDecision) {
+        // A poisoned lock (a panic while another thread held it) shouldn't crash
+        // the actor; treat it as "no waiter", which fails the ask closed.
+        let waiter = self
+            .pending_approvals
+            .lock()
+            .ok()
+            .and_then(|mut m| m.remove(call_id));
+        if let Some(tx) = waiter {
+            let _ = tx.send(decision);
+        }
+    }
+
+    /// Drop every parked approval waiter. Their receivers then error, so the
+    /// gate returns `Reject` (fail-closed) — used when a turn is torn down
+    /// (cancel/shutdown) with asks still outstanding (`doc/permission.md` §5).
+    fn clear_pending(&self) {
+        if let Ok(mut m) = self.pending_approvals.lock() {
+            m.clear();
+        }
+    }
+
     /// The actor loop. Owns `session` between turns; transitions to a busy phase
     /// while a turn task runs, replaying any commands deferred during the turn.
     async fn run(mut self, mut session: Session) {
@@ -316,8 +379,10 @@ impl SessionActor {
                 Command::Compact { keep_last } => {
                     session = self.compact(session, keep_last).await;
                 }
-                // No turn running while idle — nothing to cancel.
-                Command::Cancel => {}
+                // No turn running while idle: nothing to cancel, and no ask is
+                // parked, so a late `Approve` for an already-settled call is a
+                // no-op too.
+                Command::Cancel | Command::Approve { .. } => {}
                 Command::Shutdown => return,
             }
         }
@@ -358,18 +423,30 @@ impl SessionActor {
                         return self.cancel_turn(handle).await;
                     }
                     Some(Command::Shutdown) => {
+                        self.clear_pending();
                         handle.abort();
                         let _ = handle.await;
                         // The aborted task dropped the writer (lock released).
                         // Nothing to return — the actor is stopping.
                         return None;
                     }
+                    // A decision for a suspended `ask`: wake the parked waiter
+                    // and keep driving the same turn (it resumes in place).
+                    Some(Command::Approve { call_id, decision }) => {
+                        self.deliver_approval(&call_id, decision);
+                    }
                     // Turns never overlap: defer until this one settles.
                     Some(cmd @ (Command::Send { .. } | Command::Compact { .. })) => {
                         self.deferred.push_back(cmd);
                     }
                     None => {
-                        // All handles dropped; let the turn finish, then exit.
+                        // All handles dropped: no `Command::Approve` can ever
+                        // arrive, so a turn parked on an `ask` would hang forever
+                        // (leaking the actor task and the session lock). Drop the
+                        // waiters first — their receivers error → the gate fails
+                        // closed → the turn settles — then reap it (`doc/permission.md`
+                        // §5, mirrors the Shutdown arm).
+                        self.clear_pending();
                         return self.on_turn_done(handle.await).await;
                     }
                 }
@@ -377,7 +454,6 @@ impl SessionActor {
         }
     }
 
-    /// Handle a finished turn: emit `TurnSettled`, auto-compact if over the
     /// Handle a finished turn: emit `TurnSettled`, auto-compact if over the
     /// limit, and return the session to resume with. A hard error emits a notice
     /// and rebuilds from the log so the session stays usable. `None` means the
@@ -433,6 +509,7 @@ impl SessionActor {
     /// Writing the committed terminator makes the stop durable. Reopening to append
     /// is safe: the aborted task already released the lock.
     async fn cancel_turn(&self, handle: JoinHandle<TurnResult>) -> Option<Session> {
+        self.clear_pending();
         handle.abort();
         let _ = handle.await;
         let _ = self.outbound.send(GatewayEvent::Notice {
@@ -754,7 +831,7 @@ mod tests {
         let writer = store.create_new(None, None, vec![]).unwrap();
         let runtime = SessionRuntime::new(system.clone());
         let handle = SessionActor::spawn(
-            Arc::new(agent),
+            agent,
             store,
             system,
             (writer, runtime),
@@ -792,7 +869,7 @@ mod tests {
         let writer = store.create_new(None, None, vec![]).unwrap();
         let runtime = SessionRuntime::new(system.clone());
         let handle = SessionActor::spawn(
-            Arc::new(agent),
+            agent,
             store,
             system,
             (writer, runtime),
@@ -1004,7 +1081,7 @@ mod tests {
         let sid = writer.session_id().clone();
         let runtime = SessionRuntime::new(system.clone());
         let handle = SessionActor::spawn(
-            Arc::new(agent),
+            agent,
             store.clone(),
             system,
             (writer, runtime),
@@ -1145,5 +1222,237 @@ mod tests {
         ));
         let events = vec![started(1, "t1"), ev(2, err)];
         assert_eq!(open_turn_id(&events), Some(TurnId("t1".to_owned())));
+    }
+
+    // ── Approval closed loop (Step 5, `doc/permission.md` §5) ────────────────
+
+    /// One model round that calls the `write` tool, then (next round) answers.
+    fn write_call(call_id: &str, path: &str) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::BlockStart {
+                index: 0,
+                block_type: ContentBlockType::ToolCall {
+                    id: call_id.to_owned(),
+                    name: "write".to_owned(),
+                },
+            },
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                json_delta: format!(r#"{{"path":"{path}","content":"hi"}}"#),
+            },
+            StreamEvent::BlockStop { index: 0 },
+            StreamEvent::Completed {
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            },
+        ]
+    }
+
+    /// Spawn an actor whose agent has a real `write` tool rooted at `workspace`
+    /// and an `ask`-on-write permission policy, so a `write` call suspends for
+    /// approval. Returns the handle, the temp store dir, and the workspace dir.
+    fn spawn_actor_ask_on_write(
+        rounds: Vec<Vec<StreamEvent>>,
+    ) -> (ActorHandle, tempfile::TempDir, tempfile::TempDir) {
+        let store_dir = tempfile::tempdir().unwrap();
+        let ws_dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(store_dir.path());
+        let provider = Arc::new(ScriptedProvider {
+            rounds: Mutex::new(rounds.into_iter().collect()),
+        });
+        let mut tools = ToolRegistry::new();
+        crate::tool::register_builtin(&mut tools, ws_dir.path().to_path_buf());
+        let policy = crate::permission::PermissionPolicy {
+            deny: vec![],
+            ask: vec![crate::permission::Rule::contains("write", vec![])],
+        };
+        let agent = Agent::new(
+            provider,
+            tools,
+            AgentConfig {
+                model: "mock".to_owned(),
+                ..AgentConfig::default()
+            },
+        )
+        .with_permission(policy);
+        let system = vec![Message::System {
+            content: "sys".to_owned(),
+        }];
+        let writer = store.create_new(None, None, vec!["write".to_owned()]).unwrap();
+        let runtime = SessionRuntime::new(system.clone());
+        let handle = SessionActor::spawn(
+            agent,
+            store,
+            system,
+            (writer, runtime),
+            std::time::Duration::from_secs(3600),
+            Vec::new(),
+            StatusHub::new(),
+        );
+        (handle, store_dir, ws_dir)
+    }
+
+    /// Wait for the next `ApprovalRequested` on the stream, returning its
+    /// `call_id`. Panics on timeout — a suspended ask must announce itself.
+    async fn wait_for_approval_request(
+        rx: &mut broadcast::Receiver<GatewayEvent>,
+    ) -> String {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(GatewayEvent::ApprovalRequested { call_id, tool_name, .. })) => {
+                    assert_eq!(tool_name, "write");
+                    return call_id;
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        panic!("never saw an ApprovalRequested event");
+    }
+
+    /// Wait for `TurnSettled`. Returns once seen (or panics on timeout).
+    async fn wait_for_settled(rx: &mut broadcast::Receiver<GatewayEvent>) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(GatewayEvent::TurnSettled { .. })) => return,
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        panic!("never saw TurnSettled");
+    }
+
+    /// Approve closes the loop: an `ask` suspends the turn (announced via
+    /// `ApprovalRequested`), a `Command::Approve` resumes it, and the tool runs
+    /// (the file lands). Proves the decision — not the model — released the call.
+    #[tokio::test]
+    async fn approve_resumes_suspended_turn_and_runs_tool() {
+        let (handle, _store, ws) =
+            spawn_actor_ask_on_write(vec![write_call("call-1", "ok.txt"), answer("done")]);
+        let mut rx = handle.subscribe();
+        handle
+            .send(Command::Send {
+                text: "write a file".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let call_id = wait_for_approval_request(&mut rx).await;
+        assert!(
+            !ws.path().join("ok.txt").exists(),
+            "the tool must not run before approval"
+        );
+
+        handle
+            .send(Command::Approve {
+                call_id,
+                decision: ApprovalDecision::Approve,
+            })
+            .await
+            .unwrap();
+
+        wait_for_settled(&mut rx).await;
+        assert!(
+            ws.path().join("ok.txt").exists(),
+            "an approved call runs the tool"
+        );
+    }
+
+    /// Reject closes the loop the other way: the suspended call is blocked with
+    /// `denied_by_user` and the file never lands.
+    #[tokio::test]
+    async fn reject_blocks_suspended_turn() {
+        let (handle, _store, ws) =
+            spawn_actor_ask_on_write(vec![write_call("call-9", "no.txt"), answer("blocked")]);
+        let mut rx = handle.subscribe();
+        handle
+            .send(Command::Send {
+                text: "write a file".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let call_id = wait_for_approval_request(&mut rx).await;
+        handle
+            .send(Command::Approve {
+                call_id,
+                decision: ApprovalDecision::Reject,
+            })
+            .await
+            .unwrap();
+
+        // Drain until settled, checking a denied_by_user tool failure committed.
+        let mut denied = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(GatewayEvent::Event { event })) => {
+                    if let EventPayload::Tool(crate::core::payload::ToolEvent::Failed {
+                        error,
+                        ..
+                    }) = &event.payload
+                    {
+                        if error.code == "denied_by_user" {
+                            denied = true;
+                        }
+                    }
+                }
+                Ok(Ok(GatewayEvent::TurnSettled { .. })) => break,
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        assert!(denied, "a rejected call surfaces as denied_by_user");
+        assert!(
+            !ws.path().join("no.txt").exists(),
+            "a rejected call never runs the tool"
+        );
+    }
+
+    /// M1 regression: if every `ActorHandle` is dropped while a turn is parked on
+    /// an `ask`, the actor must not hang. The `None` inbox arm clears pending
+    /// waiters (fail-closed) so the suspended turn settles and the actor task
+    /// exits — releasing the session lock. We detect the exit by the outbound
+    /// broadcast closing (all senders live inside the actor task); a hang would
+    /// instead time out.
+    #[tokio::test]
+    async fn dropping_handles_during_pending_ask_does_not_hang() {
+        let (handle, _store, ws) =
+            spawn_actor_ask_on_write(vec![write_call("call-x", "x.txt"), answer("done")]);
+        let mut rx = handle.subscribe();
+        handle
+            .send(Command::Send {
+                text: "write a file".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        // Wait until the turn is genuinely parked on the ask.
+        let _call_id = wait_for_approval_request(&mut rx).await;
+
+        // Drop the only handle without sending Approve/Cancel/Shutdown: this is
+        // the `None` inbox path. Pre-fix, the parked turn would hang forever.
+        drop(handle);
+
+        // The actor should tear down: drain the outbound until it closes. Bounded
+        // so a regression (hang) fails the test via timeout instead of blocking.
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Closed) => return true,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                }
+            }
+        })
+        .await;
+        assert_eq!(closed, Ok(true), "actor must exit, not hang, on dropped handles mid-ask");
+        // Fail-closed: the tool never ran.
+        assert!(
+            !ws.path().join("x.txt").exists(),
+            "a turn torn down mid-ask must not have run the tool"
+        );
     }
 }

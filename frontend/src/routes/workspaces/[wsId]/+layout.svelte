@@ -7,6 +7,7 @@
 	import type { SessionSummary } from '$lib/types/SessionSummary';
 	import SessionStatusIcon from '$lib/components/SessionStatusIcon.svelte';
 	import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
+	import WorkspaceConfigDialog from '$lib/components/WorkspaceConfigDialog.svelte';
 	import Skeleton from '$lib/components/Skeleton.svelte';
 	import { connectStatus, viewState, latestSeqOf } from '$lib/status.svelte';
 
@@ -32,6 +33,10 @@
 	const activeSessionId = $derived(page.params.id);
 
 	let rows = $state<Row[]>([]);
+
+	// Whether the per-workspace config dialog (network + top-tier permission gate)
+	// is open. Its own loading/saving lives in the dialog component.
+	let showConfig = $state(false);
 
 	/** Rows ordered most-recently-active first. Activity is the last real user
 	 *  message (`summary.last_user_message_at`), falling back to `created_at` for
@@ -345,6 +350,28 @@
 			<div class="ws-title" title={workspacePath ?? workspaceId}>
 				{workspacePath ? wsLabel(workspacePath) : '工作区'}
 			</div>
+			<button
+				class="ws-config"
+				onclick={() => (showConfig = true)}
+				title="工作区配置（门控 / 网络）"
+				aria-label="工作区配置"
+			>
+				<svg
+					width="15"
+					height="15"
+					viewBox="0 0 15 15"
+					fill="none"
+					stroke="currentColor"
+					stroke-width="1.4"
+					stroke-linecap="round"
+					stroke-linejoin="round"
+				>
+					<circle cx="7.5" cy="7.5" r="2" />
+					<path
+						d="M7.5 1.2v1.6M7.5 12.2v1.6M1.2 7.5h1.6M12.2 7.5h1.6M3 3l1.1 1.1M10.9 10.9l1.1 1.1M12 3l-1.1 1.1M4.1 10.9L3 12"
+					/>
+				</svg>
+			</button>
 		</div>
 
 		<button class="new-session" onclick={newSession}>
@@ -542,6 +569,10 @@
 	</ConfirmDialog>
 {/if}
 
+{#if showConfig}
+	<WorkspaceConfigDialog {workspaceId} onclose={() => (showConfig = false)} />
+{/if}
+
 <style>
 	.panel {
 		display: grid;
@@ -599,6 +630,8 @@
 	}
 
 	.ws-title {
+		flex: 1;
+		min-width: 0;
 		font-size: 13px;
 		font-weight: 590;
 		color: var(--text-primary);
@@ -607,6 +640,28 @@
 		white-space: nowrap;
 		overflow: hidden;
 		text-overflow: ellipsis;
+	}
+
+	.ws-config {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		width: 22px;
+		height: 22px;
+		border-radius: var(--radius-sm);
+		color: var(--text-tertiary);
+		background: transparent;
+		border: none;
+		cursor: pointer;
+		flex-shrink: 0;
+		transition:
+			color var(--dur-fast) var(--ease-out),
+			background var(--dur-fast) var(--ease-out);
+	}
+
+	.ws-config:hover {
+		color: var(--text-primary);
+		background: var(--surface-hover);
 	}
 
 	.new-session {

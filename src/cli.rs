@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use crate::agent::{BlockKind, SessionRuntime, StreamSink};
+use crate::agent::{
+    ApprovalGate, ApprovalRequest, ApprovalResolution, BlockKind, SessionRuntime, StreamSink,
+};
 use crate::app::{self, DEFAULT_PROFILE, SESSIONS_SUBDIR};
 use crate::config::ConfigStore;
 use crate::core::payload::TurnFailureReason;
@@ -733,6 +735,12 @@ async fn prepare(
         // workspace-level override off the CLI (that layer is gateway-side).
         crate::sandbox::NetworkPolicy::Open,
         None,
+        // No gateway/workspace permission tiers off the CLI (both are
+        // gateway-side, `doc/permission.md` §3): pass empty policies so only the
+        // profile `[permission]` gates a CLI run. The approval gate is the
+        // terminal y/n prompt (`CliApprovalGate`).
+        crate::permission::PermissionPolicy::default(),
+        crate::permission::PermissionPolicy::default(),
         // No workspace-level mounts off the CLI (that layer is gateway-side).
         Vec::new(),
         &|msg| eprintln!("{msg}"),
@@ -772,9 +780,15 @@ async fn run_turn(config_dir: Option<PathBuf>, args: RunArgs) -> Result<()> {
         content: prep.system_prompt.clone(),
     }]);
 
-    let mut sink = CliSink::new();
-    let outcome = prep
+    // Interactive approval for `ask`-gated tool calls (`doc/permission.md` §5).
+    // A non-tty stdin (piped input) can't answer, so the gate fails closed —
+    // an ask becomes a rejection rather than a silent allow (`CLAUDE.md` §12).
+    let agent = prep
         .agent
+        .with_approval_gate(std::sync::Arc::new(CliApprovalGate::new()));
+
+    let mut sink = CliSink::new();
+    let outcome = agent
         .run_turn_with_sink(&mut writer, &mut runtime, args.prompt, &mut sink)
         .await
         .context("agent turn failed")?;
@@ -856,6 +870,97 @@ fn report_turn(outcome: &crate::agent::TurnOutcome) {
 ///
 /// Generic over the two writers so it can be driven with in-memory buffers in
 /// tests; [`CliSink::new`] wires the real `stdout`/`stderr` for the CLI.
+/// Whether a prompt answer line means "yes": `y` / `yes`, case-insensitive,
+/// surrounding whitespace ignored. Everything else (including empty) is "no",
+/// keeping the default safe.
+fn is_affirmative(line: &str) -> bool {
+    let ans = line.trim().to_ascii_lowercase();
+    ans == "y" || ans == "yes"
+}
+
+/// The interactive approval gate for the single-turn `run` command
+/// (`doc/permission.md` §5). When a tool call is classified `ask`, it prints the
+/// tool name and its arguments to stderr and reads one line from stdin: `y`/`yes`
+/// (case-insensitive) approves, anything else — including EOF or a non-terminal
+/// stdin — rejects. Rejection is the safe default, so a piped/headless `run`
+/// never silently runs a gated tool (`CLAUDE.md` §12).
+///
+/// `request` is async but the stdin read is blocking, so it runs on a
+/// blocking-safe thread via [`tokio::task::spawn_blocking`].
+struct CliApprovalGate {
+    /// Whether stdin is a terminal. A non-tty can't answer a prompt, so the gate
+    /// fails closed without even trying to read.
+    stdin_tty: bool,
+}
+
+impl CliApprovalGate {
+    fn new() -> Self {
+        Self {
+            stdin_tty: std::io::stdin().is_terminal(),
+        }
+    }
+
+    /// Prompt on stderr and read one line from stdin. Distinguishes a real human
+    /// answer (`Approved` / `Rejected`) from "no answer" (EOF / io error) — the
+    /// latter must not be audited as a user rejection when nobody decided (the M2
+    /// honesty principle, `doc/permission.md`). EOF/error → [`PromptOutcome::NoAnswer`].
+    fn prompt_blocking(tool_name: &str, input: &serde_json::Value) -> PromptOutcome {
+        let mut err = std::io::stderr();
+        let pretty = serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string());
+        let _ = writeln!(
+            err,
+            "\n[permission] tool `{tool_name}` requires approval:\n{pretty}\nApprove? [y/N] "
+        );
+        let _ = err.flush();
+
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(0) | Err(_) => PromptOutcome::NoAnswer, // EOF/error: nobody answered
+            Ok(_) if is_affirmative(&line) => PromptOutcome::Approved,
+            Ok(_) => PromptOutcome::Rejected,
+        }
+    }
+}
+
+/// The three outcomes of a terminal approval prompt. Separating `NoAnswer` from
+/// `Rejected` keeps the audit honest: only a human typing `n` is a user
+/// rejection; EOF/io-error is a fail-closed auto-denial (`doc/permission.md`).
+enum PromptOutcome {
+    Approved,
+    Rejected,
+    NoAnswer,
+}
+
+#[async_trait::async_trait]
+impl ApprovalGate for CliApprovalGate {
+    async fn request(&self, req: ApprovalRequest) -> ApprovalResolution {
+        if !self.stdin_tty {
+            // No interactive stdin to answer with: fail closed. No human decided,
+            // so this is an auto-denial, not a user rejection.
+            let mut err = std::io::stderr();
+            let _ = writeln!(
+                err,
+                "[permission] tool `{}` needs approval but stdin is not a terminal; rejecting.",
+                req.tool_name
+            );
+            return ApprovalResolution::AutoDenied;
+        }
+        // A blocking prompt on a worker thread. If the join itself fails (panic),
+        // treat it as an auto-denial — the prompt never produced a human answer.
+        match tokio::task::spawn_blocking(move || {
+            Self::prompt_blocking(&req.tool_name, &req.input)
+        })
+        .await
+        {
+            Ok(PromptOutcome::Approved) => ApprovalResolution::Approved,
+            Ok(PromptOutcome::Rejected) => ApprovalResolution::RejectedByUser,
+            // NoAnswer (EOF/io error) or a join panic: nobody decided → auto-deny,
+            // never audited as a user rejection.
+            Ok(PromptOutcome::NoAnswer) | Err(_) => ApprovalResolution::AutoDenied,
+        }
+    }
+}
+
 struct CliSink<O: Write, E: Write> {
     /// Answer channel (stdout in production).
     out: O,
@@ -1194,7 +1299,10 @@ idle_timeout_secs = 1800           # evict an idle session actor after 30 min
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use super::{BlockKind, Channel, CliSink, StreamSink};
+    use super::{
+        ApprovalGate, ApprovalRequest, ApprovalResolution, BlockKind, Channel, CliApprovalGate,
+        CliSink, StreamSink, is_affirmative,
+    };
 
     /// Build a sink writing to in-memory buffers, with TTY styling disabled so
     /// assertions see plain text (no ANSI escapes).
@@ -1276,5 +1384,33 @@ mod tests {
         assert_eq!(String::from_utf8(sink.out.clone()).unwrap(), "the answer\n");
         // stderr must start on its own line, not glued to answer text.
         assert_eq!(side(&sink), "[tool: shell] {\"cmd\":\"ls\"}\n");
+    }
+
+    /// Only `y`/`yes` (any case, trimmed) approve; everything else — including an
+    /// empty line — is a rejection, so the prompt defaults to safe.
+    #[test]
+    fn affirmative_parsing_defaults_safe() {
+        for yes in ["y", "Y", "yes", "YES", " y ", "Yes\n"] {
+            assert!(is_affirmative(yes), "{yes:?} should approve");
+        }
+        for no in ["", "n", "no", "sure", "yeah", "yep", "1", "\n"] {
+            assert!(!is_affirmative(no), "{no:?} should reject");
+        }
+    }
+
+    /// With a non-terminal stdin (a pipe, or a headless run), the gate fails
+    /// closed: it rejects without trying to read, so an `ask` never silently runs
+    /// (`CLAUDE.md` §12).
+    #[tokio::test]
+    async fn cli_gate_fail_closed_without_tty() {
+        let gate = CliApprovalGate { stdin_tty: false };
+        let decision = gate
+            .request(ApprovalRequest {
+                tool_name: "shell".to_owned(),
+                input: serde_json::json!({"command": "rm -rf /"}),
+                call_id: "c1".to_owned(),
+            })
+            .await;
+        assert_eq!(decision, ApprovalResolution::AutoDenied);
     }
 }

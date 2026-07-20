@@ -5,6 +5,7 @@ import type { EventPayload } from "./EventPayload";
 import type { EventSource } from "./EventSource";
 import type { SessionId } from "./SessionId";
 import type { TurnId } from "./TurnId";
+import type { JsonValue } from "./serde_json/JsonValue";
 
 /**
  * What a front-end sees on the wire for one session. Tagged JSON so a client
@@ -42,4 +43,4 @@ turn_id: TurnId | null,
 /**
  * The domain payload.
  */
-payload: EventPayload, } | { "type": "delta" } & Delta | { "type": "turn_settled", incomplete: string | null, } | { "type": "compacted", new_session_id: string, } | { "type": "notice", message: string, } | { "type": "context_updated", tokens: number, window: number, threshold: number, };
+payload: EventPayload, } | { "type": "delta" } & Delta | { "type": "turn_settled", incomplete: string | null, } | { "type": "compacted", new_session_id: string, } | { "type": "notice", message: string, } | { "type": "context_updated", tokens: number, window: number, threshold: number, } | { "type": "approval_requested", call_id: string, tool_name: string, input: JsonValue, };

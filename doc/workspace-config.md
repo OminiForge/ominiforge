@@ -4,7 +4,7 @@ per-workspace 的沙箱策略覆盖层，位于 profile 与 gateway 默认之间
 
 ## 1. 解析链
 
-沙箱策略（当前只有 network）沿四档派生，高档覆盖低档：
+沙箱策略沿四档派生，高档覆盖低档（`network` 覆盖语义；`permission` 见下方注）：
 
 ```text
 workspace.toml  >  profile [network]  >  gateway default_network  >  Open（硬编码兜底）
@@ -13,6 +13,7 @@ workspace.toml  >  profile [network]  >  gateway default_network  >  Open（硬�
 - 任一档命中即用该值；`Open` 是一个新 boxlite session 不至于默认断网的兜底。
 - 任一档策略名非法 → **fail loud**（Karpathy §12），建 session 失败，不静默回退到弱默认。
 - 统一在 `app::resolve_network`（`src/app.rs`）解析，单元可测。
+- `permission` 走平行的 `app::resolve_permission`,同为三层(workspace > profile > gateway),但 `deny` 是**并集**(安全底线,非覆盖)、`ask` 覆盖——见 `doc/permission.md` §3.1。
 
 ## 2. 位置：网关侧，不在项目目录
 
@@ -40,9 +41,14 @@ anchor = "workspace"                 # session | workspace | gateway
 path   = "cache"                     # 锚点根内相对子路径(可空=根本身)
 guest  = "/cache"                    # guest 内绝对挂载点
 ro     = false                       # 只读挂载,默认 false(RW)
+
+[[permission.deny]]                  # 本 workspace 追加的工具禁令(最高层)
+tool     = "shell"
+contains = ["git push"]
 ```
 
 - `[network]` 缺省或无 `policy` 键 → 不构成覆盖，落到 profile/gateway 档。
+- `[permission]` = 本 workspace 的工具门控,三层解析的**最高层**(`doc/permission.md` §3.1)。语义与 profile 一致:`deny` 与 profile+gateway **并集**(workspace 只能加禁令,不能放开下层禁令——因本文件在网关可信目录、非 agent 可写,故加 `deny` 安全),`ask` 覆盖下层。缺省=空=不贡献规则。
 - `[[mounts]]`:命名锚点辅助挂载(`doc/sandbox.md` §3.7)。锚点命名**共享范围**,不是用途:
 
   | anchor | host 根 | 共享范围 |
@@ -53,7 +59,7 @@ ro     = false                       # 只读挂载,默认 false(RW)
 
   - `path` 禁 `..`/绝对(逃逸 fail-loud);`guest` 必须绝对(否则 fail-loud);host 目录按需建。
   - 三根全在网关侧、可信;仅 boxlite 兑现,passthrough 遇 `[[mounts]]` fail-loud 拒绝(无命名空间)。
-- 记录整体对**未来权限门控 / workspace memory**开放(同文件加 section),当前定义 `[network]` + `[[mounts]]`——其余需求未落地前不设字段(现在设计=猜)。
+- 记录整体对**未来 workspace memory** 等仍开放(同文件加 section),当前定义 `[network]` + `[[mounts]]` + `[permission]`——其余需求未落地前不设字段(现在设计=猜)。
 - 未知键忽略，向前兼容。
 
 ## 4. 生命周期与 GC

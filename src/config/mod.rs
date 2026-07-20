@@ -591,7 +591,7 @@ fn resolve_system_file(profile: &mut Profile, dir: &Path) -> Result<()> {
 /// over `path` (an atomic replace on the same filesystem). Creates the parent
 /// directory if absent. A crash mid-write leaves either the old file or the new
 /// one, never a truncated one.
-fn write_atomic(path: &Path, text: &str) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, text: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|source| ConfigError::Io {
             path: parent.to_path_buf(),

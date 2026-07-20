@@ -102,7 +102,7 @@ Service Runtime Layer
 ├─ event bus
 ├─ config manager
 ├─ profile manager
-├─ permission manager
+├─ permission manager   # 已实现：工具调用门控 deny/ask/allow，见 doc/permission.md
 └─ runtime orchestration
 
 Core Agent Layer

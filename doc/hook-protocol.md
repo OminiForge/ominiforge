@@ -139,6 +139,13 @@ Host → stdin (JSON):
 Hook → (无需 stdout 输出)
 ```
 
+工具在执行前被拦截（hook block 或权限门控 deny/未批准）时，after payload 用统一的
+`blocked` 键 + `reason` 区分来源，hook 作者只需检查一个键：
+```jsonc
+{ "tool_name": "shell", "blocked": true, "reason": "hook" }        // before-hook 拦截
+{ "tool_name": "shell", "blocked": true, "reason": "permission" }  // 门控 deny / 未批准
+```
+
 ### 6.3 错误处理
 
 - Hook 进程非零退出 → 按 failure_mode 处理

@@ -42,9 +42,10 @@ const DEFAULT_CAPACITY: usize = 1024;
 pub enum ActivityStatus {
     /// A turn is running (the actor is mid-turn).
     Running,
-    /// A tool call is blocked pending user approval. Reserved: the approval
-    /// feature is not built yet, so this variant is never published — the wire
-    /// type and the front-end icon exist so wiring it later is a one-line publish.
+    /// A tool call is suspended pending user approval (`doc/permission.md` §5).
+    /// Published by `GatewayApprovalGate` while a gated `ask` waits for a decision
+    /// and cleared back to `Running`/`Idle` once resolved; the session-list icon
+    /// renders it as the amber awaiting state.
     AwaitingApproval,
     /// No turn running. The common resting state.
     Idle,

@@ -19,12 +19,12 @@ function dur(ms: number): number {
 /** fly params: enters sliding from a `y`-px offset (positive = from below).
  *  `delay` staggers entrances (e.g. card grids); it also zeroes under
  *  reduced-motion, where a delayed instant appearance is pure latency. */
-export function rise(y = 6, ms = 150, delay = 0) {
+export function rise(y = 6, ms = 120, delay = 0) {
 	return { y, duration: dur(ms), delay: reduced() ? 0 : delay, easing: cubicOut };
 }
 
 /** scale params: pops in from slightly smaller. */
-export function pop(ms = 180) {
+export function pop(ms = 200) {
 	return { start: 0.96, duration: dur(ms), easing: cubicOut };
 }
 

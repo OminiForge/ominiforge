@@ -20,12 +20,14 @@
 //! to both. Context compaction and prefix-cache management arrive with the
 //! `context` module (Phase 2).
 
+mod approval;
 mod collector;
 mod error;
 mod plan;
 mod resume;
 mod sink;
 
+pub use approval::{ApprovalDecision, ApprovalGate, ApprovalRequest, ApprovalResolution, NullGate};
 pub use error::AgentError;
 pub use plan::{PlanStep, StepStatus};
 pub use resume::rebuild_runtime;
@@ -41,12 +43,14 @@ use crate::context::{
 };
 use crate::core::payload::{
     Content, ErrorDetail, ErrorEvent, ErrorSeverity, HookEvent, InjectionEvent, InjectionSource,
-    ModelEvent, StopReason, ToolEvent, ToolOutput, ToolSource, TurnEvent, TurnFailureReason, Usage,
+    ModelEvent, PermissionEvent, PermissionOutcome, StopReason, ToolEvent, ToolOutput, ToolSource,
+    TurnEvent, TurnFailureReason, Usage,
 };
 use crate::core::{EventId, EventPayload, EventSource, SourceKind, TurnId};
 use crate::hook::{BeforeEffect, HookExecution, HookPoint, HookRegistry};
 use crate::llm::{LlmError, Message, ModelRequest, Provider, StreamEvent, ToolCall, ToolSchema};
 use crate::session::SessionWriter;
+use crate::permission::{Decision, PermissionPolicy};
 use crate::tool::{ToolError, ToolInput, ToolRegistry};
 
 use futures_util::StreamExt;
@@ -191,6 +195,13 @@ pub struct Agent {
     /// Hooks fired at fixed pipeline points (`doc/hook-protocol.md`). Empty by
     /// default — a no-op until the caller attaches a registry.
     hooks: HookRegistry,
+    /// The tool-call permission gate (`doc/permission.md`). Empty by default —
+    /// every call is allowed until the caller attaches a policy.
+    permission: PermissionPolicy,
+    /// Resolves an `Ask` decision into approve/reject. Defaults to the
+    /// fail-closed [`NullGate`]; a front-end attaches its own via
+    /// [`with_approval_gate`](Self::with_approval_gate).
+    approval: std::sync::Arc<dyn ApprovalGate>,
 }
 
 impl Agent {
@@ -203,6 +214,8 @@ impl Agent {
             config,
             compaction: None,
             hooks: HookRegistry::new(),
+            permission: PermissionPolicy::default(),
+            approval: approval::default_gate(),
         }
     }
 
@@ -219,6 +232,22 @@ impl Agent {
     #[must_use]
     pub fn with_hooks(mut self, hooks: HookRegistry) -> Self {
         self.hooks = hooks;
+        self
+    }
+
+    /// Attach a permission policy. Tool calls are then classified allow/deny/ask
+    /// in `dispatch_tool` before execution (`doc/permission.md`).
+    #[must_use]
+    pub fn with_permission(mut self, permission: PermissionPolicy) -> Self {
+        self.permission = permission;
+        self
+    }
+
+    /// Attach the approval gate that resolves `ask` decisions. Without this the
+    /// agent uses the fail-closed [`NullGate`] (an `ask` becomes a rejection).
+    #[must_use]
+    pub fn with_approval_gate(mut self, gate: std::sync::Arc<dyn ApprovalGate>) -> Self {
+        self.approval = gate;
         self
     }
 
@@ -823,6 +852,47 @@ impl TurnState<'_> {
         self.record_hook_executions(&execs)
     }
 
+    /// Record a `PermissionEvent::Requested` for a gated tool call: the audit
+    /// trail and the front-end's authoritative pending-approval source
+    /// (`doc/permission.md` §6). Emitted from the runtime, before the gate decides.
+    fn record_permission_requested(
+        &mut self,
+        call: &ToolCall,
+        input: &serde_json::Value,
+    ) -> Result<(), AgentError> {
+        self.writer.append(
+            runtime_source(),
+            EventPayload::Permission(PermissionEvent::Requested {
+                call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                input: input.clone(),
+            }),
+            None,
+            Some(self.turn_id.clone()),
+        )?;
+        Ok(())
+    }
+
+    /// Record how a gated call resolved (`doc/permission.md` §6).
+    fn record_permission_decided(
+        &mut self,
+        call: &ToolCall,
+        outcome: PermissionOutcome,
+        decided_by: &str,
+    ) -> Result<(), AgentError> {
+        self.writer.append(
+            runtime_source(),
+            EventPayload::Permission(PermissionEvent::Decided {
+                call_id: call.id.clone(),
+                outcome,
+                decided_by: decided_by.to_owned(),
+            }),
+            None,
+            Some(self.turn_id.clone()),
+        )?;
+        Ok(())
+    }
+
     // __APPEND_MARKER__
 
     /// Run one model round: send the current context, persist the streamed
@@ -1080,13 +1150,109 @@ impl TurnState<'_> {
                 )?;
                 self.fire_after(
                     HookPoint::ToolInvokeAfter,
-                    serde_json::json!({ "tool_name": call.name, "blocked": true }),
+                    serde_json::json!({ "tool_name": call.name, "blocked": true, "reason": "hook" }),
                     Some(call.name.clone()),
                 )
                 .await?;
                 return Ok((msg, false));
             }
         };
+
+        // Permission gate (`doc/permission.md`): classify the post-hook input as
+        // allow / deny / ask *before* the tool runs. Deny blocks outright; ask
+        // suspends for the approval gate; a rejected ask blocks too. A blocked
+        // call becomes a `ToolEvent::Failed` the model sees and can react to —
+        // the same shape as a hook block (§8) — so it is fed back, not fatal.
+        if !self.agent.permission.is_empty() {
+            match self.agent.permission.evaluate(&call.name, &args) {
+                Decision::Allow => {}
+                Decision::Deny => {
+                    // A policy deny is not a human-gated request — no `Requested`
+                    // is emitted (it would render a spurious approval card, §6).
+                    // Only the resolution is audited.
+                    self.record_permission_decided(
+                        call,
+                        PermissionOutcome::AutoDenied,
+                        "policy",
+                    )?;
+                    let msg = self.fail_tool(
+                        &source,
+                        &parent,
+                        call,
+                        0,
+                        "denied_by_policy",
+                        &format!(
+                            "Denied by permission policy: tool `{}` is not permitted \
+                             with this input.",
+                            call.name
+                        ),
+                    )?;
+                    self.fire_after(
+                        HookPoint::ToolInvokeAfter,
+                        serde_json::json!({ "tool_name": call.name, "blocked": true, "reason": "permission" }),
+                        Some(call.name.clone()),
+                    )
+                    .await?;
+                    return Ok((msg, false));
+                }
+                Decision::Ask => {
+                    // An `ask` genuinely requests a human decision — audit the
+                    // request, then map the gate's resolution to an outcome that
+                    // records *who* decided (`doc/permission.md` §6).
+                    self.record_permission_requested(call, &args)?;
+                    let resolution = self
+                        .agent
+                        .approval
+                        .request(ApprovalRequest {
+                            tool_name: call.name.clone(),
+                            input: args.clone(),
+                            call_id: call.id.clone(),
+                        })
+                        .await;
+                    let (outcome, decided_by) = match resolution {
+                        ApprovalResolution::Approved => (PermissionOutcome::Approved, "user"),
+                        ApprovalResolution::RejectedByUser => {
+                            (PermissionOutcome::Rejected, "user")
+                        }
+                        // Fail-closed: no human decided (no gate, dropped channel,
+                        // non-interactive terminal). Audited as such, not as a user
+                        // rejection (`CLAUDE.md` §12).
+                        ApprovalResolution::AutoDenied => {
+                            (PermissionOutcome::AutoDenied, "gate")
+                        }
+                    };
+                    self.record_permission_decided(call, outcome, decided_by)?;
+
+                    if resolution != ApprovalResolution::Approved {
+                        // Both a user rejection and a fail-closed auto-denial block
+                        // the call; the model-facing code tells them apart so the
+                        // model can react (a human said no vs. no approver reached).
+                        let (code, reason) = match resolution {
+                            ApprovalResolution::RejectedByUser => (
+                                "denied_by_user",
+                                format!("Rejected by user: the call to `{}` was not approved.", call.name),
+                            ),
+                            _ => (
+                                "denied_no_approval",
+                                format!(
+                                    "Not approved: the call to `{}` was blocked — no approval was received.",
+                                    call.name
+                                ),
+                            ),
+                        };
+                        let msg = self.fail_tool(&source, &parent, call, 0, code, &reason)?;
+                        self.fire_after(
+                            HookPoint::ToolInvokeAfter,
+                            serde_json::json!({ "tool_name": call.name, "blocked": true, "reason": "permission" }),
+                            Some(call.name.clone()),
+                        )
+                        .await?;
+                        return Ok((msg, false));
+                    }
+                    // Approved — fall through and run the tool.
+                }
+            }
+        }
 
         let Some(tool) = self.agent.tools.get(&call.name) else {
             let msg = self.fail_tool(
@@ -2785,6 +2951,194 @@ mod tests {
         assert!(
             !dir.path().join("orig.txt").exists(),
             "the original path was overridden by the hook"
+        );
+    }
+
+    // ── Permission gate (Step 3, `doc/permission.md`) ────────────────────────
+
+    /// A fake approval gate returning a fixed decision, for driving the `ask`
+    /// paths without a real front-end.
+    struct FixedGate(ApprovalResolution);
+
+    #[async_trait::async_trait]
+    impl ApprovalGate for FixedGate {
+        async fn request(&self, _req: ApprovalRequest) -> ApprovalResolution {
+            self.0
+        }
+    }
+
+    /// Build a single-round turn that calls `write`, run it under `policy`
+    /// (optionally with `gate`), and report whether the file landed plus the
+    /// events. Mirrors the hook tests' real-`write`-tool + filesystem-effect
+    /// pattern so the assertion is on actual execution, not a mock.
+    async fn run_write_under_policy(
+        dir: &std::path::Path,
+        policy: PermissionPolicy,
+        gate: Option<std::sync::Arc<dyn ApprovalGate>>,
+    ) -> (bool, Vec<CoreEvent>) {
+        let workspace = dir.to_path_buf();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            tool_call_round("c1", "write", r#"{"path":"g.txt","content":"hi"}"#),
+            text_round("done"),
+        ]));
+        let mut tools = ToolRegistry::new();
+        crate::tool::register_builtin(&mut tools, workspace);
+        let mut agent = Agent::new(
+            provider,
+            tools,
+            AgentConfig {
+                model: "mock".to_owned(),
+                ..AgentConfig::default()
+            },
+        )
+        .with_permission(policy);
+        if let Some(gate) = gate {
+            agent = agent.with_approval_gate(gate);
+        }
+
+        let store = SessionStore::new(dir.join("sessions"));
+        let mut writer = store
+            .create_new(None, None, vec!["write".to_owned()])
+            .unwrap();
+        let sid = writer.session_id().clone();
+        let mut runtime = SessionRuntime::default();
+        agent
+            .run_turn(&mut writer, &mut runtime, "write a file".to_owned())
+            .await
+            .unwrap();
+        drop(writer);
+        let events = store.read_events(&sid).unwrap();
+        (dir.join("g.txt").exists(), events)
+    }
+
+    fn has_failed_code(events: &[CoreEvent], code: &str) -> bool {
+        events.iter().any(|e| matches!(
+            &e.payload,
+            EventPayload::Tool(ToolEvent::Failed { error, .. }) if error.code == code
+        ))
+    }
+
+    fn has_permission_requested(events: &[CoreEvent]) -> bool {
+        events.iter().any(|e| {
+            matches!(
+                &e.payload,
+                EventPayload::Permission(PermissionEvent::Requested { .. })
+            )
+        })
+    }
+
+    fn has_decided_by(events: &[CoreEvent], who: &str) -> bool {
+        events.iter().any(|e| matches!(
+            &e.payload,
+            EventPayload::Permission(PermissionEvent::Decided { decided_by, .. }) if decided_by == who
+        ))
+    }
+
+    fn has_permission_decided(events: &[CoreEvent], outcome: PermissionOutcome) -> bool {
+        events.iter().any(|e| matches!(
+            &e.payload,
+            EventPayload::Permission(PermissionEvent::Decided { outcome: o, .. }) if *o == outcome
+        ))
+    }
+
+    fn deny_rule(tool: &str, contains: &[&str]) -> crate::permission::Rule {
+        crate::permission::Rule::contains(tool, contains.iter().map(|s| (*s).to_owned()).collect())
+    }
+
+    /// Allow: a policy with no matching rule runs the tool — the file lands and
+    /// no permission failure is recorded.
+    #[tokio::test]
+    async fn permission_allow_runs_the_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = PermissionPolicy {
+            deny: vec![deny_rule("shell", &["rm"])], // unrelated to write
+            ask: vec![],
+        };
+        let (wrote, events) = run_write_under_policy(dir.path(), policy, None).await;
+        assert!(wrote, "an allowed write reaches the filesystem");
+        assert!(!has_failed_code(&events, "denied_by_policy"));
+        assert!(!has_failed_code(&events, "denied_by_user"));
+        // An allowed call never enters the gate, so it leaves no audit trail.
+        assert!(!has_permission_requested(&events));
+    }
+
+    /// Deny: a matching deny rule blocks the tool before it runs — the file is
+    /// never written and a `denied_by_policy` failure is fed back. If the gate
+    /// leaked, the file would exist; asserting its absence proves code, not the
+    /// model, stopped the call.
+    #[tokio::test]
+    async fn permission_deny_blocks_before_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = PermissionPolicy {
+            deny: vec![deny_rule("write", &[])], // deny the write tool outright
+            ask: vec![],
+        };
+        let (wrote, events) = run_write_under_policy(dir.path(), policy, None).await;
+        assert!(!wrote, "a denied write never touches the filesystem");
+        assert!(has_failed_code(&events, "denied_by_policy"));
+        // A policy deny is not a human-gated request: only the resolution is
+        // audited (no `Requested`, which would render a spurious approval card —
+        // M4). `decided_by` is "policy", not "user".
+        assert!(!has_permission_requested(&events));
+        assert!(has_permission_decided(&events, PermissionOutcome::AutoDenied));
+        assert!(has_decided_by(&events, "policy"));
+    }
+
+    /// Ask + approve: an approved call runs. The same policy that blocks under a
+    /// rejecting gate must execute under an approving one — proving the gate's
+    /// answer, not the policy alone, decides an `ask`.
+    #[tokio::test]
+    async fn permission_ask_approved_runs_the_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = PermissionPolicy {
+            deny: vec![],
+            ask: vec![deny_rule("write", &[])],
+        };
+        let gate = std::sync::Arc::new(FixedGate(ApprovalResolution::Approved));
+        let (wrote, events) = run_write_under_policy(dir.path(), policy, Some(gate)).await;
+        assert!(wrote, "an approved ask runs the tool");
+        assert!(!has_failed_code(&events, "denied_by_user"));
+        assert!(has_permission_requested(&events));
+        assert!(has_permission_decided(&events, PermissionOutcome::Approved));
+    }
+
+    /// Ask + reject: a rejected call is blocked with `denied_by_user` and the
+    /// file never lands.
+    #[tokio::test]
+    async fn permission_ask_rejected_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = PermissionPolicy {
+            deny: vec![],
+            ask: vec![deny_rule("write", &[])],
+        };
+        let gate = std::sync::Arc::new(FixedGate(ApprovalResolution::RejectedByUser));
+        let (wrote, events) = run_write_under_policy(dir.path(), policy, Some(gate)).await;
+        assert!(!wrote, "a rejected ask never runs the tool");
+        assert!(has_failed_code(&events, "denied_by_user"));
+        assert!(has_permission_decided(&events, PermissionOutcome::Rejected));
+    }
+
+    /// Fail-closed default: with an `ask` policy and no gate attached, the
+    /// built-in `NullGate` rejects — an `ask` never becomes a silent allow just
+    /// because a front-end forgot to wire a gate (`CLAUDE.md` §12).
+    #[tokio::test]
+    async fn permission_ask_without_gate_is_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = PermissionPolicy {
+            deny: vec![],
+            ask: vec![deny_rule("write", &[])],
+        };
+        let (wrote, events) = run_write_under_policy(dir.path(), policy, None).await;
+        assert!(!wrote, "no gate => fail closed => tool blocked");
+        // Audited honestly: no human decided, so it is an AutoDenied by the
+        // "gate", never a fabricated "user" rejection (M2, `CLAUDE.md` §12). The
+        // model-facing code says "no approval received", not "denied by user".
+        assert!(has_permission_decided(&events, PermissionOutcome::AutoDenied));
+        assert!(has_failed_code(&events, "denied_no_approval"));
+        assert!(!has_failed_code(&events, "denied_by_user"));
+        assert!(
+            !has_decided_by(&events, "user"),
+            "a fail-closed denial must not be attributed to a user"
         );
     }
 }

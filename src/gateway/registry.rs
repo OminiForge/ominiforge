@@ -26,7 +26,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
@@ -155,6 +155,21 @@ pub struct SessionRegistry {
     inner: Arc<RegistryInner>,
 }
 
+/// Why loading a per-workspace config failed.
+///
+/// Lets the HTTP layer pick the right status: an unknown workspace id is the
+/// caller's fault (404); a present-but-malformed file is a server-side problem
+/// (500) that must not be mis-reported as "workspace does not exist".
+#[derive(Debug, thiserror::Error)]
+pub enum WorkspaceConfigError {
+    /// No recorded path resolves for this workspace id → 404.
+    #[error("unknown workspace id `{0}`")]
+    UnknownWorkspace(String),
+    /// The config file exists but could not be read/parsed → 500.
+    #[error("failed to load workspace config: {0}")]
+    Load(#[source] anyhow::Error),
+}
+
 struct RegistryInner {
     defaults: SessionDefaults,
     idle_timeout: std::time::Duration,
@@ -176,6 +191,16 @@ struct RegistryInner {
     /// one (`doc/sandbox.md` §6.2). Resolved once from `gateway.toml` at boot so
     /// a malformed default fails loud here, not per session.
     default_network: crate::sandbox::NetworkPolicy,
+    /// Gateway-wide baseline tool-call gate (`doc/permission.md` §3), the bottom
+    /// tier of the three-tier resolution. Seeded from `gateway.toml` at boot; its
+    /// `deny` rules are a floor every session inherits.
+    ///
+    /// Behind a `RwLock` because the settings UI can change it at runtime
+    /// (`PUT /gateway/permission`): a new session must pick up the updated policy
+    /// without a gateway restart, so the value is read fresh at each `assemble`
+    /// rather than captured once. A security control that silently required a
+    /// restart to take effect would be a fail-silent trap (Karpathy §12).
+    default_permission: RwLock<crate::permission::PermissionPolicy>,
     /// Per-workspace sandbox config overrides (`doc/workspace-config.md`), keyed
     /// by workspace path hash, read from the gateway's trusted `.omini/workspaces/`
     /// — the top tier of the network resolution chain.
@@ -309,6 +334,7 @@ impl SessionRegistry {
         let default_network = config
             .default_network_policy()
             .map_err(|e| anyhow::anyhow!("invalid gateway.toml default_network: {e}"))?;
+        let default_permission = RwLock::new(config.default_permission.clone());
         Ok(Self {
             inner: Arc::new(RegistryInner {
                 defaults,
@@ -318,6 +344,7 @@ impl SessionRegistry {
                 status_hub: StatusHub::new(),
                 sandbox_manager,
                 default_network,
+                default_permission,
                 workspace_config,
                 mount_anchors,
             }),
@@ -459,6 +486,167 @@ impl SessionRegistry {
             .workspace_config
             .delete(id)
             .with_context(|| format!("failed to delete workspace config `{}`", id.0))
+    }
+
+    /// The gateway-wide baseline permission policy (bottom tier of the three-tier
+    /// resolution). A clone of the live value, for the settings UI to display.
+    ///
+    /// # Errors
+    /// A poisoned lock — surfaced rather than papered over so the caller fails
+    /// loud instead of showing a stale/empty policy.
+    pub fn gateway_permission(&self) -> Result<crate::permission::PermissionPolicy> {
+        self.inner
+            .default_permission
+            .read()
+            .map_err(|_| anyhow!("gateway permission lock poisoned"))
+            .map(|p| p.clone())
+    }
+
+    /// Replace the gateway-wide baseline permission policy: update the in-memory
+    /// value (so new sessions see it immediately) **and** persist it to
+    /// `gateway.toml` (so it survives a restart). Both, atomically from the
+    /// caller's view — the file write happens first; only on success is the live
+    /// value swapped, so a failed write leaves the running gateway unchanged.
+    ///
+    /// The persisted file preserves every other gateway field: the current config
+    /// is re-loaded from disk, only `default_permission` is replaced, then the
+    /// whole record is written back.
+    ///
+    /// # Errors
+    /// No writable config root, a malformed existing `gateway.toml`, a
+    /// serialize/io failure, or a poisoned lock.
+    pub fn set_gateway_permission(
+        &self,
+        policy: crate::permission::PermissionPolicy,
+    ) -> Result<()> {
+        let roots = self.inner.defaults.config.roots();
+        // Load across ALL roots so we preserve the *effective* config (bind,
+        // api_key_env, default_network …) — `GatewayConfig::load` returns the
+        // first root that actually has a `gateway.toml`. Loading from only
+        // `roots.first()` would miss a file living in a lower root and write a
+        // shadow file (defaults + new permission) that silently masks it next boot.
+        let mut config =
+            GatewayConfig::load(roots).context("failed to load gateway.toml before update")?;
+        config.default_permission = policy.clone();
+        // Write back to the root that already holds `gateway.toml`; if none does
+        // yet (first-ever write), fall back to the highest-priority root.
+        let root = roots
+            .iter()
+            .find(|r| r.join("config").join("gateway.toml").is_file())
+            .or_else(|| roots.first())
+            .cloned()
+            .context("no config root to persist gateway.toml")?;
+        config
+            .save(&root)
+            .context("failed to persist gateway.toml")?;
+        // Persist succeeded — now swap the live value new sessions read.
+        *self
+            .inner
+            .default_permission
+            .write()
+            .map_err(|_| anyhow!("gateway permission lock poisoned"))? = policy;
+        Ok(())
+    }
+
+    /// The per-workspace config for `id` (network + mounts + permission), or the
+    /// default (all-absent) config when none is stored. Backs the workspace-config
+    /// editor.
+    ///
+    /// # Errors
+    /// An unknown workspace id (no recorded path to resolve), or a
+    /// present-but-malformed config file (fail-loud).
+    pub fn load_workspace_config(
+        &self,
+        id: &super::workspace::WorkspaceId,
+    ) -> Result<super::workspace_config::WorkspaceConfig, WorkspaceConfigError> {
+        let path = self
+            .resolve_or_seed_workspace_id(id)
+            .ok_or_else(|| WorkspaceConfigError::UnknownWorkspace(id.0.clone()))?;
+        Ok(self
+            .inner
+            .workspace_config
+            .load(&path)
+            .map_err(|e| WorkspaceConfigError::Load(anyhow!(e)))?
+            .unwrap_or_default())
+    }
+
+    /// Write the per-workspace config for `id` (settings UI full-state save).
+    ///
+    /// # Errors
+    /// An unknown workspace id, or a serialize/io failure persisting the file.
+    pub fn save_workspace_config(
+        &self,
+        id: &super::workspace::WorkspaceId,
+        config: &super::workspace_config::WorkspaceConfig,
+    ) -> Result<()> {
+        let path = self
+            .resolve_or_seed_workspace_id(id)
+            .with_context(|| format!("unknown workspace id `{}`", id.0))?;
+        self.inner
+            .workspace_config
+            .save(&path, config)
+            .with_context(|| format!("failed to write workspace config `{}`", id.0))
+    }
+
+    /// The permission-config tool catalog for a workspace: the static built-in
+    /// catalog plus this workspace's MCP tools, enumerated best-effort
+    /// (`doc/permission.md` §3.2).
+    ///
+    /// MCP enumeration spawns each configured server, runs the handshake, and
+    /// reads `tools/list` — so it is fallible and can be slow. Every per-server
+    /// failure is swallowed (the server is skipped) and the built-ins are always
+    /// returned, so the config UI degrades to "built-ins only" rather than
+    /// erroring. The spawned clients are dropped immediately; we need only the
+    /// tool list, not a live session. MCP tools carry no field metadata (their
+    /// schemas are arbitrary), so they render as generic whole-input cards.
+    ///
+    /// # Errors
+    /// An unknown workspace id (no recorded path). MCP problems are non-fatal.
+    pub async fn list_workspace_tools(
+        &self,
+        id: &super::workspace::WorkspaceId,
+    ) -> Result<Vec<crate::tool::ToolInfo>> {
+        // Resolve the id to validate it (a 404 for an unknown workspace, not an
+        // empty list). The MCP config itself comes from the gateway config roots,
+        // matching how `assemble` loads it.
+        self.resolve_or_seed_workspace_id(id)
+            .with_context(|| format!("unknown workspace id `{}`", id.0))?;
+        let mut catalog = crate::tool::builtin_catalog();
+
+        // Best-effort MCP enumeration. An empty env overlay keeps this cheap (no
+        // direnv spawn); a server that needs workspace env and fails is simply
+        // skipped — the built-ins still return.
+        let roots = self.inner.defaults.config.roots();
+        if let Ok(mcp_config) = crate::mcp::McpConfig::load(roots) {
+            let empty_env = std::collections::BTreeMap::new();
+            for server in &mcp_config.servers {
+                match crate::mcp::McpClient::connect(server, &empty_env).await {
+                    Ok((_client, tools)) => {
+                        for def in tools {
+                            catalog.push(crate::tool::ToolInfo {
+                                name: def.name,
+                                label: None,
+                                description: Some(if def.description.is_empty() {
+                                    format!("MCP · {}", server.name)
+                                } else {
+                                    def.description
+                                }),
+                                fields: Vec::new(),
+                            });
+                        }
+                        // Client dropped here: kills the subprocess (we only
+                        // wanted the tool list, `kill_on_drop`).
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "gateway: skipping MCP server `{}` in tool listing: {e}",
+                            server.name
+                        );
+                    }
+                }
+            }
+        }
+        Ok(catalog)
     }
 
     /// Create a new session **in the workspace identified by `id`**, resolving the
@@ -679,7 +867,7 @@ impl SessionRegistry {
             .await;
 
         let handle = SessionActor::spawn(
-            Arc::new(assembled.agent),
+            assembled.agent,
             self.store(),
             system,
             (writer, runtime),
@@ -764,7 +952,7 @@ impl SessionRegistry {
         let runtime = SessionRuntime::new(system.clone());
 
         let handle = SessionActor::spawn(
-            Arc::new(assembled.agent),
+            assembled.agent,
             self.store(),
             system,
             (writer, runtime),
@@ -856,7 +1044,7 @@ impl SessionRegistry {
         let runtime = SessionRuntime::new(snapshot);
 
         let handle = SessionActor::spawn(
-            Arc::new(assembled.agent),
+            assembled.agent,
             self.store(),
             system,
             (writer, runtime),
@@ -938,7 +1126,7 @@ impl SessionRegistry {
         let runtime = SessionRuntime::new(snapshot);
 
         let handle = SessionActor::spawn(
-            Arc::new(assembled.agent),
+            assembled.agent,
             self.store(),
             system,
             (writer, runtime),
@@ -1022,6 +1210,17 @@ impl SessionRegistry {
             .mount_anchors
             .resolve(&workspace_config.mounts, session_id, &workspace)
             .context("failed to resolve workspace mounts")?;
+        // Gateway baseline gate (bottom tier), read fresh so a runtime
+        // `PUT /gateway/permission` applies to new sessions without a restart.
+        // Cloned into a local BEFORE the await below: an `RwLockReadGuard` is
+        // `!Send` and must not be held across `app::assemble().await`. A poisoned
+        // lock fails the session start rather than silently dropping the floor.
+        let default_permission = self
+            .inner
+            .default_permission
+            .read()
+            .map_err(|_| anyhow!("gateway permission lock poisoned"))?
+            .clone();
         app::assemble(
             &d.config,
             workspace,
@@ -1033,6 +1232,8 @@ impl SessionRegistry {
             injected_sandbox,
             self.inner.default_network.clone(),
             workspace_network,
+            default_permission,
+            workspace_config.permission.clone(),
             mounts,
             &|msg| eprintln!("gateway: {msg}"),
         )

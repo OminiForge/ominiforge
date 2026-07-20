@@ -99,6 +99,23 @@
   无对应暂停语义挂载点，按需新增（需发版）。
 - Hook 热更新、hook 与 profile 绑定、hook 执行 monitor metrics（待 monitor 扩展）。
 
+### 权限门控系统 ✅（除 TUI 交互审批外完成）
+
+**目标**：工具执行前由代码决定 deny/ask/allow。规范见 [`permission.md`](./permission.md)。
+
+已实现（`src/permission/` + `src/agent/` + `src/gateway/` + `src/cli.rs` + `frontend/`）：
+- 策略内核 `PermissionPolicy`（deny/ask 两列表，deny→ask→allow 优先级，子串匹配，`*` 通配）。
+- profile `[permission]` section（复用 PermissionPolicy，overlay 继承，`app.rs` assemble 注入）。
+- `dispatch_tool` 接入：before-hook 之后求值；deny→`denied_by_policy`，ask→gate→`denied_by_user`。
+- `ApprovalGate` trait + `NullGate`（fail-closed）；CLI `CliApprovalGate`（终端 y/n，非 tty fail-closed）；
+  gateway `GatewayApprovalGate`（oneshot 挂起-恢复 + `Command::Approve` + `POST /approve` + WS）。
+- 持久化 `EventPayload::Permission(PermissionEvent)`（Requested/Decided）审计 + 前端重建。
+- Web `ApprovalPrompt.svelte`（会话流内联，DESIGN.md §4.9），`conversation.ts` fold。
+
+延后：
+- **TUI 交互审批**（TUI 当前走默认 NullGate，ask 即 fail-closed）。
+- 规则匹配升级（glob/regex/结构化字段）；monitor 聚合审批计数；内置 permission-guard hook 绑定。
+
 
 ### Phase 5 — Gateway（网络访问层）✅（核心完成）
 

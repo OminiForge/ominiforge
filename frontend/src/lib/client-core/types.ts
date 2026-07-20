@@ -13,6 +13,9 @@ import type { ProvidersFile } from '$lib/types/ProvidersFile';
 import type { Profile } from '$lib/types/Profile';
 import type { WorkspaceSummary } from '$lib/types/WorkspaceSummary';
 import type { SessionStatus } from '$lib/types/SessionStatus';
+import type { PermissionPolicy } from '$lib/types/PermissionPolicy';
+import type { WorkspaceConfig } from '$lib/types/WorkspaceConfig';
+import type { ToolInfo } from '$lib/types/ToolInfo';
 
 /** The settings view of `providers.toml`: the raw provider set plus which
  *  providers have an API key in the secret store. Key values are never sent —
@@ -117,6 +120,9 @@ export interface SessionClient {
 	sendMessage(id: string, text: string): Promise<void>;
 	/** Abort the running turn, if any. */
 	cancel(id: string): Promise<void>;
+	/** Answer a suspended `ask` tool call: `approve` runs it, `reject` blocks it
+	 *  (`denied_by_user`). Idempotent — a resolved/unknown `callId` is ignored. */
+	approve(id: string, callId: string, decision: 'approve' | 'reject'): Promise<void>;
 	/** Summarize and switch to a compaction session; `keepLast` keeps recent turns. */
 	compact(id: string, keepLast?: number): Promise<void>;
 	/** Derived monitor metrics for one session (folded from its committed event log). */
@@ -144,6 +150,27 @@ export interface SessionClient {
 	saveProfile(name: string, profile: Profile): Promise<void>;
 	/** Delete profile `name`'s file. */
 	deleteProfile(name: string): Promise<void>;
+	/** The built-in tool catalog (labels + targetable fields) that drives the
+	 *  permission-config UI's per-tool cards (`doc/permission.md` §3.2). */
+	listTools(): Promise<ToolInfo[]>;
+	/** This workspace's tool catalog: the built-ins plus its MCP tools
+	 *  (best-effort; MCP failures degrade to built-ins). Backs the workspace
+	 *  config dialog's per-tool cards. */
+	listWorkspaceTools(workspaceId: string): Promise<ToolInfo[]>;
+	/** The gateway-wide baseline permission policy (bottom tier of the three-tier
+	 *  gate, `doc/permission.md` §3.1) — the settings UI's read source. */
+	getGatewayPermission(): Promise<PermissionPolicy>;
+	/** Replace the gateway baseline policy. Applies to new sessions immediately
+	 *  and persists to `gateway.toml`. */
+	saveGatewayPermission(policy: PermissionPolicy): Promise<void>;
+	/** The per-workspace config (network + mounts + permission; top tier of the
+	 *  gate) for the workspace `id` resolves to. A never-configured workspace
+	 *  returns `{}` (the backend omits empty sections), so the optional fields may
+	 *  be `undefined` — callers must normalize before binding. */
+	getWorkspaceConfig(workspaceId: string): Promise<WorkspaceConfig>;
+	/** Overwrite the per-workspace config (full desired state). The file lives in
+	 *  the gateway's trusted dir, so widening its own `deny` is safe. */
+	saveWorkspaceConfig(workspaceId: string, config: WorkspaceConfig): Promise<void>;
 	/** Store (or replace) the API key for `provider` in the secret store. */
 	setSecret(provider: string, apiKey: string): Promise<void>;
 	/** Delete `provider`'s stored API key. */

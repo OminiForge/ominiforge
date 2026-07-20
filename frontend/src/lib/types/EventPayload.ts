@@ -4,6 +4,7 @@ import type { ErrorEvent } from "./ErrorEvent";
 import type { HookEvent } from "./HookEvent";
 import type { InjectionEvent } from "./InjectionEvent";
 import type { ModelEvent } from "./ModelEvent";
+import type { PermissionEvent } from "./PermissionEvent";
 import type { SessionEvent } from "./SessionEvent";
 import type { ToolEvent } from "./ToolEvent";
 import type { TurnEvent } from "./TurnEvent";
@@ -11,4 +12,4 @@ import type { TurnEvent } from "./TurnEvent";
 /**
  * Domain-tagged payload of a [`super::CoreEvent`].
  */
-export type EventPayload = { "Turn": TurnEvent } | { "Model": ModelEvent } | { "Tool": ToolEvent } | { "Session": SessionEvent } | { "Artifact": ArtifactEvent } | { "Injection": InjectionEvent } | { "Hook": HookEvent } | { "Error": ErrorEvent };
+export type EventPayload = { "Turn": TurnEvent } | { "Model": ModelEvent } | { "Tool": ToolEvent } | { "Session": SessionEvent } | { "Artifact": ArtifactEvent } | { "Injection": InjectionEvent } | { "Hook": HookEvent } | { "Permission": PermissionEvent } | { "Error": ErrorEvent };

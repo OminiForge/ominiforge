@@ -21,6 +21,7 @@ pub enum EventPayload {
     Artifact(ArtifactEvent),
     Injection(InjectionEvent),
     Hook(HookEvent),
+    Permission(PermissionEvent),
     Error(ErrorEvent),
 }
 
@@ -386,6 +387,49 @@ pub enum HookOutcome {
     Observed,
     /// The hook itself failed (non-zero exit, timeout, bad output).
     Failed { error: String },
+}
+
+/// A permission-gate decision on a tool call (`doc/permission.md` §6).
+///
+/// The gate classifies each call before it runs; an `ask` suspends it for a
+/// human. Both the request and its resolution are recorded so the log is a
+/// complete audit trail *and* a front-end can reconstruct a pending prompt after
+/// a reload (the live `GatewayEvent::ApprovalRequested` is only an instant
+/// hint). A denied call additionally surfaces to the model as a
+/// [`ToolEvent::Failed`] (`denied_by_policy` / `denied_by_user`); this event is
+/// the parallel audit record, not the model-facing result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
+pub enum PermissionEvent {
+    /// A tool call was classified `ask` (or `deny`) and entered the gate. Carries
+    /// the tool name and the post-hook input the human (or policy) is judging.
+    Requested {
+        /// The model-assigned tool-call id, correlating this to the `Decided`
+        /// event and the underlying `ToolEvent`.
+        call_id: String,
+        tool_name: String,
+        input: serde_json::Value,
+    },
+    /// The gate resolved. `decided_by` is `"user"` (a human answered an ask) or
+    /// `"policy"` (a deny rule, or the fail-closed default, auto-resolved it).
+    Decided {
+        call_id: String,
+        outcome: PermissionOutcome,
+        decided_by: String,
+    },
+}
+
+/// How a [`PermissionEvent::Requested`] resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
+pub enum PermissionOutcome {
+    /// A human approved an `ask`; the tool ran.
+    Approved,
+    /// A human rejected an `ask`; the tool was blocked (`denied_by_user`).
+    Rejected,
+    /// The policy denied outright, or no gate was wired and the fail-closed
+    /// default rejected the ask (`denied_by_policy`). No human was consulted.
+    AutoDenied,
 }
 
 /// A structured error surfaced as its own event. See `doc/event-schema.md` §10.

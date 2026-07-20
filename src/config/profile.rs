@@ -41,6 +41,13 @@ pub struct Profile {
     pub hooks: HooksSection,
     #[serde(default)]
     pub network: NetworkSection,
+
+    /// `[permission]`: the tool-call gate for sessions on this profile
+    /// (`doc/permission.md`). Empty (the default) imposes no gate. Reused
+    /// verbatim as the [`PermissionPolicy`](crate::permission::PermissionPolicy)
+    /// the agent evaluates — the section *is* the policy.
+    #[serde(default)]
+    pub permission: crate::permission::PermissionPolicy,
 }
 
 /// `[profile]`: identity and inheritance.
@@ -211,6 +218,7 @@ impl Profile {
             budget: BudgetSection::default(),
             hooks: HooksSection::default(),
             network: NetworkSection::default(),
+            permission: crate::permission::PermissionPolicy::default(),
         }
     }
 
@@ -234,6 +242,7 @@ impl Profile {
             budget: pick_budget(self.budget, parent.budget),
             hooks: pick_hooks(self.hooks, parent.hooks),
             network: pick_network(self.network, parent.network),
+            permission: pick_permission(self.permission, parent.permission),
         }
     }
 }
@@ -331,9 +340,98 @@ fn pick_network(child: NetworkSection, parent: NetworkSection) -> NetworkSection
     }
 }
 
+fn pick_permission(
+    child: crate::permission::PermissionPolicy,
+    parent: crate::permission::PermissionPolicy,
+) -> crate::permission::PermissionPolicy {
+    // Deliberate divergence from the general field-level override (§4): `deny` is
+    // a *security floor* (union-inherited) while `ask` is replace-or-inherit.
+    // This is the same merge the three-tier resolution uses, so it lives once on
+    // the policy kernel (`PermissionPolicy::layer_over`) — the child overlays
+    // onto the parent. See `doc/permission.md` §3.
+    child.layer_over(parent)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+
+    use crate::permission::Decision;
+
+    /// A `[permission]` section parses into the profile's policy and evaluates:
+    /// this is the config → gate bridge Step 2 exists to build. A test that only
+    /// checked the section parsed (not that it *decides*) would pass even if the
+    /// rules were dropped on the floor.
+    #[test]
+    fn permission_section_parses_and_gates() {
+        let toml_src = r#"
+[profile]
+name = "guarded"
+
+[[permission.deny]]
+tool = "shell"
+contains = ["rm -rf"]
+
+[[permission.ask]]
+tool = "write"
+"#;
+        let profile: super::Profile = toml::from_str(toml_src).unwrap();
+        let policy = &profile.permission;
+        assert_eq!(
+            policy.evaluate("shell", &serde_json::json!({"command": "rm -rf /"})),
+            Decision::Deny
+        );
+        assert_eq!(
+            policy.evaluate("write", &serde_json::json!({"path": "x"})),
+            Decision::Ask
+        );
+        assert_eq!(
+            policy.evaluate("read", &serde_json::json!({"path": "x"})),
+            Decision::Allow
+        );
+    }
+
+    /// M3 safety: overlaying a child profile UNION-inherits the parent's `deny`
+    /// rules — a child adding an unrelated `ask` must not silently reopen a tool
+    /// the parent banned (stealth escalation). `ask` still replaces on override.
+    #[test]
+    fn overlay_unions_deny_and_replaces_ask() {
+        use crate::permission::{PermissionPolicy, Rule};
+        let parent = super::Profile {
+            permission: PermissionPolicy {
+                deny: vec![Rule::contains("shell", vec!["rm -rf".to_owned()])],
+                ask: vec![Rule::contains("read", vec![])],
+            },
+            ..super::Profile::builtin_default()
+        };
+        let child = super::Profile {
+            permission: PermissionPolicy {
+                deny: vec![Rule::contains("net", vec![])],
+                ask: vec![Rule::contains("write", vec![])],
+            },
+            ..super::Profile::builtin_default()
+        };
+        let merged = child.overlay_onto(parent).permission;
+        // Parent's deny survived (not dropped) AND the child's deny was added.
+        assert_eq!(
+            merged.evaluate("shell", &serde_json::json!({"command": "rm -rf /"})),
+            Decision::Deny,
+            "parent deny must be inherited, not silently dropped"
+        );
+        assert_eq!(merged.evaluate("net", &serde_json::json!({})), Decision::Deny);
+        // Child's ask replaced parent's ask (write asks; read no longer does).
+        assert_eq!(merged.evaluate("write", &serde_json::json!({})), Decision::Ask);
+        assert_eq!(merged.evaluate("read", &serde_json::json!({})), Decision::Allow);
+    }
+
+    /// A profile file with no `[permission]` section yields an empty policy —
+    /// the gate is opt-in, so existing profiles keep running ungated.
+    #[test]
+    fn absent_permission_section_is_empty_policy() {
+        let profile: super::Profile =
+            toml::from_str("[profile]\nname = \"p\"\n").unwrap();
+        assert!(profile.permission.is_empty());
+    }
 
     use super::*;
 

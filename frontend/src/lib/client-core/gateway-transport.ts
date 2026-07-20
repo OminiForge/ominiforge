@@ -17,6 +17,9 @@ import type { ProvidersFile } from '$lib/types/ProvidersFile';
 import type { Profile } from '$lib/types/Profile';
 import type { WorkspaceSummary } from '$lib/types/WorkspaceSummary';
 import type { SessionStatus } from '$lib/types/SessionStatus';
+import type { PermissionPolicy } from '$lib/types/PermissionPolicy';
+import type { WorkspaceConfig } from '$lib/types/WorkspaceConfig';
+import type { ToolInfo } from '$lib/types/ToolInfo';
 import { endpoints } from './endpoints';
 import type {
 	CreateSessionOptions,
@@ -139,6 +142,16 @@ export class GatewayTransport implements SessionClient {
 		return body.profiles;
 	}
 
+	async listTools(): Promise<ToolInfo[]> {
+		const body = await this.#json<{ tools: ToolInfo[] }>(endpoints.tools());
+		return body.tools;
+	}
+
+	async listWorkspaceTools(workspaceId: string): Promise<ToolInfo[]> {
+		const body = await this.#json<{ tools: ToolInfo[] }>(endpoints.workspaceTools(workspaceId));
+		return body.tools;
+	}
+
 	async listModels(): Promise<ModelSummary[]> {
 		const body = await this.#json<{ models: ModelSummary[] }>(endpoints.models());
 		return body.models;
@@ -185,6 +198,13 @@ export class GatewayTransport implements SessionClient {
 
 	cancel(id: string): Promise<void> {
 		return this.#send(endpoints.cancel(id), { method: 'POST' });
+	}
+
+	approve(id: string, callId: string, decision: 'approve' | 'reject'): Promise<void> {
+		return this.#send(endpoints.approve(id), {
+			method: 'POST',
+			body: JSON.stringify({ call_id: callId, decision })
+		});
 	}
 
 	compact(id: string, keepLast?: number): Promise<void> {
@@ -234,6 +254,28 @@ export class GatewayTransport implements SessionClient {
 
 	deleteProfile(name: string): Promise<void> {
 		return this.#send(endpoints.profile(name), { method: 'DELETE' });
+	}
+
+	getGatewayPermission(): Promise<PermissionPolicy> {
+		return this.#json<PermissionPolicy>(endpoints.gatewayPermission());
+	}
+
+	saveGatewayPermission(policy: PermissionPolicy): Promise<void> {
+		return this.#send(endpoints.gatewayPermission(), {
+			method: 'PUT',
+			body: JSON.stringify(policy)
+		});
+	}
+
+	getWorkspaceConfig(workspaceId: string): Promise<WorkspaceConfig> {
+		return this.#json<WorkspaceConfig>(endpoints.workspaceConfig(workspaceId));
+	}
+
+	saveWorkspaceConfig(workspaceId: string, config: WorkspaceConfig): Promise<void> {
+		return this.#send(endpoints.workspaceConfig(workspaceId), {
+			method: 'PUT',
+			body: JSON.stringify(config)
+		});
 	}
 
 	setSecret(provider: string, apiKey: string): Promise<void> {

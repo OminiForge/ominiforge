@@ -59,6 +59,101 @@ pub struct ToolDescriptor {
     pub input_schema: serde_json::Value,
 }
 
+/// A human-facing description of a tool for the permission-config UI.
+///
+/// This is NOT what the model sees (that is [`ToolDescriptor`]) — it is the
+/// metadata the front-end turns into a per-tool gating card (`doc/permission.md`
+/// §3.2): a friendly label, the one-line purpose, and which input fields a rule
+/// may target (so the user picks a field from a dropdown instead of typing a
+/// JSON path they cannot know).
+///
+/// Serialized to the front-end via `GET /tools`; only built-in tools have a
+/// hand-authored catalog entry today. A tool with no entry (e.g. an MCP tool)
+/// still gates fine — the UI falls back to a generic "whole input" card.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
+pub struct ToolInfo {
+    /// The tool name a [`crate::permission::Rule`] targets (its `tool` field).
+    pub name: String,
+    /// A short human label for the card header (e.g. "运行命令"). Falls back to
+    /// `name` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// One-line purpose, shown under the label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The input fields a rule may scope to. Empty = only whole-input rules make
+    /// sense for this tool (the UI shows no field dropdown).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<ToolField>,
+}
+
+/// One targetable input field of a tool, for the config UI's field dropdown.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
+pub struct ToolField {
+    /// The JSON key a rule's `field` targets (e.g. `"command"`, `"path"`).
+    pub key: String,
+    /// A human label for the field in the dropdown (e.g. "命令", "路径").
+    pub label: String,
+    /// Whether this field holds a filesystem path — the UI offers prefix
+    /// (directory allow/deny-list) controls for it, not just substring.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_path: bool,
+}
+
+/// The permission-config catalog for the built-in tools.
+///
+/// Static and always available (`doc/permission.md` §3.2) — unlike MCP tools,
+/// the built-ins need no subprocess to enumerate, so `GET /tools` can serve this
+/// without a workspace context. Ordered read → write → edit → shell (roughly
+/// least → most powerful), the order the cards render in.
+#[must_use]
+pub fn builtin_catalog() -> Vec<ToolInfo> {
+    let path_field = |desc: &str| ToolField {
+        key: "path".to_owned(),
+        label: format!("路径（{desc}）"),
+        is_path: true,
+    };
+    vec![
+        ToolInfo {
+            name: "read".to_owned(),
+            label: Some("读文件".to_owned()),
+            description: Some("读取工作区内的文本文件或列目录".to_owned()),
+            fields: vec![path_field("读取的文件")],
+        },
+        ToolInfo {
+            name: "write".to_owned(),
+            label: Some("写文件".to_owned()),
+            description: Some("写入（覆盖）工作区内的文本文件".to_owned()),
+            fields: vec![
+                path_field("写入的文件"),
+                ToolField {
+                    key: "content".to_owned(),
+                    label: "内容".to_owned(),
+                    is_path: false,
+                },
+            ],
+        },
+        ToolInfo {
+            name: "edit".to_owned(),
+            label: Some("改文件".to_owned()),
+            description: Some("按行编辑工作区内的文件".to_owned()),
+            fields: vec![path_field("编辑的文件")],
+        },
+        ToolInfo {
+            name: "shell".to_owned(),
+            label: Some("运行命令".to_owned()),
+            description: Some("在工作区目录执行 shell 命令".to_owned()),
+            fields: vec![ToolField {
+                key: "command".to_owned(),
+                label: "命令".to_owned(),
+                is_path: false,
+            }],
+        },
+    ]
+}
+
 /// A single invocation request.
 #[derive(Debug, Clone)]
 pub struct ToolInput {

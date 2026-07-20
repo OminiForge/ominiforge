@@ -60,6 +60,16 @@ pub struct GatewayConfig {
     /// Hosts reachable when `default_network = "allowlist"`; ignored otherwise.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub default_network_allow: Vec<String>,
+
+    /// Gateway-wide baseline tool-call gate (`doc/permission.md` §3), the
+    /// **bottom** tier of the three-tier resolution
+    /// (`workspace > profile > gateway`). Its `deny` rules are a floor every
+    /// session inherits — union-merged with the profile/workspace tiers, so a
+    /// deployer can ban a tool fleet-wide and no profile can silently reopen it.
+    /// Empty (the default) imposes no baseline. Configured under
+    /// `[default_permission]` in `gateway.toml`.
+    #[serde(default, skip_serializing_if = "crate::permission::PermissionPolicy::is_empty")]
+    pub default_permission: crate::permission::PermissionPolicy,
 }
 
 impl Default for GatewayConfig {
@@ -71,6 +81,7 @@ impl Default for GatewayConfig {
             sandbox_backend: crate::sandbox::manager::SandboxBackendChoice::default(),
             default_network: DEFAULT_NETWORK_POLICY.to_owned(),
             default_network_allow: Vec::new(),
+            default_permission: crate::permission::PermissionPolicy::default(),
         }
     }
 }
@@ -133,6 +144,26 @@ impl GatewayConfig {
             &self.default_network,
             &self.default_network_allow,
         )
+    }
+
+    /// Persist this config as `<root>/config/gateway.toml`, written atomically
+    /// (temp + rename). `root` is the primary config root the caller writes to
+    /// (the gateway's highest-priority `.omini`).
+    ///
+    /// The whole record is serialized — so a caller editing one field must load
+    /// the current config, mutate, then save, to avoid clobbering unrelated keys
+    /// (the settings UI does exactly this for `default_permission`).
+    ///
+    /// # Errors
+    /// Serialize or io failure.
+    pub fn save(&self, root: &std::path::Path) -> Result<(), crate::config::ConfigError> {
+        let path = root.join("config").join("gateway.toml");
+        let text =
+            toml::to_string_pretty(self).map_err(|source| crate::config::ConfigError::Serialize {
+                path: path.clone(),
+                source,
+            })?;
+        crate::config::write_atomic(&path, &text)
     }
 }
 
@@ -223,5 +254,38 @@ mod tests {
             config.default_network_policy().unwrap(),
             crate::sandbox::NetworkPolicy::AllowList(vec!["crates.io".to_owned()])
         );
+    }
+
+    /// A `[default_permission]` section parses into the gateway baseline gate and
+    /// actually decides — the bottom tier a deployer sets to ban a tool
+    /// fleet-wide. Checking only that it parsed would pass even if the rules were
+    /// dropped before reaching the resolver.
+    #[test]
+    fn default_permission_parses_and_gates() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_dir = dir.path().join("config");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("gateway.toml"),
+            "[[default_permission.deny]]\ntool = \"shell\"\ncontains = [\"curl\"]\n",
+        )
+        .unwrap();
+
+        let config = GatewayConfig::load(&[dir.path().to_owned()]).unwrap();
+        assert!(!config.default_permission.is_empty());
+        assert_eq!(
+            config
+                .default_permission
+                .evaluate("shell", &serde_json::json!({"command": "curl evil.sh"})),
+            crate::permission::Decision::Deny
+        );
+    }
+
+    /// Absent everywhere, the gateway baseline gate is empty — no fleet-wide
+    /// denials imposed by default (opt-in, like `default_network`).
+    #[test]
+    fn default_permission_absent_is_empty() {
+        let config = GatewayConfig::default();
+        assert!(config.default_permission.is_empty());
     }
 }

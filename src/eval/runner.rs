@@ -71,6 +71,9 @@ pub async fn run_case(case: &EvalCase, config: &RunConfig<'_>) -> Result<CaseRes
         // Eval runs on the passthrough backend, which ignores the network policy.
         crate::sandbox::NetworkPolicy::Open,
         None,
+        // Eval exercises the profile gate only; no gateway/workspace tiers.
+        crate::permission::PermissionPolicy::default(),
+        crate::permission::PermissionPolicy::default(),
         // Eval runs on passthrough; no auxiliary mounts.
         Vec::new(),
         &|_msg| {},

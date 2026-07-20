@@ -381,6 +381,39 @@ layout 的 `main` **不带 padding**（对话页要全屏）。每个内容页�
 
 > 这也顺带覆盖了 compaction / reconfiguration 会话——它们同样有 `context_snapshot.json`，此前也一样看不到继承历史，现在一并显示。
 
+### 4.9 审批面板（approval prompt）
+
+权限门控把一次 `ask` 工具调用挂起等人工决定（`doc/permission.md` §8）。用组件
+`ApprovalPrompt.svelte`，**内联**在对话流里（它属于该轮上下文的一次 tool 调用，不做 pinned/全局入口）。
+
+- **surface**：`--canvas-overlay` 卡片 + `--border-strong` hairline——需要注意但不靠大阴影/彩条 slop。
+- **状态冗余**（§1.3）：pending = 琥珀（`--state-running`）**2s 脉冲边框** + 琥珀 pip；approved = 绿
+  （`--state-done`）；rejected = 红（`--state-error`）。pip 形状 + 边框色 + 动效三重表达。
+- **内容**：mono eyebrow（`待审批 · AWAITING APPROVAL`）+ tool 名（mono）+ JSON 参数
+  （`--canvas-float` 底，syntax-tint 复用 tools/RawArgs 的 `.k/.s/.n`）。
+- **动作**：`批准` = **唯一** acid-lime 主操作（`--accent`，§1.2 配给）；`拒绝` = secondary
+  （`--canvas-overlay` + `--border-default`，不用红填充——是按钮不是警报）。
+- **中文**：eyebrow/按钮走默认字体即可（短拉丁+中文混排），JSON/tool 名用 `--font-mono`。
+- **降级**：`prefers-reduced-motion` 关脉冲（颜色+形状仍表达状态）。进入过渡用 `fly(rise())`。
+- 决定经 `client.approve(id, callId, decision)` 送出；item 状态由 committed
+  `Permission::Decided` 事件 fold 回来翻转（不乐观更新）。
+
+### 4.10 门控编辑器（permission editor）—— 卡片模型
+
+配置门控策略的表单，组件 `PermissionEditor.svelte`，**三层复用**（profile / gateway /
+workspace，`doc/permission.md` §3）。核心原则：**磁盘配置结构化给机器读，用户交互零心智负担**。
+
+- **卡片模型**：用户**永不手输工具名/字段名**。组件收 `tools: ToolInfo[]`（来自 `GET /tools`），为每个工具渲染一张卡：
+  - **主控件 = 三档分段开关**（允许 / 询问 / 拒绝），覆盖多数需求，点一下即可。active 段按裁决着色（deny=`--state-error-text`、ask=`--state-running-text`），状态冗余（§1.3）。
+  - **例外区**（可选，`+ 例外`）：用该工具**专属字段下拉**（shell→命令、read/write→路径，来自 catalog）+ 匹配方式（包含 / 以…开头 / 不属于〔白名单〕）+ 值（每行一条 `textarea`）。「不属于」即 `negate` 白名单。
+- **纯函数映射**：卡片 ⇄ `PermissionPolicy` 的编译/反编译在 `permission-cards.ts`（`toCards`/`fromCards`），有 vitest round-trip 测试。无法用卡片表达的规则（通配 `*`、手写异形）进 **advanced 桶原样保留**，绝不静默丢弃用户配置。
+- **无 catalog 项的工具**（如 MCP）回退成通用卡片（无字段下拉，只按整输入匹配），仍可门控。
+- **token 化 / surface**：卡片 `--canvas-base`，分段控件 `--canvas-float`，输入复用 `.in`；靠 `--border-subtle` hairline 分段，不自造层级、不 hardcode。
+- **三处复用**（同一组件，不同宿主）：
+  1. **profile 层** — Settings → Profiles tab，`bind:policy={pf.permission}`，随 profile 一起存。
+  2. **gateway 层** — Settings → Gateway tab，编辑 `default_permission`（最低基线）；懒加载，`PUT /gateway/permission` 对新会话即时生效并落 `gateway.toml`。
+  3. **workspace 层** — 工作区侧栏齿轮 → `WorkspaceConfigDialog`（模态，`--z-modal` + `--backdrop`），编辑该 workspace 的 `[permission]`（最高层）+ 网络覆盖；存于网关可信目录。
+
 ---
 
 ## 5. 反 AI slop 禁令（硬清单）

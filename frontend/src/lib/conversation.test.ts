@@ -720,3 +720,97 @@ describe('plan fold', () => {
 		expect(steps[0].status).toBe('completed');
 	});
 });
+
+
+function permRequested(seq: number, callId: string, tool: string): GatewayEvent {
+	return {
+		type: 'event',
+		schema_version: 'ominiforge.event.v1',
+		seq,
+		session_id: 's',
+		timestamp: '2026-06-24T00:00:00Z',
+		source: { kind: 'Runtime', id: 'runtime' },
+		parent_event_id: null,
+		turn_id: null,
+		payload: {
+			Permission: { Requested: { call_id: callId, tool_name: tool, input: { path: 'x.txt' } } }
+		}
+	} as unknown as GatewayEvent;
+}
+
+function permDecided(
+	seq: number,
+	callId: string,
+	outcome: 'Approved' | 'Rejected' | 'AutoDenied'
+): GatewayEvent {
+	return {
+		type: 'event',
+		schema_version: 'ominiforge.event.v1',
+		seq,
+		session_id: 's',
+		timestamp: '2026-06-24T00:00:00Z',
+		source: { kind: 'Runtime', id: 'runtime' },
+		parent_event_id: null,
+		turn_id: null,
+		payload: { Permission: { Decided: { call_id: callId, outcome, decided_by: 'user' } } }
+	} as unknown as GatewayEvent;
+}
+
+describe('permission approval fold', () => {
+	it('Requested pushes a pending approval item carrying the tool + input', () => {
+		const state = fold([permRequested(1, 'c1', 'write')]);
+		const appr = state.items.filter((i) => i.kind === 'approval');
+		expect(appr).toHaveLength(1);
+		const a = appr[0] as Extract<(typeof appr)[number], { kind: 'approval' }>;
+		expect(a.callId).toBe('c1');
+		expect(a.toolName).toBe('write');
+		expect(a.status).toBe('pending');
+		expect(a.args).toContain('x.txt');
+	});
+
+	it('Decided flips a human decision (approved/rejected) in place, not a new item', () => {
+		const approved = fold([permRequested(1, 'c1', 'write'), permDecided(2, 'c1', 'Approved')]);
+		const a = approved.items.filter((i) => i.kind === 'approval');
+		expect(a).toHaveLength(1);
+		expect((a[0] as { status: string }).status).toBe('approved');
+
+		const rejected = fold([permRequested(1, 'c3', 'write'), permDecided(2, 'c3', 'Rejected')]);
+		const rj = rejected.items.filter((i) => i.kind === 'approval');
+		expect((rj[0] as { status: string }).status).toBe('rejected');
+	});
+
+	it('AutoDenied removes the approval card (no human decided — M4)', () => {
+		// A fail-closed / policy denial is not a human approval outcome; the card
+		// must not linger as a spurious "rejected" prompt (the tool-failure card
+		// conveys the block instead).
+		const state = fold([permRequested(1, 'c2', 'shell'), permDecided(2, 'c2', 'AutoDenied')]);
+		expect(state.items.filter((i) => i.kind === 'approval')).toHaveLength(0);
+	});
+
+	it('a Decided for an unknown call id leaves state untouched', () => {
+		const state = fold([permRequested(1, 'c1', 'write'), permDecided(2, 'other', 'Approved')]);
+		const a = state.items.filter((i) => i.kind === 'approval');
+		expect((a[0] as { status: string }).status).toBe('pending');
+	});
+
+	it('a turn Interrupted while an ask is pending drops the zombie card', () => {
+		// Cancel/crash mid-ask: the Decided will never commit, so the pending card
+		// can never resolve. The Interrupted fold must clear it or a replayed
+		// history shows a frozen approval prompt with dead buttons.
+		const state = fold([permRequested(1, 'c1', 'shell'), turnInterrupted(2)]);
+		expect(state.items.filter((i) => i.kind === 'approval')).toHaveLength(0);
+	});
+
+	it('an already-resolved approval survives a later Interrupted', () => {
+		// Only *pending* cards are zombies; a card that already flipped to
+		// approved/rejected is real history and must stay.
+		const state = fold([
+			permRequested(1, 'c1', 'write'),
+			permDecided(2, 'c1', 'Approved'),
+			turnInterrupted(3)
+		]);
+		const a = state.items.filter((i) => i.kind === 'approval');
+		expect(a).toHaveLength(1);
+		expect((a[0] as { status: string }).status).toBe('approved');
+	});
+});

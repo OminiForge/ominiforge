@@ -22,6 +22,7 @@
 		type PlanStep
 	} from '$lib/conversation';
 	import ToolBlock from '$lib/components/tools/ToolBlock.svelte';
+	import ApprovalPrompt from '$lib/components/ApprovalPrompt.svelte';
 	import { num, statLabel, formatCost, cacheLabel, topTools } from '$lib/stats';
 	import { markSeen } from '$lib/status.svelte';
 	import { loadQueue, saveQueue, enqueue, removeFromQueue, type QueuedMessage } from '$lib/queue';
@@ -728,6 +729,22 @@
 		}
 	}
 
+	// Answer a permission `ask` (doc/permission.md §5). The decision is delivered
+	// to the suspended turn over the actor; the item flips to approved/rejected
+	// when the committed `Permission::Decided` event folds back in.
+	async function decideApproval(callId: string, decision: 'approve' | 'reject') {
+		try {
+			await client.approve(sessionId, callId, decision);
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
+			// Rethrow so ApprovalPrompt's own catch re-enables its buttons: a failed
+			// approve (dropped connection, dead session) must not freeze the card on
+			// a permanent "处理中…". The card stays `pending` (no Decided folds), so
+			// the user can retry once the buttons are live again.
+			throw e;
+		}
+	}
+
 	// Compaction stays available programmatically; the button was removed in
 	// favour of a future `/` command (see redesign plan). Keep the function so
 	// the slash-command wiring can call it later.
@@ -1179,6 +1196,16 @@
 						{:else if item.kind === 'tool'}
 							<div class="item" in:fly|local={itemEnter}>
 								<ToolBlock {item} />
+							</div>
+						{:else if item.kind === 'approval'}
+							<div class="item" in:fly|local={itemEnter}>
+								<ApprovalPrompt
+									callId={item.callId}
+									toolName={item.toolName}
+									args={item.args}
+									status={item.status}
+									onDecide={decideApproval}
+								/>
 							</div>
 						{:else if item.kind === 'plan'}
 							<!-- Streaming placeholders (item.streaming) render nothing: a flashing

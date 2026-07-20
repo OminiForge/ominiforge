@@ -90,6 +90,33 @@ fn resolve_network(
         crate::sandbox::NetworkPolicy::from_policy_name(name, &section.allow)
     })
 }
+
+/// Resolve a session's effective tool-call gate from the three-tier chain
+/// (`doc/permission.md` §3), parallel to [`resolve_network`] but with a
+/// **union** merge rather than override:
+///
+/// ```text
+/// workspace [permission]  >  profile [permission]  >  gateway default_permission
+/// ```
+///
+/// Precedence differs from network by design. Network is a single policy where
+/// the most specific tier wins outright. Permission is a **security floor**: the
+/// `deny` lists of all three tiers are *unioned* so a lower tier's ban can never
+/// be silently dropped by a higher one (a stealth privilege escalation), while
+/// each tier's `ask` list overrides the one below it. This is exactly
+/// [`PermissionPolicy::layer_over`], applied bottom-up: gateway is the base,
+/// profile layers over it, workspace layers on top.
+///
+/// All three tiers are gateway-trusted or deployer-owned config — none is read
+/// from the agent-writable project dir — so the workspace tier widening `deny`
+/// is safe (`doc/workspace-config.md`, "Why gateway-side").
+fn resolve_permission(
+    workspace: crate::permission::PermissionPolicy,
+    profile: crate::permission::PermissionPolicy,
+    gateway: crate::permission::PermissionPolicy,
+) -> crate::permission::PermissionPolicy {
+    workspace.layer_over(profile.layer_over(gateway))
+}
 /// Resolve config and build an [`Agent`] for `profile_name`, with optional model
 /// and temperature overrides.
 ///
@@ -121,6 +148,8 @@ pub async fn assemble(
     )>,
     default_network: crate::sandbox::NetworkPolicy,
     workspace_network: Option<crate::sandbox::NetworkPolicy>,
+    default_permission: crate::permission::PermissionPolicy,
+    workspace_permission: crate::permission::PermissionPolicy,
     mounts: Vec<crate::sandbox::VolumeMount>,
     on_warn: &(dyn Fn(&str) + Sync),
 ) -> Result<Assembled> {
@@ -272,6 +301,22 @@ pub async fn assemble(
         .into_registry(|msg| on_warn(msg));
     if !hooks.is_empty() {
         agent = agent.with_hooks(hooks);
+    }
+
+    // Tool-call permission gate resolved across all three tiers
+    // (`doc/permission.md` §3): gateway `default_permission` (base) < profile
+    // `[permission]` < workspace `[permission]`, with `deny` union-merged into a
+    // security floor. Empty (no tier sets a rule) imposes no gate, preserving the
+    // pre-permission fast path. The approval gate for `ask` is attached by the
+    // front-end (CLI/gateway), not here — headless assembly defaults to the
+    // fail-closed `NullGate`.
+    let permission = resolve_permission(
+        workspace_permission,
+        profile.permission.clone(),
+        default_permission,
+    );
+    if !permission.is_empty() {
+        agent = agent.with_permission(permission);
     }
 
     Ok(Assembled {
@@ -596,5 +641,47 @@ mod tests {
             allow: Vec::new(),
         };
         assert!(resolve_network(None, &bad, NetworkPolicy::Open).is_err());
+    }
+
+    /// Permission precedence (`doc/permission.md` §3): three tiers, `deny`
+    /// unioned into a floor, `ask` overridden top-down. The test pins the
+    /// security-critical asymmetry — a lower tier's `deny` MUST survive a higher
+    /// tier that sets its own rules, or a workspace/profile could silently reopen
+    /// a gateway-banned tool. A regression that used plain override (like network)
+    /// would drop the gateway ban and this test would catch it.
+    #[test]
+    fn permission_resolution_unions_deny_across_tiers() {
+        use crate::permission::{Decision, PermissionPolicy, Rule};
+        let rule = |tool: &str, pat: &str| {
+            Rule::contains(tool, if pat.is_empty() { vec![] } else { vec![pat.to_owned()] })
+        };
+
+        let gateway = PermissionPolicy { deny: vec![rule("shell", "curl")], ask: vec![] };
+        let profile = PermissionPolicy { deny: vec![rule("shell", "rm -rf")], ask: vec![rule("write", "")] };
+        let workspace = PermissionPolicy { deny: vec![rule("net", "")], ask: vec![rule("read", "")] };
+
+        let effective = resolve_permission(workspace, profile, gateway);
+
+        // Every tier's deny survived — the union floor.
+        assert_eq!(effective.evaluate("shell", &serde_json::json!({"c": "curl x"})), Decision::Deny);
+        assert_eq!(effective.evaluate("shell", &serde_json::json!({"c": "rm -rf /"})), Decision::Deny);
+        assert_eq!(effective.evaluate("net", &serde_json::json!({})), Decision::Deny);
+        // Workspace ask (top tier) replaced the profile ask: `read` asks, `write` no longer does.
+        assert_eq!(effective.evaluate("read", &serde_json::json!({"p": "x"})), Decision::Ask);
+        assert_eq!(effective.evaluate("write", &serde_json::json!({"p": "x"})), Decision::Allow);
+    }
+
+    /// All tiers empty → empty effective policy → the pre-permission fast path is
+    /// preserved (the agent skips the gate). A tier accidentally injecting a rule
+    /// would flip this.
+    #[test]
+    fn permission_resolution_all_empty_is_empty() {
+        use crate::permission::PermissionPolicy;
+        let effective = resolve_permission(
+            PermissionPolicy::default(),
+            PermissionPolicy::default(),
+            PermissionPolicy::default(),
+        );
+        assert!(effective.is_empty());
     }
 }

@@ -142,6 +142,13 @@ before_tool = ["security-guard"]     # 额外绑定的 hook
 [network]
 policy = "allowlist"                 # isolated | allowlist | open；缺省继承 gateway 兜底
 allow = ["crates.io", "pypi.org"]    # 仅 allowlist 生效的可达主机
+
+[[permission.deny]]                  # 工具调用门控（deny 最高优先级）
+tool = "shell"
+contains = ["rm -rf", "sudo"]
+
+[[permission.ask]]                   # 命中则需人工审批；无 contains = 对该工具任意调用
+tool = "write"
 ```
 
 ### 3.1 Profile 字段说明
@@ -164,6 +171,8 @@ allow = ["crates.io", "pypi.org"]    # 仅 allowlist 生效的可达主机
 | hooks.* | ✗ | 默认无额外 hook |
 | network.policy | ✗ | 沙箱网络策略 `isolated`/`allowlist`/`open`；缺省继承 gateway `default_network`（兜底 = `open`）。见 `doc/sandbox.md` §6.2 |
 | network.allow | ✗ | `allowlist` 下的可达主机；其他策略忽略 |
+| permission.deny | ✗ | 门控 deny 规则表（`{tool, contains}`）；命中即阻断。见 `doc/permission.md` |
+| permission.ask | ✗ | 门控 ask 规则表；命中需人工审批。缺省 = 空策略 = 全 allow |
 
 ### 3.2 Model 引用格式
 

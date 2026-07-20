@@ -18,6 +18,7 @@ export const endpoints = {
 	reconfigure: (id: string) => `${API}/sessions/${encodeURIComponent(id)}/reconfigure`,
 	message: (id: string) => `${API}/sessions/${encodeURIComponent(id)}/message`,
 	cancel: (id: string) => `${API}/sessions/${encodeURIComponent(id)}/cancel`,
+	approve: (id: string) => `${API}/sessions/${encodeURIComponent(id)}/approve`,
 	compact: (id: string) => `${API}/sessions/${encodeURIComponent(id)}/compact`,
 	summary: (id: string) => `${API}/sessions/${encodeURIComponent(id)}/summary`,
 	snapshot: (id: string) => `${API}/sessions/${encodeURIComponent(id)}/snapshot`,
@@ -31,7 +32,15 @@ export const endpoints = {
 	profiles: () => `${API}/profiles`,
 	profile: (name: string) => `${API}/profiles/${encodeURIComponent(name)}`,
 	models: () => `${API}/models`,
+	/** Built-in tool catalog for the permission-config UI (labels + fields). */
+	tools: () => `${API}/tools`,
 	providers: () => `${API}/providers`,
+	/** Per-workspace config (network + mounts + permission); top tier of the gate. */
+	workspaceConfig: (id: string) => `${API}/workspaces/${encodeURIComponent(id)}/config`,
+	/** Per-workspace tool catalog (built-ins + this workspace's MCP tools). */
+	workspaceTools: (id: string) => `${API}/workspaces/${encodeURIComponent(id)}/tools`,
+	/** Gateway-wide baseline permission policy; bottom tier of the gate. */
+	gatewayPermission: () => `${API}/gateway/permission`,
 	secrets: () => `${API}/secrets`,
 	secret: (provider: string) => `${API}/secrets/${encodeURIComponent(provider)}`
 } as const;

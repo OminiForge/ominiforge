@@ -2,13 +2,17 @@
 	import { onMount } from 'svelte';
 	import { client } from '$lib/client';
 	import Notice from '$lib/components/Notice.svelte';
+	import PermissionEditor from '$lib/components/PermissionEditor.svelte';
+	import Skeleton from '$lib/components/Skeleton.svelte';
 	import type { ProviderConfig } from '$lib/types/ProviderConfig';
 	import type { ProviderType } from '$lib/types/ProviderType';
 	import type { ModelConfig } from '$lib/types/ModelConfig';
 	import type { Profile } from '$lib/types/Profile';
 	import type { ProfileSummary } from '$lib/types/ProfileSummary';
+	import type { PermissionPolicy } from '$lib/types/PermissionPolicy';
+	import type { ToolInfo } from '$lib/types/ToolInfo';
 
-	type Tab = 'providers' | 'profiles';
+	type Tab = 'providers' | 'profiles' | 'gateway';
 	let tab = $state<Tab>('providers');
 
 	// ---- Providers state ----
@@ -22,6 +26,15 @@
 	let profileList = $state<ProfileSummary[]>([]);
 	let selectedName = $state<string>('');
 	let profile = $state<Profile | null>(null);
+
+	// ---- Gateway state ----
+	// The gateway-wide baseline permission policy (bottom tier). Loaded lazily on
+	// first Gateway-tab open so the providers/profiles path pays nothing.
+	let gatewayPermission = $state<PermissionPolicy | null>(null);
+
+	// Tool catalog for the permission editors' per-tool cards. Loaded once with
+	// providers/profiles; empty until then (editor renders no cards, harmless).
+	let toolCatalog = $state<ToolInfo[]>([]);
 
 	// ---- Shared UI ----
 	let loading = $state(true);
@@ -51,9 +64,37 @@
 		profileList = await client.listProfiles();
 	}
 
+	async function loadTools() {
+		toolCatalog = await client.listTools();
+	}
+
+	async function loadGatewayPermission() {
+		gatewayPermission = await client.getGatewayPermission();
+	}
+
+	async function saveGatewayPermission() {
+		if (!gatewayPermission) return;
+		error = null;
+		try {
+			await client.saveGatewayPermission(gatewayPermission);
+			flash('Gateway 门控已保存');
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
+		}
+	}
+
+	// Lazy-load the gateway policy the first time its tab is opened.
+	$effect(() => {
+		if (tab === 'gateway' && gatewayPermission === null) {
+			loadGatewayPermission().catch((e) => {
+				error = e instanceof Error ? e.message : String(e);
+			});
+		}
+	});
+
 	onMount(async () => {
 		try {
-			await Promise.all([loadProviders(), loadProfiles()]);
+			await Promise.all([loadProviders(), loadProfiles(), loadTools()]);
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 		} finally {
@@ -148,7 +189,8 @@
 			memory: { scopes: [], auto_write: null },
 			budget: { session_max_usd: null, daily_max_usd: null, warn_at_percent: null },
 			hooks: { before_tool: [], after_tool: [] },
-			network: { policy: null, allow: [] }
+			network: { policy: null, allow: [] },
+			permission: { deny: [], ask: [] }
 		};
 	}
 
@@ -210,6 +252,9 @@
 				</button>
 				<button class="tab" class:active={tab === 'profiles'} onclick={() => (tab = 'profiles')}>
 					Profiles
+				</button>
+				<button class="tab" class:active={tab === 'gateway'} onclick={() => (tab = 'gateway')}>
+					Gateway
 				</button>
 			</div>
 		</header>
@@ -303,7 +348,7 @@
 					<button class="btn-primary" onclick={saveProviders}>保存 Providers</button>
 				</div>
 			</section>
-		{:else}
+		{:else if tab === 'profiles'}
 			<!-- PROFILES-SECTION -->
 			<section class="two-col">
 				<aside class="list">
@@ -361,11 +406,44 @@
 							</label>
 						</div>
 
+						<div class="perm-block">
+							<div class="perm-head">
+								<span class="key">Permission 门控</span>
+								<span class="perm-note">profile 层（三层解析的中间层，见 doc/permission.md §3）</span>
+							</div>
+							<PermissionEditor bind:policy={pf.permission} tools={toolCatalog} />
+						</div>
+
 						<div class="actions">
 							<button class="btn-primary" onclick={saveProfile}>保存 Profile</button>
 						</div>
 					{:else}
 						<p class="muted">选择左侧 profile 编辑，或新建一个。</p>
+					{/if}
+				</div>
+			</section>
+		{:else}
+			<!-- GATEWAY-SECTION -->
+			<section class="stack">
+				<div class="editor">
+					<div class="perm-head">
+						<span class="key">Gateway 基线门控</span>
+						<span class="perm-note">
+							三层解析的最低层（doc/permission.md §3.1）。deny 规则是全 gateway 的安全底线，任何
+							profile / workspace 都无法放开；对<strong>新建会话</strong>立即生效，并持久化到 gateway.toml。
+						</span>
+					</div>
+					{#if gatewayPermission}
+						<PermissionEditor bind:policy={gatewayPermission} tools={toolCatalog} />
+						<div class="actions">
+							<button class="btn-primary" onclick={saveGatewayPermission}>保存 Gateway 门控</button>
+						</div>
+					{:else}
+						<div class="skel-cards" aria-hidden="true">
+							{#each Array(4) as _}
+								<Skeleton width="100%" height="64px" radius="var(--radius-md)" />
+							{/each}
+						</div>
 					{/if}
 				</div>
 			</section>
@@ -723,6 +801,31 @@
 		border-radius: var(--radius-md);
 		background: var(--canvas-raised);
 		padding: var(--space-4);
+	}
+
+	.perm-block {
+		border-top: 1px solid var(--border-subtle);
+		padding-top: var(--space-4);
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-3);
+	}
+
+	.perm-head {
+		display: flex;
+		align-items: baseline;
+		gap: var(--space-2);
+	}
+
+	.perm-note {
+		font-size: 11px;
+		color: var(--text-tertiary);
+	}
+
+	.skel-cards {
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-2);
 	}
 
 	@media (max-width: 768px) {

@@ -37,6 +37,17 @@ export type Item =
 			result?: string;
 			error_code?: string;
 	  }
+	/** A permission `ask`: a tool call suspended for a human decision
+	 *  (`doc/permission.md` §6). Folded from `Permission::Requested` (pending) →
+	 *  `Permission::Decided` (approved/rejected). `callId` answers via
+	 *  `POST /approve`; `args` is the pretty-printed input under review. */
+	| {
+			kind: 'approval';
+			callId: string;
+			toolName: string;
+			args: string;
+			status: 'pending' | 'approved' | 'rejected';
+	  }
 	/** A plan checklist, folded from `plan` control-tool calls (one card per
 	 *  `init`). `streaming` marks a placeholder shown while the call's args are
 	 *  still streaming (partial JSON, not yet foldable); it is replaced by the
@@ -113,6 +124,11 @@ export function apply(state: ConversationState, ev: GatewayEvent): ConversationS
 		// Live-only context occupancy snapshot: handled by the page (STATS panel),
 		// not folded into conversation items.
 		case 'context_updated': return state;
+		// Ephemeral prompt hint (permission `ask`): the durable
+		// `Permission::Requested` event is what folds the ApprovalPrompt card (see
+		// the Permission branch below); this live-only signal just drives the
+		// session-list status icon, so it is intentionally not folded here.
+		case 'approval_requested': return state;
 		default: return assertNever(ev);
 	}
 }
@@ -134,8 +150,19 @@ function applyCommitted(
 				: started;
 		}
 		if ('Resumed' in t) return { ...next, turnRunning: true };
-		if ('Completed' in t || 'Failed' in t || 'Interrupted' in t)
-			return { ...next, turnRunning: false };
+		if ('Completed' in t || 'Failed' in t || 'Interrupted' in t) {
+			// A turn that ends while an `ask` is still pending (cancel / crash /
+			// interrupt) leaves an approval card that can never resolve — its
+			// `Permission::Decided` will never commit because the turn owning the
+			// call is gone. Drop those zombie cards so a replayed history doesn't
+			// show a frozen "待审批" prompt whose buttons do nothing (the gateway
+			// cancel path is racy about writing Decided; this fold is the race-free
+			// guarantee). Already-resolved cards keep their status.
+			const items = next.items.filter(
+				(it) => !(it.kind === 'approval' && it.status === 'pending')
+			);
+			return { ...next, items, turnRunning: false };
+		}
 		return next;
 	}
 	if ('Model' in payload) {
@@ -176,9 +203,49 @@ function applyCommitted(
 			);
 		return next;
 	}
+	if ('Permission' in payload) {
+		const perm = payload.Permission;
+		if ('Requested' in perm) {
+			const r = perm.Requested;
+			return push(next, {
+				kind: 'approval',
+				callId: r.call_id,
+				toolName: r.tool_name,
+				args: JSON.stringify(r.input, null, 2),
+				status: 'pending'
+			});
+		}
+		if ('Decided' in perm) return resolveApproval(next, perm.Decided.call_id, perm.Decided.outcome);
+		return next;
+	}
 	if ('Error' in payload)
 		return push(next, { kind: 'error', message: payload.Error.Raised.message });
 	return next;
+}
+
+/// Mark the pending approval item for `callId` resolved. `Approved` → approved;
+/// `Rejected`/`AutoDenied` → rejected (both blocked the call — the UI only
+/// distinguishes ran-vs-blocked). Items are immutable, so map to a new array;
+/// an unknown `callId` (already gone) leaves state untouched.
+function resolveApproval(
+	state: ConversationState,
+	callId: string,
+	outcome: 'Approved' | 'Rejected' | 'AutoDenied'
+): ConversationState {
+	// AutoDenied = no human decided (policy deny, or a fail-closed gate). It is
+	// not a human approval outcome, so drop the card entirely rather than render
+	// a spurious "rejected" approval the user never saw (the paired
+	// denied_* tool-failure card already conveys the block). Approved/Rejected
+	// are real human decisions — flip the card's status in place.
+	if (outcome === 'AutoDenied') {
+		const items = state.items.filter((it) => !(it.kind === 'approval' && it.callId === callId));
+		return { ...state, items };
+	}
+	const status: 'approved' | 'rejected' = outcome === 'Approved' ? 'approved' : 'rejected';
+	const items = state.items.map((it) =>
+		it.kind === 'approval' && it.callId === callId ? { ...it, status } : it
+	);
+	return { ...state, items };
 }
 
 /// Finalize streaming previews with authoritative committed content.
