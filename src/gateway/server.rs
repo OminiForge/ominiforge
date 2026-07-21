@@ -2835,7 +2835,7 @@ default = "openai-main/gpt-4o"
             .unwrap();
         let tools = body["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, vec!["read", "write", "edit", "shell"]);
+        assert_eq!(names, vec!["find", "read", "write", "edit", "shell"]);
         // shell exposes a `command` field the UI scopes rules to.
         let shell = tools.iter().find(|t| t["name"] == "shell").unwrap();
         assert_eq!(shell["fields"][0]["key"], "command");

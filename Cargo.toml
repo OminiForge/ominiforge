@@ -83,6 +83,8 @@ ts-rs = { version = "12", optional = true, features = [
   "serde-json-impl",
   "no-serde-warnings",
 ] }
+ignore = "0.4.31"
+globset = "0.4.19"
 
 [features]
 # Gateway on by default (doc/architecture.md §5.1); build without it via

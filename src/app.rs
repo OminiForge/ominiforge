@@ -24,7 +24,9 @@ use crate::agent::{Agent, AgentConfig};
 use crate::config::{ConfigStore, ResolvedModel};
 use crate::context::DEFAULT_COMPACTION_THRESHOLD;
 use crate::session::SessionStore;
-use crate::tool::{EditTool, ReadTool, ShellTool, SnapshotStore, ToolRegistry, WriteTool};
+use crate::tool::{
+    EditTool, FindTool, ReadTool, ShellTool, SnapshotStore, ToolRegistry, WriteTool,
+};
 
 /// Sessions live under `<workspace>/.omini/sessions`.
 pub const SESSIONS_SUBDIR: &str = ".omini/sessions";
@@ -344,6 +346,9 @@ fn register_profile_tools(
     sandbox: Arc<dyn crate::sandbox::Sandbox>,
 ) {
     let snapshots = SnapshotStore::new();
+    if profile.tools.allows("find") {
+        registry.register(Arc::new(FindTool::new(workspace.clone())));
+    }
     if profile.tools.allows("read") {
         registry.register(Arc::new(ReadTool::new(
             workspace.clone(),
@@ -575,7 +580,7 @@ mod tests {
             )),
         );
         let names: Vec<String> = reg.descriptors().into_iter().map(|d| d.name).collect();
-        assert_eq!(names, vec!["edit", "read", "shell", "write"]);
+        assert_eq!(names, vec!["edit", "find", "read", "shell", "write"]);
     }
 
     /// An explicit `builtin` list that omits `edit` must not register it — the

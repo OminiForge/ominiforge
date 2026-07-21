@@ -9,6 +9,7 @@
 
 mod edit;
 mod error;
+mod find;
 mod read;
 mod shell;
 mod snapshot;
@@ -16,6 +17,7 @@ mod write;
 
 pub use edit::EditTool;
 pub use error::ToolError;
+pub use find::FindTool;
 pub use read::ReadTool;
 pub use shell::ShellTool;
 pub use snapshot::SnapshotStore;
@@ -106,8 +108,8 @@ pub struct ToolField {
 ///
 /// Static and always available (`doc/permission.md` §3.2) — unlike MCP tools,
 /// the built-ins need no subprocess to enumerate, so `GET /tools` can serve this
-/// without a workspace context. Ordered read → write → edit → shell (roughly
-/// least → most powerful), the order the cards render in.
+/// without a workspace context. Ordered find → read → write → edit → shell
+/// (roughly least → most powerful), the order the cards render in.
 #[must_use]
 pub fn builtin_catalog() -> Vec<ToolInfo> {
     let path_field = |desc: &str| ToolField {
@@ -116,6 +118,16 @@ pub fn builtin_catalog() -> Vec<ToolInfo> {
         is_path: true,
     };
     vec![
+        ToolInfo {
+            name: "find".to_owned(),
+            label: Some("找文件".to_owned()),
+            description: Some("按 glob 通配符查找工作区内的文件（遵循 .gitignore）".to_owned()),
+            fields: vec![ToolField {
+                key: "pattern".to_owned(),
+                label: "通配符".to_owned(),
+                is_path: false,
+            }],
+        },
         ToolInfo {
             name: "read".to_owned(),
             label: Some("读文件".to_owned()),
@@ -272,6 +284,7 @@ fn resolve_in_workspace(workspace: &Path, requested: &str) -> Result<PathBuf, To
 /// than duplicating the wiring a third time.
 pub fn register_builtin(registry: &mut ToolRegistry, workspace: PathBuf) {
     let snapshots = SnapshotStore::new();
+    registry.register(Arc::new(FindTool::new(workspace.clone())));
     registry.register(Arc::new(ReadTool::new(
         workspace.clone(),
         snapshots.clone(),
@@ -294,7 +307,7 @@ mod tests {
         let mut reg = ToolRegistry::new();
         register_builtin(&mut reg, PathBuf::from("/tmp/ws"));
         let names: Vec<String> = reg.descriptors().into_iter().map(|d| d.name).collect();
-        assert_eq!(names, vec!["edit", "read", "shell", "write"]);
+        assert_eq!(names, vec!["edit", "find", "read", "shell", "write"]);
     }
 
     #[test]
