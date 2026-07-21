@@ -105,10 +105,12 @@ injection 被摘要浓缩。
 
 记录权限门控对一次工具调用的决策（`doc/permission.md` §6）：`Requested{call_id,tool_name,input}`
 **仅在 ask（挂起等人应答）时写**——deny 是纯策略拦截、无人参与，故只写一条
-`Decided{call_id,outcome,decided_by}`（无 Requested，避免前端渲染多余审批卡）。`outcome`:
-Approved/Rejected/AutoDenied；`decided_by`: `"user"`（人批准/拒绝）/ `"policy"`（deny 规则命中）/
-`"gate"`（ask 无人应答的 fail-closed 兜底）。持久化以留完整审计轨，并让前端在刷新/重连后从事件流
-重建待审批提示。deny/reject 另产生 model 可见的
+`Decided{call_id,outcome,decided_by,scope}`（无 Requested，避免前端渲染多余审批卡）。`outcome`:
+Approved/Rejected/AutoDenied；`decided_by`: `"user"`（人批准/拒绝）/ `"policy"`（deny 规则命中，或
+固化规则自动裁决的同轮 pending ask，§5.1）/ `"gate"`（ask 无人应答的 fail-closed 兜底）。
+`scope: Option<ApprovalScope>`（`once`/`session`/`profile`/`gateway`，可选缺省）：人做了决定时记录其
+作用域（含 `once`）；policy deny 与 fail-closed 兜底（及 CLI 批准）为 `None`。持久化以留完整审计轨，
+并让前端在刷新/重连后从事件流重建待审批提示。deny/reject 另产生 model 可见的
 `ToolEvent::Failed { code: denied_by_policy | denied_by_user }`；PermissionEvent 是并行审计记录。
 
 ## 4. Payload 大小限制

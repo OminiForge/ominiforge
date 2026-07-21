@@ -400,6 +400,7 @@ tool = "write"
         let parent = super::Profile {
             permission: PermissionPolicy {
                 deny: vec![Rule::contains("shell", vec!["rm -rf".to_owned()])],
+                allow: vec![],
                 ask: vec![Rule::contains("read", vec![])],
             },
             ..super::Profile::builtin_default()
@@ -407,6 +408,7 @@ tool = "write"
         let child = super::Profile {
             permission: PermissionPolicy {
                 deny: vec![Rule::contains("net", vec![])],
+                allow: vec![],
                 ask: vec![Rule::contains("write", vec![])],
             },
             ..super::Profile::builtin_default()
@@ -418,18 +420,26 @@ tool = "write"
             Decision::Deny,
             "parent deny must be inherited, not silently dropped"
         );
-        assert_eq!(merged.evaluate("net", &serde_json::json!({})), Decision::Deny);
+        assert_eq!(
+            merged.evaluate("net", &serde_json::json!({})),
+            Decision::Deny
+        );
         // Child's ask replaced parent's ask (write asks; read no longer does).
-        assert_eq!(merged.evaluate("write", &serde_json::json!({})), Decision::Ask);
-        assert_eq!(merged.evaluate("read", &serde_json::json!({})), Decision::Allow);
+        assert_eq!(
+            merged.evaluate("write", &serde_json::json!({})),
+            Decision::Ask
+        );
+        assert_eq!(
+            merged.evaluate("read", &serde_json::json!({})),
+            Decision::Allow
+        );
     }
 
     /// A profile file with no `[permission]` section yields an empty policy —
     /// the gate is opt-in, so existing profiles keep running ungated.
     #[test]
     fn absent_permission_section_is_empty_policy() {
-        let profile: super::Profile =
-            toml::from_str("[profile]\nname = \"p\"\n").unwrap();
+        let profile: super::Profile = toml::from_str("[profile]\nname = \"p\"\n").unwrap();
         assert!(profile.permission.is_empty());
     }
 

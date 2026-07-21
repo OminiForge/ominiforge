@@ -1,0 +1,222 @@
+// Pure compile/decompile between the on-disk permission model (two flat rule
+// lists, `doc/permission.md` §3) and the incremental rule-row model the UI
+// renders: one row per rule the user actually added — no card per catalog
+// tool, no full-list editing. Kept out of the Svelte component so the mapping
+// — the part that must be correct — is unit-tested.
+//
+// The disk model is the contract; rows are a view. Round-tripping any policy
+// we produced must be lossless. Rules we can NOT render (a match mode this UI
+// predates; the degenerate negate-without-patterns shape) are preserved
+// verbatim in an `advanced` bucket rather than silently dropped — never lose a
+// user's config.
+//
+// Also home to `resolveEffective`: a client-side per-tier SOURCE VIEW of the
+// three-tier resolution (`doc/permission.md` §3.1) for the read-only
+// "effective policy" view — deny unions across tiers, the highest tier with
+// any ask rules wins the ask list wholesale, and every rule keeps the tier
+// that set it (not a byte-for-byte mirror of the backend merge; see its doc).
+
+import type { PermissionPolicy } from '$lib/types/PermissionPolicy';
+import type { Rule } from '$lib/types/Rule';
+import type { MatchMode } from '$lib/types/MatchMode';
+import type { ToolInfo } from '$lib/types/ToolInfo';
+
+/** Which list a rule sits in — the list IS the verdict (`doc/permission.md` §2).
+ *  Evaluation order: `deny` > `allow` > `ask` (allow exempts from ask, never
+ *  from deny). */
+export type Decision = 'deny' | 'allow' | 'ask';
+
+/** One editable rule. `values` empty (and not negated) = a tool-level bare
+ *  rule, i.e. the tool's default verdict at this tier. */
+export interface RuleRow {
+	list: Decision;
+	/** Tool name; `"*"` = any tool. */
+	tool: string;
+	/** Restrict the match to one input field; null = search all string values. */
+	field: string | null;
+	mode: MatchMode;
+	/** Allow-list form: match when NO pattern hits. */
+	negate: boolean;
+	values: string[];
+}
+
+/** The whole editor state: the rows the user added, plus rules the row UI
+ *  can't represent (preserved, shown read-only). */
+export interface RowModel {
+	rows: RuleRow[];
+	advanced: { list: Decision; rule: Rule }[];
+}
+
+// The match modes the row UI can render. A rule using any other mode (a future
+// backend addition) must go to `advanced` untouched, not be silently coerced
+// by the mode dropdown — the header comment's promise.
+const RENDERABLE_MODES: readonly MatchMode[] = ['substring', 'prefix'];
+
+function patternsOf(rule: Rule): string[] {
+	return rule.contains ?? [];
+}
+
+function modeOf(rule: Rule): MatchMode {
+	return rule.mode ?? 'substring';
+}
+
+/** Whether the row model can represent this rule faithfully. */
+function isRowRenderable(rule: Rule): boolean {
+	if (!RENDERABLE_MODES.includes(modeOf(rule))) return false;
+	// negate with no patterns never matches — a degenerate shape we don't
+	// author; keep it in advanced rather than mis-render or silently drop it.
+	if (rule.negate && patternsOf(rule).length === 0) return false;
+	return true;
+}
+
+/** Compile one disk rule to a row; null when the row UI can't represent it
+ *  (see {@link isRowRenderable}) — the caller routes those to `advanced`. */
+export function ruleToRow(rule: Rule, list: Decision): RuleRow | null {
+	if (!isRowRenderable(rule)) return null;
+	const values = patternsOf(rule);
+	// Canonicalize: with no patterns (and no negate) a rule is tool-level
+	// regardless of field/mode — an empty `contains` matches any input, so
+	// `{tool, field}` is the bare rule wearing a hat. Render the bare form.
+	const bare = values.length === 0;
+	return {
+		list,
+		tool: rule.tool,
+		field: bare ? null : (rule.field ?? null),
+		mode: bare ? 'substring' : modeOf(rule),
+		negate: rule.negate ?? false,
+		values
+	};
+}
+
+/** Compile a policy into rows. An empty/undefined policy yields no rows —
+ *  the empty tier renders as "no rules here", not as a full tool list. Rows
+ *  come out in evaluation order (deny, allow, ask) so the list reads as
+ *  precedence. */
+export function toRows(policy: PermissionPolicy | undefined): RowModel {
+	policy ??= {};
+	const rows: RuleRow[] = [];
+	const advanced: RowModel['advanced'] = [];
+
+	const apply = (list: Decision, rules: Rule[]) => {
+		for (const rule of rules) {
+			const row = ruleToRow(rule, list);
+			if (row) rows.push(row);
+			else advanced.push({ list, rule });
+		}
+	};
+	apply('deny', policy.deny ?? []);
+	apply('allow', policy.allow ?? []);
+	apply('ask', policy.ask ?? []);
+	return { rows, advanced };
+}
+
+/** Decompile rows back to a policy: the inverse of {@link toRows}. Rows keep
+ *  their relative order within each list; preserved `advanced` rules are
+ *  appended to their original lists. */
+export function fromRows(model: RowModel): PermissionPolicy {
+	const deny: Rule[] = [];
+	const allow: Rule[] = [];
+	const ask: Rule[] = [];
+	const lists: Record<Decision, Rule[]> = { deny, allow, ask };
+
+	for (const row of model.rows) {
+		// Bare row (no values): a tool-level rule. An empty-values negate row
+		// never matches — a no-op rule; drop it rather than write a dead rule.
+		if (row.values.length === 0) {
+			if (row.negate) continue;
+			lists[row.list].push({ tool: row.tool });
+			continue;
+		}
+		const rule: Rule = { tool: row.tool, contains: row.values };
+		if (row.field) rule.field = row.field;
+		if (row.mode !== 'substring') rule.mode = row.mode;
+		if (row.negate) rule.negate = true;
+		lists[row.list].push(rule);
+	}
+
+	for (const { list, rule } of model.advanced) {
+		lists[list].push(rule);
+	}
+
+	const policy: PermissionPolicy = {};
+	if (deny.length) policy.deny = deny;
+	if (allow.length) policy.allow = allow;
+	if (ask.length) policy.ask = ask;
+	return policy;
+}
+
+/** A one-line plain-language reading of a row, so the user never decodes
+ *  field + mode + negate mentally — the antidote to the "不属于（白名单）"
+ *  double negative. The verdict itself is NOT in the text: callers render it
+ *  as a colored badge next to the summary, and saying it twice reads stuttered. */
+export function summaryOf(row: RuleRow, catalog: ToolInfo[]): string {
+	const info = catalog.find((t) => t.name === row.tool);
+	const toolLabel = row.tool === '*' ? '任意工具' : (info?.label ?? row.tool);
+
+	if (row.values.length === 0 && !row.negate) {
+		return `${toolLabel}（整个工具）`;
+	}
+	const fieldLabel = row.field
+		? (info?.fields?.find((f) => f.key === row.field)?.label ?? row.field)
+		: '输入';
+	const vals = row.values.length ? row.values.join('、') : '（未填）';
+	if (row.negate) {
+		const rel = row.mode === 'prefix' ? '不以' : '不包含';
+		const suffix = row.mode === 'prefix' ? ' 开头' : '';
+		return `${toolLabel}：当 ${fieldLabel} ${rel} ${vals}${suffix}（仅允许这些）`;
+	}
+	const rel = row.mode === 'prefix' ? '以' : '包含';
+	const suffix = row.mode === 'prefix' ? ' 开头' : '';
+	return `${toolLabel}：当 ${fieldLabel} ${rel} ${vals}${suffix}`;
+}
+
+/** The tier a rule comes from, for the effective view's source badges. */
+export type Tier = 'gateway' | 'profile' | 'workspace';
+
+export interface EffectiveRule {
+	list: Decision;
+	tier: Tier;
+	rule: Rule;
+}
+
+/**
+ * Effective-policy SOURCE VIEW for the settings 门控 tab (`doc/permission.md`
+ * §3.1): the three tiers resolved into one list, every rule labeled with the
+ * tier that set it — 逐条标注来源层 is the point of the view (DESIGN.md §4.10).
+ * The merge rules mirror `app::resolve_permission` / `PermissionPolicy::layer_over`:
+ * - `deny` unions across all three tiers (any tier's denial holds; upper tiers
+ *   cannot reopen it).
+ * - `allow` unions the same way; an allow hit exempts a call from `ask` rules
+ *   (never from `deny`).
+ * - `ask` is wholesale replacement: the highest tier (workspace > profile >
+ *   gateway) with ANY ask rules supplies the entire effective ask list.
+ * Deliberately NOT a full mirror of the backend: `layer_over` also collapses
+ * duplicate deny/allow rules across tiers, while this view reports a
+ * duplicated rule once per tier that set it — the source badge is the
+ * information. An empty result means "everything allowed".
+ */
+export function resolveEffective(
+	gateway: PermissionPolicy | undefined,
+	profile: PermissionPolicy | undefined,
+	workspace: PermissionPolicy | undefined
+): EffectiveRule[] {
+	const out: EffectiveRule[] = [];
+	const tiers: [Tier, PermissionPolicy | undefined][] = [
+		['gateway', gateway],
+		['profile', profile],
+		['workspace', workspace]
+	];
+	for (const [tier, pol] of tiers) {
+		for (const rule of pol?.deny ?? []) out.push({ list: 'deny', tier, rule });
+		for (const rule of pol?.allow ?? []) out.push({ list: 'allow', tier, rule });
+	}
+	// Highest tier first; the first tier with any ask rules wins the list.
+	for (const [tier, pol] of [...tiers].reverse()) {
+		const asks = pol?.ask ?? [];
+		if (asks.length > 0) {
+			for (const rule of asks) out.push({ list: 'ask', tier, rule });
+			break;
+		}
+	}
+	return out;
+}

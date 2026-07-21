@@ -28,13 +28,17 @@ use serde::Serialize;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::agent::{Agent, ApprovalDecision, BlockKind, SessionRuntime, StreamSink, TurnOutcome};
-use crate::core::payload::TurnEvent;
+use crate::agent::{
+    Agent, ApprovalDecision, ApprovalScope, BlockKind, SessionRuntime, StreamSink, TurnOutcome,
+};
+use crate::core::payload::{
+    BlockContent, ErrorDetail, ErrorSeverity, ModelEvent, ToolEvent, TurnEvent,
+};
 use crate::core::{CoreEvent, EventId, EventPayload, EventSource, SessionId, SourceKind, TurnId};
 use crate::llm::Message;
 use crate::session::{EventBus, SessionStore, SessionWriter};
 
-use super::approval::{GatewayApprovalGate, PendingApprovals};
+use super::approval::{GatewayApprovalGate, PendingApprovals, ScopedDecision};
 use super::status::{ActivityStatus, SessionStatus, StatusHub};
 use super::workspace::WorkspaceId;
 
@@ -128,10 +132,13 @@ pub enum Command {
     Compact { keep_last: Option<usize> },
     /// Deliver a human decision for a tool call the permission policy suspended
     /// (`doc/permission.md` §5). Routed to the parked waiter by `call_id`; an
-    /// unknown id is ignored (already resolved, or the turn moved on).
+    /// unknown id is ignored (already resolved, or the turn moved on). `scope`
+    /// says how far the decision reaches (`once` / `session` / `profile` /
+    /// `gateway`).
     Approve {
         call_id: String,
         decision: ApprovalDecision,
+        scope: ApprovalScope,
     },
     /// Stop the actor and release the session lock.
     Shutdown,
@@ -226,7 +233,10 @@ impl SessionActor {
     /// is cancelled mid-flight. `mcp_clients` are held alive for the actor's
     /// lifetime (per-session MCP isolation). `status` is the process-wide status
     /// hub the actor publishes running/idle transitions to; the session's
-    /// `workspace_id` (immutable, from its meta) is stamped on each.
+    /// `workspace_id` (immutable, from its meta) is stamped on each. `on_scoped`
+    /// persists `profile`/`gateway`-scoped approval decisions (injected by the
+    /// registry, which owns the config roots).
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         agent: Agent,
         store: SessionStore,
@@ -235,6 +245,7 @@ impl SessionActor {
         idle_timeout: std::time::Duration,
         mcp_clients: Vec<Arc<crate::mcp::McpClient>>,
         status: StatusHub,
+        on_scoped: Option<Arc<dyn Fn(ScopedDecision) + Send + Sync>>,
     ) -> ActorHandle {
         let (inbox_tx, inbox_rx) = mpsc::channel(INBOX_CAPACITY);
         let (outbound, _) = broadcast::channel(OUTBOUND_CAPACITY);
@@ -259,8 +270,10 @@ impl SessionActor {
         let session = (session.0.with_bus(bus.clone()), session.1);
 
         // The approval gate shares the actor's pending table, outbound stream,
-        // status hub, and latest-seq cache, so an `ask` suspends the turn and a
-        // `Command::Approve` resumes it (`doc/permission.md` §5).
+        // status hub, latest-seq cache, and the agent's live policy handle, so
+        // an `ask` suspends the turn, a `Command::Approve` resumes it, and a
+        // scoped decision pins a rule into the running session
+        // (`doc/permission.md` §5).
         let pending_approvals: PendingApprovals = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let gate = GatewayApprovalGate::new(
             Arc::clone(&pending_approvals),
@@ -269,6 +282,8 @@ impl SessionActor {
             session_id.clone(),
             workspace_id.clone(),
             Arc::clone(&latest_seq),
+            agent.permission_handle(),
+            on_scoped,
         );
         let agent = Arc::new(agent.with_approval_gate(Arc::new(gate)));
 
@@ -321,10 +336,11 @@ impl SessionActor {
     }
 
     /// Route a human decision to the tool call parked awaiting it. Removing the
-    /// sender and sending the decision wakes the suspended turn task. An unknown
-    /// `call_id` (already resolved, or the turn moved on) is a no-op. A dropped
-    /// receiver (the turn abandoned the wait) means the `send` fails harmlessly.
-    fn deliver_approval(&self, call_id: &str, decision: ApprovalDecision) {
+    /// entry and sending the decision wakes the suspended turn task. An unknown
+    /// `call_id` (already resolved — by an earlier answer or a pinned rule — or
+    /// the turn moved on) is a no-op. A dropped receiver (the turn abandoned the
+    /// wait) means the `send` fails harmlessly.
+    fn deliver_approval(&self, call_id: &str, decision: ApprovalDecision, scope: ApprovalScope) {
         // A poisoned lock (a panic while another thread held it) shouldn't crash
         // the actor; treat it as "no waiter", which fails the ask closed.
         let waiter = self
@@ -332,8 +348,12 @@ impl SessionActor {
             .lock()
             .ok()
             .and_then(|mut m| m.remove(call_id));
-        if let Some(tx) = waiter {
-            let _ = tx.send(decision);
+        if let Some(entry) = waiter {
+            let _ = entry.sender.send(super::approval::PendingAnswer {
+                decision,
+                scope,
+                pinned_by_rule: false,
+            });
         }
     }
 
@@ -432,8 +452,8 @@ impl SessionActor {
                     }
                     // A decision for a suspended `ask`: wake the parked waiter
                     // and keep driving the same turn (it resumes in place).
-                    Some(Command::Approve { call_id, decision }) => {
-                        self.deliver_approval(&call_id, decision);
+                    Some(Command::Approve { call_id, decision, scope }) => {
+                        self.deliver_approval(&call_id, decision, scope);
                     }
                     // Turns never overlap: defer until this one settles.
                     Some(cmd @ (Command::Send { .. } | Command::Compact { .. })) => {
@@ -515,11 +535,102 @@ impl SessionActor {
         let _ = self.outbound.send(GatewayEvent::Notice {
             message: "turn cancelled".to_owned(),
         });
+        // The task is dead, so nothing more can commit: backfill any tool call
+        // it left dangling (the abort can win the race against the fail-closed
+        // gate writing `denied_no_approval`) *before* the terminator, so the
+        // Interrupted event stays the log's tail.
+        self.record_cancelled_tool_calls();
         self.record_interrupted();
         // The turn is over. Publish after `record_interrupted` so the status'
         // `latest_seq` includes the committed Interrupted terminator.
         self.publish_status(ActivityStatus::Idle);
         self.reopen_after_abort()
+    }
+
+    /// Backfill a `ToolEvent::Failed { code: "cancelled" }` for every tool call
+    /// of the open turn that has no `Completed`/`Failed` pairing.
+    ///
+    /// The abort in [`cancel_turn`](Self::cancel_turn) can kill the turn task
+    /// mid-dispatch — parked on an `ask`, or inside `tool.invoke` — before the
+    /// fail-closed path writes its failure event. Without a result event the
+    /// assistant's `tool_call` dangles in the log, and the next turn's provider
+    /// request fails the pairing check (`tool_call_ids did not have response
+    /// messages`). The task is already dead when this runs, so the scan races
+    /// nothing; a call the task did settle (the gate won the race) is in the
+    /// settled set and skipped. Best-effort like [`record_interrupted`]: a
+    /// reopen/append failure leaves the pre-existing behavior, and
+    /// `rebuild_runtime` synthesizes the missing result on read either way.
+    fn record_cancelled_tool_calls(&self) {
+        let events = self.store.read_events(&self.session_id).unwrap_or_default();
+        let Some(turn_id) = open_turn_id(&events) else {
+            return; // no open turn — nothing can be dangling
+        };
+        // The universe is the open turn's tool-call content blocks (block seq →
+        // tool name); a call is settled when any `Completed`/`Failed` points at
+        // its block's seq. Restricting to the open turn keeps an older, cleanly
+        // settled turn's calls untouched.
+        let mut calls: Vec<(u64, String)> = Vec::new();
+        let mut settled: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for event in &events {
+            if event.turn_id.as_ref() != Some(&turn_id) {
+                continue;
+            }
+            match &event.payload {
+                EventPayload::Model(ModelEvent::ContentBlock {
+                    content: BlockContent::ToolCall { name, .. },
+                    ..
+                }) => calls.push((event.seq, name.clone())),
+                EventPayload::Tool(
+                    ToolEvent::Completed {
+                        tool_call_event_id, ..
+                    }
+                    | ToolEvent::Failed {
+                        tool_call_event_id, ..
+                    },
+                ) => {
+                    settled.insert(tool_call_event_id.seq);
+                }
+                _ => {}
+            }
+        }
+        let dangling: Vec<(u64, String)> = calls
+            .into_iter()
+            .filter(|(seq, _)| !settled.contains(seq))
+            .collect();
+        if dangling.is_empty() {
+            return;
+        }
+        // Reopen to append: the aborted task already released the writer lock.
+        let Ok(writer) = self.store.open(&self.session_id) else {
+            return;
+        };
+        let mut writer = writer.with_bus(self.bus.clone());
+        for (seq, tool_name) in dangling {
+            let call_event = EventId {
+                session_id: self.session_id.clone(),
+                seq,
+            };
+            let _ = writer.append(
+                EventSource {
+                    kind: SourceKind::Tool,
+                    id: tool_name,
+                },
+                EventPayload::Tool(ToolEvent::Failed {
+                    tool_call_event_id: call_event.clone(),
+                    duration_ms: 0,
+                    error: ErrorDetail {
+                        code: "cancelled".to_owned(),
+                        message: "turn cancelled by user".to_owned(),
+                        severity: ErrorSeverity::Error,
+                        retryable: false,
+                        source_event_id: Some(call_event.clone()),
+                        provider_raw: None,
+                    },
+                }),
+                Some(call_event),
+                Some(turn_id.clone()),
+            );
+        }
     }
 
     /// Append a committed `TurnEvent::Interrupted` for the turn left open by an
@@ -838,6 +949,7 @@ mod tests {
             std::time::Duration::from_secs(3600),
             Vec::new(),
             StatusHub::new(),
+            None,
         );
         (handle, dir)
     }
@@ -876,6 +988,7 @@ mod tests {
             idle_timeout,
             Vec::new(),
             status,
+            None,
         );
         (handle, dir)
     }
@@ -1088,6 +1201,7 @@ mod tests {
             std::time::Duration::from_secs(3600),
             Vec::new(),
             StatusHub::new(),
+            None,
         );
 
         let mut rx = handle.subscribe();
@@ -1264,6 +1378,7 @@ mod tests {
         crate::tool::register_builtin(&mut tools, ws_dir.path().to_path_buf());
         let policy = crate::permission::PermissionPolicy {
             deny: vec![],
+            allow: vec![],
             ask: vec![crate::permission::Rule::contains("write", vec![])],
         };
         let agent = Agent::new(
@@ -1278,7 +1393,9 @@ mod tests {
         let system = vec![Message::System {
             content: "sys".to_owned(),
         }];
-        let writer = store.create_new(None, None, vec!["write".to_owned()]).unwrap();
+        let writer = store
+            .create_new(None, None, vec!["write".to_owned()])
+            .unwrap();
         let runtime = SessionRuntime::new(system.clone());
         let handle = SessionActor::spawn(
             agent,
@@ -1288,20 +1405,29 @@ mod tests {
             std::time::Duration::from_secs(3600),
             Vec::new(),
             StatusHub::new(),
+            None,
         );
         (handle, store_dir, ws_dir)
     }
 
     /// Wait for the next `ApprovalRequested` on the stream, returning its
     /// `call_id`. Panics on timeout — a suspended ask must announce itself.
-    async fn wait_for_approval_request(
+    async fn wait_for_approval_request(rx: &mut broadcast::Receiver<GatewayEvent>) -> String {
+        wait_for_approval_request_for(rx, "write").await
+    }
+
+    /// Like [`wait_for_approval_request`], but expecting a specific tool.
+    async fn wait_for_approval_request_for(
         rx: &mut broadcast::Receiver<GatewayEvent>,
+        tool: &str,
     ) -> String {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
-                Ok(Ok(GatewayEvent::ApprovalRequested { call_id, tool_name, .. })) => {
-                    assert_eq!(tool_name, "write");
+                Ok(Ok(GatewayEvent::ApprovalRequested {
+                    call_id, tool_name, ..
+                })) => {
+                    assert_eq!(tool_name, tool);
                     return call_id;
                 }
                 Ok(Ok(_)) => {}
@@ -1349,6 +1475,7 @@ mod tests {
             .send(Command::Approve {
                 call_id,
                 decision: ApprovalDecision::Approve,
+                scope: ApprovalScope::Once,
             })
             .await
             .unwrap();
@@ -1379,6 +1506,7 @@ mod tests {
             .send(Command::Approve {
                 call_id,
                 decision: ApprovalDecision::Reject,
+                scope: ApprovalScope::Once,
             })
             .await
             .unwrap();
@@ -1390,18 +1518,15 @@ mod tests {
             match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
                 Ok(Ok(GatewayEvent::Event { event })) => {
                     if let EventPayload::Tool(crate::core::payload::ToolEvent::Failed {
-                        error,
-                        ..
+                        error, ..
                     }) = &event.payload
+                        && error.code == "denied_by_user"
                     {
-                        if error.code == "denied_by_user" {
-                            denied = true;
-                        }
+                        denied = true;
                     }
                 }
-                Ok(Ok(GatewayEvent::TurnSettled { .. })) => break,
+                Ok(Ok(GatewayEvent::TurnSettled { .. }) | Err(_)) | Err(_) => break,
                 Ok(Ok(_)) => {}
-                Ok(Err(_)) | Err(_) => break,
             }
         }
         assert!(denied, "a rejected call surfaces as denied_by_user");
@@ -1441,18 +1566,922 @@ mod tests {
         let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 match rx.recv().await {
-                    Ok(_) => {}
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => return true,
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
                 }
             }
         })
         .await;
-        assert_eq!(closed, Ok(true), "actor must exit, not hang, on dropped handles mid-ask");
+        assert_eq!(
+            closed,
+            Ok(true),
+            "actor must exit, not hang, on dropped handles mid-ask"
+        );
         // Fail-closed: the tool never ran.
         assert!(
             !ws.path().join("x.txt").exists(),
             "a turn torn down mid-ask must not have run the tool"
+        );
+    }
+
+    // ── Cancel robustness + parallel approvals (`doc/permission.md` §5) ──────
+
+    /// A tool whose `invoke` never completes, so the turn is inside the tool
+    /// (not the approval gate) when the cancel lands.
+    struct HangingTool;
+
+    #[async_trait::async_trait]
+    impl crate::tool::Tool for HangingTool {
+        fn descriptor(&self) -> crate::tool::ToolDescriptor {
+            crate::tool::ToolDescriptor {
+                name: "hang".to_owned(),
+                description: "never returns".to_owned(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        async fn invoke(&self, _input: crate::tool::ToolInput) -> crate::tool::ToolResult {
+            std::future::pending().await
+        }
+    }
+
+    /// One model round that calls the `hang` tool, so a cancel lands
+    /// mid-execution rather than mid-approval.
+    fn hang_call(call_id: &str) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::BlockStart {
+                index: 0,
+                block_type: ContentBlockType::ToolCall {
+                    id: call_id.to_owned(),
+                    name: "hang".to_owned(),
+                },
+            },
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                json_delta: "{}".to_owned(),
+            },
+            StreamEvent::BlockStop { index: 0 },
+            StreamEvent::Completed {
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            },
+        ]
+    }
+
+    /// One model round issuing two `write` calls (block index 0 and 1), so the
+    /// round holds two asks to dispatch at once.
+    fn two_write_calls(call1: &str, path1: &str, call2: &str, path2: &str) -> Vec<StreamEvent> {
+        let block = |index: u32, call_id: &str, path: &str| {
+            vec![
+                StreamEvent::BlockStart {
+                    index,
+                    block_type: ContentBlockType::ToolCall {
+                        id: call_id.to_owned(),
+                        name: "write".to_owned(),
+                    },
+                },
+                StreamEvent::ToolCallDelta {
+                    index,
+                    json_delta: format!(r#"{{"path":"{path}","content":"hi"}}"#),
+                },
+                StreamEvent::BlockStop { index },
+            ]
+        };
+        let mut events = block(0, call1, path1);
+        events.extend(block(1, call2, path2));
+        events.push(StreamEvent::Completed {
+            stop_reason: StopReason::ToolUse,
+            usage: Usage::default(),
+        });
+        events
+    }
+
+    /// How one tool-call content block settled in the log — the invariant
+    /// behind the provider's call↔result pairing constraint.
+    #[derive(Debug, PartialEq, Eq)]
+    enum CallPairing {
+        /// No `Completed`/`Failed` ever paired the call — the poison that 400s
+        /// the next turn's provider request.
+        Dangling,
+        Completed,
+        Failed(String),
+    }
+
+    /// Pair every tool-call content block in the log with its outcome.
+    fn pair_log(events: &[CoreEvent]) -> Vec<(String, CallPairing)> {
+        let mut calls: Vec<(u64, String)> = Vec::new();
+        let mut completed: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut failed: HashMap<u64, String> = HashMap::new();
+        for event in events {
+            match &event.payload {
+                EventPayload::Model(ModelEvent::ContentBlock {
+                    content: BlockContent::ToolCall { id, .. },
+                    ..
+                }) => calls.push((event.seq, id.clone())),
+                EventPayload::Tool(ToolEvent::Completed {
+                    tool_call_event_id, ..
+                }) => {
+                    completed.insert(tool_call_event_id.seq);
+                }
+                EventPayload::Tool(ToolEvent::Failed {
+                    tool_call_event_id,
+                    error,
+                    ..
+                }) => {
+                    failed.insert(tool_call_event_id.seq, error.code.clone());
+                }
+                _ => {}
+            }
+        }
+        calls
+            .into_iter()
+            .map(|(seq, id)| {
+                let pairing = failed.get(&seq).map_or_else(
+                    || {
+                        if completed.contains(&seq) {
+                            CallPairing::Completed
+                        } else {
+                            CallPairing::Dangling
+                        }
+                    },
+                    |code| CallPairing::Failed(code.clone()),
+                );
+                (id, pairing)
+            })
+            .collect()
+    }
+
+    /// Read the single session's committed log from a temp store dir.
+    fn read_log(store_dir: &tempfile::TempDir) -> Vec<CoreEvent> {
+        let store = SessionStore::new(store_dir.path());
+        let ids = store.list().unwrap();
+        assert_eq!(ids.len(), 1, "test stores hold exactly one session");
+        store.read_events(&ids[0]).unwrap()
+    }
+
+    /// Wait for the committed `Turn::Interrupted` on the stream (it lands
+    /// slightly after Cancel is accepted). Panics on timeout.
+    async fn wait_for_interrupted(rx: &mut broadcast::Receiver<GatewayEvent>) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(GatewayEvent::Event { event }))
+                    if matches!(
+                        event.payload,
+                        EventPayload::Turn(TurnEvent::Interrupted { .. })
+                    ) =>
+                {
+                    return;
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        panic!("never saw Turn::Interrupted");
+    }
+
+    /// Wait until a `ToolEvent::Started` commits — the tool is mid-execution.
+    async fn wait_for_tool_started(rx: &mut broadcast::Receiver<GatewayEvent>) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(GatewayEvent::Event { event }))
+                    if matches!(event.payload, EventPayload::Tool(ToolEvent::Started { .. })) =>
+                {
+                    return;
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        panic!("never saw ToolEvent::Started");
+    }
+
+    /// Cancel during an `ask`: the abort kills the turn task before any failure
+    /// is written, leaving the assistant's `tool_call` dangling — and the next
+    /// provider request 400s on the unpaired call. `cancel_turn` must backfill
+    /// a `cancelled` failure so every call in the log pairs with a result.
+    #[tokio::test]
+    async fn cancel_during_ask_backfills_cancelled_failure() {
+        let (handle, store_dir, ws) =
+            spawn_actor_ask_on_write(vec![write_call("call-1", "x.txt"), answer("done")]);
+        let mut rx = handle.subscribe();
+        handle
+            .send(Command::Send {
+                text: "write a file".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let _call_id = wait_for_approval_request(&mut rx).await;
+        handle.send(Command::Cancel).await.unwrap();
+        wait_for_interrupted(&mut rx).await;
+
+        let events = read_log(&store_dir);
+        assert_eq!(
+            pair_log(&events),
+            vec![(
+                "call-1".to_owned(),
+                CallPairing::Failed("cancelled".to_owned())
+            )],
+        );
+        // The terminator still tails the log (the backfill lands before it).
+        assert!(matches!(
+            events.last().map(|e| &e.payload),
+            Some(EventPayload::Turn(TurnEvent::Interrupted { .. }))
+        ));
+        assert!(!ws.path().join("x.txt").exists(), "the tool never ran");
+    }
+
+    /// Cancel mid-execution: the hanging tool never produces a result event, so
+    /// without the backfill its call would dangle in the log — the same
+    /// provider-400 poison as a cancel mid-ask.
+    #[tokio::test]
+    async fn cancel_during_execution_backfills_cancelled_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let provider = Arc::new(ScriptedProvider {
+            rounds: Mutex::new(
+                vec![hang_call("call-1"), answer("done")]
+                    .into_iter()
+                    .collect(),
+            ),
+        });
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(HangingTool));
+        let agent = Agent::new(
+            provider,
+            tools,
+            AgentConfig {
+                model: "mock".to_owned(),
+                ..AgentConfig::default()
+            },
+        );
+        let system = vec![Message::System {
+            content: "sys".to_owned(),
+        }];
+        let writer = store
+            .create_new(None, None, vec!["hang".to_owned()])
+            .unwrap();
+        let sid = writer.session_id().clone();
+        let runtime = SessionRuntime::new(system.clone());
+        let handle = SessionActor::spawn(
+            agent,
+            store.clone(),
+            system,
+            (writer, runtime),
+            std::time::Duration::from_secs(3600),
+            Vec::new(),
+            StatusHub::new(),
+            None,
+        );
+
+        let mut rx = handle.subscribe();
+        handle
+            .send(Command::Send {
+                text: "run".to_owned(),
+            })
+            .await
+            .unwrap();
+        wait_for_tool_started(&mut rx).await;
+        handle.send(Command::Cancel).await.unwrap();
+        wait_for_interrupted(&mut rx).await;
+
+        let events = store.read_events(&sid).unwrap();
+        assert_eq!(
+            pair_log(&events),
+            vec![(
+                "call-1".to_owned(),
+                CallPairing::Failed("cancelled".to_owned())
+            )],
+        );
+    }
+
+    /// A cleanly settled turn's calls must stay untouched: a cancel in a LATER
+    /// turn backfills only that turn's dangling calls.
+    #[tokio::test]
+    async fn cancel_backfills_only_the_open_turns_dangling_calls() {
+        let (handle, store_dir, ws) = spawn_actor_ask_on_write(vec![
+            write_call("call-1", "ok.txt"),
+            answer("done"),
+            write_call("call-2", "no.txt"),
+            answer("unused"),
+        ]);
+        let mut rx = handle.subscribe();
+        // Turn 1: approved to completion — call-1 gets a real `Completed`.
+        handle
+            .send(Command::Send {
+                text: "write a file".to_owned(),
+            })
+            .await
+            .unwrap();
+        let call_id = wait_for_approval_request(&mut rx).await;
+        handle
+            .send(Command::Approve {
+                call_id,
+                decision: ApprovalDecision::Approve,
+                scope: ApprovalScope::Once,
+            })
+            .await
+            .unwrap();
+        wait_for_settled(&mut rx).await;
+        assert!(ws.path().join("ok.txt").exists());
+
+        // Turn 2: the ask suspends again; this time cancel.
+        handle
+            .send(Command::Send {
+                text: "write another".to_owned(),
+            })
+            .await
+            .unwrap();
+        let _call_id = wait_for_approval_request(&mut rx).await;
+        handle.send(Command::Cancel).await.unwrap();
+        wait_for_interrupted(&mut rx).await;
+
+        let events = read_log(&store_dir);
+        assert_eq!(
+            pair_log(&events),
+            vec![
+                ("call-1".to_owned(), CallPairing::Completed),
+                (
+                    "call-2".to_owned(),
+                    CallPairing::Failed("cancelled".to_owned())
+                ),
+            ],
+        );
+        assert!(!ws.path().join("no.txt").exists());
+    }
+
+    /// A cancelled turn with no tool calls backfills nothing — the scan must
+    /// not invent failures for a turn that never dispatched.
+    #[tokio::test]
+    async fn cancel_without_tool_calls_backfills_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let agent = Agent::new(
+            Arc::new(HangingProvider),
+            ToolRegistry::new(),
+            AgentConfig {
+                model: "mock".to_owned(),
+                ..AgentConfig::default()
+            },
+        );
+        let system = vec![Message::System {
+            content: "sys".to_owned(),
+        }];
+        let writer = store.create_new(None, None, vec![]).unwrap();
+        let sid = writer.session_id().clone();
+        let runtime = SessionRuntime::new(system.clone());
+        let handle = SessionActor::spawn(
+            agent,
+            store.clone(),
+            system,
+            (writer, runtime),
+            std::time::Duration::from_secs(3600),
+            Vec::new(),
+            StatusHub::new(),
+            None,
+        );
+
+        let mut rx = handle.subscribe();
+        handle
+            .send(Command::Send {
+                text: "hi".to_owned(),
+            })
+            .await
+            .unwrap();
+        // Wait until the turn is actually running before cancelling.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            assert!(tokio::time::Instant::now() < deadline, "turn never started");
+            if let Ok(Ok(GatewayEvent::Event { event })) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await
+                && matches!(event.payload, EventPayload::Turn(TurnEvent::Started { .. }))
+            {
+                break;
+            }
+        }
+        handle.send(Command::Cancel).await.unwrap();
+        wait_for_interrupted(&mut rx).await;
+
+        let events = store.read_events(&sid).unwrap();
+        assert!(pair_log(&events).is_empty(), "no tool calls to pair");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e.payload, EventPayload::Tool(_))),
+            "no tool events may be written for a tool-less turn"
+        );
+    }
+
+    /// Two asks in one round: BOTH `ApprovalRequested`s fire before any answer
+    /// (two-phase dispatch — the old serial loop starved the second call behind
+    /// the first ask), and a cancel with both in flight kills both waiters and
+    /// pairs both calls.
+    #[tokio::test]
+    async fn two_asks_are_published_together_and_cancel_pairs_both() {
+        let (handle, store_dir, ws) = spawn_actor_ask_on_write(vec![
+            two_write_calls("call-1", "a.txt", "call-2", "b.txt"),
+            answer("done"),
+        ]);
+        let mut rx = handle.subscribe();
+        handle
+            .send(Command::Send {
+                text: "write both".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let first = wait_for_approval_request(&mut rx).await;
+        let second = wait_for_approval_request(&mut rx).await;
+        assert_ne!(first, second, "both asks must publish before any answer");
+
+        handle.send(Command::Cancel).await.unwrap();
+        wait_for_interrupted(&mut rx).await;
+
+        let events = read_log(&store_dir);
+        assert_eq!(
+            pair_log(&events),
+            vec![
+                (
+                    "call-1".to_owned(),
+                    CallPairing::Failed("cancelled".to_owned())
+                ),
+                (
+                    "call-2".to_owned(),
+                    CallPairing::Failed("cancelled".to_owned())
+                ),
+            ],
+        );
+        assert!(!ws.path().join("a.txt").exists());
+        assert!(!ws.path().join("b.txt").exists());
+    }
+
+    // ── Independent per-call chains (`doc/permission.md` §5) ─────────────────
+
+    /// A tool that records each invocation's call id at entry (`started`) and
+    /// at exit (`finished`) — proves WHICH call is executing at any moment,
+    /// and whether it has finished (independent-chain tests).
+    struct MarkingTool {
+        started: Arc<Mutex<Vec<String>>>,
+        finished: Arc<Mutex<Vec<String>>>,
+        delay: std::time::Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tool::Tool for MarkingTool {
+        fn descriptor(&self) -> crate::tool::ToolDescriptor {
+            crate::tool::ToolDescriptor {
+                name: "gated".to_owned(),
+                description: "records execution markers".to_owned(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        async fn invoke(&self, input: crate::tool::ToolInput) -> crate::tool::ToolResult {
+            self.started.lock().unwrap().push(input.call_id.clone());
+            tokio::time::sleep(self.delay).await;
+            self.finished.lock().unwrap().push(input.call_id);
+            Ok(crate::core::payload::ToolOutput {
+                content: vec![crate::core::payload::Content::Text("marked".to_owned())],
+                is_error: false,
+                error_code: None,
+            })
+        }
+    }
+
+    /// One model round issuing one `{}`-argument call per `(id, tool)` pair, in
+    /// order.
+    fn named_calls_round(calls: &[(&str, &str)]) -> Vec<StreamEvent> {
+        let mut events = Vec::new();
+        for (index, (id, name)) in (0u32..).zip(calls.iter()) {
+            events.extend([
+                StreamEvent::BlockStart {
+                    index,
+                    block_type: ContentBlockType::ToolCall {
+                        id: (*id).to_owned(),
+                        name: (*name).to_owned(),
+                    },
+                },
+                StreamEvent::ToolCallDelta {
+                    index,
+                    json_delta: "{}".to_owned(),
+                },
+                StreamEvent::BlockStop { index },
+            ]);
+        }
+        events.push(StreamEvent::Completed {
+            stop_reason: StopReason::ToolUse,
+            usage: Usage::default(),
+        });
+        events
+    }
+
+    /// Spawn an actor with a custom tool registry and an `ask`-on-`ask_tool`
+    /// policy. Returns the handle and the temp store dir.
+    fn spawn_actor_with_tools(
+        rounds: Vec<Vec<StreamEvent>>,
+        tools: ToolRegistry,
+        ask_tool: &str,
+    ) -> (ActorHandle, tempfile::TempDir) {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(store_dir.path());
+        let provider = Arc::new(ScriptedProvider {
+            rounds: Mutex::new(rounds.into_iter().collect()),
+        });
+        let policy = crate::permission::PermissionPolicy {
+            deny: vec![],
+            allow: vec![],
+            ask: vec![crate::permission::Rule::contains(ask_tool, vec![])],
+        };
+        let agent = Agent::new(
+            provider,
+            tools,
+            AgentConfig {
+                model: "mock".to_owned(),
+                ..AgentConfig::default()
+            },
+        )
+        .with_permission(policy);
+        let system = vec![Message::System {
+            content: "sys".to_owned(),
+        }];
+        let writer = store
+            .create_new(None, None, vec![ask_tool.to_owned()])
+            .unwrap();
+        let runtime = SessionRuntime::new(system.clone());
+        let handle = SessionActor::spawn(
+            agent,
+            store,
+            system,
+            (writer, runtime),
+            std::time::Duration::from_secs(3600),
+            Vec::new(),
+            StatusHub::new(),
+            None,
+        );
+        (handle, store_dir)
+    }
+
+    /// Poll `marks` until it contains `call_id` — a marker the tool pushes from
+    /// inside `invoke`, so this returns the moment the execution starts.
+    async fn wait_for_mark(marks: &Arc<Mutex<Vec<String>>>, call_id: &str) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            if marks.lock().unwrap().iter().any(|id| id == call_id) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("never saw an execution mark for {call_id}");
+    }
+
+    /// Call ids in the order their result events (`Completed`/`Failed`)
+    /// committed — proves the write-back stays in call order even when
+    /// executions finish out of order.
+    fn result_order(events: &[CoreEvent]) -> Vec<String> {
+        let mut call_ids: HashMap<u64, String> = HashMap::new();
+        for event in events {
+            if let EventPayload::Model(ModelEvent::ContentBlock {
+                content: BlockContent::ToolCall { id, .. },
+                ..
+            }) = &event.payload
+            {
+                call_ids.insert(event.seq, id.clone());
+            }
+        }
+        events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                EventPayload::Tool(
+                    ToolEvent::Completed {
+                        tool_call_event_id, ..
+                    }
+                    | ToolEvent::Failed {
+                        tool_call_event_id, ..
+                    },
+                ) => call_ids.get(&tool_call_event_id.seq).cloned(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Poll the log until a `PermissionEvent::Decided` for `call_id` commits —
+    /// the moment the human's decision becomes durable (and visible to a
+    /// front-end folding the log).
+    async fn wait_for_decided(store_dir: &tempfile::TempDir, call_id: &str) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            let events = read_log(store_dir);
+            if events.iter().any(|e| {
+                matches!(
+                    &e.payload,
+                    EventPayload::Permission(crate::core::payload::PermissionEvent::Decided {
+                        call_id: id,
+                        ..
+                    }) if id == call_id
+                )
+            }) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("never saw a Decided for {call_id}");
+    }
+
+    /// Independent chains: approving call #2 first starts #2's execution while
+    /// call #1 is still undecided — and #2's `Decided` commits at once (the
+    /// approval is immediately visible), not queued behind #1's chain. Result
+    /// events commit in *completion* order (#2 before #1), while the model
+    /// still reads the tool results in `tool_call` order (#1 before #2).
+    #[tokio::test]
+    async fn second_approval_executes_before_the_first_is_decided() {
+        let started: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let finished: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(MarkingTool {
+            started: Arc::clone(&started),
+            finished: Arc::clone(&finished),
+            delay: std::time::Duration::from_millis(300),
+        }));
+        let (handle, store_dir) = spawn_actor_with_tools(
+            vec![
+                named_calls_round(&[("call-1", "gated"), ("call-2", "gated")]),
+                answer("done"),
+            ],
+            tools,
+            "gated",
+        );
+        let mut rx = handle.subscribe();
+        handle
+            .send(Command::Send {
+                text: "run both".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        // Both asks publish before either is answered.
+        let first = wait_for_approval_request_for(&mut rx, "gated").await;
+        let second = wait_for_approval_request_for(&mut rx, "gated").await;
+        assert_eq!((first.as_str(), second.as_str()), ("call-1", "call-2"));
+
+        // Approve #2 FIRST: its chain must start executing while #1 is still
+        // undecided — no waiting on the earlier call's gate.
+        handle
+            .send(Command::Approve {
+                call_id: "call-2".to_owned(),
+                decision: ApprovalDecision::Approve,
+                scope: ApprovalScope::Once,
+            })
+            .await
+            .unwrap();
+        wait_for_mark(&started, "call-2").await;
+        assert!(
+            !started.lock().unwrap().iter().any(|id| id == "call-1"),
+            "call-1 must not execute before its own approval"
+        );
+        // …and #2's `Decided` commits immediately — while #1 is still
+        // undecided — so a front-end folding the log clears the card at once.
+        wait_for_decided(&store_dir, "call-2").await;
+        let events = read_log(&store_dir);
+        assert!(
+            !events.iter().any(|e| matches!(
+                &e.payload,
+                EventPayload::Permission(crate::core::payload::PermissionEvent::Decided {
+                    call_id,
+                    ..
+                }) if call_id == "call-1"
+            )),
+            "call-1 must still be undecided when call-2's decision commits"
+        );
+
+        // Approve #1 too: the turn settles. #2 was decided and executed first,
+        // so its `Completed` committed first — the front-end saw it the moment
+        // it finished — while the model still reads the results in call order.
+        handle
+            .send(Command::Approve {
+                call_id: "call-1".to_owned(),
+                decision: ApprovalDecision::Approve,
+                scope: ApprovalScope::Once,
+            })
+            .await
+            .unwrap();
+        wait_for_settled(&mut rx).await;
+        let events = read_log(&store_dir);
+        assert_eq!(
+            result_order(&events),
+            vec!["call-2", "call-1"],
+            "result events commit in completion order"
+        );
+        let runtime = crate::agent::rebuild_runtime(&events, vec![]);
+        let result_ids: Vec<&str> = runtime
+            .context
+            .iter()
+            .filter_map(|m| match m {
+                Message::Tool { tool_call_id, .. } => Some(tool_call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            result_ids,
+            ["call-1", "call-2"],
+            "the model reads tool results in `tool_call` order"
+        );
+        assert_eq!(finished.lock().unwrap().len(), 2, "both chains executed");
+    }
+
+    /// Approval → immediate execution: a single ask starts its tool as soon as
+    /// the decision lands — observed mid-execution (started, not yet finished).
+    #[tokio::test]
+    async fn approval_starts_execution_immediately() {
+        let started: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let finished: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(MarkingTool {
+            started: Arc::clone(&started),
+            finished: Arc::clone(&finished),
+            delay: std::time::Duration::from_millis(500),
+        }));
+        let (handle, store_dir) = spawn_actor_with_tools(
+            vec![named_calls_round(&[("call-1", "gated")]), answer("done")],
+            tools,
+            "gated",
+        );
+        let mut rx = handle.subscribe();
+        handle
+            .send(Command::Send {
+                text: "run".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let call_id = wait_for_approval_request_for(&mut rx, "gated").await;
+        handle
+            .send(Command::Approve {
+                call_id,
+                decision: ApprovalDecision::Approve,
+                scope: ApprovalScope::Once,
+            })
+            .await
+            .unwrap();
+
+        // The execution begins the moment the approval lands: the start marker
+        // fires long before the 500ms tool could finish — nothing else is
+        // waited on first.
+        wait_for_mark(&started, "call-1").await;
+        assert!(
+            finished.lock().unwrap().is_empty(),
+            "caught mid-execution: the approval started the tool at once"
+        );
+        wait_for_settled(&mut rx).await;
+        assert_eq!(
+            pair_log(&read_log(&store_dir)),
+            vec![("call-1".to_owned(), CallPairing::Completed)],
+        );
+    }
+
+    /// Cancel recalls an executing chain: an approved, mid-`invoke` chain is
+    /// aborted — its side effect never completes (no `finished` marker) and
+    /// the log pairs the call with a `cancelled` failure (`doc/permission.md`
+    /// §5.2). Pre-fix, the detached chain ran to completion while the log said
+    /// cancelled.
+    #[tokio::test]
+    async fn cancel_aborts_an_executing_chain_before_its_side_effect() {
+        let started: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let finished: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(MarkingTool {
+            started: Arc::clone(&started),
+            finished: Arc::clone(&finished),
+            // Effectively never finishes on its own — the abort is what stops it.
+            delay: std::time::Duration::from_secs(3600),
+        }));
+        let (handle, store_dir) = spawn_actor_with_tools(
+            vec![named_calls_round(&[("call-1", "gated")]), answer("done")],
+            tools,
+            "gated",
+        );
+        let mut rx = handle.subscribe();
+        handle
+            .send(Command::Send {
+                text: "run".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let call_id = wait_for_approval_request_for(&mut rx, "gated").await;
+        handle
+            .send(Command::Approve {
+                call_id,
+                decision: ApprovalDecision::Approve,
+                scope: ApprovalScope::Once,
+            })
+            .await
+            .unwrap();
+        // The chain is now mid-`invoke` (started, nowhere near finished).
+        wait_for_mark(&started, "call-1").await;
+
+        handle.send(Command::Cancel).await.unwrap();
+        wait_for_interrupted(&mut rx).await;
+
+        assert!(
+            finished.lock().unwrap().is_empty(),
+            "the chain was aborted mid-invoke — the side effect never completed"
+        );
+        assert_eq!(
+            pair_log(&read_log(&store_dir)),
+            vec![(
+                "call-1".to_owned(),
+                CallPairing::Failed("cancelled".to_owned())
+            )],
+        );
+    }
+
+    /// Same-round pin: approving one of three parallel asks with `session`
+    /// scope pins an allow rule, and the matching still-pending asks
+    /// auto-approve against it — audited as the rule's decision (`"policy"`),
+    /// not a human's — and execute without further answers (`doc/permission.md`
+    /// §5.1).
+    #[tokio::test]
+    async fn session_pin_auto_approves_matching_pending_asks() {
+        let started: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let finished: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(MarkingTool {
+            started: Arc::clone(&started),
+            finished: Arc::clone(&finished),
+            delay: std::time::Duration::ZERO,
+        }));
+        let (handle, store_dir) = spawn_actor_with_tools(
+            vec![
+                named_calls_round(&[
+                    ("call-1", "gated"),
+                    ("call-2", "gated"),
+                    ("call-3", "gated"),
+                ]),
+                answer("done"),
+            ],
+            tools,
+            "gated",
+        );
+        let mut rx = handle.subscribe();
+        handle
+            .send(Command::Send {
+                text: "run all three".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        // All three asks publish.
+        for _ in 0..3 {
+            wait_for_approval_request_for(&mut rx, "gated").await;
+        }
+
+        // Approve ONLY call-1, with `session` scope: the pin re-evaluates the
+        // other two against the new rule and auto-approves them.
+        handle
+            .send(Command::Approve {
+                call_id: "call-1".to_owned(),
+                decision: ApprovalDecision::Approve,
+                scope: ApprovalScope::Session,
+            })
+            .await
+            .unwrap();
+        wait_for_settled(&mut rx).await;
+
+        // All three executed — call-2/3 without any further human answer.
+        assert_eq!(finished.lock().unwrap().len(), 3, "all three chains ran");
+        let events = read_log(&store_dir);
+        let decided = |id: &str| {
+            events.iter().find_map(|e| match &e.payload {
+                EventPayload::Permission(crate::core::payload::PermissionEvent::Decided {
+                    call_id,
+                    decided_by,
+                    scope,
+                    ..
+                }) if call_id == id => Some((decided_by.clone(), *scope)),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            decided("call-1"),
+            Some(("user".to_owned(), Some(ApprovalScope::Session))),
+            "the human answered call-1, scoped to the session"
+        );
+        for id in ["call-2", "call-3"] {
+            assert_eq!(
+                decided(id),
+                Some(("policy".to_owned(), Some(ApprovalScope::Session))),
+                "{id} was auto-approved by the pinned rule, audited as the rule's decision"
+            );
+        }
+        assert_eq!(
+            pair_log(&events),
+            vec![
+                ("call-1".to_owned(), CallPairing::Completed),
+                ("call-2".to_owned(), CallPairing::Completed),
+                ("call-3".to_owned(), CallPairing::Completed),
+            ],
         );
     }
 }

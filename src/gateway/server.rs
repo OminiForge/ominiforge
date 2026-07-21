@@ -43,11 +43,11 @@ use crate::monitor::{self, PricingTable};
 use crate::session::SessionMeta;
 
 use super::actor::{ActorHandle, Command, GatewayEvent};
-use crate::agent::ApprovalDecision;
 use super::config::GatewayConfig;
 use super::registry::SessionRegistry;
 use super::status::SessionStatus;
 use super::workspace::{WorkspaceId, group_sessions};
+use crate::agent::{ApprovalDecision, ApprovalScope};
 
 /// Shared server state: the session registry and the optional bearer token.
 #[derive(Clone)]
@@ -391,7 +391,7 @@ async fn put_gateway_permission(
     State(state): State<AppState>,
     Json(policy): Json<crate::permission::PermissionPolicy>,
 ) -> Response {
-    match state.registry.set_gateway_permission(policy) {
+    match state.registry.set_gateway_permission(policy).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => internal_error(&e),
     }
@@ -588,7 +588,7 @@ async fn put_profile(
     Path(name): Path<String>,
     Json(profile): Json<crate::config::Profile>,
 ) -> Response {
-    match state.registry.save_profile(&name, &profile) {
+    match state.registry.save_profile(&name, &profile).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => internal_error(&e),
     }
@@ -749,6 +749,10 @@ struct ApproveBody {
     call_id: String,
     /// `approve` runs the tool; `reject` blocks it (`denied_by_user`).
     decision: ApprovalDecision,
+    /// How far the decision reaches: `once` (default — this call only),
+    /// `session`, `profile`, or `gateway` (`doc/permission.md` §5).
+    #[serde(default)]
+    scope: Option<ApprovalScope>,
 }
 
 /// `POST /sessions/{id}/approve` — deliver a human decision for a tool call the
@@ -769,6 +773,7 @@ async fn approve_tool_call(
         .send(Command::Approve {
             call_id: body.call_id,
             decision: body.decision,
+            scope: body.scope.unwrap_or(ApprovalScope::Once),
         })
         .await
     {
@@ -1089,10 +1094,13 @@ enum WsClientMessage {
     Send { text: String },
     /// Abort the running turn.
     Cancel,
-    /// Deliver a decision for a suspended `ask` tool call.
+    /// Deliver a decision for a suspended `ask` tool call. `scope` (`once` /
+    /// `session` / `profile` / `gateway`) defaults to `once`.
     Approve {
         call_id: String,
         decision: ApprovalDecision,
+        #[serde(default)]
+        scope: Option<ApprovalScope>,
     },
 }
 
@@ -1124,8 +1132,12 @@ async fn ws_loop(socket: WebSocket, handle: ActorHandle) {
                         let command = match cmd {
                             WsClientMessage::Send { text } => Command::Send { text },
                             WsClientMessage::Cancel => Command::Cancel,
-                            WsClientMessage::Approve { call_id, decision } => {
-                                Command::Approve { call_id, decision }
+                            WsClientMessage::Approve { call_id, decision, scope } => {
+                                Command::Approve {
+                                    call_id,
+                                    decision,
+                                    scope: scope.unwrap_or(ApprovalScope::Once),
+                                }
                             }
                         };
                         if handle.send(command).await.is_err() {
@@ -1622,13 +1634,12 @@ default = "openai-main/gpt-4o"
             .to_owned();
 
         // The fork's runtime must report the inherited override, not the default.
-        let rt: serde_json::Value =
-            reqwest::get(format!("{base}/api/sessions/{fork_id}/runtime"))
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
+        let rt: serde_json::Value = reqwest::get(format!("{base}/api/sessions/{fork_id}/runtime"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
         assert_eq!(
             rt["model"], "gpt-4o-mini",
             "fork must inherit the parent's model override on the runtime panel"
@@ -1676,13 +1687,12 @@ default = "openai-main/gpt-4o"
             .unwrap()
             .to_owned();
 
-        let rt: serde_json::Value =
-            reqwest::get(format!("{base}/api/sessions/{new_id}/runtime"))
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
+        let rt: serde_json::Value = reqwest::get(format!("{base}/api/sessions/{new_id}/runtime"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
         assert_eq!(
             rt["model"], "gpt-4o-mini",
             "reconfigured session must report and persist the new model"
@@ -2752,7 +2762,11 @@ default = "openai-main/gpt-4o"
         // Plant a broken config file for this workspace's id.
         let cfg_dir = dir.path().join(".omini").join("workspaces");
         std::fs::create_dir_all(&cfg_dir).unwrap();
-        std::fs::write(cfg_dir.join(format!("{}.toml", id.0)), "this is = not valid ][").unwrap();
+        std::fs::write(
+            cfg_dir.join(format!("{}.toml", id.0)),
+            "this is = not valid ][",
+        )
+        .unwrap();
 
         let state = AppState {
             registry,
@@ -2763,7 +2777,11 @@ default = "openai-main/gpt-4o"
         let resp = reqwest::get(format!("{base}/api/workspaces/{}/config", id.0))
             .await
             .unwrap();
-        assert_eq!(resp.status(), 500, "malformed config is a server error, not a 404");
+        assert_eq!(
+            resp.status(),
+            500,
+            "malformed config is a server error, not a 404"
+        );
     }
 
     /// `GET /workspaces/{id}/tools` returns at least the built-in catalog for a
@@ -2781,13 +2799,12 @@ default = "openai-main/gpt-4o"
             pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
-        let body: serde_json::Value =
-            reqwest::get(format!("{base}/api/workspaces/{}/tools", id.0))
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
+        let body: serde_json::Value = reqwest::get(format!("{base}/api/workspaces/{}/tools", id.0))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
         let names: Vec<&str> = body["tools"]
             .as_array()
             .unwrap()
@@ -2855,6 +2872,9 @@ default = "openai-main/gpt-4o"
         assert_eq!(resp.status(), 200);
         let got: serde_json::Value = resp.json().await.unwrap();
         // Empty policy: deny/ask omitted (skip_serializing_if), network absent.
-        assert!(got["permission"].get("deny").is_none() || got["permission"]["deny"].as_array().unwrap().is_empty());
+        assert!(
+            got["permission"].get("deny").is_none()
+                || got["permission"]["deny"].as_array().unwrap().is_empty()
+        );
     }
 }

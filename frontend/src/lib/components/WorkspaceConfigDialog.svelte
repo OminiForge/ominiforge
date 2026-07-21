@@ -3,7 +3,7 @@
 	import { fadeIn, pop } from '$lib/motion';
 	import { client } from '$lib/client';
 	import Button from './Button.svelte';
-	import PermissionEditor from './PermissionEditor.svelte';
+	import PermissionRulesEditor from './PermissionRulesEditor.svelte';
 	import Skeleton from './Skeleton.svelte';
 	import type { WorkspaceConfig } from '$lib/types/WorkspaceConfig';
 	import type { ToolInfo } from '$lib/types/ToolInfo';
@@ -180,7 +180,7 @@
 				{#if config.permission}
 					<div class="perm-block">
 						<span class="key">Permission 门控</span>
-						<PermissionEditor bind:policy={config.permission} tools={toolCatalog} />
+						<PermissionRulesEditor bind:policy={config.permission} tools={toolCatalog} />
 					</div>
 				{/if}
 			</div>

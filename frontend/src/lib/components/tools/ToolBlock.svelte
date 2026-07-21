@@ -1,20 +1,43 @@
 <script lang="ts">
 	import type { Item } from '$lib/conversation';
 	import { resultComponent } from '$lib/tools/registry';
+	import ApprovalControls from '$lib/components/ApprovalControls.svelte';
+	import type { ApprovalScope } from '$lib/types/ApprovalScope';
 
 	/** The 120% tool card (DESIGN.md §4.1): a collapsible three-state shell (pip +
 	 *  name + status badge + arg preview + chevron) whose body is dispatched to a
 	 *  per-tool result component by name.  All tools stay open after completion;
 	 *  `read` auto-collapses.  The user's toggle overrides and persists across
-	 *  status flips. */
-	let { item }: { item: Item & { kind: 'tool' } } = $props();
+	 *  status flips.
+	 *
+	 *  A permission `ask` suspends the call *inside this card* (`approvalPending`):
+	 *  the header grows ApprovalControls and the badge reads 等待批准; the decision
+	 *  resolves back through the same card (approved → it runs; rejected → the
+	 *  paired Tool::Failed lands it in error). No separate approval card. */
+	let {
+		item,
+		onDecide
+	}: {
+		item: Item & { kind: 'tool' };
+		/** Answer a permission `ask` with a decision + scope (Conversation wires
+		 *  `client.approve` through this). Optional: history renders read-only. */
+		onDecide?: (
+			callId: string,
+			decision: 'approve' | 'reject',
+			scope: ApprovalScope
+		) => void | Promise<void>;
+	} = $props();
 
-	// Tools stay open after completion, except `read` which auto-collapses.
+	// Tools stay open after completion, except `read` which auto-collapses. A
+	// pending approval always stays open — its prompt is in the header.
 	let override = $state<boolean | null>(null);
 	const expanded = $derived(
-		override ?? !(item.name === 'read' && item.status !== 'running')
+		override ??
+			(item.approvalPending === true || !(item.name === 'read' && item.status !== 'running'))
 	);
 	const Body = $derived(resultComponent(item.name));
+
+	const awaiting = $derived(item.approvalPending === true);
 
 	function clip(s: string, n: number): string {
 		const line = s.split('\n')[0];
@@ -61,30 +84,36 @@
 	class:done={item.status === 'done'}
 	class:running={item.status === 'running'}
 	class:error={item.status === 'error'}
+	class:awaiting
 	class:expanded
 >
-	<button class="tool-header" onclick={() => (override = !expanded)} aria-expanded={expanded}>
-		<span class="tool-pip"></span>
-		{#if item.status === 'running'}
-			<span class="tool-spinner"></span>
+	<div class="tool-header">
+		<button class="tool-toggle" onclick={() => (override = !expanded)} aria-expanded={expanded}>
+			<span class="tool-pip"></span>
+			{#if item.status === 'running' && !awaiting}
+				<span class="tool-spinner"></span>
+			{/if}
+			<span class="tool-name">{item.name}</span>
+			<span class="tool-status-badge">{awaiting ? '等待批准' : item.status}</span>
+			{#if preview}
+				<span class="tool-preview">{preview}</span>
+			{/if}
+			<svg
+				class="tool-chevron"
+				viewBox="0 0 12 12"
+				fill="none"
+				stroke="currentColor"
+				stroke-width="1.6"
+				stroke-linecap="round"
+				stroke-linejoin="round"
+			>
+				<polyline points="4,2 8,6 4,10" />
+			</svg>
+		</button>
+		{#if awaiting && item.callId && onDecide}
+			<ApprovalControls callId={item.callId} {onDecide} />
 		{/if}
-		<span class="tool-name">{item.name}</span>
-		<span class="tool-status-badge">{item.status}</span>
-		{#if preview}
-			<span class="tool-preview">{preview}</span>
-		{/if}
-		<svg
-			class="tool-chevron"
-			viewBox="0 0 12 12"
-			fill="none"
-			stroke="currentColor"
-			stroke-width="1.6"
-			stroke-linecap="round"
-			stroke-linejoin="round"
-		>
-			<polyline points="4,2 8,6 4,10" />
-		</svg>
-	</button>
+	</div>
 	{#if expanded}
 		<div class="tool-detail">
 			<Body
@@ -94,7 +123,7 @@
 				status={item.status}
 				error_code={item.error_code}
 			/>
-			{#if item.status === 'running'}
+			{#if item.status === 'running' && !awaiting}
 				<div class="running-indicator">
 					<span class="tool-spinner"></span>
 					<span>正在执行…</span>
@@ -136,17 +165,27 @@
 	.tool-header {
 		display: flex;
 		align-items: center;
-		gap: var(--space-2);
-		padding: 7px var(--space-3);
 		background: var(--canvas-overlay);
-		cursor: pointer;
 		user-select: none;
 		transition: background var(--dur-fast) var(--ease-out);
-		width: 100%;
-		text-align: left;
 	}
 	.tool-header:hover {
 		background: var(--canvas-float);
+	}
+	/* The toggle is a real <button> nested next to (not around) the approval
+	   controls — interactive elements must not nest. */
+	.tool-toggle {
+		flex: 1;
+		min-width: 0;
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+		padding: 7px var(--space-3);
+		cursor: pointer;
+		text-align: left;
+	}
+	.tool-header > :global(.controls) {
+		margin-right: var(--space-2);
 	}
 
 	.tool-pip {
@@ -163,10 +202,14 @@
 	.running .tool-pip {
 		background: var(--state-running);
 	}
+	.awaiting .tool-pip {
+		background: var(--state-running);
+	}
 	.error .tool-pip {
 		background: var(--state-error);
 	}
-	.running .tool-pip::after {
+	.running .tool-pip::after,
+	.awaiting .tool-pip::after {
 		content: '';
 		position: absolute;
 		inset: -3px;

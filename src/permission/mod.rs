@@ -8,9 +8,10 @@
 //! the `tool:invoke:before` hooks have run (so it judges the final, possibly
 //! hook-rewritten input) and before the tool executes.
 //!
-//! The policy is a two-list rule table evaluated in fixed precedence
-//! (`evaluate`): a matching **deny** rule wins over a matching **ask** rule, and
-//! a call matching neither is **allowed**. This module is pure decision logic —
+//! The policy is a three-list rule table evaluated in fixed precedence
+//! (`evaluate`): a matching **deny** rule wins outright, a matching **allow**
+//! rule (a pinned approval) outranks **ask**, and a call matching nothing is
+//! **allowed**. This module is pure decision logic —
 //! it performs no I/O and knows nothing about how `Ask` is resolved (that is the
 //! agent's `ApprovalGate`) or how the table is configured (that is
 //! `[permission]` in `doc/profile.md`).
@@ -57,9 +58,11 @@ pub enum MatchMode {
 /// tool name matches [`tool`](Self::tool) **and** the input satisfies the
 /// rule's field / mode / pattern test.
 ///
-/// A rule carries no verdict of its own — which list (`deny` or `ask`) it sits
-/// in is the verdict (`doc/permission.md` §3). This keeps the table readable:
-/// every rule under `deny` denies, every rule under `ask` asks.
+/// A rule carries no verdict of its own — which list (`deny`, `allow`, or
+/// `ask`) it sits in is the verdict (`doc/permission.md` §3). This keeps the
+/// table readable:
+/// every rule under `deny` denies, every rule under `allow` runs, every rule
+/// under `ask` asks.
 ///
 /// The structured shape (`field` + `mode` + `negate`) is what the config UI's
 /// per-tool cards compile to; a hand-written TOML rule that sets only `contains`
@@ -171,14 +174,13 @@ impl Rule {
                 .iter()
                 .any(|pattern| value_hits(value, pattern, self.mode))
         };
-        self.field.as_ref().map_or_else(
-            || hit_in(input),
-            |name| input.get(name).is_some_and(hit_in),
-        )
+        self.field
+            .as_ref()
+            .map_or_else(|| hit_in(input), |name| input.get(name).is_some_and(hit_in))
     }
 }
 
-/// A tool-call gate: two ordered rule lists whose precedence is fixed by
+/// A tool-call gate: three ordered rule lists whose precedence is fixed by
 /// [`evaluate`](Self::evaluate).
 ///
 /// The empty policy allows everything, so a profile with no `[permission]`
@@ -190,8 +192,13 @@ pub struct PermissionPolicy {
     /// Rules that, when matched, block the call. Highest precedence.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<Rule>,
-    /// Rules that, when matched (and no deny rule matched), require human
-    /// approval.
+    /// Rules that, when matched (and no deny rule matched), run the call
+    /// without asking — pinned approvals (`doc/permission.md` §5). Outranks
+    /// `ask`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<Rule>,
+    /// Rules that, when matched (and neither deny nor allow matched), require
+    /// human approval.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ask: Vec<Rule>,
 }
@@ -199,11 +206,15 @@ pub struct PermissionPolicy {
 impl PermissionPolicy {
     /// Classify a tool call. Precedence is fixed and mirrors the reference
     /// three-gate pipeline: a matching `deny` rule wins outright; otherwise a
+    /// matching `allow` rule runs the call (a pinned approval); otherwise a
     /// matching `ask` rule requires approval; otherwise the call is allowed.
     #[must_use]
     pub fn evaluate(&self, tool: &str, input: &serde_json::Value) -> Decision {
         if self.deny.iter().any(|r| r.matches(tool, input)) {
             return Decision::Deny;
+        }
+        if self.allow.iter().any(|r| r.matches(tool, input)) {
+            return Decision::Allow;
         }
         if self.ask.iter().any(|r| r.matches(tool, input)) {
             return Decision::Ask;
@@ -215,7 +226,7 @@ impl PermissionPolicy {
     /// entirely in that case, preserving the pre-permission fast path.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.deny.is_empty() && self.ask.is_empty()
+        self.deny.is_empty() && self.allow.is_empty() && self.ask.is_empty()
     }
 
     /// Layer this policy (the higher-precedence override) over `base` (the
@@ -225,8 +236,9 @@ impl PermissionPolicy {
     /// (`doc/permission.md` §3) and the three-tier resolution
     /// (`workspace > profile > gateway`, `resolve_permission` in `app.rs`):
     ///
-    /// - `deny` is **union-inherited** — a security floor. The override may add
-    ///   denials but can never drop one it inherited (dropping would be a stealth
+    /// - `deny` and `allow` are **union-inherited** — a security floor and a
+    ///   pinned-approval set, respectively. The override may add rules but can
+    ///   never drop one it inherited (dropping a denial would be a stealth
     ///   privilege escalation). Duplicates are collapsed so repeated layering is
     ///   idempotent.
     /// - `ask` is **replace-or-inherit** — a non-empty override `ask` list wins
@@ -240,8 +252,46 @@ impl PermissionPolicy {
                 deny.push(rule);
             }
         }
-        let ask = if self.ask.is_empty() { base.ask } else { self.ask };
-        Self { deny, ask }
+        let mut allow = base.allow;
+        for rule in self.allow {
+            if !allow.contains(&rule) {
+                allow.push(rule);
+            }
+        }
+        let ask = if self.ask.is_empty() {
+            base.ask
+        } else {
+            self.ask
+        };
+        Self { deny, allow, ask }
+    }
+}
+
+/// Compile a [`Rule`] from an approved/rejected tool call — the rule a scoped
+/// approval pins (`doc/permission.md` §5).
+///
+/// When `primary_field` names a field whose value is a non-empty string (e.g.
+/// `command` for `shell`, `path` for `read`/`write`/`edit`), the rule is
+/// field-scoped with that value — **verbatim, never truncated** — as a
+/// substring pattern. A truncated prefix would match calls the human never
+/// approved (anything sharing the prefix), silently widening the grant beyond
+/// the call that was decided; the full value keeps the pinned rule within the
+/// approved call's own text. Otherwise the rule degrades to a tool-level bare
+/// rule matching any call to `tool`.
+#[must_use]
+pub fn rule_from_call(tool: &str, input: &serde_json::Value, primary_field: Option<&str>) -> Rule {
+    let value = primary_field
+        .and_then(|field| input.get(field))
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty());
+    match (primary_field, value) {
+        (Some(field), Some(value)) => Rule {
+            tool: tool.to_owned(),
+            field: Some(field.to_owned()),
+            patterns: vec![value.to_owned()],
+            ..Rule::default()
+        },
+        _ => Rule::contains(tool, Vec::new()),
     }
 }
 
@@ -290,6 +340,7 @@ mod tests {
     fn deny_rule_blocks_matching_command() {
         let policy = PermissionPolicy {
             deny: vec![rule("shell", &["rm -rf"])],
+            allow: vec![],
             ask: vec![],
         };
         assert_eq!(
@@ -310,6 +361,7 @@ mod tests {
     fn deny_wins_over_ask() {
         let policy = PermissionPolicy {
             deny: vec![rule("shell", &["rm -rf"])],
+            allow: vec![],
             ask: vec![rule("shell", &[])], // ask on any shell call
         };
         assert_eq!(
@@ -330,13 +382,21 @@ mod tests {
     fn tool_level_and_wildcard_rules() {
         let tool_level = PermissionPolicy {
             deny: vec![],
+            allow: vec![],
             ask: vec![rule("write", &[])],
         };
-        assert_eq!(tool_level.evaluate("write", &json!({"path": "a"})), Decision::Ask);
-        assert_eq!(tool_level.evaluate("read", &json!({"path": "a"})), Decision::Allow);
+        assert_eq!(
+            tool_level.evaluate("write", &json!({"path": "a"})),
+            Decision::Ask
+        );
+        assert_eq!(
+            tool_level.evaluate("read", &json!({"path": "a"})),
+            Decision::Allow
+        );
 
         let wildcard = PermissionPolicy {
             deny: vec![rule("*", &["/etc/"])],
+            allow: vec![],
             ask: vec![],
         };
         assert_eq!(
@@ -356,6 +416,7 @@ mod tests {
     fn matching_recurses_into_nested_values() {
         let policy = PermissionPolicy {
             deny: vec![rule("shell", &["sudo"])],
+            allow: vec![],
             ask: vec![],
         };
         assert_eq!(
@@ -379,7 +440,10 @@ mod tests {
         assert!(parsed.matches("shell", &json!({"command": "rm -rf /"})));
         // It serializes back to `contains`, not `patterns`, so files keep shape.
         let text = toml::to_string(&parsed).unwrap();
-        assert!(text.contains("contains"), "must serialize as contains, got: {text}");
+        assert!(
+            text.contains("contains"),
+            "must serialize as contains, got: {text}"
+        );
         assert!(!text.contains("patterns"));
     }
 
@@ -395,6 +459,7 @@ mod tests {
                 patterns: vec!["danger".to_owned()],
                 ..Rule::default()
             }],
+            allow: vec![],
             ask: vec![],
         };
         // Hit in the scoped field → deny.
@@ -422,11 +487,18 @@ mod tests {
                 patterns: vec!["/etc/".to_owned()],
                 ..Rule::default()
             }],
+            allow: vec![],
             ask: vec![],
         };
-        assert_eq!(policy.evaluate("read", &json!({"path": "/etc/passwd"})), Decision::Deny);
+        assert_eq!(
+            policy.evaluate("read", &json!({"path": "/etc/passwd"})),
+            Decision::Deny
+        );
         // Contains "/etc/" but not as a prefix -> allowed (substring would deny).
-        assert_eq!(policy.evaluate("read", &json!({"path": "home/x/etc/y"})), Decision::Allow);
+        assert_eq!(
+            policy.evaluate("read", &json!({"path": "home/x/etc/y"})),
+            Decision::Allow
+        );
     }
 
     /// `negate` expresses an allow-list: ask `write` when `path` does NOT start
@@ -437,6 +509,7 @@ mod tests {
     fn negate_expresses_allowlist() {
         let policy = PermissionPolicy {
             deny: vec![],
+            allow: vec![],
             ask: vec![Rule {
                 tool: "write".to_owned(),
                 field: Some("path".to_owned()),
@@ -446,9 +519,15 @@ mod tests {
             }],
         };
         // Outside the allow-list → ask.
-        assert_eq!(policy.evaluate("write", &json!({"path": "etc/shadow"})), Decision::Ask);
+        assert_eq!(
+            policy.evaluate("write", &json!({"path": "etc/shadow"})),
+            Decision::Ask
+        );
         // Inside the allow-list → allowed (silent).
-        assert_eq!(policy.evaluate("write", &json!({"path": "src/main.rs"})), Decision::Allow);
+        assert_eq!(
+            policy.evaluate("write", &json!({"path": "src/main.rs"})),
+            Decision::Allow
+        );
     }
 
     /// An empty `negate` allow-list must NOT lock the tool out: with nothing in
@@ -475,19 +554,30 @@ mod tests {
     fn layer_over_unions_deny_and_replaces_ask() {
         let base = PermissionPolicy {
             deny: vec![rule("shell", &["rm -rf"])],
+            allow: vec![],
             ask: vec![rule("read", &[])],
         };
         let over = PermissionPolicy {
             deny: vec![rule("net", &[])],
+            allow: vec![],
             ask: vec![rule("write", &[])],
         };
         let merged = over.layer_over(base);
         // Base deny survived AND the override's deny was added (union floor).
-        assert_eq!(merged.evaluate("shell", &json!({"command": "rm -rf /"})), Decision::Deny);
+        assert_eq!(
+            merged.evaluate("shell", &json!({"command": "rm -rf /"})),
+            Decision::Deny
+        );
         assert_eq!(merged.evaluate("net", &json!({})), Decision::Deny);
         // The override's non-empty ask replaced the base's — base's `read` ask is gone.
-        assert_eq!(merged.evaluate("read", &json!({"path": "x"})), Decision::Allow);
-        assert_eq!(merged.evaluate("write", &json!({"path": "x"})), Decision::Ask);
+        assert_eq!(
+            merged.evaluate("read", &json!({"path": "x"})),
+            Decision::Allow
+        );
+        assert_eq!(
+            merged.evaluate("write", &json!({"path": "x"})),
+            Decision::Ask
+        );
     }
 
     /// An empty override contributes nothing: `deny` unchanged, `ask` inherited.
@@ -497,9 +587,138 @@ mod tests {
     fn layer_over_empty_override_inherits_base() {
         let base = PermissionPolicy {
             deny: vec![rule("shell", &["rm -rf"])],
+            allow: vec![],
             ask: vec![rule("write", &[])],
         };
         let merged = PermissionPolicy::default().layer_over(base.clone());
         assert_eq!(merged, base);
+    }
+
+    /// Precedence with three lists: `deny` wins outright, `allow` (a pinned
+    /// approval) silences a matching `ask`, and a call matching neither still
+    /// asks. If `allow` ever outranked `deny`, a pinned approval would quietly
+    /// downgrade a ban; if `ask` outranked `allow`, a scoped approval would
+    /// keep prompting — the exact thing it exists to stop.
+    #[test]
+    fn allow_sits_between_deny_and_ask() {
+        let policy = PermissionPolicy {
+            deny: vec![rule("shell", &["rm -rf"])],
+            allow: vec![rule("shell", &["cargo test"])],
+            ask: vec![rule("shell", &[])], // ask on any shell call
+        };
+        // deny still wins over a matching allow + ask.
+        assert_eq!(
+            policy.evaluate("shell", &json!({"command": "rm -rf /"})),
+            Decision::Deny
+        );
+        // allow wins over the matching ask — the pinned approval runs silently.
+        assert_eq!(
+            policy.evaluate("shell", &json!({"command": "cargo test --all"})),
+            Decision::Allow
+        );
+        // Neither deny nor allow matched → ask still gates.
+        assert_eq!(
+            policy.evaluate("shell", &json!({"command": "make"})),
+            Decision::Ask
+        );
+    }
+
+    /// `allow` unions across layers exactly like `deny`: a lower tier's pinned
+    /// approvals survive an override that adds its own, and duplicates collapse
+    /// — layering a policy over the tier a scoped approval was just persisted
+    /// into must stay idempotent (no growing list on every approval).
+    #[test]
+    fn layer_over_unions_allow_and_dedups() {
+        let shared = rule("shell", &["cargo test"]);
+        let base = PermissionPolicy {
+            deny: vec![],
+            allow: vec![shared.clone()],
+            ask: vec![],
+        };
+        let over = PermissionPolicy {
+            deny: vec![],
+            allow: vec![shared.clone(), rule("read", &["src/"])],
+            ask: vec![],
+        };
+        let merged = over.layer_over(base);
+        // Base's entry kept, the override's new entry added, the shared one once.
+        assert_eq!(merged.allow, vec![shared, rule("read", &["src/"])]);
+    }
+
+    /// The common case: a shell call compiles to a field-scoped substring rule
+    /// on the command — exactly what a "remember this" approval pins.
+    #[test]
+    fn rule_from_call_compiles_primary_field() {
+        let rule = rule_from_call(
+            "shell",
+            &json!({"command": "git status", "timeout": 30}),
+            Some("command"),
+        );
+        assert_eq!(
+            rule,
+            Rule {
+                tool: "shell".to_owned(),
+                field: Some("command".to_owned()),
+                patterns: vec!["git status".to_owned()],
+                ..Rule::default()
+            }
+        );
+    }
+
+    /// A long value is kept VERBATIM: a truncated prefix would match calls the
+    /// human never approved (any command sharing the prefix, e.g. an approved
+    /// long command's prefix followed by `; rm -rf …`), silently widening the
+    /// grant. The pinned rule must not match beyond the approved call's own
+    /// text.
+    #[test]
+    fn rule_from_call_keeps_long_values_verbatim() {
+        let long = "x".repeat(500);
+        let rule = rule_from_call("shell", &json!({"command": long}), Some("command"));
+        assert_eq!(rule.patterns[0], "x".repeat(500));
+        // A command that merely SHARES the would-be prefix does not match: the
+        // full approved text is not a substring of a shorter/different command…
+        let policy = PermissionPolicy {
+            deny: vec![],
+            allow: vec![rule],
+            ask: vec![Rule::contains("shell", Vec::new())],
+        };
+        assert_eq!(
+            policy.evaluate("shell", &json!({"command": "x".repeat(300)})),
+            Decision::Ask,
+            "a shorter command sharing the prefix is not covered"
+        );
+        // …while the approved command itself is covered, even with a suffix
+        // (substring semantics — documented threat model).
+        assert_eq!(
+            policy.evaluate(
+                "shell",
+                &json!({"command": format!("{} --flag", "x".repeat(500))})
+            ),
+            Decision::Allow
+        );
+    }
+
+    /// No usable primary value — field absent, non-string, or empty — degrades
+    /// to a tool-level bare rule: "this tool, whatever the input was".
+    #[test]
+    fn rule_from_call_falls_back_to_bare_rule() {
+        let bare = Rule::contains("shell", Vec::new());
+        assert_eq!(
+            rule_from_call("shell", &json!({"timeout": 30}), Some("command")),
+            bare
+        );
+        assert_eq!(
+            rule_from_call("shell", &json!({"command": 42}), Some("command")),
+            bare
+        );
+        assert_eq!(
+            rule_from_call("shell", &json!({"command": ""}), Some("command")),
+            bare
+        );
+        // No field named at all (a tool outside the catalog) is bare too.
+        assert_eq!(
+            rule_from_call("mcp__search", &json!({"q": "x"}), None),
+            Rule::contains("mcp__search", Vec::new())
+        );
     }
 }

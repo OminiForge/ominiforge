@@ -2,7 +2,7 @@
 import type { Rule } from "./Rule";
 
 /**
- * A tool-call gate: two ordered rule lists whose precedence is fixed by
+ * A tool-call gate: three ordered rule lists whose precedence is fixed by
  * [`evaluate`](Self::evaluate).
  *
  * The empty policy allows everything, so a profile with no `[permission]`
@@ -15,7 +15,13 @@ export type PermissionPolicy = {
  */
 deny?: Array<Rule>, 
 /**
- * Rules that, when matched (and no deny rule matched), require human
- * approval.
+ * Rules that, when matched (and no deny rule matched), run the call
+ * without asking — pinned approvals (`doc/permission.md` §5). Outranks
+ * `ask`.
+ */
+allow?: Array<Rule>, 
+/**
+ * Rules that, when matched (and neither deny nor allow matched), require
+ * human approval.
  */
 ask?: Array<Rule>, };

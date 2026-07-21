@@ -6,9 +6,11 @@ import type { MatchMode } from "./MatchMode";
  * tool name matches [`tool`](Self::tool) **and** the input satisfies the
  * rule's field / mode / pattern test.
  *
- * A rule carries no verdict of its own — which list (`deny` or `ask`) it sits
- * in is the verdict (`doc/permission.md` §3). This keeps the table readable:
- * every rule under `deny` denies, every rule under `ask` asks.
+ * A rule carries no verdict of its own — which list (`deny`, `allow`, or
+ * `ask`) it sits in is the verdict (`doc/permission.md` §3). This keeps the
+ * table readable:
+ * every rule under `deny` denies, every rule under `allow` runs, every rule
+ * under `ask` asks.
  *
  * The structured shape (`field` + `mode` + `negate`) is what the config UI's
  * per-tool cards compile to; a hand-written TOML rule that sets only `contains`

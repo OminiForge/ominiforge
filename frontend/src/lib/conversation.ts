@@ -36,17 +36,14 @@ export type Item =
 			status: 'running' | 'done' | 'error';
 			result?: string;
 			error_code?: string;
-	  }
-	/** A permission `ask`: a tool call suspended for a human decision
-	 *  (`doc/permission.md` §6). Folded from `Permission::Requested` (pending) →
-	 *  `Permission::Decided` (approved/rejected). `callId` answers via
-	 *  `POST /approve`; `args` is the pretty-printed input under review. */
-	| {
-			kind: 'approval';
-			callId: string;
-			toolName: string;
-			args: string;
-			status: 'pending' | 'approved' | 'rejected';
+			/** The model-assigned tool-call id — bridges `Permission::Requested`
+			 *  (which keys on it) to this card. Present on committed tool items. */
+			callId?: string;
+			/** A permission `ask` has suspended this call for a human decision
+			 *  (`doc/permission.md` §6): the approval controls render inside this
+			 *  card (no separate approval card). Cleared by `Permission::Decided`;
+			 *  the final status then arrives via `Tool::Completed/Failed`. */
+			approvalPending?: boolean;
 	  }
 	/** A plan checklist, folded from `plan` control-tool calls (one card per
 	 *  `init`). `streaming` marks a placeholder shown while the call's args are
@@ -81,6 +78,13 @@ export interface ConversationState {
 	committedEnd?: number;
 	/** committed tool_call seq → items position, for pairing Tool::Completed */
 	toolSeqs: Map<number, number>;
+	/** callId → items position of a tool card synthesized by a
+	 *  `Permission::Requested` that arrived BEFORE its ToolCall ContentBlock
+	 *  (out-of-order event delivery). The late ContentBlock completes the
+	 *  orphan in place (backfills seq/name/args, registers toolSeqs) instead of
+	 *  pushing a duplicate; until then the card's `seq` is the Requested
+	 *  event's, which pairResult must never see. */
+	orphanTools: Map<string, number>;
 	/** Whether a turn is currently running. Driven last-write-wins by the turn
 	 *  lifecycle: committed `Turn::Started`/`Resumed` set it, committed
 	 *  `Completed`/`Failed`/`Interrupted` and live `turn_settled`/`notice`/
@@ -104,32 +108,50 @@ export interface ConversationState {
 }
 
 export function emptyState(): ConversationState {
-	return { items: [], open: {}, toolSeqs: new Map(), runtimeModels: new Set() };
+	return {
+		items: [],
+		open: {},
+		toolSeqs: new Map(),
+		orphanTools: new Map(),
+		runtimeModels: new Set()
+	};
 }
 
 export function apply(state: ConversationState, ev: GatewayEvent): ConversationState {
 	switch (ev.type) {
-		case 'event':    return applyCommitted(state, ev);
-		case 'delta':    return applyDelta(state, ev);
-		case 'turn_settled': return {
-			...state,
-			lastSettle: ev.incomplete,
-			turnRunning: false,
-			requestStart: undefined,
-			requestCommitted: undefined,
-			commitBase: undefined
-		};
-		case 'compacted':    return push({ ...state, turnRunning: false }, { kind: 'notice', message: `compacted → ${ev.new_session_id}` });
-		case 'notice':       return push({ ...state, turnRunning: false }, { kind: 'notice', message: ev.message });
+		case 'event':
+			return applyCommitted(state, ev);
+		case 'delta':
+			return applyDelta(state, ev);
+		case 'turn_settled':
+			return {
+				...state,
+				lastSettle: ev.incomplete,
+				turnRunning: false,
+				requestStart: undefined,
+				requestCommitted: undefined,
+				commitBase: undefined
+			};
+		case 'compacted':
+			return push(
+				{ ...state, turnRunning: false },
+				{ kind: 'notice', message: `compacted → ${ev.new_session_id}` }
+			);
+		case 'notice':
+			return push({ ...state, turnRunning: false }, { kind: 'notice', message: ev.message });
 		// Live-only context occupancy snapshot: handled by the page (STATS panel),
 		// not folded into conversation items.
-		case 'context_updated': return state;
+		case 'context_updated':
+			return state;
 		// Ephemeral prompt hint (permission `ask`): the durable
-		// `Permission::Requested` event is what folds the ApprovalPrompt card (see
-		// the Permission branch below); this live-only signal just drives the
-		// session-list status icon, so it is intentionally not folded here.
-		case 'approval_requested': return state;
-		default: return assertNever(ev);
+		// `Permission::Requested` event is what marks the gated tool card
+		// approval-pending (see the Permission branch below); this live-only
+		// signal just drives the session-list status icon, so it is intentionally
+		// not folded here.
+		case 'approval_requested':
+			return state;
+		default:
+			return assertNever(ev);
 	}
 }
 
@@ -152,14 +174,16 @@ function applyCommitted(
 		if ('Resumed' in t) return { ...next, turnRunning: true };
 		if ('Completed' in t || 'Failed' in t || 'Interrupted' in t) {
 			// A turn that ends while an `ask` is still pending (cancel / crash /
-			// interrupt) leaves an approval card that can never resolve — its
+			// interrupt) leaves an approval prompt that can never resolve — its
 			// `Permission::Decided` will never commit because the turn owning the
-			// call is gone. Drop those zombie cards so a replayed history doesn't
-			// show a frozen "待审批" prompt whose buttons do nothing (the gateway
+			// call is gone. Clear those zombie pending flags so a replayed history
+			// doesn't show a frozen "等待批准" whose buttons do nothing (the gateway
 			// cancel path is racy about writing Decided; this fold is the race-free
-			// guarantee). Already-resolved cards keep their status.
-			const items = next.items.filter(
-				(it) => !(it.kind === 'approval' && it.status === 'pending')
+			// guarantee).
+			const hasPending = next.items.some((it) => it.kind === 'tool' && it.approvalPending);
+			if (!hasPending) return { ...next, turnRunning: false };
+			const items = next.items.map((it) =>
+				it.kind === 'tool' && it.approvalPending ? { ...it, approvalPending: false } : it
 			);
 			return { ...next, items, turnRunning: false };
 		}
@@ -186,14 +210,18 @@ function applyCommitted(
 				commitBase: undefined
 			};
 		}
-		if ('ContentBlock' in m)
-			return commitBlock(next, Number(core.seq), m.ContentBlock.content);
+		if ('ContentBlock' in m) return commitBlock(next, Number(core.seq), m.ContentBlock.content);
 		return next;
 	}
 	if ('Tool' in payload) {
 		const tool = payload.Tool;
 		if ('Completed' in tool)
-			return pairResult(next, Number(tool.Completed.tool_call_event_id.seq), tool.Completed.result, false);
+			return pairResult(
+				next,
+				Number(tool.Completed.tool_call_event_id.seq),
+				tool.Completed.result,
+				false
+			);
 		if ('Failed' in tool)
 			return pairResult(
 				next,
@@ -206,46 +234,50 @@ function applyCommitted(
 	if ('Permission' in payload) {
 		const perm = payload.Permission;
 		if ('Requested' in perm) {
+			// Attach the approval prompt to the gated call's tool card (folded from
+			// the earlier `ToolCall` content block, keyed by the same model-assigned
+			// call id) — no separate approval card. If that card is somehow missing
+			// (the ContentBlock almost always commits first; out-of-order delivery
+			// is the exception), synthesize one so the prompt is never lost, and
+			// register it as an orphan so the late ContentBlock completes THIS
+			// card instead of pushing a duplicate (see commitBlock).
 			const r = perm.Requested;
-			return push(next, {
-				kind: 'approval',
+			const pos = next.items.findIndex((it) => it.kind === 'tool' && it.callId === r.call_id);
+			if (pos >= 0) {
+				const items = [...next.items];
+				const it = items[pos];
+				if (it.kind === 'tool') items[pos] = { ...it, approvalPending: true };
+				return { ...next, items };
+			}
+			const orphanTools = new Map(next.orphanTools);
+			orphanTools.set(r.call_id, next.items.length);
+			const pushed = push(next, {
+				kind: 'tool',
+				seq: Number(core.seq),
 				callId: r.call_id,
-				toolName: r.tool_name,
-				args: JSON.stringify(r.input, null, 2),
-				status: 'pending'
+				name: r.tool_name,
+				args: JSON.stringify(r.input),
+				status: 'running',
+				approvalPending: true
 			});
+			return { ...pushed, orphanTools };
 		}
-		if ('Decided' in perm) return resolveApproval(next, perm.Decided.call_id, perm.Decided.outcome);
+		if ('Decided' in perm) {
+			// The human answered: clear the pending flag and let the paired
+			// `Tool::Completed/Failed` drive the card's final status (approved → the
+			// call runs; rejected → `denied_by_user`; auto-denied →
+			// `denied_no_approval` / `denied_by_policy`).
+			const d = perm.Decided;
+			const items = next.items.map((it) =>
+				it.kind === 'tool' && it.callId === d.call_id ? { ...it, approvalPending: false } : it
+			);
+			return { ...next, items };
+		}
 		return next;
 	}
 	if ('Error' in payload)
 		return push(next, { kind: 'error', message: payload.Error.Raised.message });
 	return next;
-}
-
-/// Mark the pending approval item for `callId` resolved. `Approved` → approved;
-/// `Rejected`/`AutoDenied` → rejected (both blocked the call — the UI only
-/// distinguishes ran-vs-blocked). Items are immutable, so map to a new array;
-/// an unknown `callId` (already gone) leaves state untouched.
-function resolveApproval(
-	state: ConversationState,
-	callId: string,
-	outcome: 'Approved' | 'Rejected' | 'AutoDenied'
-): ConversationState {
-	// AutoDenied = no human decided (policy deny, or a fail-closed gate). It is
-	// not a human approval outcome, so drop the card entirely rather than render
-	// a spurious "rejected" approval the user never saw (the paired
-	// denied_* tool-failure card already conveys the block). Approved/Rejected
-	// are real human decisions — flip the card's status in place.
-	if (outcome === 'AutoDenied') {
-		const items = state.items.filter((it) => !(it.kind === 'approval' && it.callId === callId));
-		return { ...state, items };
-	}
-	const status: 'approved' | 'rejected' = outcome === 'Approved' ? 'approved' : 'rejected';
-	const items = state.items.map((it) =>
-		it.kind === 'approval' && it.callId === callId ? { ...it, status } : it
-	);
-	return { ...state, items };
 }
 
 /// Finalize streaming previews with authoritative committed content.
@@ -278,9 +310,7 @@ function commitBlock(
 		// ContentBlock events — a backend event-forwarding race).  Strip any
 		// trailing streaming items so committed content replaces them rather
 		// than duplicating.
-		const firstStreaming = state.items.findIndex(
-			(i) => 'streaming' in i && i.streaming
-		);
+		const firstStreaming = state.items.findIndex((i) => 'streaming' in i && i.streaming);
 		if (firstStreaming >= 0) {
 			items = state.items.slice(0, firstStreaming);
 			commitBase = firstStreaming;
@@ -293,11 +323,13 @@ function commitBlock(
 
 	let item: Item;
 	if ('Text' in content) {
-		if (!content.Text.text.trim()) return { ...state, requestCommitted: true, commitBase, committedEnd: items.length };
+		if (!content.Text.text.trim())
+			return { ...state, requestCommitted: true, commitBase, committedEnd: items.length };
 		item = { kind: 'text', text: content.Text.text, streaming: false };
 		items.push(item);
 	} else if ('Reasoning' in content) {
-		if (!content.Reasoning.text.trim()) return { ...state, requestCommitted: true, commitBase, committedEnd: items.length };
+		if (!content.Reasoning.text.trim())
+			return { ...state, requestCommitted: true, commitBase, committedEnd: items.length };
 		item = { kind: 'reasoning', text: content.Reasoning.text, streaming: false };
 		// Insert reasoning at commitBase so it appears before any text items
 		// that the collector emitted earlier (providers may open text@0 before reasoning@1).
@@ -314,10 +346,92 @@ function commitBlock(
 			return { ...state, items, requestCommitted: true, commitBase, committedEnd: items.length };
 		}
 		const toolSeqs = new Map(state.toolSeqs);
+		let orphanTools = state.orphanTools;
+		const orphanAt = orphanTools.get(content.ToolCall.id);
+		if (orphanAt !== undefined) {
+			// A Permission::Requested synthesized this call's card before the
+			// ToolCall committed (out-of-order delivery). Complete the orphan —
+			// pushing a fresh card would duplicate it, and only registering the
+			// REAL ToolCall seq lets the paired Tool::Completed/Failed find the
+			// card (the orphan's provisional seq is the Requested event's).
+			orphanTools = new Map(orphanTools);
+			orphanTools.delete(content.ToolCall.id);
+			// The recorded index may be stale: the first-commit truncation above
+			// can slice away items appended after requestStart, or shift them.
+			// Re-validate, then fall back to a fresh lookup by callId.
+			const isOrphanAt = (p: number) => {
+				const it = items[p];
+				return it !== undefined && it.kind === 'tool' && it.callId === content.ToolCall.id;
+			};
+			const pos = isOrphanAt(orphanAt)
+				? orphanAt
+				: items.findIndex((it) => it.kind === 'tool' && it.callId === content.ToolCall.id);
+			if (pos >= 0) {
+				const cur = items[pos];
+				if (cur.kind === 'tool') {
+					toolSeqs.set(seq, pos);
+					// Spread keeps approvalPending: the ask is still outstanding
+					// (or was already cleared by a Decided that landed on the orphan).
+					items[pos] = {
+						...cur,
+						seq,
+						name: content.ToolCall.name,
+						args: content.ToolCall.arguments
+					};
+					return {
+						...state,
+						items,
+						toolSeqs,
+						orphanTools,
+						requestCommitted: true,
+						commitBase,
+						committedEnd: items.length
+					};
+				}
+			}
+			// The orphan itself was truncated away above: fall through and push
+			// a fresh card, but keep the outstanding ask on it — dropping
+			// approvalPending here would disarm a prompt the human may be
+			// answering right now. (If a severely-reordered Decided already
+			// landed, the flag is a zombie that the turn-end fold clears.)
+			toolSeqs.set(seq, items.length);
+			items.push({
+				kind: 'tool',
+				seq,
+				callId: content.ToolCall.id,
+				name: content.ToolCall.name,
+				args: content.ToolCall.arguments,
+				status: 'running',
+				approvalPending: true
+			});
+			return {
+				...state,
+				items,
+				toolSeqs,
+				orphanTools,
+				requestCommitted: true,
+				commitBase,
+				committedEnd: items.length
+			};
+		}
 		toolSeqs.set(seq, items.length);
-		item = { kind: 'tool', seq, name: content.ToolCall.name, args: content.ToolCall.arguments, status: 'running' };
+		item = {
+			kind: 'tool',
+			seq,
+			callId: content.ToolCall.id,
+			name: content.ToolCall.name,
+			args: content.ToolCall.arguments,
+			status: 'running'
+		};
 		items.push(item);
-		return { ...state, items, toolSeqs, requestCommitted: true, commitBase, committedEnd: items.length };
+		return {
+			...state,
+			items,
+			toolSeqs,
+			requestCommitted: true,
+			commitBase,
+			committedEnd: items.length
+		};
 	}
 
 	return { ...state, items, requestCommitted: true, commitBase, committedEnd: items.length };
@@ -434,7 +548,11 @@ function lastPlanIndex(items: Item[]): number {
 function pairResult(
 	state: ConversationState,
 	callSeq: number,
-	output: { content: Array<{ Text: string } | unknown>; is_error: boolean; error_code: string | null },
+	output: {
+		content: Array<{ Text: string } | unknown>;
+		is_error: boolean;
+		error_code: string | null;
+	},
 	failed: boolean
 ): ConversationState {
 	const pos = state.toolSeqs.get(callSeq);
@@ -472,7 +590,8 @@ function applyDelta(
 
 	switch (ev.delta) {
 		case 'block_start': {
-			const kind = ev.kind === 'reasoning' ? 'reasoning' : ev.kind === 'tool_call' ? 'tool_call' : 'text';
+			const kind =
+				ev.kind === 'reasoning' ? 'reasoning' : ev.kind === 'tool_call' ? 'tool_call' : 'text';
 			if (kind === 'tool_call') {
 				// Plan is a control tool: show a single streaming placeholder card,
 				// not a generic tool block. Its args stream as partial JSON (not
@@ -552,7 +671,8 @@ function applyDelta(
 			items.push({ kind: 'tool', seq: -1, name: '', args: ev.json, status: 'running' });
 			return { ...state, items, open };
 		}
-		default: return assertNever(ev);
+		default:
+			return assertNever(ev);
 	}
 }
 

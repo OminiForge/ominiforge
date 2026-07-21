@@ -16,6 +16,7 @@ import type { SessionStatus } from '$lib/types/SessionStatus';
 import type { PermissionPolicy } from '$lib/types/PermissionPolicy';
 import type { WorkspaceConfig } from '$lib/types/WorkspaceConfig';
 import type { ToolInfo } from '$lib/types/ToolInfo';
+import type { ApprovalScope } from '$lib/types/ApprovalScope';
 
 /** The settings view of `providers.toml`: the raw provider set plus which
  *  providers have an API key in the secret store. Key values are never sent —
@@ -121,8 +122,16 @@ export interface SessionClient {
 	/** Abort the running turn, if any. */
 	cancel(id: string): Promise<void>;
 	/** Answer a suspended `ask` tool call: `approve` runs it, `reject` blocks it
-	 *  (`denied_by_user`). Idempotent — a resolved/unknown `callId` is ignored. */
-	approve(id: string, callId: string, decision: 'approve' | 'reject'): Promise<void>;
+	 *  (`denied_by_user`). `scope` says how far the decision reaches: `once` (this
+	 *  call only), `session` (remember for this session), `profile` (persist to
+	 *  the profile), `gateway` (persist to the gateway baseline). Idempotent — a
+	 *  resolved/unknown `callId` is ignored. */
+	approve(
+		id: string,
+		callId: string,
+		decision: 'approve' | 'reject',
+		scope: ApprovalScope
+	): Promise<void>;
 	/** Summarize and switch to a compaction session; `keepLast` keeps recent turns. */
 	compact(id: string, keepLast?: number): Promise<void>;
 	/** Derived monitor metrics for one session (folded from its committed event log). */

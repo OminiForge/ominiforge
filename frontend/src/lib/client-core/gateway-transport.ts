@@ -20,6 +20,7 @@ import type { SessionStatus } from '$lib/types/SessionStatus';
 import type { PermissionPolicy } from '$lib/types/PermissionPolicy';
 import type { WorkspaceConfig } from '$lib/types/WorkspaceConfig';
 import type { ToolInfo } from '$lib/types/ToolInfo';
+import type { ApprovalScope } from '$lib/types/ApprovalScope';
 import { endpoints } from './endpoints';
 import type {
 	CreateSessionOptions,
@@ -200,10 +201,15 @@ export class GatewayTransport implements SessionClient {
 		return this.#send(endpoints.cancel(id), { method: 'POST' });
 	}
 
-	approve(id: string, callId: string, decision: 'approve' | 'reject'): Promise<void> {
+	approve(
+		id: string,
+		callId: string,
+		decision: 'approve' | 'reject',
+		scope: ApprovalScope
+	): Promise<void> {
 		return this.#send(endpoints.approve(id), {
 			method: 'POST',
-			body: JSON.stringify({ call_id: callId, decision })
+			body: JSON.stringify({ call_id: callId, decision, scope })
 		});
 	}
 

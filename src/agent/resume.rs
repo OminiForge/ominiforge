@@ -23,6 +23,11 @@
 //!   tool result by the *call* id (a string like `call_9`), but the event only
 //!   stores the `EventId` of the `ContentBlock` that emitted the call; we map
 //!   `seq → call_id` on the way through and look it up.
+//! - An assistant `tool_call` with **no** matching result event (a turn aborted
+//!   mid-dispatch, a truncated/crashed log) gets a synthesized `[cancelled]`
+//!   `Tool` message, so the rebuilt view always satisfies the provider's
+//!   `tool_call↔tool_message` pairing constraint instead of failing the next
+//!   request with a 400.
 //! - `InjectionEvent::ContextInjected` → a `User` message (runtime reminders are
 //!   pushed as user turns by [`super::TurnState::inject_runtime`]).
 //!
@@ -61,11 +66,33 @@ pub fn rebuild_runtime(events: &[CoreEvent], system: Vec<Message>) -> SessionRun
 /// Rebuild the conversation view: `system` followed by the messages replayed
 /// from `events`.
 fn rebuild_context(events: &[CoreEvent], system: Vec<Message>) -> Vec<Message> {
-    let mut builder = ContextRebuilder::new(system);
+    let mut builder = ContextRebuilder::new(system, settled_tool_calls(events));
     for event in events {
         builder.accept(event);
     }
     builder.finish()
+}
+
+/// The `ContentBlock` seqs whose tool call has a `Completed`/`Failed` event
+/// somewhere in the stream. Pre-scanned over the whole log: at the moment an
+/// assistant message is flushed, its calls' results may not have been folded
+/// yet (they arrive as later events), so only this global set can tell a call
+/// that will never settle from one that settles later.
+fn settled_tool_calls(events: &[CoreEvent]) -> HashSet<u64> {
+    events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            EventPayload::Tool(
+                ToolEvent::Completed {
+                    tool_call_event_id, ..
+                }
+                | ToolEvent::Failed {
+                    tool_call_event_id, ..
+                },
+            ) => Some(tool_call_event_id.seq),
+            _ => None,
+        })
+        .collect()
 }
 
 /// An assistant message under construction, accumulating the content blocks of a
@@ -77,6 +104,9 @@ struct PendingAssistant {
     request_id: Option<String>,
     text: String,
     tool_calls: Vec<ToolCall>,
+    /// The `ContentBlock` seq of each entry in `tool_calls` (same order), so the
+    /// flush can tell which calls never produced a result event.
+    tool_call_seqs: Vec<u64>,
 }
 
 /// Folds an event stream back into a `Vec<Message>`, mirroring how the agent
@@ -84,17 +114,28 @@ struct PendingAssistant {
 struct ContextRebuilder {
     ctx: Vec<Message>,
     pending: Option<PendingAssistant>,
+    /// Tool-result messages buffered behind the pending assistant. The
+    /// concurrent dispatcher commits results in *completion* order; the flush
+    /// re-emits them in the assistant's `tool_call` order, so the rebuilt view
+    /// matches what the live runtime fed the model.
+    tool_buffer: Vec<Message>,
     /// `ContentBlock` event seq → the tool *call* id it carried, so a later
     /// `ToolEvent` can recover the call id the model uses to address the result.
     call_ids: HashMap<u64, String>,
+    /// `ContentBlock` seqs whose call settles somewhere in the stream (see
+    /// [`settled_tool_calls`]); a call outside this set gets a synthesized
+    /// `[cancelled]` result at flush.
+    settled: HashSet<u64>,
 }
 
 impl ContextRebuilder {
-    fn new(system: Vec<Message>) -> Self {
+    fn new(system: Vec<Message>, settled: HashSet<u64>) -> Self {
         Self {
             ctx: system,
             pending: None,
+            tool_buffer: Vec::new(),
             call_ids: HashMap::new(),
+            settled,
         }
     }
 
@@ -119,22 +160,22 @@ impl ContextRebuilder {
                 result,
                 ..
             }) => {
-                self.flush();
-                self.ctx.push(Message::Tool {
+                let message = Message::Tool {
                     tool_call_id: self.call_id_for(tool_call_event_id.seq),
                     content: render_output(result),
-                });
+                };
+                self.accept_tool_message(message);
             }
             EventPayload::Tool(ToolEvent::Failed {
                 tool_call_event_id,
                 error,
                 ..
             }) => {
-                self.flush();
-                self.ctx.push(Message::Tool {
+                let message = Message::Tool {
                     tool_call_id: self.call_id_for(tool_call_event_id.seq),
                     content: format!("[{}] {}", error.code, error.message),
-                });
+                };
+                self.accept_tool_message(message);
             }
             EventPayload::Injection(crate::core::payload::InjectionEvent::ContextInjected {
                 content,
@@ -146,6 +187,24 @@ impl ContextRebuilder {
                 });
             }
             _ => {}
+        }
+    }
+
+    /// Take in one tool-result message. Inside a results window (the pending
+    /// assistant carries calls) it is buffered — the flush emits the round's
+    /// results in `tool_call` order, however they committed. Outside one it
+    /// flushes and passes straight through, matching the pre-buffering
+    /// behavior (a result with no tool-calling assistant before it).
+    fn accept_tool_message(&mut self, message: Message) {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|p| !p.tool_calls.is_empty())
+        {
+            self.tool_buffer.push(message);
+        } else {
+            self.flush();
+            self.ctx.push(message);
         }
     }
 
@@ -176,6 +235,7 @@ impl ContextRebuilder {
                     name: name.clone(),
                     arguments: arguments.clone(),
                 });
+                pending.tool_call_seqs.push(seq);
                 self.call_ids.insert(seq, id.clone());
             }
             BlockContent::Reasoning { .. } => {}
@@ -191,16 +251,53 @@ impl ContextRebuilder {
             .unwrap_or_else(|| seq.to_string())
     }
 
-    /// Push any pending assistant message into the view. A message with neither
-    /// text nor tool calls is dropped (matching the collector's empty-block rule).
+    /// Push any pending assistant message into the view, then the tool results
+    /// buffered behind it — re-emitted in the assistant's `tool_call` order
+    /// (the concurrent dispatcher commits results in *completion* order; the
+    /// model must read them in call order, exactly as the live runtime fed
+    /// them). A call with no result anywhere in the stream (aborted turn,
+    /// truncated log) gets a synthesized `[cancelled]` `Tool` message — the
+    /// provider rejects an assistant `tool_call` left without a response. A
+    /// message with neither text nor tool calls is dropped (matching the
+    /// collector's empty-block rule).
     fn flush(&mut self) {
         if let Some(pending) = self.pending.take() {
             let content = (!pending.text.is_empty()).then_some(pending.text);
             if content.is_some() || !pending.tool_calls.is_empty() {
+                // Pair each call id with its block seq before the calls move
+                // into the message.
+                let calls: Vec<(u64, String)> = pending
+                    .tool_call_seqs
+                    .iter()
+                    .zip(&pending.tool_calls)
+                    .map(|(seq, call)| (*seq, call.id.clone()))
+                    .collect();
                 self.ctx.push(Message::Assistant {
                     content,
                     tool_calls: pending.tool_calls,
                 });
+                let mut buffer = std::mem::take(&mut self.tool_buffer);
+                for (seq, call_id) in &calls {
+                    if let Some(at) = buffer.iter().position(|m| {
+                        matches!(m, Message::Tool { tool_call_id, .. } if tool_call_id == call_id)
+                    }) {
+                        self.ctx.push(buffer.remove(at));
+                    } else if !self.settled.contains(seq) {
+                        self.ctx.push(Message::Tool {
+                            tool_call_id: call_id.clone(),
+                            content:
+                                "[cancelled] the turn ended before a tool result was recorded"
+                                    .to_owned(),
+                        });
+                    }
+                }
+                // Orphan results (no call of this assistant matched) keep
+                // their arrival order, after the paired ones.
+                self.ctx.append(&mut buffer);
+            } else {
+                // The assistant was dropped as empty: any buffered results are
+                // orphans — keep them rather than lose them.
+                self.ctx.append(&mut self.tool_buffer);
             }
         }
     }
@@ -641,5 +738,215 @@ mod tests {
         let rt = rebuild_runtime(&[], system.clone());
         assert_eq!(rt.context, system);
         assert!(rt.plan.is_empty());
+    }
+
+    /// A tool call whose turn died before any result event landed (abort,
+    /// crash) must not rebuild into a dangling assistant `tool_call` — the
+    /// provider rejects that with a 400. The rebuild synthesizes a `[cancelled]`
+    /// tool message instead, keeping the call↔result pairing intact.
+    #[test]
+    fn synthesizes_cancelled_result_for_dangling_tool_call() {
+        let events = vec![
+            ev(0, runtime_src(), started("do it")),
+            ev(
+                1,
+                model_src(),
+                tool_call_block("r1", "call_1", "write", "{}"),
+            ),
+            // The turn died here: no ToolEvent::Completed/Failed ever landed.
+        ];
+
+        let rt = rebuild_runtime(&events, vec![]);
+
+        assert_eq!(
+            rt.context,
+            vec![
+                Message::User {
+                    content: "do it".to_owned()
+                },
+                Message::Assistant {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_1".to_owned(),
+                        name: "write".to_owned(),
+                        arguments: "{}".to_owned(),
+                    }]
+                },
+                Message::Tool {
+                    tool_call_id: "call_1".to_owned(),
+                    content: "[cancelled] the turn ended before a tool result was recorded"
+                        .to_owned(),
+                },
+            ]
+        );
+    }
+
+    /// One request, two calls, only one settled: the settled call keeps its real
+    /// result and only the dangling one is synthesized — the synthesis must not
+    /// duplicate a result that exists later in the stream, and the pair is
+    /// emitted in `tool_call` order.
+    #[test]
+    fn synthesizes_only_the_calls_missing_a_result() {
+        let events = vec![
+            ev(0, runtime_src(), started("do two things")),
+            ev(
+                1,
+                model_src(),
+                tool_call_block("r1", "call_1", "write", "{}"),
+            ),
+            ev(
+                2,
+                model_src(),
+                tool_call_block("r1", "call_2", "write", "{}"),
+            ),
+            // call_1 settles (result points at seq 1); call_2's never lands.
+            ev(3, tool_src("write"), tool_completed(1, "written")),
+        ];
+
+        let rt = rebuild_runtime(&events, vec![]);
+
+        assert_eq!(
+            rt.context,
+            vec![
+                Message::User {
+                    content: "do two things".to_owned()
+                },
+                Message::Assistant {
+                    content: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "call_1".to_owned(),
+                            name: "write".to_owned(),
+                            arguments: "{}".to_owned(),
+                        },
+                        ToolCall {
+                            id: "call_2".to_owned(),
+                            name: "write".to_owned(),
+                            arguments: "{}".to_owned(),
+                        },
+                    ]
+                },
+                Message::Tool {
+                    tool_call_id: "call_1".to_owned(),
+                    content: "written".to_owned()
+                },
+                Message::Tool {
+                    tool_call_id: "call_2".to_owned(),
+                    content: "[cancelled] the turn ended before a tool result was recorded"
+                        .to_owned(),
+                },
+            ]
+        );
+    }
+
+    /// A dangling call at a turn boundary is synthesized before the next turn's
+    /// user message — the pairing holds mid-stream, not just at the tail.
+    #[test]
+    fn synthesized_result_lands_before_the_next_turn() {
+        let events = vec![
+            ev(0, runtime_src(), started("first")),
+            ev(
+                1,
+                model_src(),
+                tool_call_block("r1", "call_1", "write", "{}"),
+            ),
+            // The turn ended with the call dangling; a new turn begins.
+            ev(2, runtime_src(), started("second")),
+            ev(3, model_src(), text_block("r2", "ok")),
+        ];
+
+        let rt = rebuild_runtime(&events, vec![]);
+
+        assert_eq!(
+            rt.context,
+            vec![
+                Message::User {
+                    content: "first".to_owned()
+                },
+                Message::Assistant {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_1".to_owned(),
+                        name: "write".to_owned(),
+                        arguments: "{}".to_owned(),
+                    }]
+                },
+                Message::Tool {
+                    tool_call_id: "call_1".to_owned(),
+                    content: "[cancelled] the turn ended before a tool result was recorded"
+                        .to_owned(),
+                },
+                Message::User {
+                    content: "second".to_owned()
+                },
+                Message::Assistant {
+                    content: Some("ok".to_owned()),
+                    tool_calls: vec![]
+                },
+            ]
+        );
+    }
+
+    /// Results that committed in completion order (the concurrent dispatcher
+    /// writes each result as its chain finishes) are re-emitted in the
+    /// assistant's `tool_call` order — the rebuilt view stays byte-identical
+    /// to the live context the model was fed.
+    #[test]
+    fn out_of_order_results_rebuild_in_call_order() {
+        let events = vec![
+            ev(0, runtime_src(), started("do two things")),
+            ev(
+                1,
+                model_src(),
+                tool_call_block("r1", "call_1", "write", "{}"),
+            ),
+            ev(
+                2,
+                model_src(),
+                tool_call_block("r1", "call_2", "write", "{}"),
+            ),
+            // Completion order: call_2's result committed first.
+            ev(3, tool_src("write"), tool_completed(2, "second")),
+            ev(4, tool_src("write"), tool_completed(1, "first")),
+            ev(5, model_src(), text_block("r2", "done")),
+        ];
+
+        let rt = rebuild_runtime(&events, vec![]);
+
+        assert_eq!(
+            rt.context,
+            vec![
+                Message::User {
+                    content: "do two things".to_owned()
+                },
+                Message::Assistant {
+                    content: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "call_1".to_owned(),
+                            name: "write".to_owned(),
+                            arguments: "{}".to_owned(),
+                        },
+                        ToolCall {
+                            id: "call_2".to_owned(),
+                            name: "write".to_owned(),
+                            arguments: "{}".to_owned(),
+                        },
+                    ]
+                },
+                Message::Tool {
+                    tool_call_id: "call_1".to_owned(),
+                    content: "first".to_owned()
+                },
+                Message::Tool {
+                    tool_call_id: "call_2".to_owned(),
+                    content: "second".to_owned()
+                },
+                Message::Assistant {
+                    content: Some("done".to_owned()),
+                    tool_calls: vec![]
+                },
+            ]
+        );
     }
 }

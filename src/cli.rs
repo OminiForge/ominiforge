@@ -14,7 +14,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::agent::{
-    ApprovalGate, ApprovalRequest, ApprovalResolution, BlockKind, SessionRuntime, StreamSink,
+    ApprovalGate, ApprovalOutcome, ApprovalRequest, ApprovalResolution, BlockKind, SessionRuntime,
+    StreamSink,
 };
 use crate::app::{self, DEFAULT_PROFILE, SESSIONS_SUBDIR};
 use crate::config::ConfigStore;
@@ -933,8 +934,23 @@ enum PromptOutcome {
 
 #[async_trait::async_trait]
 impl ApprovalGate for CliApprovalGate {
-    async fn request(&self, req: ApprovalRequest) -> ApprovalResolution {
-        if !self.stdin_tty {
+    async fn request(&self, req: ApprovalRequest) -> ApprovalOutcome {
+        let resolution = if self.stdin_tty {
+            // A blocking prompt on a worker thread. If the join itself fails
+            // (panic), treat it as an auto-denial — the prompt never produced a
+            // human answer.
+            match tokio::task::spawn_blocking(move || {
+                Self::prompt_blocking(&req.tool_name, &req.input)
+            })
+            .await
+            {
+                Ok(PromptOutcome::Approved) => ApprovalResolution::Approved,
+                Ok(PromptOutcome::Rejected) => ApprovalResolution::RejectedByUser,
+                // NoAnswer (EOF/io error) or a join panic: nobody decided →
+                // auto-deny, never audited as a user rejection.
+                Ok(PromptOutcome::NoAnswer) | Err(_) => ApprovalResolution::AutoDenied,
+            }
+        } else {
             // No interactive stdin to answer with: fail closed. No human decided,
             // so this is an auto-denial, not a user rejection.
             let mut err = std::io::stderr();
@@ -943,20 +959,13 @@ impl ApprovalGate for CliApprovalGate {
                 "[permission] tool `{}` needs approval but stdin is not a terminal; rejecting.",
                 req.tool_name
             );
-            return ApprovalResolution::AutoDenied;
-        }
-        // A blocking prompt on a worker thread. If the join itself fails (panic),
-        // treat it as an auto-denial — the prompt never produced a human answer.
-        match tokio::task::spawn_blocking(move || {
-            Self::prompt_blocking(&req.tool_name, &req.input)
-        })
-        .await
-        {
-            Ok(PromptOutcome::Approved) => ApprovalResolution::Approved,
-            Ok(PromptOutcome::Rejected) => ApprovalResolution::RejectedByUser,
-            // NoAnswer (EOF/io error) or a join panic: nobody decided → auto-deny,
-            // never audited as a user rejection.
-            Ok(PromptOutcome::NoAnswer) | Err(_) => ApprovalResolution::AutoDenied,
+            ApprovalResolution::AutoDenied
+        };
+        // The terminal prompt has no scope picker: every CLI decision is a
+        // one-shot, so there is no scope to record.
+        ApprovalOutcome {
+            resolution,
+            scope: None,
         }
     }
 }
@@ -1404,13 +1413,14 @@ mod tests {
     #[tokio::test]
     async fn cli_gate_fail_closed_without_tty() {
         let gate = CliApprovalGate { stdin_tty: false };
-        let decision = gate
+        let outcome = gate
             .request(ApprovalRequest {
                 tool_name: "shell".to_owned(),
                 input: serde_json::json!({"command": "rm -rf /"}),
                 call_id: "c1".to_owned(),
             })
             .await;
-        assert_eq!(decision, ApprovalResolution::AutoDenied);
+        assert_eq!(outcome.resolution, ApprovalResolution::AutoDenied);
+        assert_eq!(outcome.scope, None);
     }
 }

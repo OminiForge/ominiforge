@@ -68,7 +68,10 @@ pub struct WorkspaceConfig {
     /// Safe to live here *because* the file is gateway-side and deployer-owned
     /// (see the module header): reading a permission grant from the
     /// agent-writable project dir would let an agent widen its own gate.
-    #[serde(default, skip_serializing_if = "crate::permission::PermissionPolicy::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "crate::permission::PermissionPolicy::is_empty"
+    )]
     pub permission: crate::permission::PermissionPolicy,
 }
 
@@ -160,11 +163,7 @@ impl WorkspaceConfigStore {
     /// # Errors
     /// The workspace path does not resolve, the directory cannot be created, the
     /// record cannot be serialized, or the file cannot be written.
-    pub fn save(
-        &self,
-        workspace_path: &Path,
-        config: &WorkspaceConfig,
-    ) -> Result<(), ConfigError> {
+    pub fn save(&self, workspace_path: &Path, config: &WorkspaceConfig) -> Result<(), ConfigError> {
         let canonical =
             std::fs::canonicalize(workspace_path).map_err(|source| ConfigError::Io {
                 path: workspace_path.to_owned(),
@@ -310,6 +309,7 @@ mod tests {
             mounts: vec![],
             permission: PermissionPolicy {
                 deny: vec![Rule::contains("shell", vec!["curl".to_owned()])],
+                allow: vec![],
                 ask: vec![],
             },
         };

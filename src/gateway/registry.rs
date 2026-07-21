@@ -32,7 +32,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use tokio::sync::Mutex;
 
-use crate::agent::SessionRuntime;
+use crate::agent::{ApprovalDecision, ApprovalScope, SessionRuntime};
 use crate::app::{self, Assembled};
 use crate::config::{ConfigStore, ModelSummary, ProfileSummary};
 use crate::core::SessionId;
@@ -40,6 +40,7 @@ use crate::llm::Message;
 use crate::session::{SessionMeta, SessionStore};
 
 use super::actor::{ActorHandle, Command, SessionActor};
+use super::approval::ScopedDecision;
 use super::config::GatewayConfig;
 use super::status::{ActivityStatus, StatusHub};
 
@@ -208,6 +209,13 @@ struct RegistryInner {
     /// Resolves `[[mounts]]` anchors (`doc/sandbox.md` §3.7) to host directories
     /// under the gateway's trusted `.omini` tree.
     mount_anchors: MountAnchors,
+    /// Serializes every profile/gateway config read-modify-write
+    /// (`save_profile`, `set_gateway_permission`, scoped-approval persistence):
+    /// two concurrent writers must not lose each other's rules (lost update).
+    /// Async because the scoped-rule callback locks it on a spawned task; no
+    /// file I/O happens while holding it on an executor thread — that runs on
+    /// `spawn_blocking`.
+    config_write_lock: Mutex<()>,
 }
 
 /// Resolves a workspace's named mount anchors (`doc/sandbox.md` §3.7) into
@@ -347,6 +355,7 @@ impl SessionRegistry {
                 default_permission,
                 workspace_config,
                 mount_anchors,
+                config_write_lock: Mutex::new(()),
             }),
         })
     }
@@ -502,11 +511,106 @@ impl SessionRegistry {
             .map(|p| p.clone())
     }
 
+    /// The profile a rule pinned from session `sid` persists into: the session's
+    /// stamped profile, or the gateway default when the session tracks the
+    /// default (the same fallback [`runtime_info`](Self::runtime_info) uses).
+    /// `None` when the session meta is unreadable — the caller logs and skips
+    /// persistence rather than writing the rule into a guessed profile.
+    fn effective_profile_name(&self, sid: &SessionId) -> Option<String> {
+        let meta = self.store().read_meta(sid).ok()?;
+        Some(
+            meta.profile_id
+                .unwrap_or_else(|| self.inner.defaults.profile.clone()),
+        )
+    }
+
+    /// The callback injected into every session's approval gate: persist a
+    /// `profile`/`gateway`-scoped approval decision as a rule in the matching
+    /// config layer (`doc/permission.md` §5). The gate has already pinned the
+    /// rule into the session's live policy; this is the durable half. The work
+    /// runs on a detached task — serialized with every other profile/gateway
+    /// config write by `config_write_lock`, the blocking file I/O off the
+    /// executor via `spawn_blocking`. A persistence failure is logged and
+    /// swallowed — an approval must not fail because a config write did.
+    fn scoped_rule_callback(&self, sid: SessionId) -> Arc<dyn Fn(ScopedDecision) + Send + Sync> {
+        let registry = self.clone();
+        Arc::new(move |scoped: ScopedDecision| {
+            let registry = registry.clone();
+            let sid = sid.clone();
+            tokio::spawn(async move {
+                // Serialize the read-modify-write against every other config
+                // write (`save_profile` / `set_gateway_permission`): two
+                // concurrent writers must not lose each other's rules.
+                let _guard = registry.inner.config_write_lock.lock().await;
+                let task = {
+                    let registry = registry.clone();
+                    let sid = sid.clone();
+                    tokio::task::spawn_blocking(move || registry.persist_scoped_rule(&sid, &scoped))
+                };
+                match task.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => eprintln!(
+                        "gateway: failed to persist approval rule for session `{}`: {e:#}",
+                        sid.0
+                    ),
+                    Err(e) => {
+                        eprintln!(
+                            "gateway: persistence task for session `{}` failed: {e}",
+                            sid.0
+                        );
+                    }
+                }
+            });
+        })
+    }
+
+    /// Persist one scoped decision's compiled rule into its config layer —
+    /// profile TOML for `profile`, `gateway.toml` for `gateway` (approve →
+    /// `allow`, reject → `deny`). A rule already present is a no-op (no
+    /// rewrite), so repeated pins of the same call stay idempotent. Runs on
+    /// `spawn_blocking` with `config_write_lock` held (see
+    /// [`scoped_rule_callback`](Self::scoped_rule_callback)).
+    fn persist_scoped_rule(&self, sid: &SessionId, scoped: &ScopedDecision) -> Result<()> {
+        match scoped.scope {
+            ApprovalScope::Profile => {
+                let name = self
+                    .effective_profile_name(sid)
+                    .context("session meta unreadable; refusing to guess a profile")?;
+                let mut profile = self.load_profile_raw(&name)?;
+                let list = match scoped.decision {
+                    ApprovalDecision::Approve => &mut profile.permission.allow,
+                    ApprovalDecision::Reject => &mut profile.permission.deny,
+                };
+                if !list.contains(&scoped.rule) {
+                    list.push(scoped.rule.clone());
+                    self.save_profile_locked(&name, &profile)?;
+                }
+                Ok(())
+            }
+            ApprovalScope::Gateway => {
+                let mut policy = self.gateway_permission()?;
+                let list = match scoped.decision {
+                    ApprovalDecision::Approve => &mut policy.allow,
+                    ApprovalDecision::Reject => &mut policy.deny,
+                };
+                if !list.contains(&scoped.rule) {
+                    list.push(scoped.rule.clone());
+                    self.set_gateway_permission_locked(policy)?;
+                }
+                Ok(())
+            }
+            // The gate only invokes the callback for the two durable scopes.
+            ApprovalScope::Once | ApprovalScope::Session => Ok(()),
+        }
+    }
+
     /// Replace the gateway-wide baseline permission policy: update the in-memory
     /// value (so new sessions see it immediately) **and** persist it to
     /// `gateway.toml` (so it survives a restart). Both, atomically from the
     /// caller's view — the file write happens first; only on success is the live
     /// value swapped, so a failed write leaves the running gateway unchanged.
+    /// Serialized with every other profile/gateway config write
+    /// (`config_write_lock`).
     ///
     /// The persisted file preserves every other gateway field: the current config
     /// is re-loaded from disk, only `default_permission` is replaced, then the
@@ -515,7 +619,17 @@ impl SessionRegistry {
     /// # Errors
     /// No writable config root, a malformed existing `gateway.toml`, a
     /// serialize/io failure, or a poisoned lock.
-    pub fn set_gateway_permission(
+    pub async fn set_gateway_permission(
+        &self,
+        policy: crate::permission::PermissionPolicy,
+    ) -> Result<()> {
+        let _guard = self.inner.config_write_lock.lock().await;
+        self.set_gateway_permission_locked(policy)
+    }
+
+    /// The lock-free body of [`set_gateway_permission`](Self::set_gateway_permission),
+    /// for callers already holding `config_write_lock` (scoped-rule persistence).
+    fn set_gateway_permission_locked(
         &self,
         policy: crate::permission::PermissionPolicy,
     ) -> Result<()> {
@@ -874,6 +988,7 @@ impl SessionRegistry {
             self.inner.idle_timeout,
             assembled.mcp_clients,
             self.inner.status_hub.clone(),
+            Some(self.scoped_rule_callback(id.clone())),
         );
         actors.insert(id.clone(), handle.clone());
         Ok(handle)
@@ -959,6 +1074,7 @@ impl SessionRegistry {
             self.inner.idle_timeout,
             assembled.mcp_clients,
             self.inner.status_hub.clone(),
+            Some(self.scoped_rule_callback(id.clone())),
         );
         self.inner
             .actors
@@ -1051,6 +1167,7 @@ impl SessionRegistry {
             self.inner.idle_timeout,
             assembled.mcp_clients,
             self.inner.status_hub.clone(),
+            Some(self.scoped_rule_callback(id.clone())),
         );
         self.inner
             .actors
@@ -1133,6 +1250,7 @@ impl SessionRegistry {
             self.inner.idle_timeout,
             assembled.mcp_clients,
             self.inner.status_hub.clone(),
+            Some(self.scoped_rule_callback(id.clone())),
         );
         self.inner
             .actors
@@ -1300,11 +1418,19 @@ impl SessionRegistry {
             .with_context(|| format!("failed to load profile `{name}`"))
     }
 
-    /// Overwrite profile `name`'s file with `profile`.
+    /// Overwrite profile `name`'s file with `profile`, serialized with every
+    /// other profile/gateway config write (`config_write_lock`).
     ///
     /// # Errors
     /// [`anyhow::Error`] on serialize/io failure.
-    pub fn save_profile(&self, name: &str, profile: &crate::config::Profile) -> Result<()> {
+    pub async fn save_profile(&self, name: &str, profile: &crate::config::Profile) -> Result<()> {
+        let _guard = self.inner.config_write_lock.lock().await;
+        self.save_profile_locked(name, profile)
+    }
+
+    /// The lock-free body of [`save_profile`](Self::save_profile), for callers
+    /// already holding `config_write_lock` (scoped-rule persistence).
+    fn save_profile_locked(&self, name: &str, profile: &crate::config::Profile) -> Result<()> {
         self.inner
             .defaults
             .config

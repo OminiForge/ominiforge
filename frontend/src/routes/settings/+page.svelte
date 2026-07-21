@@ -2,8 +2,10 @@
 	import { onMount } from 'svelte';
 	import { client } from '$lib/client';
 	import Notice from '$lib/components/Notice.svelte';
-	import PermissionEditor from '$lib/components/PermissionEditor.svelte';
+	import PermissionRulesEditor from '$lib/components/PermissionRulesEditor.svelte';
+	import SaveBar from '$lib/components/SaveBar.svelte';
 	import Skeleton from '$lib/components/Skeleton.svelte';
+	import { resolveEffective, ruleToRow, summaryOf, type Tier } from '$lib/permission-rules';
 	import type { ProviderConfig } from '$lib/types/ProviderConfig';
 	import type { ProviderType } from '$lib/types/ProviderType';
 	import type { ModelConfig } from '$lib/types/ModelConfig';
@@ -11,8 +13,10 @@
 	import type { ProfileSummary } from '$lib/types/ProfileSummary';
 	import type { PermissionPolicy } from '$lib/types/PermissionPolicy';
 	import type { ToolInfo } from '$lib/types/ToolInfo';
+	import type { WorkspaceSummary } from '$lib/types/WorkspaceSummary';
+	import type { WorkspaceConfig } from '$lib/types/WorkspaceConfig';
 
-	type Tab = 'providers' | 'profiles' | 'gateway';
+	type Tab = 'providers' | 'profiles' | 'permissions';
 	let tab = $state<Tab>('providers');
 
 	// ---- Providers state ----
@@ -21,23 +25,35 @@
 	let configured = $state<Set<string>>(new Set());
 	// Per-provider pending key input; only non-empty entries are written on save.
 	let keyInput = $state<Record<string, string>>({});
+	let providersSnapshot = $state('');
 
 	// ---- Profiles state ----
 	let profileList = $state<ProfileSummary[]>([]);
 	let selectedName = $state<string>('');
 	let profile = $state<Profile | null>(null);
+	let profileSnapshot = $state<string | null>(null);
 
-	// ---- Gateway state ----
-	// The gateway-wide baseline permission policy (bottom tier). Loaded lazily on
-	// first Gateway-tab open so the providers/profiles path pays nothing.
-	let gatewayPermission = $state<PermissionPolicy | null>(null);
+	// ---- Permissions tab state ----
+	// The three gate tiers (doc/permission.md §3.1): gateway baseline (bottom),
+	// profile, workspace (top). Loaded lazily on first tab open so the
+	// providers/profiles path pays nothing.
+	let gatewayPolicy = $state<PermissionPolicy | null>(null);
+	let gatewaySnapshot = $state<string | null>(null);
+	let wsList = $state<WorkspaceSummary[]>([]);
+	let selectedWs = $state<string>('');
+	let wsConfig = $state<WorkspaceConfig | null>(null);
+	let wsTools = $state<ToolInfo[]>([]);
+	let wsSnapshot = $state<string | null>(null);
+	let permLoaded = $state(false);
 
-	// Tool catalog for the permission editors' per-tool cards. Loaded once with
-	// providers/profiles; empty until then (editor renders no cards, harmless).
+	// Tool catalog for the rule editors' tool pickers. Loaded once with
+	// providers/profiles; the workspace tier swaps in its own catalog (built-ins
+	// + MCP tools) when a workspace is selected.
 	let toolCatalog = $state<ToolInfo[]>([]);
 
 	// ---- Shared UI ----
 	let loading = $state(true);
+	let saving = $state(false);
 	let error = $state<string | null>(null);
 	let notice = $state<string | null>(null);
 
@@ -51,13 +67,52 @@
 		if (active) pill = { x: active.offsetLeft, w: active.offsetWidth };
 	});
 
-	const PROVIDER_TYPES: ProviderType[] = ['openai-chat', 'openai-completion', 'anthropic', 'custom'];
+	const PROVIDER_TYPES: ProviderType[] = [
+		'openai-chat',
+		'openai-completion',
+		'anthropic',
+		'custom'
+	];
+
+	// ---- Dirty tracking: one JSON snapshot per independently-savable unit ----
+	const providersDirty = $derived(
+		!loading &&
+			(JSON.stringify(providers) !== providersSnapshot ||
+				Object.values(keyInput).some((k) => k.trim().length > 0))
+	);
+	// New-profile state has no snapshot (nothing on disk to differ from) — an
+	// unsaved draft is dirty by definition, or the SaveBar would never offer
+	// to save it.
+	const profileDirty = $derived(
+		profile !== null && (profileSnapshot === null || JSON.stringify(profile) !== profileSnapshot)
+	);
+	const gatewayDirty = $derived(
+		gatewayPolicy !== null &&
+			gatewaySnapshot !== null &&
+			JSON.stringify(gatewayPolicy) !== gatewaySnapshot
+	);
+	const wsDirty = $derived(
+		wsConfig !== null && wsSnapshot !== null && JSON.stringify(wsConfig) !== wsSnapshot
+	);
+	const dirtyCount = $derived(
+		[providersDirty, profileDirty, gatewayDirty, wsDirty].filter(Boolean).length
+	);
+
+	// Intercept page leave with unsaved edits — the SaveBar is always visible,
+	// but a route change / tab close is not.
+	function guardUnsaved(e: BeforeUnloadEvent) {
+		if (dirtyCount > 0) {
+			e.preventDefault();
+			e.returnValue = '';
+		}
+	}
 
 	async function loadProviders() {
 		const view = await client.getProviders();
 		providers = view.providers;
 		configured = new Set(view.secret_names);
 		keyInput = {};
+		providersSnapshot = JSON.stringify(providers);
 	}
 
 	async function loadProfiles() {
@@ -68,25 +123,19 @@
 		toolCatalog = await client.listTools();
 	}
 
-	async function loadGatewayPermission() {
-		gatewayPermission = await client.getGatewayPermission();
-	}
-
-	async function saveGatewayPermission() {
-		if (!gatewayPermission) return;
-		error = null;
-		try {
-			await client.saveGatewayPermission(gatewayPermission);
-			flash('Gateway 门控已保存');
-		} catch (e) {
-			error = e instanceof Error ? e.message : String(e);
-		}
-	}
-
-	// Lazy-load the gateway policy the first time its tab is opened.
+	// Lazy-load the permissions tab's data the first time it is opened.
 	$effect(() => {
-		if (tab === 'gateway' && gatewayPermission === null) {
-			loadGatewayPermission().catch((e) => {
+		if (tab === 'permissions' && !permLoaded) {
+			permLoaded = true;
+			(async () => {
+				const [gw, workspaces] = await Promise.all([
+					client.getGatewayPermission(),
+					client.listWorkspaces()
+				]);
+				gatewayPolicy = gw ?? {};
+				gatewaySnapshot = JSON.stringify(gatewayPolicy);
+				wsList = workspaces;
+			})().catch((e) => {
 				error = e instanceof Error ? e.message : String(e);
 			});
 		}
@@ -134,8 +183,8 @@
 		providers[pi].models = providers[pi].models.filter((_, idx) => idx !== mi);
 	}
 
-	async function saveProviders() {
-		error = null;
+	// Each save returns success so saveAll can stop at the first failure.
+	async function saveProviders(): Promise<boolean> {
 		try {
 			await client.saveProviders({ providers });
 			// Persist any newly-entered API keys, then clear the inputs.
@@ -146,9 +195,11 @@
 				}
 			}
 			keyInput = {};
-			flash('Providers saved');
+			providersSnapshot = JSON.stringify(providers);
+			return true;
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
+			return false;
 		}
 	}
 
@@ -169,16 +220,24 @@
 	async function selectProfile(name: string) {
 		error = null;
 		selectedName = name;
+		profile = null;
+		profileSnapshot = null;
+		if (!name) return;
 		try {
-			profile = await client.getProfile(name);
+			const p = await client.getProfile(name);
+			// The backend omits an empty `[permission]` section; normalize so the
+			// rule editor always binds a concrete object.
+			p.permission ??= {};
+			profile = p;
+			profileSnapshot = JSON.stringify(p);
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
-			profile = null;
 		}
 	}
 
 	function newProfile() {
 		selectedName = '';
+		profileSnapshot = null;
 		profile = {
 			profile: { name: '', description: null, extends: null },
 			prompt: { system: null, system_file: null },
@@ -190,25 +249,26 @@
 			budget: { session_max_usd: null, daily_max_usd: null, warn_at_percent: null },
 			hooks: { before_tool: [], after_tool: [] },
 			network: { policy: null, allow: [] },
-			permission: { deny: [], ask: [] }
+			permission: {}
 		};
 	}
 
-	async function saveProfile() {
-		if (!profile) return;
-		error = null;
+	async function saveProfile(): Promise<boolean> {
+		if (!profile) return true;
 		const name = profile.profile.name.trim();
 		if (!name) {
 			error = 'Profile name is required';
-			return;
+			return false;
 		}
 		try {
 			await client.saveProfile(name, profile);
 			await loadProfiles();
 			selectedName = name;
-			flash(`Profile ${name} saved`);
+			profileSnapshot = JSON.stringify(profile);
+			return true;
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
+			return false;
 		}
 	}
 
@@ -220,12 +280,126 @@
 			if (selectedName === name) {
 				selectedName = '';
 				profile = null;
+				profileSnapshot = null;
 			}
 			flash(`Profile ${name} deleted`);
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 		}
 	}
+
+	// ---- Permissions tab: gateway / workspace tiers ----
+	async function saveGateway(): Promise<boolean> {
+		if (!gatewayPolicy) return true;
+		try {
+			await client.saveGatewayPermission(gatewayPolicy);
+			gatewaySnapshot = JSON.stringify(gatewayPolicy);
+			return true;
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
+			return false;
+		}
+	}
+
+	async function selectWorkspace(id: string) {
+		error = null;
+		selectedWs = id;
+		wsConfig = null;
+		wsTools = [];
+		wsSnapshot = null;
+		if (!id) return;
+		try {
+			// This workspace's tool catalog: built-ins + its MCP tools (best-effort;
+			// MCP failures degrade to built-ins server-side).
+			const [cfg, tools] = await Promise.all([
+				client.getWorkspaceConfig(id),
+				client.listWorkspaceTools(id)
+			]);
+			// The backend omits empty sections; normalize before binding.
+			cfg.permission ??= {};
+			cfg.mounts ??= [];
+			cfg.network ??= null;
+			wsConfig = cfg;
+			wsTools = tools;
+			wsSnapshot = JSON.stringify(cfg);
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
+		}
+	}
+
+	async function saveWorkspace(): Promise<boolean> {
+		if (!wsConfig || !selectedWs) return true;
+		try {
+			await client.saveWorkspaceConfig(selectedWs, wsConfig);
+			wsSnapshot = JSON.stringify(wsConfig);
+			return true;
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
+			return false;
+		}
+	}
+
+	// ---- SaveBar: save / discard across all dirty units ----
+	async function saveAll() {
+		error = null;
+		saving = true;
+		try {
+			// Stop at the first failure; already-saved units stay saved.
+			if (providersDirty && !(await saveProviders())) return;
+			if (profileDirty && !(await saveProfile())) return;
+			if (gatewayDirty && !(await saveGateway())) return;
+			if (wsDirty && !(await saveWorkspace())) return;
+			flash('已保存');
+		} finally {
+			saving = false;
+		}
+	}
+
+	async function discardAll() {
+		error = null;
+		if (providersDirty) await loadProviders().catch(() => {});
+		// An existing profile reloads from disk; a never-saved draft has nothing
+		// to reload — discarding abandons it.
+		if (profileDirty && selectedName) await selectProfile(selectedName);
+		else if (profileDirty) {
+			profile = null;
+			profileSnapshot = null;
+		}
+		if (gatewayDirty) {
+			const gw = await client.getGatewayPermission().catch(() => null);
+			if (gw !== null) {
+				gatewayPolicy = gw ?? {};
+				gatewaySnapshot = JSON.stringify(gatewayPolicy);
+			}
+		}
+		if (wsDirty && selectedWs) await selectWorkspace(selectedWs);
+	}
+
+	// ---- Effective view (read-only, doc/permission.md §3.1) ----
+	let effOpen = $state(false);
+	const effCatalog = $derived(wsTools.length > 0 ? wsTools : toolCatalog);
+	const effective = $derived(
+		resolveEffective(gatewayPolicy ?? {}, profile?.permission ?? {}, wsConfig?.permission ?? {})
+	);
+	// Ask rules on tiers shadowed by a higher tier's ask list never fire
+	// (wholesale replacement) — surface that, it is otherwise invisible.
+	const shadowedAsks = $derived.by(() => {
+		const askTiers = [
+			['workspace', wsConfig?.permission] as const,
+			['profile', profile?.permission] as const,
+			['gateway', gatewayPolicy] as const
+		]
+			.map(([tier, pol]) => ({ tier: tier as Tier, count: pol?.ask?.length ?? 0 }))
+			.filter((t) => t.count > 0);
+		const winner = askTiers[0];
+		return { winner: winner?.tier ?? null, shadowed: askTiers.slice(1) };
+	});
+
+	const TIER_LABEL: Record<Tier, string> = {
+		gateway: '网关基线',
+		profile: 'Profile',
+		workspace: '工作区'
+	};
 
 	// Bridge a nullable-number model field to a text input (empty = null).
 	function numOrNull(v: string): number | null {
@@ -234,7 +408,7 @@
 	}
 </script>
 
-<!-- TEMPLATE-APPEND -->
+<svelte:window onbeforeunload={guardUnsaved} />
 
 <div class="page">
 	<div class="page-inner">
@@ -253,8 +427,12 @@
 				<button class="tab" class:active={tab === 'profiles'} onclick={() => (tab = 'profiles')}>
 					Profiles
 				</button>
-				<button class="tab" class:active={tab === 'gateway'} onclick={() => (tab = 'gateway')}>
-					Gateway
+				<button
+					class="tab"
+					class:active={tab === 'permissions'}
+					onclick={() => (tab = 'permissions')}
+				>
+					门控
 				</button>
 			</div>
 		</header>
@@ -270,7 +448,12 @@
 				{#each providers as p, pi (pi)}
 					<div class="panel">
 						<div class="panel-head">
-							<input class="in title-in" placeholder="provider 名称" bind:value={p.name} spellcheck="false" />
+							<input
+								class="in title-in"
+								placeholder="provider 名称"
+								bind:value={p.name}
+								spellcheck="false"
+							/>
 							<button class="btn-ghost danger" onclick={() => removeProvider(pi)}>删除</button>
 						</div>
 
@@ -283,28 +466,44 @@
 							</label>
 							<label class="field">
 								<span class="key">Base URL</span>
-								<input class="in" bind:value={p.base_url} placeholder="https://api…/v1" spellcheck="false" />
+								<input
+									class="in"
+									bind:value={p.base_url}
+									placeholder="https://api…/v1"
+									spellcheck="false"
+								/>
 							</label>
 							<label class="field">
 								<span class="key">api_key_env（回退）</span>
-								<input class="in" bind:value={p.api_key_env} placeholder="OPENAI_API_KEY" spellcheck="false" />
+								<input
+									class="in"
+									bind:value={p.api_key_env}
+									placeholder="OPENAI_API_KEY"
+									spellcheck="false"
+								/>
 							</label>
 							<label class="field">
 								<span class="key">
 									API Key
-									{#if configured.has(p.name)}<span class="badge ok">已配置</span>{:else}<span class="badge">未配置</span>{/if}
+									{#if configured.has(p.name)}<span class="badge ok">已配置</span>{:else}<span
+											class="badge">未配置</span
+										>{/if}
 								</span>
 								<div class="key-row">
 									<input
 										class="in"
 										type="password"
-										placeholder={configured.has(p.name) ? '••••••（保存后更新）' : '输入 key（保存到 DB）'}
+										placeholder={configured.has(p.name)
+											? '••••••（保存后更新）'
+											: '输入 key（保存到 DB）'}
 										bind:value={keyInput[p.name]}
 										spellcheck="false"
 										autocomplete="off"
 									/>
 									{#if configured.has(p.name)}
-										<button class="btn-ghost danger" onclick={() => clearSecret(p.name)}>清除</button>
+										<button class="btn-ghost danger" onclick={() => clearSecret(p.name)}
+											>清除</button
+										>
 									{/if}
 								</div>
 							</label>
@@ -323,17 +522,37 @@
 									</label>
 									<label class="mfield">
 										<span class="mkey">上下文窗口</span>
-										<input class="in num" type="number" placeholder="128000" bind:value={m.context_window} />
+										<input
+											class="in num"
+											type="number"
+											placeholder="128000"
+											bind:value={m.context_window}
+										/>
 									</label>
 									<label class="mfield">
 										<span class="mkey">最大输出</span>
-										<input class="in num" type="number" placeholder="16384" bind:value={m.max_output_tokens} />
+										<input
+											class="in num"
+											type="number"
+											placeholder="16384"
+											bind:value={m.max_output_tokens}
+										/>
 									</label>
 									<label class="mfield">
 										<span class="mkey">默认温度</span>
-										<input class="in num" type="number" step="0.1" placeholder="0.0" bind:value={m.default_temperature} />
+										<input
+											class="in num"
+											type="number"
+											step="0.1"
+											placeholder="0.0"
+											bind:value={m.default_temperature}
+										/>
 									</label>
-									<button class="btn-ghost danger mrm" onclick={() => removeModel(pi, mi)} aria-label="删除 model">×</button>
+									<button
+										class="btn-ghost danger mrm"
+										onclick={() => removeModel(pi, mi)}
+										aria-label="删除 model">×</button
+									>
 								</div>
 							{/each}
 							{#if p.models.length === 0}
@@ -345,7 +564,6 @@
 
 				<div class="actions">
 					<button class="btn-ghost" onclick={addProvider}>+ provider</button>
-					<button class="btn-primary" onclick={saveProviders}>保存 Providers</button>
 				</div>
 			</section>
 		{:else if tab === 'profiles'}
@@ -374,48 +592,73 @@
 							</label>
 							<label class="field">
 								<span class="key">Extends</span>
-								<input class="in" value={pf.profile.extends ?? ''} oninput={(e) => (pf.profile.extends = e.currentTarget.value || null)} placeholder="父 profile" spellcheck="false" />
+								<input
+									class="in"
+									value={pf.profile.extends ?? ''}
+									oninput={(e) => (pf.profile.extends = e.currentTarget.value || null)}
+									placeholder="父 profile"
+									spellcheck="false"
+								/>
 							</label>
 							<label class="field span2">
 								<span class="key">Description</span>
-								<input class="in" value={pf.profile.description ?? ''} oninput={(e) => (pf.profile.description = e.currentTarget.value || null)} />
+								<input
+									class="in"
+									value={pf.profile.description ?? ''}
+									oninput={(e) => (pf.profile.description = e.currentTarget.value || null)}
+								/>
 							</label>
 						</div>
 
 						<label class="field">
 							<span class="key">System Prompt</span>
-							<textarea class="in ta" rows="4" value={pf.prompt.system ?? ''} oninput={(e) => (pf.prompt.system = e.currentTarget.value || null)}></textarea>
+							<textarea
+								class="in ta"
+								rows="4"
+								value={pf.prompt.system ?? ''}
+								oninput={(e) => (pf.prompt.system = e.currentTarget.value || null)}
+							></textarea>
 						</label>
 
 						<div class="grid2">
 							<label class="field">
 								<span class="key">Model default</span>
-								<input class="in" value={pf.model.default ?? ''} oninput={(e) => (pf.model.default = e.currentTarget.value || null)} placeholder="provider/model_id" spellcheck="false" />
+								<input
+									class="in"
+									value={pf.model.default ?? ''}
+									oninput={(e) => (pf.model.default = e.currentTarget.value || null)}
+									placeholder="provider/model_id"
+									spellcheck="false"
+								/>
 							</label>
 							<label class="field">
 								<span class="key">Temperature</span>
-								<input class="in" value={pf.model.temperature ?? ''} oninput={(e) => (pf.model.temperature = numOrNull(e.currentTarget.value))} placeholder="模型默认" />
+								<input
+									class="in"
+									value={pf.model.temperature ?? ''}
+									oninput={(e) => (pf.model.temperature = numOrNull(e.currentTarget.value))}
+									placeholder="模型默认"
+								/>
 							</label>
 							<label class="field">
 								<span class="key">Max output tokens</span>
-								<input class="in" value={pf.model.max_output_tokens ?? ''} oninput={(e) => (pf.model.max_output_tokens = numOrNull(e.currentTarget.value))} placeholder="模型默认" />
+								<input
+									class="in"
+									value={pf.model.max_output_tokens ?? ''}
+									oninput={(e) => (pf.model.max_output_tokens = numOrNull(e.currentTarget.value))}
+									placeholder="模型默认"
+								/>
 							</label>
 							<label class="field">
 								<span class="key">Compaction threshold</span>
-								<input class="in" value={pf.context.compaction_threshold ?? ''} oninput={(e) => (pf.context.compaction_threshold = numOrNull(e.currentTarget.value))} placeholder="0.8" />
+								<input
+									class="in"
+									value={pf.context.compaction_threshold ?? ''}
+									oninput={(e) =>
+										(pf.context.compaction_threshold = numOrNull(e.currentTarget.value))}
+									placeholder="0.8"
+								/>
 							</label>
-						</div>
-
-						<div class="perm-block">
-							<div class="perm-head">
-								<span class="key">Permission 门控</span>
-								<span class="perm-note">profile 层（三层解析的中间层，见 doc/permission.md §3）</span>
-							</div>
-							<PermissionEditor bind:policy={pf.permission} tools={toolCatalog} />
-						</div>
-
-						<div class="actions">
-							<button class="btn-primary" onclick={saveProfile}>保存 Profile</button>
 						</div>
 					{:else}
 						<p class="muted">选择左侧 profile 编辑，或新建一个。</p>
@@ -423,35 +666,158 @@
 				</div>
 			</section>
 		{:else}
-			<!-- GATEWAY-SECTION -->
+			<!-- PERMISSIONS-SECTION -->
 			<section class="stack">
-				<div class="editor">
-					<div class="perm-head">
-						<span class="key">Gateway 基线门控</span>
-						<span class="perm-note">
-							三层解析的最低层（doc/permission.md §3.1）。deny 规则是全 gateway 的安全底线，任何
-							profile / workspace 都无法放开；对<strong>新建会话</strong>立即生效，并持久化到 gateway.toml。
-						</span>
+				<div class="tier">
+					<div class="tier-head">
+						<h2>Gateway 基线</h2>
+						<p class="tier-desc">
+							三层解析的最低层。这里的 deny 是整个网关的安全底线，任何 profile / 工作区都无法放开。
+						</p>
 					</div>
-					{#if gatewayPermission}
-						<PermissionEditor bind:policy={gatewayPermission} tools={toolCatalog} />
-						<div class="actions">
-							<button class="btn-primary" onclick={saveGatewayPermission}>保存 Gateway 门控</button>
-						</div>
+					{#if gatewayPolicy}
+						<PermissionRulesEditor
+							bind:policy={gatewayPolicy}
+							tools={toolCatalog}
+							showDefaults
+							emptyHint="无规则 —— 未命中即允许"
+						/>
 					{:else}
-						<div class="skel-cards" aria-hidden="true">
-							{#each Array(4) as _}
-								<Skeleton width="100%" height="64px" radius="var(--radius-md)" />
-							{/each}
+						<!-- Mirror the loaded layout (defaults table + rule rows) so
+						     content doesn't jump when it lands (§3.2). -->
+						<div class="skel-rows" aria-hidden="true">
+							<Skeleton width="100%" height="38px" radius="var(--radius-md)" />
+							<Skeleton width="100%" height="28px" />
+							<Skeleton width="64%" height="28px" />
+						</div>
+					{/if}
+				</div>
+
+				<div class="tier">
+					<div class="tier-head">
+						<h2>Profile</h2>
+						<p class="tier-desc">中间层。只列本层添加的规则；空的 profile 不施加任何门控。</p>
+					</div>
+					<select
+						class="in sel tier-picker"
+						value={selectedName}
+						onchange={(e) => selectProfile(e.currentTarget.value)}
+					>
+						<option value="">选择 profile…</option>
+						{#each profileList as p (p.name)}
+							<option value={p.name}>{p.name}</option>
+						{/each}
+					</select>
+					{#if profile}
+						{#key selectedName}
+							<PermissionRulesEditor bind:policy={profile.permission} tools={toolCatalog} />
+						{/key}
+					{:else if selectedName}
+						<div class="skel-rows" aria-hidden="true">
+							<Skeleton width="100%" height="28px" />
+							<Skeleton width="72%" height="28px" />
+							<Skeleton width="48%" height="28px" />
+						</div>
+					{/if}
+				</div>
+
+				<div class="tier">
+					<div class="tier-head">
+						<h2>工作区</h2>
+						<p class="tier-desc">
+							最高层，存于网关可信目录。deny 与下层并集（只增不减），ask 设了则整体替换下层。
+						</p>
+					</div>
+					<select
+						class="in sel tier-picker"
+						value={selectedWs}
+						onchange={(e) => selectWorkspace(e.currentTarget.value)}
+					>
+						<option value="">选择工作区…</option>
+						{#each wsList as w (w.id)}
+							<option value={w.id}>{w.path ?? w.id}</option>
+						{/each}
+					</select>
+					{#if wsConfig && wsConfig.permission}
+						{#key selectedWs}
+							<PermissionRulesEditor bind:policy={wsConfig.permission} tools={wsTools} />
+						{/key}
+					{:else if selectedWs}
+						<div class="skel-rows" aria-hidden="true">
+							<Skeleton width="100%" height="28px" />
+							<Skeleton width="72%" height="28px" />
+							<Skeleton width="48%" height="28px" />
+						</div>
+					{/if}
+				</div>
+
+				<div class="tier">
+					<h2 class="eff-title">
+						<button class="eff-head" onclick={() => (effOpen = !effOpen)} aria-expanded={effOpen}>
+							<svg
+								class="chev"
+								class:open={effOpen}
+								viewBox="0 0 14 14"
+								fill="none"
+								stroke="currentColor"
+								stroke-width="1.6"
+								stroke-linecap="round"
+								stroke-linejoin="round"
+							>
+								<polyline points="5,3 9,7 5,11" />
+							</svg>
+							生效结果
+							<span class="eff-count">
+								{effective.length > 0 ? `${effective.length} 条生效规则` : '全部允许'}
+							</span>
+						</button>
+					</h2>
+					{#if effOpen}
+						<div class="eff-body">
+							<p class="tier-desc">
+								按当前选中的 profile 与工作区计算：deny 三层并集，ask 取最高设置层，allow
+								三层并集且命中时豁免 ask。
+							</p>
+							{#if effective.length === 0}
+								<p class="muted">三层都没有规则 —— 所有工具直接允许。</p>
+							{:else}
+								{#each effective as eff, i (i)}
+									{@const row = ruleToRow(eff.rule, eff.list)}
+									<div class="eff-row">
+										<span
+											class="verdict"
+											class:deny={eff.list === 'deny'}
+											class:ask={eff.list === 'ask'}
+											class:allow={eff.list === 'allow'}
+										>
+											{eff.list === 'deny' ? '拒绝' : eff.list === 'allow' ? '允许' : '询问'}
+										</span>
+										<span class="eff-summary">
+											{row ? summaryOf(row, effCatalog) : JSON.stringify(eff.rule)}
+										</span>
+										<span class="tier-badge">{TIER_LABEL[eff.tier]}</span>
+									</div>
+								{/each}
+							{/if}
+							{#if shadowedAsks.shadowed.length > 0}
+								<p class="eff-note">
+									{TIER_LABEL[shadowedAsks.winner ?? 'gateway']} 层设了询问规则，
+									{shadowedAsks.shadowed
+										.map((s) => `${TIER_LABEL[s.tier]} 层的 ${s.count} 条`)
+										.join('、')}
+									询问规则被整表替换，不生效。
+								</p>
+							{/if}
 						</div>
 					{/if}
 				</div>
 			</section>
 		{/if}
+
+		<SaveBar {dirtyCount} {saving} onsave={saveAll} ondiscard={discardAll} />
 	</div>
 </div>
 
-<!-- STYLE-APPEND -->
 <style>
 	.page {
 		height: 100%;
@@ -530,8 +896,7 @@
 	.muted {
 		color: var(--text-tertiary);
 		font-size: 13px;
-		padding: var(--space-8);
-		text-align: center;
+		padding: var(--space-4);
 	}
 
 	.stack {
@@ -539,7 +904,7 @@
 		flex-direction: column;
 		gap: var(--space-4);
 	}
-	/* STYLE-APPEND-2 */
+
 	.panel {
 		border: 1px solid var(--border-subtle);
 		border-radius: var(--radius-md);
@@ -638,7 +1003,7 @@
 		color: var(--state-done-text);
 		background: var(--state-done-bg);
 	}
-	/* STYLE-APPEND-3 */
+
 	.models {
 		border-top: 1px solid var(--border-subtle);
 		padding-top: var(--space-3);
@@ -694,22 +1059,6 @@
 		gap: var(--space-2);
 		justify-content: flex-end;
 		align-items: center;
-	}
-
-	.btn-primary {
-		padding: 7px var(--space-4);
-		background: var(--accent);
-		color: var(--accent-fg);
-		border: 1px solid var(--accent);
-		border-radius: var(--radius-sm);
-		font-size: 13px;
-		font-weight: 590;
-		cursor: pointer;
-		transition: background var(--motion-fast);
-	}
-
-	.btn-primary:hover {
-		background: var(--accent-hover);
 	}
 
 	.btn-ghost {
@@ -803,29 +1152,151 @@
 		padding: var(--space-4);
 	}
 
-	.perm-block {
-		border-top: 1px solid var(--border-subtle);
-		padding-top: var(--space-4);
+	/* ---- Permissions tab: tier sections ---- */
+	.tier {
+		border: 1px solid var(--border-subtle);
+		border-radius: var(--radius-md);
+		background: var(--canvas-raised);
+		padding: var(--space-4);
 		display: flex;
 		flex-direction: column;
 		gap: var(--space-3);
 	}
 
-	.perm-head {
-		display: flex;
-		align-items: baseline;
-		gap: var(--space-2);
+	.tier-head h2 {
+		font-family: var(--font-chinese);
+		font-size: 13px;
+		font-weight: 600;
+		color: var(--text-primary);
 	}
 
-	.perm-note {
+	.tier-desc {
+		font-family: var(--font-chinese);
+		font-size: 11px;
+		line-height: 1.6;
+		color: var(--text-tertiary);
+		margin-top: 2px;
+	}
+
+	.tier-picker {
+		max-width: 320px;
+	}
+
+	/* Loading placeholder: compact rows, same rhythm as the editor's `.rows`. */
+	.skel-rows {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+	}
+
+	.sel {
+		font-family: var(--font-chinese);
+		background: var(--canvas-raised);
+	}
+
+	/* ---- Effective view ---- */
+	/* Heading wraps the toggle (button is valid phrasing content inside h2; the
+	   inverse nesting is not). The button inherits this font via the global
+	   `button { font: inherit }` reset. */
+	.eff-title {
+		font-family: var(--font-chinese);
+		font-size: 13px;
+		font-weight: 600;
+		color: var(--text-primary);
+	}
+
+	.eff-head {
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+		width: 100%;
+		text-align: left;
+	}
+
+	.chev {
+		width: 12px;
+		height: 12px;
+		color: var(--text-tertiary);
+		transition: transform var(--dur-fast) var(--ease-out);
+	}
+
+	.chev.open {
+		transform: rotate(90deg);
+	}
+
+	.eff-count {
+		margin-left: auto;
+		font-family: var(--font-chinese);
 		font-size: 11px;
 		color: var(--text-tertiary);
 	}
 
-	.skel-cards {
+	.eff-body {
 		display: flex;
 		flex-direction: column;
+		gap: 2px;
+		border-top: 1px solid var(--border-subtle);
+		padding-top: var(--space-3);
+	}
+
+	.eff-row {
+		display: flex;
+		align-items: center;
 		gap: var(--space-2);
+		padding: 4px 0;
+	}
+
+	.verdict {
+		flex-shrink: 0;
+		font-family: var(--font-chinese);
+		font-size: 11px;
+		font-weight: 590;
+		padding: 1px 6px;
+		border-radius: var(--radius-sm);
+	}
+
+	.verdict.deny {
+		color: var(--state-error-text);
+		background: var(--state-error-bg);
+	}
+
+	.verdict.allow {
+		color: var(--state-done-text);
+		background: var(--state-done-bg);
+	}
+
+	.verdict.ask {
+		color: var(--state-running-text);
+		background: var(--state-running-bg);
+	}
+
+	.eff-summary {
+		flex: 1;
+		min-width: 0;
+		font-family: var(--font-chinese);
+		font-size: 12px;
+		color: var(--text-secondary);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+
+	.tier-badge {
+		flex-shrink: 0;
+		font-family: var(--font-chinese);
+		font-size: 11px;
+		color: var(--text-tertiary);
+		background: var(--canvas-float);
+		padding: 1px 6px;
+		border-radius: var(--radius-sm);
+	}
+
+	.eff-note {
+		margin-top: var(--space-2);
+		font-family: var(--font-chinese);
+		font-size: 11px;
+		line-height: 1.6;
+		color: var(--state-running-text);
 	}
 
 	@media (max-width: 768px) {
@@ -834,8 +1305,4 @@
 			grid-template-columns: 1fr;
 		}
 	}
-
-
 </style>
-
-

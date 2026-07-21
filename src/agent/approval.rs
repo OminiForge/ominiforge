@@ -43,6 +43,26 @@ pub enum ApprovalDecision {
     Reject,
 }
 
+/// How far a human's decision reaches beyond the single call that prompted it
+/// (`doc/permission.md` §5). Serialized `snake_case` so a gateway client can
+/// send it on the wire alongside the decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalScope {
+    /// This call only — the resting case; nothing is pinned anywhere.
+    Once,
+    /// Pin the decision for the rest of this session: compiled to a rule and
+    /// written into the session's live in-memory policy.
+    Session,
+    /// Pin the decision durably for every session on this profile: written into
+    /// the profile TOML (and the live session policy).
+    Profile,
+    /// Pin the decision gateway-wide: written into `gateway.toml` (and the live
+    /// session policy).
+    Gateway,
+}
+
 /// How a gate *resolved* an [`ApprovalRequest`].
 ///
 /// Richer than [`ApprovalDecision`] (the human-facing / wire answer) because the
@@ -58,12 +78,33 @@ pub enum ApprovalResolution {
     Approved,
     /// A human explicitly rejected the call.
     RejectedByUser,
+    /// A rule pinned by an earlier scoped decision resolved the ask — no fresh
+    /// human answer was given for this call. `approved` is the rule's verdict
+    /// (`allow` pinned → true, `deny` pinned → false). Audited as
+    /// `decided_by: "policy"` (`doc/permission.md` §5.1).
+    PinnedByRule {
+        /// Whether the pinned rule allowed (`true`) or denied (`false`).
+        approved: bool,
+    },
     /// No human decided: the gate failed closed (no approver reachable). This is
     /// still a block, but nobody was consulted.
     AutoDenied,
 }
 
-/// Resolves an [`ApprovalRequest`] to an [`ApprovalDecision`].
+/// A gate's full answer to an [`ApprovalRequest`].
+///
+/// The three-way [`ApprovalResolution`] plus, when a human decided, the
+/// [`ApprovalScope`] they chose (`None` for an auto-denial — nobody decided, so
+/// there is no scope to record).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApprovalOutcome {
+    /// What happened to the call (run / blocked / fail-closed).
+    pub resolution: ApprovalResolution,
+    /// How far the human's decision reaches; `None` when no human decided.
+    pub scope: Option<ApprovalScope>,
+}
+
+/// Resolves an [`ApprovalRequest`] to an [`ApprovalOutcome`].
 ///
 /// Implementations own the interaction: a terminal gate prompts and reads stdin;
 /// the gateway gate publishes an `AwaitingApproval` status and awaits a command
@@ -76,7 +117,17 @@ pub enum ApprovalResolution {
 pub trait ApprovalGate: Send + Sync {
     /// Ask the human whether `req` may run, resolving when they answer (or when
     /// the gate gives up and fails closed).
-    async fn request(&self, req: ApprovalRequest) -> ApprovalResolution;
+    async fn request(&self, req: ApprovalRequest) -> ApprovalOutcome;
+
+    /// Whether the gate can field multiple concurrent `request`s. A gate that
+    /// routes decisions over a shared channel (the gateway) returns `true`, so
+    /// the agent dispatches a round's tool calls in two phases — preparing all
+    /// of them (and publishing every `ask`) before settling any. Interactive
+    /// prompts (the CLI) and the null gate keep the serial default: the agent
+    /// then dispatches one call at a time, exactly as before.
+    fn supports_concurrent_requests(&self) -> bool {
+        false
+    }
 }
 
 /// The fail-closed default gate: every request resolves to
@@ -90,9 +141,12 @@ pub struct NullGate;
 
 #[async_trait::async_trait]
 impl ApprovalGate for NullGate {
-    async fn request(&self, _req: ApprovalRequest) -> ApprovalResolution {
+    async fn request(&self, _req: ApprovalRequest) -> ApprovalOutcome {
         // No human is present, so this is an auto-denial, not a user rejection.
-        ApprovalResolution::AutoDenied
+        ApprovalOutcome {
+            resolution: ApprovalResolution::AutoDenied,
+            scope: None,
+        }
     }
 }
 

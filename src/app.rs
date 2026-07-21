@@ -643,7 +643,7 @@ mod tests {
         assert!(resolve_network(None, &bad, NetworkPolicy::Open).is_err());
     }
 
-    /// Permission precedence (`doc/permission.md` §3): three tiers, `deny`
+    /// Permission precedence (`doc/permission.md` §3): three tiers, `deny`/`allow`
     /// unioned into a floor, `ask` overridden top-down. The test pins the
     /// security-critical asymmetry — a lower tier's `deny` MUST survive a higher
     /// tier that sets its own rules, or a workspace/profile could silently reopen
@@ -653,22 +653,105 @@ mod tests {
     fn permission_resolution_unions_deny_across_tiers() {
         use crate::permission::{Decision, PermissionPolicy, Rule};
         let rule = |tool: &str, pat: &str| {
-            Rule::contains(tool, if pat.is_empty() { vec![] } else { vec![pat.to_owned()] })
+            Rule::contains(
+                tool,
+                if pat.is_empty() {
+                    vec![]
+                } else {
+                    vec![pat.to_owned()]
+                },
+            )
         };
 
-        let gateway = PermissionPolicy { deny: vec![rule("shell", "curl")], ask: vec![] };
-        let profile = PermissionPolicy { deny: vec![rule("shell", "rm -rf")], ask: vec![rule("write", "")] };
-        let workspace = PermissionPolicy { deny: vec![rule("net", "")], ask: vec![rule("read", "")] };
+        let gateway = PermissionPolicy {
+            deny: vec![rule("shell", "curl")],
+            allow: vec![],
+            ask: vec![],
+        };
+        let profile = PermissionPolicy {
+            deny: vec![rule("shell", "rm -rf")],
+            allow: vec![],
+            ask: vec![rule("write", "")],
+        };
+        let workspace = PermissionPolicy {
+            deny: vec![rule("net", "")],
+            allow: vec![],
+            ask: vec![rule("read", "")],
+        };
 
         let effective = resolve_permission(workspace, profile, gateway);
 
         // Every tier's deny survived — the union floor.
-        assert_eq!(effective.evaluate("shell", &serde_json::json!({"c": "curl x"})), Decision::Deny);
-        assert_eq!(effective.evaluate("shell", &serde_json::json!({"c": "rm -rf /"})), Decision::Deny);
-        assert_eq!(effective.evaluate("net", &serde_json::json!({})), Decision::Deny);
+        assert_eq!(
+            effective.evaluate("shell", &serde_json::json!({"c": "curl x"})),
+            Decision::Deny
+        );
+        assert_eq!(
+            effective.evaluate("shell", &serde_json::json!({"c": "rm -rf /"})),
+            Decision::Deny
+        );
+        assert_eq!(
+            effective.evaluate("net", &serde_json::json!({})),
+            Decision::Deny
+        );
         // Workspace ask (top tier) replaced the profile ask: `read` asks, `write` no longer does.
-        assert_eq!(effective.evaluate("read", &serde_json::json!({"p": "x"})), Decision::Ask);
-        assert_eq!(effective.evaluate("write", &serde_json::json!({"p": "x"})), Decision::Allow);
+        assert_eq!(
+            effective.evaluate("read", &serde_json::json!({"p": "x"})),
+            Decision::Ask
+        );
+        assert_eq!(
+            effective.evaluate("write", &serde_json::json!({"p": "x"})),
+            Decision::Allow
+        );
+    }
+
+    /// `allow` unions across the tiers exactly like `deny`: a lower tier's
+    /// pinned approvals survive a higher tier that pins its own, and the union
+    /// collapses duplicates. A pinned approval must ALSO win over a lower
+    /// tier's ask on the same call (deny > allow > ask).
+    #[test]
+    fn permission_resolution_unions_allow_across_tiers() {
+        use crate::permission::{Decision, PermissionPolicy, Rule};
+        let rule = |tool: &str, pat: &str| {
+            Rule::contains(
+                tool,
+                if pat.is_empty() {
+                    vec![]
+                } else {
+                    vec![pat.to_owned()]
+                },
+            )
+        };
+
+        let gateway = PermissionPolicy {
+            deny: vec![],
+            allow: vec![rule("shell", "cargo test")],
+            ask: vec![rule("shell", "")],
+        };
+        let profile = PermissionPolicy {
+            deny: vec![],
+            allow: vec![rule("shell", "cargo test"), rule("read", "src/")],
+            ask: vec![],
+        };
+        let workspace = PermissionPolicy::default();
+
+        let effective = resolve_permission(workspace, profile, gateway);
+        // Both tiers' pinned approvals survived; the shared one appears once.
+        assert_eq!(effective.allow.len(), 2);
+        // The pinned approval outranks the gateway tier's ask-all-shell rule.
+        assert_eq!(
+            effective.evaluate("shell", &serde_json::json!({"command": "cargo test --all"})),
+            Decision::Allow
+        );
+        assert_eq!(
+            effective.evaluate("read", &serde_json::json!({"path": "src/main.rs"})),
+            Decision::Allow
+        );
+        // A shell call outside the allow list still falls through to ask.
+        assert_eq!(
+            effective.evaluate("shell", &serde_json::json!({"command": "make"})),
+            Decision::Ask
+        );
     }
 
     /// All tiers empty → empty effective policy → the pre-permission fast path is

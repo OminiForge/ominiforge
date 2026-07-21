@@ -416,6 +416,11 @@ pub enum PermissionEvent {
         call_id: String,
         outcome: PermissionOutcome,
         decided_by: String,
+        /// How far a human's decision reaches (`once` / `session` / `profile` /
+        /// `gateway`); `None` when no human decided (a policy deny or a
+        /// fail-closed auto-denial). Optional so older logs still deserialize.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<crate::agent::ApprovalScope>,
     },
 }
 

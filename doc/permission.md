@@ -19,12 +19,13 @@ allow / deny / ask。核心原则——安全不能靠信任模型，要靠代�
 
 ## 2. 策略模型
 
-`PermissionPolicy`（`src/permission/mod.rs`）两个有序规则列表：
+`PermissionPolicy`（`src/permission/mod.rs`）三个有序规则列表：
 
 ```rust
 pub struct PermissionPolicy {
-    pub deny: Vec<Rule>,  // 命中即阻断，最高优先级
-    pub ask:  Vec<Rule>,  // 命中且无 deny 命中 → 需人工审批
+    pub deny:  Vec<Rule>,  // 命中即阻断，最高优先级
+    pub allow: Vec<Rule>,  // 命中且无 deny 命中 → 直接放行（固化的批准），压过 ask
+    pub ask:   Vec<Rule>,  // 命中且无 deny/allow 命中 → 需人工审批
 }
 pub struct Rule {
     pub tool: String,          // 工具名；"*" 通配任意工具，否则精确匹配
@@ -32,8 +33,9 @@ pub struct Rule {
 }
 ```
 
-**求值顺序（固定）**：`deny` 命中 → `Deny`；否则 `ask` 命中 → `Ask`；否则 `Allow`。
-deny 永远压过 ask（"请确认"不能降级一条禁令）。
+**求值顺序（固定）**：`deny` 命中 → `Deny`；否则 `allow` 命中 → `Allow`；否则 `ask` 命中 → `Ask`；
+否则 `Allow`。deny 永远压过 allow/ask（"已批准"与"请确认"都不能降级一条禁令）；allow 压过 ask——
+它是作用域审批固化下来的规则（§5.1），命中即免问。
 
 **匹配语义**：`contains` 中任一模式作为**子串**出现在输入 JSON 的**任意字符串值**里即命中
 （递归数组/对象；只搜 value，不搜 key）。匹配模式含 `substring`/`prefix`（§3 规则模型），glob/regex 待后续。
@@ -71,7 +73,7 @@ contains = ["curl", "wget"]
 | `mode` | `substring`（子串，缺省）/ `prefix`（前缀，用于路径目录白/黑名单） | `substring` |
 | `negate` | `true` = **无**任一模式命中时才匹配。这是白名单的表达方式（"path 不以 src/ 等开头就 ask"）。空模式列表 + negate = 永不匹配（空白名单不锁死工具） | `false` |
 
-`field`/`mode`/`negate` 是配置 UI 的「每工具卡片」编译出来的结构化形态（§3.2）；手写 `contains = [...]` 老规则原样有效（`contains` 是 `patterns` 的磁盘别名，读写都用 `contains`）。
+`field`/`mode`/`negate` 是配置 UI 的规则行编译出来的结构化形态（§3.2）；手写 `contains = [...]` 老规则原样有效（`contains` 是 `patterns` 的磁盘别名，读写都用 `contains`）。
 
 ```toml
 [[permission.deny]]
@@ -106,6 +108,7 @@ gateway default_permission （gateway.toml，最低基线）
 ```
 
 - **`deny` = 三层并集**：任一层禁掉的工具，上层都无法静默放开。部署方在 `gateway.toml` 设一条 fleet-wide 禁令，任何 profile/workspace 都改不掉。
+- **`allow` = 三层并集**（同 deny，去重）：低层固化的批准（§5.1）不会被上层静默丢弃。
 - **`ask` = 自上而下覆盖**：高层设了 ask 则替换低层的 ask 列表，未设则继承。
 
 解析函数 `app::resolve_permission(workspace, profile, gateway)`，等价于 `workspace.layer_over(profile.layer_over(gateway))`。
@@ -130,17 +133,19 @@ contains = ["git push"]       # 仅此 workspace 追加禁令
 
 CLI 运行只经过 profile 层（gateway/workspace 两层都是 gateway 侧，CLI 传空策略）。
 
-### 3.2 工具目录与配置 UI（零心智负担）
+### 3.2 工具目录与配置 UI（增量规则列表）
 
-用户配置门控时**不手输工具名/字段名**。`GET /tools` 返回内置工具目录（`crate::tool::builtin_catalog`：read/write/edit/shell 的友好标签 + 可作为 `field` 的输入字段列表 + 字段是否为路径）。前端据此为每个工具渲染一张卡片：主控件是三档开关（allow/ask/deny，覆盖多数需求），例外区用该工具专属的字段下拉 + 大白话措辞（shell→命令、read/write→路径），把用户操作编译成上面的结构化 `Rule`。
+用户配置门控时**不手输工具名/字段名**。`GET /tools` 返回内置工具目录（`crate::tool::builtin_catalog`：read/write/edit/shell 的友好标签 + 可作为 `field` 的输入字段列表 + 字段是否为路径）。前端配置界面是**增量规则列表**（`PermissionRulesEditor.svelte`）：每层只渲染用户真正添加的规则，空层 = 一行说明 +「添加规则」按钮，绝不预渲染全量工具列表。规则行折叠态是大白话摘要（「拒绝 运行命令：当 命令 包含 rm -rf」），展开后才出现决策 seg、工具下拉（目录 +「任意工具 (*)」）与条件区（field/mode/白名单/值，默认折叠）；无条件规则即该工具在本层的默认裁决。gateway 层额外提供折叠的**工具默认表**（每目录工具一行三态 seg），编辑的同样是 bare rules。
 
-- 磁盘 = 机器读，结构化/规范化（`Rule` 全字段）；用户层 = 卡片，简单零负担。二者转换是纯函数。
+- 磁盘 = 机器读，结构化/规范化（`Rule` 全字段）；用户层 = 规则行，简单零负担。二者转换是纯函数（`permission-rules.ts` 的 `toRows`/`fromRows`）。
+- 门控 tab 底部有只读的**生效结果视图**：`resolveEffective` 前端复刻三层解析（deny 并集逐条标来源层、ask 取最高设置层并提示被整表替换的低层规则）。
 - 内置 4 种工具目录是静态的（无需子进程），故 profile 层与 gateway 层配置界面都能用（`GET /tools`）。
-- MCP 动态工具按 workspace best-effort 列举：`GET /workspaces/{id}/tools` 起 MCP 子进程读 `tools/list`，失败则跳过该 server、仍返回内置项（不报错）。仅 workspace 配置弹窗用它（gateway/profile 层无具体 workspace 上下文）。MCP 工具无字段元数据，回退成「整输入」通用卡片，仍可门控。
+- MCP 动态工具按 workspace best-effort 列举：`GET /workspaces/{id}/tools` 起 MCP 子进程读 `tools/list`，失败则跳过该 server、仍返回内置项（不报错）。仅 workspace 层用它（gateway/profile 层无具体 workspace 上下文）。MCP 工具无字段元数据，条件退化为「任意输入」，仍可门控。
 
 **overlay 继承（安全语义，有意区别于一般 field-level override）**：
 - `deny` **并集继承**——子 profile 可*增加*禁令，但**永不**静默丢弃从父级继承的 deny。
   （否则子 profile 顺手加一条无关 `ask` 就可能重新打开父级禁掉的工具 = 隐蔽提权。）
+- `allow` 同 `deny` **并集继承**（去重）——父级固化的批准不在子 profile 中丢失。
 - `ask` 沿用替换语义——子 profile 设了任意 ask 规则则替换父级 ask 列表，否则继承。
 
 （overlay 与三层解析共用同一套合并逻辑 `PermissionPolicy::layer_over`。）
@@ -168,7 +173,14 @@ CLI 运行只经过 profile 层（gateway/workspace 两层都是 gateway 侧，C
 #[async_trait]
 pub trait ApprovalGate: Send + Sync {
     // 三态而非二态：区分「人拒绝」与「无人应答的兜底拒绝」，让审计不撒谎（M2）。
-    async fn request(&self, req: ApprovalRequest) -> ApprovalResolution; // Approved | RejectedByUser | AutoDenied
+    // 返回值同时携带人选择的作用域（§5.1），无人决定时为 None。
+    async fn request(&self, req: ApprovalRequest) -> ApprovalOutcome;
+    // ApprovalOutcome { resolution: Approved | RejectedByUser | AutoDenied,
+    //                   scope: Option<ApprovalScope> }
+
+    // 能否并发受理多个 request：gateway 为 true（走共享表路由），启用 §5.2 的
+    // 两阶段并行分发；CLI/NullGate 为 false，保持逐条串行。
+    fn supports_concurrent_requests(&self) -> bool { false }
 }
 ```
 
@@ -183,10 +195,41 @@ pub trait ApprovalGate: Send + Sync {
   1. turn task 在 `dispatch_tool` 建 `oneshot`、插入共享 `PendingApprovals` 表（keyed by call_id）；
   2. publish `ActivityStatus::AwaitingApproval` + 发 `GatewayEvent::ApprovalRequested`；
   3. `rx.await` 挂起——此时 actor 的 `run_turn_phase` select-loop 仍在监听 inbox；
-  4. 客户端回 `Command::Approve { call_id, decision }` → actor 查表 send → turn 原地恢复。
-  - 每 session 独立 Agent（spawn 时 `Arc::new` 一次），gate 与 actor 共享该表。
+  4. 客户端回 `Command::Approve { call_id, decision, scope }` → actor 查表 send → turn 原地恢复。
+  - 每 session 独立 Agent（spawn 时 `Arc::new` 一次），gate 与 actor 共享该表；gate 还持有 agent 的
+    live policy handle（`Agent::permission_handle()`），供作用域审批固化规则（§5.1）。
   - cancel/shutdown 时 `clear_pending`：挂起的 rx 被 drop → gate 返回 `AutoDenied`（fail-closed）。
     turn 被 abort 后可能来不及写 `Decided`，故僵尸审批卡由前端在 `Turn::Interrupted/Failed` fold 时清理（race-free，`conversation.ts`）。
+
+### 5.1 作用域审批（ApprovalScope）
+
+每个审批决定带一个作用域（wire 字段 `scope`，缺省 `once`）：
+
+| scope | 语义 |
+|---|---|
+| `once` | 仅此次调用（现状、默认）；不留痕 |
+| `session` | 当前会话：规则写进该会话的内存 policy（`Agent.permission` 为 `Arc<RwLock<PermissionPolicy>>`，gate 与 agent 共享），立即生效——包括同轮仍 pending 的 ask（见下） |
+| `profile` | 固化进 profile TOML（`permission.allow`/`permission.deny`）+ 当前会话 policy |
+| `gateway` | 固化进 `gateway.toml`（`default_permission`）+ 当前会话 policy |
+
+批准写 `allow` 规则，拒绝写 `deny` 规则。规则从 tool call 输入编译（`permission::rule_from_call`）：取工具主字段（内置工具目录的第一个 field：shell→`command`，read/write/edit→`path`）的字符串值，作 `field` 定位的 `substring` 模式——**完整值，不截断**（截断前缀会命中未经批准的同前缀调用，静默扩大授权面）；取不到非空字符串（字段缺失/非字符串/目录外工具如 MCP）则退化为工具级 bare rule（该工具任意调用都命中）。同一调用重复批准幂等（写前 `contains` 判重，profile/gateway 层已在则不重写文件）。
+
+- 生效路径：gateway gate 收到非 once 决定 → 编译规则 → 写会话 live policy（去重）→ `profile`/`gateway` 再调 registry 注入的 `on_scoped` 回调持久化。profile 名取 session meta 的 `profile_id`，缺省回退 gateway 默认 profile（同 `runtime_info` 语义）；meta 读不到则放弃持久化而非瞎猜写入。
+- **同轮重评估**：pin 落地后，该 session 仍 pending 的每条 ask（pending 表存有 tool/input）按更新后的 policy 重新求值——命中 `allow` 自动批准、命中 `deny` 自动拒绝（model 侧等同 policy deny），其余保持待人工。自动裁决走正常 `Decided` 审计，`decided_by` 记 **`"policy"`**（是规则而非人解决了这条 ask），`scope` 记该 pin 的作用域；人工答复与 pin 竞争同一条 ask 时，`HashMap::remove` 保证只有一个裁决生效。
+- 内存与持久化一致：profile/gateway pin 先写会话 live policy（与 agent 同一 `Arc`，内存层同步更新），再走 `on_scoped` 持久化（registry 以 `config_write_lock` 串行化读-改-写、阻塞 I/O 走 `spawn_blocking`）。
+- 持久化失败只记日志（`eprintln!`，gateway 层惯例），不影响审批本身的返回。
+- 求值顺序保证 `deny > allow > ask`：固化的 allow 永远压不过一条 deny 禁令；固化后命中即免问。
+
+### 5.2 并行分发（两阶段 dispatch）
+
+gate 的 `supports_concurrent_requests()` 为 true（gateway）时，一轮里的多个 tool call 走两阶段分发；为 false（CLI/NullGate）时保持逐条串行（prepare→settle 内联，语义不变）。
+
+- **阶段 A（按序、不等任何人）**：每个 call 依次写 `ToolEvent::Started` → `tool:invoke:before` hooks → 权限评估。deny 立即定案；ask 写 `Permission::Requested` 并 spawn `gate.request`——**所有审批提示一次性全部发出**，任一 call 的 `Requested` 不等其他 call。
+- **每条 call 一条独立链**：await 自己的 gate 结果 → 批准即执行（例：先批 #2，#2 马上开始执行，不等 #1 被决定）；allow 链跳过 gate 直接执行。被拒/被 deny/失败的不执行。
+- **审计即时**：链在 gate 出结果的当下经 verdict channel 回报，turn task 收到即写 `PermissionEvent::Decided`（按决定到达顺序）——前端 fold 到 `Decided` 立即清除等待卡。
+- **结果事件按完成顺序写**：哪条链先完成，它的 `Tool::Completed/Failed` 先落盘——前端即时看到每次完成。失败/reject 的结果事件同样按各自链的完成时点落盘。
+- **喂给模型的 tool result 仍严格按 `tool_call` 顺序**：turn task 把各链产出的 `Message` 按槽位收集，全部结束后按 call 序 `push_message`；resume 重建（`rebuild_runtime`）也把同一轮的结果按 assistant 的 `tool_call` 序重排，保证 live 与重建视图一致。provider 的 tool_call↔tool_message 配对约束在两条路径上都满足。
+- writer 始终只在 turn task 上；链只跑 gate 等待与工具执行。**取消语义**：turn future 被 drop（cancel/硬错误）时 `ChainAbortGuard` abort 所有未完成链——`invoke` 中断、副作用不完成（而非旧 detach 行为：任务跑完、日志却写 cancelled）；gate task 由 actor 的 `clear_pending` fail-closed（pending 表清空，不留僵尸）；日志由 `record_cancelled_tool_calls` 补 `Failed(cancelled)`；前端在 turn 终态 fold 清理僵尸审批卡（不变）。乱序完成不改变这些语义。
 
 ## 6. 事件与审计
 
@@ -195,10 +238,14 @@ pub trait ApprovalGate: Send + Sync {
 ```rust
 pub enum PermissionEvent {
     Requested { call_id, tool_name, input },
-    Decided   { call_id, outcome, decided_by },  // outcome: Approved|Rejected|AutoDenied
+    Decided   { call_id, outcome, decided_by, scope },  // outcome: Approved|Rejected|AutoDenied
 }
 ```
 
+- `scope: Option<ApprovalScope>`（serde default + None 不序列化）：人做了决定时记录其作用域
+  （含 `once`，审计统一）；policy deny、fail-closed 兜底、以及 `CliApprovalGate`（终端提示无作用域
+  选择，恒 `scope: None`——CLI 的人为批准也记为 None，与「审计统一」措辞一致）为 `None`。
+  旧日志无此字段仍可正常反序列化。
 - 持久化写 log：既是完整审计轨，又让前端在**刷新/重连**后从事件流 fold 重建待审批提示
   （committed 事件会 replay）。
 - `GatewayEvent::ApprovalRequested` 是 ephemeral 的**即时提示**（点亮列表状态灯 + 低延迟弹面板），
@@ -207,28 +254,35 @@ pub enum PermissionEvent {
 ## 7. Wire 协议
 
 - `GatewayEvent::ApprovalRequested { call_id, tool_name, input }`（SSE/WS，ephemeral）。
-- `POST /sessions/{id}/approve`，body `{ call_id, decision: "approve"|"reject" }` → 202。
-- WS `{ "type": "approve", "call_id", "decision" }`。
+- `POST /sessions/{id}/approve`，body `{ call_id, decision: "approve"|"reject", scope?: "once"|"session"|"profile"|"gateway" }` → 202（`scope` 缺省 `once`）。
+- WS `{ "type": "approve", "call_id", "decision", "scope"? }`。
 - 幂等：未知/已决 call_id 被 actor 忽略。
-- ts 绑定：`PermissionEvent.ts` / `PermissionOutcome.ts` / `PermissionPolicy.ts` / `Rule.ts`，改 wire 类型后跑 `just ts-export`。
+- ts 绑定：`PermissionEvent.ts` / `PermissionOutcome.ts` / `PermissionPolicy.ts` / `Rule.ts` / `ApprovalScope.ts`，改 wire 类型后跑 `just ts-export`。
 
 ## 8. 前端（Web）
 
-- 会话流内联 `ApprovalPrompt.svelte`（`frontend/DESIGN.md` §4.9）：待审批 = 琥珀脉冲边框卡片 +
-  tool 名 + JSON 参数（语法高亮）+ Approve（acid-lime 主操作）/ Reject（secondary）。
-- `conversation.ts` 从 `Permission::Requested` fold 出 pending item，`Decided` 就地翻 approved/rejected。
-- 会话列表状态灯 `SessionStatusIcon.svelte` 的 `awaiting` 态（琥珀脉冲点）已存。
+- 审批附着在会话流的 **tool 卡**上（`ApprovalControls.svelte`，`frontend/DESIGN.md` §4.9）：等待态为
+  琥珀脉冲 pip +「等待批准」+ 行内批准（acid-lime 主操作）/ 拒绝按钮（含作用域选择）；无独立审批弹窗。
+- 决策流（`conversation.ts` fold）：`Permission::Requested` 给该 call 的卡片置 `approvalPending` →
+  `Decided` 清除标记 → 卡片终态由 `Tool::Completed/Failed` 驱动（并行分发下按完成顺序即时更新）。
+- 会话列表状态灯 `SessionStatusIcon.svelte` 的 `awaiting` 态（琥珀脉冲点）；仅当该 session 无 pending
+  ask 时才回到 Running（并行 ask 未全部解决不闪动）。
+- 三层配置 UI 在 Settings → 门控 tab（`frontend/DESIGN.md` §4.10）：增量规则列表 + gateway 工具默认表 +
+  生效结果视图；workspace 层另可从工作区侧栏齿轮的 `WorkspaceConfigDialog` 快捷编辑。
 
 ## 9. 实现状态与待完善
 
-已实现：策略内核 + 三层解析（workspace > profile > gateway，`deny` 并集）+ dispatch 接入
-（allow/deny/ask）+ CLI 终端 gate + gateway 挂起-恢复闭环 + 持久化 `PermissionEvent` 审计 +
-Web 审批面板。
+已实现：策略内核（deny/allow/ask 三列表，`deny > allow > ask`）+ 三层解析（workspace > profile > gateway，`deny`/`allow` 并集）+ dispatch 接入
+（allow/deny/ask）+ CLI 终端 gate + gateway 挂起-恢复闭环 + 持久化 `PermissionEvent` 审计（含 `Decided.scope`）+
+作用域审批（once/session/profile/gateway：`rule_from_call` 完整值编译规则，session 写会话内存 policy 即时生效
+（含同轮 pending ask 重评估、自动裁决记 `decided_by: "policy"`），profile/gateway 经 registry `on_scoped` 回调固化进
+profile TOML / `gateway.toml`（`config_write_lock` 串行化 + `spawn_blocking`））+
+并行分发（§5.2：两阶段 dispatch、独立链批准即执行、Decided 即时落盘、结果按完成序、模型消息按 call 序、
+cancel 经 `ChainAbortGuard` 召回执行链）+
+Web 审批（tool 卡内 ApprovalControls，含作用域选择）+ 三层 Web 配置 UI（Settings → 门控 tab：增量规则列表、
+gateway 工具默认表、生效结果视图；`frontend/DESIGN.md` §4.10）。
 
 待后续：
-- **三层的 Web 配置 UI**：profile `[permission]` 编辑器（批次 2）、gateway `default_permission`
-  与 workspace `[permission]` 编辑器 + 写端点（批次 3）。当前三层后端已通，profile 层可经
-  profile TOML 手写，gateway/workspace 层可手写对应 toml。
 - **TUI 交互审批**（当前 TUI 走默认 gate，ask 即 fail-closed 拒绝）。
 - 规则匹配升级：`substring`/`prefix` + `field` 定位 + `negate` 白名单**已实现**（§3 规则模型）；未来可加 glob / regex。
 - monitor 层聚合审批/拒绝计数进 `SessionSummary`（当前审计已由 event log 覆盖）。

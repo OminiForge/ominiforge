@@ -68,7 +68,10 @@ pub struct GatewayConfig {
     /// deployer can ban a tool fleet-wide and no profile can silently reopen it.
     /// Empty (the default) imposes no baseline. Configured under
     /// `[default_permission]` in `gateway.toml`.
-    #[serde(default, skip_serializing_if = "crate::permission::PermissionPolicy::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "crate::permission::PermissionPolicy::is_empty"
+    )]
     pub default_permission: crate::permission::PermissionPolicy,
 }
 
@@ -158,11 +161,12 @@ impl GatewayConfig {
     /// Serialize or io failure.
     pub fn save(&self, root: &std::path::Path) -> Result<(), crate::config::ConfigError> {
         let path = root.join("config").join("gateway.toml");
-        let text =
-            toml::to_string_pretty(self).map_err(|source| crate::config::ConfigError::Serialize {
+        let text = toml::to_string_pretty(self).map_err(|source| {
+            crate::config::ConfigError::Serialize {
                 path: path.clone(),
                 source,
-            })?;
+            }
+        })?;
         crate::config::write_atomic(&path, &text)
     }
 }

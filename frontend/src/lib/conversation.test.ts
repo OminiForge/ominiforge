@@ -36,7 +36,10 @@ function reqStarted(seq: number, model = 'm'): GatewayEvent {
 /** Build a ContentBlock committed event. */
 function contentBlock(
 	seq: number,
-	content: { Text: { text: string } } | { Reasoning: { text: string } } | { ToolCall: { id: string; name: string; arguments: string } }
+	content:
+		| { Text: { text: string } }
+		| { Reasoning: { text: string } }
+		| { ToolCall: { id: string; name: string; arguments: string } }
 ): GatewayEvent {
 	return {
 		type: 'event',
@@ -589,7 +592,9 @@ describe('conversation fold', () => {
 
 /** A committed `plan` tool call carrying the given op JSON as its arguments. */
 function planCall(seq: number, op: object): GatewayEvent {
-	return contentBlock(seq, { ToolCall: { id: `p${seq}`, name: 'plan', arguments: JSON.stringify(op) } });
+	return contentBlock(seq, {
+		ToolCall: { id: `p${seq}`, name: 'plan', arguments: JSON.stringify(op) }
+	});
 }
 
 /** Pull the single plan card's steps (asserts exactly one exists). */
@@ -721,7 +726,6 @@ describe('plan fold', () => {
 	});
 });
 
-
 function permRequested(seq: number, callId: string, tool: string): GatewayEvent {
 	return {
 		type: 'event',
@@ -756,61 +760,179 @@ function permDecided(
 	} as unknown as GatewayEvent;
 }
 
+/** A `Tool::Failed` event pairing back to the ToolCall content block at
+ *  `callSeq` (how the fold finds the card). `message` carries the denial code
+ *  (e.g. `denied_by_user`) as the fold only reads `error.message`. */
+function toolFailed(seq: number, callSeq: number, message: string): GatewayEvent {
+	return {
+		type: 'event',
+		schema_version: 'ominiforge.event.v1',
+		seq,
+		session_id: 's',
+		timestamp: '2026-06-24T00:00:00Z',
+		source: { kind: 'Runtime', id: 'runtime' },
+		parent_event_id: null,
+		turn_id: null,
+		payload: {
+			Tool: {
+				Failed: {
+					tool_call_event_id: { session_id: 's', seq: callSeq },
+					error: { message }
+				}
+			}
+		}
+	} as unknown as GatewayEvent;
+}
+
+/** A `Tool::Completed` event pairing back to the ToolCall content block at
+ *  `callSeq`, carrying `text` as its result. */
+function toolCompleted(seq: number, callSeq: number, text: string): GatewayEvent {
+	return {
+		type: 'event',
+		schema_version: 'ominiforge.event.v1',
+		seq,
+		session_id: 's',
+		timestamp: '2026-06-24T00:00:00Z',
+		source: { kind: 'Runtime', id: 'runtime' },
+		parent_event_id: null,
+		turn_id: null,
+		payload: {
+			Tool: {
+				Completed: {
+					tool_call_event_id: { session_id: 's', seq: callSeq },
+					result: { content: [{ Text: text }], is_error: false, error_code: null }
+				}
+			}
+		}
+	} as unknown as GatewayEvent;
+}
+
 describe('permission approval fold', () => {
-	it('Requested pushes a pending approval item carrying the tool + input', () => {
-		const state = fold([permRequested(1, 'c1', 'write')]);
-		const appr = state.items.filter((i) => i.kind === 'approval');
-		expect(appr).toHaveLength(1);
-		const a = appr[0] as Extract<(typeof appr)[number], { kind: 'approval' }>;
-		expect(a.callId).toBe('c1');
-		expect(a.toolName).toBe('write');
-		expect(a.status).toBe('pending');
-		expect(a.args).toContain('x.txt');
-	});
-
-	it('Decided flips a human decision (approved/rejected) in place, not a new item', () => {
-		const approved = fold([permRequested(1, 'c1', 'write'), permDecided(2, 'c1', 'Approved')]);
-		const a = approved.items.filter((i) => i.kind === 'approval');
-		expect(a).toHaveLength(1);
-		expect((a[0] as { status: string }).status).toBe('approved');
-
-		const rejected = fold([permRequested(1, 'c3', 'write'), permDecided(2, 'c3', 'Rejected')]);
-		const rj = rejected.items.filter((i) => i.kind === 'approval');
-		expect((rj[0] as { status: string }).status).toBe('rejected');
-	});
-
-	it('AutoDenied removes the approval card (no human decided — M4)', () => {
-		// A fail-closed / policy denial is not a human approval outcome; the card
-		// must not linger as a spurious "rejected" prompt (the tool-failure card
-		// conveys the block instead).
-		const state = fold([permRequested(1, 'c2', 'shell'), permDecided(2, 'c2', 'AutoDenied')]);
-		expect(state.items.filter((i) => i.kind === 'approval')).toHaveLength(0);
-	});
-
-	it('a Decided for an unknown call id leaves state untouched', () => {
-		const state = fold([permRequested(1, 'c1', 'write'), permDecided(2, 'other', 'Approved')]);
-		const a = state.items.filter((i) => i.kind === 'approval');
-		expect((a[0] as { status: string }).status).toBe('pending');
-	});
-
-	it('a turn Interrupted while an ask is pending drops the zombie card', () => {
-		// Cancel/crash mid-ask: the Decided will never commit, so the pending card
-		// can never resolve. The Interrupted fold must clear it or a replayed
-		// history shows a frozen approval prompt with dead buttons.
-		const state = fold([permRequested(1, 'c1', 'shell'), turnInterrupted(2)]);
-		expect(state.items.filter((i) => i.kind === 'approval')).toHaveLength(0);
-	});
-
-	it('an already-resolved approval survives a later Interrupted', () => {
-		// Only *pending* cards are zombies; a card that already flipped to
-		// approved/rejected is real history and must stay.
+	// The approval prompt attaches to the gated call's own tool card (folded from
+	// the earlier ToolCall content block, bridged by the model-assigned call id) —
+	// there is no separate approval item kind.
+	it('Requested marks the matching tool card approval-pending', () => {
 		const state = fold([
-			permRequested(1, 'c1', 'write'),
-			permDecided(2, 'c1', 'Approved'),
+			contentBlock(1, { ToolCall: { id: 'c1', name: 'write', arguments: '{"path":"x.txt"}' } }),
+			permRequested(2, 'c1', 'write')
+		]);
+		const tools = state.items.filter((i) => i.kind === 'tool');
+		expect(tools).toHaveLength(1);
+		expect(tools[0].kind === 'tool' && tools[0].approvalPending).toBe(true);
+		expect(tools[0].kind === 'tool' && tools[0].callId).toBe('c1');
+	});
+
+	it('Requested with no matching tool card synthesizes one (defensive)', () => {
+		// The ContentBlock always commits first in practice; if it is somehow
+		// missing, the prompt must still surface instead of vanishing.
+		const state = fold([permRequested(1, 'c9', 'write')]);
+		const tools = state.items.filter((i) => i.kind === 'tool');
+		expect(tools).toHaveLength(1);
+		const t = tools[0];
+		expect(t.kind === 'tool' && t.approvalPending).toBe(true);
+		expect(t.kind === 'tool' && t.name).toBe('write');
+		expect(t.kind === 'tool' && t.args).toContain('x.txt');
+	});
+
+	it('Decided clears the pending flag; the card stays for its tool outcome', () => {
+		// Approved or rejected, the card's final status arrives via the paired
+		// Tool::Completed/Failed — the Decided itself only disarms the prompt.
+		for (const outcome of ['Approved', 'Rejected', 'AutoDenied'] as const) {
+			const state = fold([
+				contentBlock(1, { ToolCall: { id: 'c1', name: 'write', arguments: '{"path":"x.txt"}' } }),
+				permRequested(2, 'c1', 'write'),
+				permDecided(3, 'c1', outcome)
+			]);
+			const tools = state.items.filter((i) => i.kind === 'tool');
+			expect(tools).toHaveLength(1);
+			expect(tools[0].kind === 'tool' && tools[0].approvalPending).toBe(false);
+		}
+	});
+
+	it('a rejection then lands as the tool card error via Tool::Failed', () => {
+		const state = fold([
+			contentBlock(1, { ToolCall: { id: 'c1', name: 'shell', arguments: '{"command":"curl x"}' } }),
+			permRequested(2, 'c1', 'shell'),
+			permDecided(3, 'c1', 'Rejected'),
+			toolFailed(4, 1, 'denied_by_user')
+		]);
+		const t = state.items.find((i) => i.kind === 'tool');
+		expect(t?.kind === 'tool' && t.status).toBe('error');
+		expect(t?.kind === 'tool' && t.result).toContain('denied_by_user');
+	});
+
+	it('a Decided for an unknown call id leaves the pending flag untouched', () => {
+		const state = fold([
+			contentBlock(1, { ToolCall: { id: 'c1', name: 'write', arguments: '{"path":"x.txt"}' } }),
+			permRequested(2, 'c1', 'write'),
+			permDecided(3, 'other', 'Approved')
+		]);
+		const t = state.items.find((i) => i.kind === 'tool');
+		expect(t?.kind === 'tool' && t.approvalPending).toBe(true);
+	});
+
+	it('a turn Interrupted while an ask is pending disarms the zombie prompt', () => {
+		// Cancel/crash mid-ask: the Decided will never commit, so the prompt can
+		// never resolve. The Interrupted fold must clear the flag or a replayed
+		// history shows a frozen approval prompt with dead buttons. The tool card
+		// itself stays (it is real history).
+		const state = fold([
+			contentBlock(1, { ToolCall: { id: 'c1', name: 'shell', arguments: '{"command":"x"}' } }),
+			permRequested(2, 'c1', 'shell'),
 			turnInterrupted(3)
 		]);
-		const a = state.items.filter((i) => i.kind === 'approval');
-		expect(a).toHaveLength(1);
-		expect((a[0] as { status: string }).status).toBe('approved');
+		const t = state.items.find((i) => i.kind === 'tool');
+		expect(t?.kind === 'tool' && t.approvalPending).toBe(false);
+	});
+
+	// ── Out-of-order: Requested before its ToolCall ContentBlock ────────
+	//
+	// Event delivery can invert the commit order (the ask fires the moment the
+	// gate suspends the call; the collector's ContentBlock forwards on another
+	// task). The synthesized card must be COMPLETED by the late block — never
+	// duplicated — and re-registered under the real ToolCall seq, or the paired
+	// Tool::Completed/Failed (which keys on that seq) never finds the card and
+	// it spins in `running` forever.
+
+	it('Requested before its ToolCall ContentBlock: the late block completes the orphan', () => {
+		const state = fold([
+			permRequested(1, 'c1', 'write'),
+			contentBlock(2, { ToolCall: { id: 'c1', name: 'write', arguments: '{"path":"x.txt"}' } }),
+			permDecided(3, 'c1', 'Approved'),
+			toolCompleted(4, 2, 'wrote x.txt')
+		]);
+		const tools = state.items.filter((i) => i.kind === 'tool');
+		// One card, not two; the orphan was completed in place.
+		expect(tools).toHaveLength(1);
+		const t = tools[0];
+		// Backfilled with the REAL ToolCall seq/args (the Requested seq is gone),
+		// which is what let the Completed below pair.
+		expect(t.kind === 'tool' && t.seq).toBe(2);
+		expect(t.kind === 'tool' && t.args).toBe('{"path":"x.txt"}');
+		expect(t.kind === 'tool' && t.approvalPending).toBe(false);
+		expect(t.kind === 'tool' && t.status).toBe('done');
+		expect(t.kind === 'tool' && t.result).toContain('wrote x.txt');
+		expect(state.orphanTools.size).toBe(0);
+	});
+
+	it('Requested before ContentBlock after RequestStarted: the prompt survives truncation', () => {
+		// Same reorder one request in: the first committed block truncates items
+		// appended past requestStart — orphan included. The rebuilt card must
+		// keep the outstanding ask (a deciding human must not lose the buttons)
+		// and still pair its result.
+		const state = fold([
+			reqStarted(1),
+			permRequested(2, 'c1', 'write'),
+			contentBlock(3, { ToolCall: { id: 'c1', name: 'write', arguments: '{"path":"x.txt"}' } }),
+			toolCompleted(4, 3, 'wrote x.txt')
+		]);
+		const tools = state.items.filter((i) => i.kind === 'tool');
+		expect(tools).toHaveLength(1);
+		const t = tools[0];
+		expect(t.kind === 'tool' && t.seq).toBe(3);
+		expect(t.kind === 'tool' && t.approvalPending).toBe(true);
+		expect(t.kind === 'tool' && t.status).toBe('done');
+		expect(t.kind === 'tool' && t.result).toContain('wrote x.txt');
+		expect(state.orphanTools.size).toBe(0);
 	});
 });

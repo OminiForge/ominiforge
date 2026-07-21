@@ -27,7 +27,10 @@ mod plan;
 mod resume;
 mod sink;
 
-pub use approval::{ApprovalDecision, ApprovalGate, ApprovalRequest, ApprovalResolution, NullGate};
+pub use approval::{
+    ApprovalDecision, ApprovalGate, ApprovalOutcome, ApprovalRequest, ApprovalResolution,
+    ApprovalScope, NullGate,
+};
 pub use error::AgentError;
 pub use plan::{PlanStep, StepStatus};
 pub use resume::rebuild_runtime;
@@ -49,11 +52,11 @@ use crate::core::payload::{
 use crate::core::{EventId, EventPayload, EventSource, SourceKind, TurnId};
 use crate::hook::{BeforeEffect, HookExecution, HookPoint, HookRegistry};
 use crate::llm::{LlmError, Message, ModelRequest, Provider, StreamEvent, ToolCall, ToolSchema};
-use crate::session::SessionWriter;
 use crate::permission::{Decision, PermissionPolicy};
+use crate::session::SessionWriter;
 use crate::tool::{ToolError, ToolInput, ToolRegistry};
 
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 
 use plan::{PLAN_TOOL_NAME, PlanError, PlanOp, apply_plan_op};
 
@@ -196,8 +199,11 @@ pub struct Agent {
     /// default — a no-op until the caller attaches a registry.
     hooks: HookRegistry,
     /// The tool-call permission gate (`doc/permission.md`). Empty by default —
-    /// every call is allowed until the caller attaches a policy.
-    permission: PermissionPolicy,
+    /// every call is allowed until the caller attaches a policy. Behind an
+    /// `Arc<RwLock>` so a front-end (the gateway's approval gate) can pin
+    /// scoped approvals into the running session mid-turn
+    /// ([`permission_handle`](Self::permission_handle)).
+    permission: Arc<std::sync::RwLock<PermissionPolicy>>,
     /// Resolves an `Ask` decision into approve/reject. Defaults to the
     /// fail-closed [`NullGate`]; a front-end attaches its own via
     /// [`with_approval_gate`](Self::with_approval_gate).
@@ -214,7 +220,7 @@ impl Agent {
             config,
             compaction: None,
             hooks: HookRegistry::new(),
-            permission: PermissionPolicy::default(),
+            permission: Arc::new(std::sync::RwLock::new(PermissionPolicy::default())),
             approval: approval::default_gate(),
         }
     }
@@ -239,8 +245,17 @@ impl Agent {
     /// in `dispatch_tool` before execution (`doc/permission.md`).
     #[must_use]
     pub fn with_permission(mut self, permission: PermissionPolicy) -> Self {
-        self.permission = permission;
+        self.permission = Arc::new(std::sync::RwLock::new(permission));
         self
+    }
+
+    /// A shared handle to the live permission policy, so a front-end (the
+    /// gateway's approval gate) can pin scoped approvals into the running
+    /// session (`doc/permission.md` §5). Writes through the handle take effect
+    /// on the next `dispatch_tool` evaluation.
+    #[must_use]
+    pub fn permission_handle(&self) -> Arc<std::sync::RwLock<PermissionPolicy>> {
+        Arc::clone(&self.permission)
     }
 
     /// Attach the approval gate that resolves `ask` decisions. Without this the
@@ -446,6 +461,134 @@ enum Gate {
     GiveUp,
 }
 
+/// A call that will not execute, carrying everything its failure write needs
+/// (`TurnState::write_deferred_failure`). On the concurrent path the event is
+/// written immediately after phase A — the call is already decided, there is
+/// nothing to wait for; on the serial path it is written in place, so the
+/// failure always commits in completion order like any other result event.
+/// Only the messages fed to the model keep strict call order.
+struct DeferredFailure {
+    /// The tool-call event this failure pairs with.
+    parent: EventId,
+    /// The machine-readable failure code (`denied_by_policy`, …).
+    code: &'static str,
+    /// The human/model-facing message.
+    reason: String,
+    /// The `tool:invoke:after` payload to fire after the failure write, if any.
+    after_payload: Option<serde_json::Value>,
+}
+
+/// How an answered `ask` settles (`TurnState::audit_ask`).
+enum AskVerdict {
+    /// Run the tool.
+    Approved,
+    /// Block the call with this model-facing code/reason.
+    Blocked { code: &'static str, reason: String },
+}
+
+/// What one per-call chain (`TurnState::spawn_chain`) settled into. A chain
+/// only *runs* — awaiting its own gate answer and executing; the gate's answer
+/// is reported back over the verdict channel the moment it lands (audited on
+/// the turn task immediately), and the result event is written on the turn
+/// task as soon as the chain finishes, in completion order.
+enum ChainResult {
+    /// The call was blocked (gate rejection/auto-denial) or could not run
+    /// (unknown tool): write this failure as the chain's result.
+    Failed {
+        code: &'static str,
+        reason: String,
+        after_payload: Option<serde_json::Value>,
+    },
+    /// The call executed: write this result (invoke outcome + wall time).
+    Executed {
+        result: (crate::tool::ToolResult, std::time::Duration),
+    },
+}
+
+/// One call's state in the concurrent dispatcher: either a failure deferred
+/// from `prepare_tool` (written immediately — already decided) or a running
+/// per-call chain to join.
+enum PhaseBOutcome {
+    /// No chain — write this failure right away.
+    Failed(DeferredFailure),
+    /// A running chain: the call awaits only its *own* gate answer (an `ask`)
+    /// and executes the moment it is approved — an `allow` chain went straight
+    /// to execution — never waiting on any other call's decision.
+    Chained {
+        parent: EventId,
+        handle: tokio::task::JoinHandle<ChainResult>,
+    },
+}
+
+/// Aborts every still-running chain when dropped (`drive` holds it across the
+/// write-back loop): on a cancel or a hard turn error the turn task's future
+/// is dropped, and this guard with it — killing each chain's `tool.invoke`
+/// mid-flight rather than letting a detached task finish its side effects
+/// while the log reads `cancelled` (`doc/permission.md` §5.2). On the normal
+/// path the loop has drained every chain, so the aborts are no-ops.
+struct ChainAbortGuard(Vec<tokio::task::AbortHandle>);
+
+impl Drop for ChainAbortGuard {
+    fn drop(&mut self) {
+        for handle in &self.0 {
+            handle.abort();
+        }
+    }
+}
+
+/// One leaf tool call after [`TurnState::prepare_tool`]: the dispatch front half
+/// (parse, `Started`, before-hooks, permission) has run, so what remains is
+/// execution, nothing (already settled), or a human decision.
+enum PreparedCall {
+    /// Permission allowed: execute with this post-hook input, under this parent
+    /// event id.
+    Run {
+        parent: EventId,
+        args: serde_json::Value,
+    },
+    /// Settled before execution (bad arguments, hook block, policy deny):
+    /// decided and audited; the failure *event* is written immediately on the
+    /// concurrent path (its feedback message still joins the model-facing
+    /// results in call order).
+    Settled(DeferredFailure),
+    /// The policy asked a human (`Requested` already audited). `gate` is the
+    /// spawned gate task when the round is dispatched concurrently, or `None`
+    /// to request inline on the serial path.
+    Ask {
+        parent: EventId,
+        args: serde_json::Value,
+        gate: Option<tokio::task::JoinHandle<ApprovalOutcome>>,
+    },
+}
+
+/// Map a gate answer to what the call may do. Pure — usable inside a spawned
+/// chain, which has no turn-state access; the audit write happens later, on
+/// the turn task (`TurnState::audit_answer`).
+fn ask_verdict(resolution: ApprovalResolution, tool_name: &str) -> AskVerdict {
+    match resolution {
+        ApprovalResolution::Approved | ApprovalResolution::PinnedByRule { approved: true } => {
+            AskVerdict::Approved
+        }
+        ApprovalResolution::RejectedByUser => AskVerdict::Blocked {
+            code: "denied_by_user",
+            reason: format!("Rejected by user: the call to `{tool_name}` was not approved."),
+        },
+        // A pinned deny rule blocks exactly like a policy deny in `prepare_tool`.
+        ApprovalResolution::PinnedByRule { approved: false } => AskVerdict::Blocked {
+            code: "denied_by_policy",
+            reason: format!(
+                "Denied by permission policy: tool `{tool_name}` is not permitted with this input."
+            ),
+        },
+        ApprovalResolution::AutoDenied => AskVerdict::Blocked {
+            code: "denied_no_approval",
+            reason: format!(
+                "Not approved: the call to `{tool_name}` was blocked — no approval was received."
+            ),
+        },
+    }
+}
+
 impl TurnState<'_> {
     /// Drive the turn to completion. Built by
     /// [`run_turn_with_sink`](Agent::run_turn_with_sink); the only entry point.
@@ -515,6 +658,7 @@ impl TurnState<'_> {
     /// The round loop. Returns `Ok` for every *graceful* outcome (clean finish,
     /// max-rounds safety net, plan stall); a hard provider/persistence fault
     /// short-circuits as `Err` and is given a terminal trace by [`run`](Self::run).
+    #[allow(clippy::too_many_lines)] // the two-phase dispatch keeps one linear narration
     async fn drive(&mut self) -> Result<TurnOutcome, AgentError> {
         while self.round < self.agent.config.max_rounds {
             let outcome = self.run_model_round().await?;
@@ -551,12 +695,125 @@ impl TurnState<'_> {
             // threshold (`doc/plan.md` §7).
             let mut progressed = false;
             let mut touched: Vec<String> = Vec::new();
-            for call in tool_calls {
-                let event_id = outcome.tool_call_event_ids.get(&call.id).cloned();
-                touched.extend(touched_paths(&call));
-                let (result, made_progress) = self.dispatch(&call, event_id).await?;
-                progressed |= made_progress;
-                self.runtime.push_message(result);
+            if self.agent.approval.supports_concurrent_requests() {
+                // Two-phase dispatch (`doc/permission.md` §5). Phase A prepares
+                // every call in order — `Started`, before-hooks, permission —
+                // never waiting on a human, spawning a gate task per `ask` so
+                // all of the round's prompts are live at once. Phase B runs
+                // every call on its own chain: it executes the moment its own
+                // approval lands, and its result event commits as soon as it
+                // finishes. Only the messages fed back to the model wait —
+                // they assemble afterwards, strictly in call order.
+                let mut prepared: Vec<PreparedCall> = Vec::with_capacity(tool_calls.len());
+                for call in &tool_calls {
+                    let event_id = outcome.tool_call_event_ids.get(&call.id).cloned();
+                    touched.extend(touched_paths(call));
+                    let mut prep = self.prepare_tool(call, event_id).await?;
+                    if let PreparedCall::Ask { args, gate, .. } = &mut prep {
+                        let approval = Arc::clone(&self.agent.approval);
+                        let request = ApprovalRequest {
+                            tool_name: call.name.clone(),
+                            input: args.clone(),
+                            call_id: call.id.clone(),
+                        };
+                        *gate = Some(tokio::spawn(async move { approval.request(request).await }));
+                    }
+                    prepared.push(prep);
+                }
+                // Phase B: spawn one independent chain per call. Each chain
+                // awaits only its *own* gate answer and executes the moment it
+                // is approved — an approval of call #2 starts #2's execution
+                // while call #1 is still undecided. `allow` chains skip the
+                // gate. Ask chains report their answers over the verdict
+                // channel the moment they land.
+                let (verdict_tx, mut verdict_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<(usize, ApprovalOutcome)>();
+                // Tool-result messages accumulate per slot and are pushed after
+                // the loop, so the model always sees them in `tool_call` order.
+                let mut results: Vec<Option<Message>> =
+                    (0..tool_calls.len()).map(|_| None).collect();
+                let mut completions = futures_util::stream::FuturesUnordered::new();
+                let mut abort_handles = Vec::new();
+                for (slot, (call, prep)) in tool_calls.iter().zip(prepared).enumerate() {
+                    let (outcome, abort) = self.spawn_chain(slot, call, prep, verdict_tx.clone());
+                    if let Some(abort) = abort {
+                        abort_handles.push(abort);
+                    }
+                    match outcome {
+                        // Settled in phase A (bad args, hook block, policy deny):
+                        // no chain to wait on — the failure writes immediately.
+                        PhaseBOutcome::Failed(failure) => {
+                            let (message, made_progress) =
+                                self.write_deferred_failure(call, failure).await?;
+                            progressed |= made_progress;
+                            results[slot] = Some(message);
+                        }
+                        // Map the join so the completion carries its slot.
+                        // Dropping the mapped future drops the `JoinHandle`,
+                        // which detaches the chain (a `JoinSet` would abort its
+                        // tasks on drop, changing the cancel semantics the
+                        // gateway relies on).
+                        PhaseBOutcome::Chained { parent, handle } => {
+                            completions.push(handle.map(move |joined| (slot, parent, joined)));
+                        }
+                    }
+                }
+                // From here until the write-back loop ends, dropping the turn
+                // future (cancel, hard error) recalls every still-running chain
+                // — each `invoke` dies mid-flight instead of a detached task
+                // finishing its side effects while the log reads `cancelled`
+                // (`doc/permission.md` §5.2). On the normal path the loop
+                // drains every chain and the guard's aborts are no-ops.
+                let _chain_guard = ChainAbortGuard(abort_handles);
+                // The verdict channel closes once every ask chain dropped its
+                // sender (chains hold theirs to the end of their run).
+                drop(verdict_tx);
+                // Write-back driver: a verdict is audited the moment it arrives
+                // (a human's approval is visible at once), and each chain's
+                // result event commits the moment the chain finishes — the
+                // front-end watches every call complete in real time, in
+                // completion order. The select never waits on one call's chain
+                // to write another call's events.
+                loop {
+                    tokio::select! {
+                        // Verdicts first: a decision is audited as soon as it
+                        // lands, never queued behind a completion.
+                        biased;
+                        Some((vslot, answer)) = verdict_rx.recv() => {
+                            self.audit_answer(&tool_calls[vslot], answer)?;
+                        }
+                        Some((slot, parent, joined)) = completions.next() => {
+                            let call = &tool_calls[slot];
+                            let (message, made_progress) =
+                                self.write_chain_result(call, parent, joined).await?;
+                            progressed |= made_progress;
+                            results[slot] = Some(message);
+                        }
+                        // The verdict channel is closed and drained, and every
+                        // chain completed — nothing left to wait for. (A
+                        // verdict always precedes its chain's completion, so a
+                        // closed channel can never strand an unfinished chain.)
+                        else => break,
+                    }
+                }
+                // Belt and braces, in case the race reasoning above ever
+                // changes: mop up any straggler rather than drop a decision.
+                while let Ok((vslot, answer)) = verdict_rx.try_recv() {
+                    self.audit_answer(&tool_calls[vslot], answer)?;
+                }
+                // The model sees tool results strictly in `tool_call` order,
+                // however the executions finished.
+                for message in results.into_iter().flatten() {
+                    self.runtime.push_message(message);
+                }
+            } else {
+                for call in tool_calls {
+                    let event_id = outcome.tool_call_event_ids.get(&call.id).cloned();
+                    touched.extend(touched_paths(&call));
+                    let (result, made_progress) = self.dispatch(&call, event_id).await?;
+                    progressed |= made_progress;
+                    self.runtime.push_message(result);
+                }
             }
             // Load any nested project-guidance file the touched paths sit under,
             // once per session, *after* the round's tool results are in place so
@@ -873,12 +1130,15 @@ impl TurnState<'_> {
         Ok(())
     }
 
-    /// Record how a gated call resolved (`doc/permission.md` §6).
+    /// Record how a gated call resolved (`doc/permission.md` §6). `scope` is the
+    /// human-chosen reach of the decision when one was made (`None` for policy
+    /// denies and fail-closed auto-denials).
     fn record_permission_decided(
         &mut self,
         call: &ToolCall,
         outcome: PermissionOutcome,
         decided_by: &str,
+        scope: Option<ApprovalScope>,
     ) -> Result<(), AgentError> {
         self.writer.append(
             runtime_source(),
@@ -886,6 +1146,7 @@ impl TurnState<'_> {
                 call_id: call.id.clone(),
                 outcome,
                 decided_by: decided_by.to_owned(),
+                scope,
             }),
             None,
             Some(self.turn_id.clone()),
@@ -1084,13 +1345,28 @@ impl TurnState<'_> {
 
     /// Execute one leaf tool call, persisting `ToolEvent`s and returning the
     /// `Tool` message to feed back to the model, paired with whether it made
-    /// progress (a non-error result; see [`dispatch`](Self::dispatch)).
-    #[allow(clippy::too_many_lines)] // before/after hook brackets around one dispatch
+    /// progress (a non-error result; see [`dispatch`](Self::dispatch)). This is
+    /// the serial path: prepare and settle inline, one call at a time.
     async fn dispatch_tool(
         &mut self,
         call: &ToolCall,
         tool_call_event_id: Option<EventId>,
     ) -> Result<(Message, bool), AgentError> {
+        let prepared = self.prepare_tool(call, tool_call_event_id).await?;
+        self.settle_prepared(call, prepared).await
+    }
+
+    /// The dispatch front half: parse the arguments, write `ToolEvent::Started`,
+    /// run the `tool:invoke:before` chain, and classify the post-hook input
+    /// through the permission policy (`doc/permission.md`). Every step is
+    /// in-order and never waits on a human, so the concurrent dispatcher can
+    /// run it back-to-back for a whole round before settling any call.
+    #[allow(clippy::too_many_lines)] // before/after hook brackets around one dispatch
+    async fn prepare_tool(
+        &mut self,
+        call: &ToolCall,
+        tool_call_event_id: Option<EventId>,
+    ) -> Result<PreparedCall, AgentError> {
         let parent = self.parent_event_id(tool_call_event_id);
         let source = EventSource {
             kind: SourceKind::Tool,
@@ -1103,16 +1379,12 @@ impl TurnState<'_> {
             match serde_json::from_str(&call.arguments) {
                 Ok(value) => value,
                 Err(e) => {
-                    return self
-                        .fail_tool(
-                            &source,
-                            &parent,
-                            call,
-                            0,
-                            "invalid_arguments",
-                            &format!("tool arguments were not valid JSON: {e}"),
-                        )
-                        .map(|m| (m, false));
+                    return Ok(PreparedCall::Settled(DeferredFailure {
+                        parent,
+                        code: "invalid_arguments",
+                        reason: format!("tool arguments were not valid JSON: {e}"),
+                        after_payload: None,
+                    }));
                 }
             }
         };
@@ -1140,21 +1412,14 @@ impl TurnState<'_> {
         {
             BeforeEffect::Proceed(payload) => payload,
             BeforeEffect::Block { reason, by } => {
-                let msg = self.fail_tool(
-                    &source,
-                    &parent,
-                    call,
-                    0,
-                    "blocked_by_hook",
-                    &format!("Blocked by hook [{by}]: {reason}"),
-                )?;
-                self.fire_after(
-                    HookPoint::ToolInvokeAfter,
-                    serde_json::json!({ "tool_name": call.name, "blocked": true, "reason": "hook" }),
-                    Some(call.name.clone()),
-                )
-                .await?;
-                return Ok((msg, false));
+                return Ok(PreparedCall::Settled(DeferredFailure {
+                    parent,
+                    code: "blocked_by_hook",
+                    reason: format!("Blocked by hook [{by}]: {reason}"),
+                    after_payload: Some(
+                        serde_json::json!({ "tool_name": call.name, "blocked": true, "reason": "hook" }),
+                    ),
+                }));
             }
         };
 
@@ -1163,8 +1428,20 @@ impl TurnState<'_> {
         // suspends for the approval gate; a rejected ask blocks too. A blocked
         // call becomes a `ToolEvent::Failed` the model sees and can react to —
         // the same shape as a hook block (§8) — so it is fed back, not fatal.
-        if !self.agent.permission.is_empty() {
-            match self.agent.permission.evaluate(&call.name, &args) {
+        //
+        // The policy is cloned out under a read lock — never held across an
+        // `.await` — so a scoped approval pinning a rule mid-turn is picked up
+        // on the next evaluation. A poisoned lock still holds an intact policy
+        // (a writer panic cannot tear a `Vec<Rule>`), so recovering the guard
+        // keeps the gate in force rather than silently skipping it.
+        let policy = self
+            .agent
+            .permission
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if !policy.is_empty() {
+            match policy.evaluate(&call.name, &args) {
                 Decision::Allow => {}
                 Decision::Deny => {
                     // A policy deny is not a human-gated request — no `Requested`
@@ -1174,87 +1451,178 @@ impl TurnState<'_> {
                         call,
                         PermissionOutcome::AutoDenied,
                         "policy",
+                        None,
                     )?;
-                    let msg = self.fail_tool(
-                        &source,
-                        &parent,
-                        call,
-                        0,
-                        "denied_by_policy",
-                        &format!(
+                    return Ok(PreparedCall::Settled(DeferredFailure {
+                        parent,
+                        code: "denied_by_policy",
+                        reason: format!(
                             "Denied by permission policy: tool `{}` is not permitted \
                              with this input.",
                             call.name
                         ),
-                    )?;
-                    self.fire_after(
-                        HookPoint::ToolInvokeAfter,
-                        serde_json::json!({ "tool_name": call.name, "blocked": true, "reason": "permission" }),
-                        Some(call.name.clone()),
-                    )
-                    .await?;
-                    return Ok((msg, false));
+                        after_payload: Some(
+                            serde_json::json!({ "tool_name": call.name, "blocked": true, "reason": "permission" }),
+                        ),
+                    }));
                 }
                 Decision::Ask => {
                     // An `ask` genuinely requests a human decision — audit the
-                    // request, then map the gate's resolution to an outcome that
-                    // records *who* decided (`doc/permission.md` §6).
+                    // request now, so every ask of a round is published before
+                    // any of them settles; the gate itself is awaited in the
+                    // settle half (`doc/permission.md` §6).
                     self.record_permission_requested(call, &args)?;
-                    let resolution = self
-                        .agent
-                        .approval
-                        .request(ApprovalRequest {
-                            tool_name: call.name.clone(),
-                            input: args.clone(),
-                            call_id: call.id.clone(),
-                        })
-                        .await;
-                    let (outcome, decided_by) = match resolution {
-                        ApprovalResolution::Approved => (PermissionOutcome::Approved, "user"),
-                        ApprovalResolution::RejectedByUser => {
-                            (PermissionOutcome::Rejected, "user")
-                        }
-                        // Fail-closed: no human decided (no gate, dropped channel,
-                        // non-interactive terminal). Audited as such, not as a user
-                        // rejection (`CLAUDE.md` §12).
-                        ApprovalResolution::AutoDenied => {
-                            (PermissionOutcome::AutoDenied, "gate")
-                        }
-                    };
-                    self.record_permission_decided(call, outcome, decided_by)?;
-
-                    if resolution != ApprovalResolution::Approved {
-                        // Both a user rejection and a fail-closed auto-denial block
-                        // the call; the model-facing code tells them apart so the
-                        // model can react (a human said no vs. no approver reached).
-                        let (code, reason) = match resolution {
-                            ApprovalResolution::RejectedByUser => (
-                                "denied_by_user",
-                                format!("Rejected by user: the call to `{}` was not approved.", call.name),
-                            ),
-                            _ => (
-                                "denied_no_approval",
-                                format!(
-                                    "Not approved: the call to `{}` was blocked — no approval was received.",
-                                    call.name
-                                ),
-                            ),
-                        };
-                        let msg = self.fail_tool(&source, &parent, call, 0, code, &reason)?;
-                        self.fire_after(
-                            HookPoint::ToolInvokeAfter,
-                            serde_json::json!({ "tool_name": call.name, "blocked": true, "reason": "permission" }),
-                            Some(call.name.clone()),
-                        )
-                        .await?;
-                        return Ok((msg, false));
-                    }
-                    // Approved — fall through and run the tool.
+                    return Ok(PreparedCall::Ask {
+                        parent,
+                        args,
+                        gate: None,
+                    });
                 }
             }
         }
+        Ok(PreparedCall::Run { parent, args })
+    }
 
+    /// The dispatch back half: resolve a prepared call to its `Tool` message.
+    /// An `ask` awaits the gate task the concurrent dispatcher spawned (or
+    /// requests inline on the serial path); an approved call then executes.
+    async fn settle_prepared(
+        &mut self,
+        call: &ToolCall,
+        prepared: PreparedCall,
+    ) -> Result<(Message, bool), AgentError> {
+        match prepared {
+            PreparedCall::Settled(failure) => self.write_deferred_failure(call, failure).await,
+            PreparedCall::Run { parent, args } => self.execute_tool(call, parent, args).await,
+            PreparedCall::Ask { parent, args, gate } => {
+                let answer = match gate {
+                    // A join error means the gate task panicked: nobody decided,
+                    // so fail closed as an auto-denial, never a user rejection.
+                    Some(handle) => handle.await.unwrap_or(ApprovalOutcome {
+                        resolution: ApprovalResolution::AutoDenied,
+                        scope: None,
+                    }),
+                    None => {
+                        self.agent
+                            .approval
+                            .request(ApprovalRequest {
+                                tool_name: call.name.clone(),
+                                input: args.clone(),
+                                call_id: call.id.clone(),
+                            })
+                            .await
+                    }
+                };
+                self.settle_ask(call, parent, args, answer).await
+            }
+        }
+    }
+
+    /// Settle an `ask` once the gate answered: audit the decision
+    /// (`doc/permission.md` §6), then block or execute.
+    async fn settle_ask(
+        &mut self,
+        call: &ToolCall,
+        parent: EventId,
+        args: serde_json::Value,
+        answer: ApprovalOutcome,
+    ) -> Result<(Message, bool), AgentError> {
+        match self.audit_ask(call, answer)? {
+            AskVerdict::Approved => self.execute_tool(call, parent, args).await,
+            AskVerdict::Blocked { code, reason } => {
+                self.write_deferred_failure(
+                    call,
+                    DeferredFailure {
+                        parent,
+                        code,
+                        reason,
+                        after_payload: Some(
+                            serde_json::json!({ "tool_name": call.name, "blocked": true, "reason": "permission" }),
+                        ),
+                    },
+                )
+                .await
+            }
+        }
+    }
+
+    /// Record the `PermissionEvent::Decided` for an answered `ask`, mapping the
+    /// resolution to *who* decided (`doc/permission.md` §6): a human's answer
+    /// audits as `"user"`, a fail-closed auto-denial as `"gate"` — never as a
+    /// user rejection (`CLAUDE.md` §12).
+    fn audit_answer(&mut self, call: &ToolCall, answer: ApprovalOutcome) -> Result<(), AgentError> {
+        let (outcome, decided_by) = match answer.resolution {
+            ApprovalResolution::Approved => (PermissionOutcome::Approved, "user"),
+            ApprovalResolution::RejectedByUser => (PermissionOutcome::Rejected, "user"),
+            // A pinned rule, not a fresh human answer, resolved the ask
+            // (`doc/permission.md` §5.1): audited as `"policy"` — approved by
+            // an `allow` pin, or auto-denied by a `deny` pin.
+            ApprovalResolution::PinnedByRule { approved: true } => {
+                (PermissionOutcome::Approved, "policy")
+            }
+            ApprovalResolution::PinnedByRule { approved: false } => {
+                (PermissionOutcome::AutoDenied, "policy")
+            }
+            // Fail-closed: no human decided (no gate, dropped channel,
+            // non-interactive terminal).
+            ApprovalResolution::AutoDenied => (PermissionOutcome::AutoDenied, "gate"),
+        };
+        self.record_permission_decided(call, outcome, decided_by, answer.scope)
+    }
+
+    /// Audit an answered `ask` and classify it: approved to execute, or
+    /// blocked with the model-facing code/reason (`ask_verdict`).
+    fn audit_ask(
+        &mut self,
+        call: &ToolCall,
+        answer: ApprovalOutcome,
+    ) -> Result<AskVerdict, AgentError> {
+        self.audit_answer(call, answer)?;
+        Ok(ask_verdict(answer.resolution, &call.name))
+    }
+
+    /// Write a pre-execution failure (bad arguments, hook block, policy deny,
+    /// gate rejection) and build its feedback message. Shared by the serial
+    /// settle and the concurrent dispatcher (which writes these immediately —
+    /// the call is already decided, there is nothing to wait for).
+    async fn write_deferred_failure(
+        &mut self,
+        call: &ToolCall,
+        failure: DeferredFailure,
+    ) -> Result<(Message, bool), AgentError> {
+        let source = EventSource {
+            kind: SourceKind::Tool,
+            id: call.name.clone(),
+        };
+        let message = self.fail_tool(
+            &source,
+            &failure.parent,
+            call,
+            0,
+            failure.code,
+            &failure.reason,
+        )?;
+        if let Some(payload) = failure.after_payload {
+            self.fire_after(HookPoint::ToolInvokeAfter, payload, Some(call.name.clone()))
+                .await?;
+        }
+        Ok((message, false))
+    }
+
+    /// Execute a prepared call inline (the serial path): look the tool up,
+    /// invoke it, and write the result back through
+    /// [`write_execution_result`](Self::write_execution_result).
+    async fn execute_tool(
+        &mut self,
+        call: &ToolCall,
+        parent: EventId,
+        args: serde_json::Value,
+    ) -> Result<(Message, bool), AgentError> {
         let Some(tool) = self.agent.tools.get(&call.name) else {
+            let source = EventSource {
+                kind: SourceKind::Tool,
+                id: call.name.clone(),
+            };
             let msg = self.fail_tool(
                 &source,
                 &parent,
@@ -1266,16 +1634,187 @@ impl TurnState<'_> {
             return Ok((msg, false));
         };
 
-        let started = Instant::now();
         let input = ToolInput {
             call_id: call.id.clone(),
             input: args,
             timeout: self.agent.config.tool_timeout,
         };
-        let elapsed = |start: Instant| duration_ms(start.elapsed());
+        let started = Instant::now();
+        let result = tool.invoke(input).await;
+        self.write_execution_result(call, parent, Ok((result, started.elapsed())))
+            .await
+    }
 
-        let (message, made_progress) = match tool.invoke(input).await {
-            Ok(output) => {
+    /// Spawn one call's independent chain (the concurrent path): the chain
+    /// awaits only its *own* gate answer and, on approval, executes
+    /// immediately — never waiting on any other call's decision. An `allow`
+    /// chain skips the gate entirely. An `ask` chain reports its answer over
+    /// `verdict_tx` the moment it lands (audited on the turn task at once — a
+    /// human's approval is immediately visible); its result event commits as
+    /// soon as the chain finishes, in completion order (`write_chain_result`).
+    /// A `Settled` call from `prepare_tool` needs no chain — its deferred
+    /// failure writes immediately after phase A.
+    ///
+    /// The chain's [`tokio::task::AbortHandle`] comes back with it so `drive`
+    /// can recall the chain on cancel (`ChainAbortGuard`).
+    #[allow(clippy::too_many_lines)] // the ask arm is one straight-line closure
+    fn spawn_chain(
+        &self,
+        slot: usize,
+        call: &ToolCall,
+        prep: PreparedCall,
+        verdict_tx: tokio::sync::mpsc::UnboundedSender<(usize, ApprovalOutcome)>,
+    ) -> (PhaseBOutcome, Option<tokio::task::AbortHandle>) {
+        match prep {
+            PreparedCall::Settled(failure) => (PhaseBOutcome::Failed(failure), None),
+            PreparedCall::Run { parent, args } => {
+                let tool = self.agent.tools.get(&call.name);
+                let tool_name = call.name.clone();
+                let input = ToolInput {
+                    call_id: call.id.clone(),
+                    input: args,
+                    timeout: self.agent.config.tool_timeout,
+                };
+                let handle = tokio::spawn(async move {
+                    match tool {
+                        Some(tool) => {
+                            let started = Instant::now();
+                            let result = tool.invoke(input).await;
+                            ChainResult::Executed {
+                                result: (result, started.elapsed()),
+                            }
+                        }
+                        None => ChainResult::Failed {
+                            code: "unknown_tool",
+                            reason: format!("no such tool: {tool_name}"),
+                            after_payload: None,
+                        },
+                    }
+                });
+                let abort = handle.abort_handle();
+                (PhaseBOutcome::Chained { parent, handle }, Some(abort))
+            }
+            PreparedCall::Ask { parent, args, gate } => {
+                let tool = self.agent.tools.get(&call.name);
+                let approval = Arc::clone(&self.agent.approval);
+                let timeout = self.agent.config.tool_timeout;
+                let tool_name = call.name.clone();
+                let call_id = call.id.clone();
+                let handle = tokio::spawn(async move {
+                    let answer = match gate {
+                        // A join error means the gate task panicked: nobody
+                        // decided, so fail closed as an auto-denial.
+                        Some(handle) => handle.await.unwrap_or(ApprovalOutcome {
+                            resolution: ApprovalResolution::AutoDenied,
+                            scope: None,
+                        }),
+                        None => {
+                            approval
+                                .request(ApprovalRequest {
+                                    tool_name: tool_name.clone(),
+                                    input: args.clone(),
+                                    call_id: call_id.clone(),
+                                })
+                                .await
+                        }
+                    };
+                    // Report the verdict before doing anything else: the turn
+                    // task audits it the moment it lands, so a human's decision
+                    // becomes visible immediately rather than at this call's
+                    // ordered write-back slot. A dead receiver (the turn failed
+                    // hard) is harmless — the chain's own work continues.
+                    let _ = verdict_tx.send((slot, answer));
+                    match ask_verdict(answer.resolution, &tool_name) {
+                        AskVerdict::Approved => match tool {
+                            Some(tool) => {
+                                let started = Instant::now();
+                                let result = tool
+                                    .invoke(ToolInput {
+                                        call_id,
+                                        input: args,
+                                        timeout,
+                                    })
+                                    .await;
+                                ChainResult::Executed {
+                                    result: (result, started.elapsed()),
+                                }
+                            }
+                            None => ChainResult::Failed {
+                                code: "unknown_tool",
+                                reason: format!("no such tool: {tool_name}"),
+                                after_payload: None,
+                            },
+                        },
+                        AskVerdict::Blocked { code, reason } => ChainResult::Failed {
+                            code,
+                            reason,
+                            after_payload: Some(
+                                serde_json::json!({ "tool_name": tool_name, "blocked": true, "reason": "permission" }),
+                            ),
+                        },
+                    }
+                });
+                let abort = handle.abort_handle();
+                (PhaseBOutcome::Chained { parent, handle }, Some(abort))
+            }
+        }
+    }
+
+    /// Write a finished chain's settlement as its result event, the moment the
+    /// chain completes: the execution result, or the failure. (The gate's
+    /// answer was already audited when the chain reported it over the verdict
+    /// channel.) A panicked chain becomes this call's `tool_panic` failure,
+    /// scoped to the call.
+    async fn write_chain_result(
+        &mut self,
+        call: &ToolCall,
+        parent: EventId,
+        outcome: Result<ChainResult, tokio::task::JoinError>,
+    ) -> Result<(Message, bool), AgentError> {
+        match outcome {
+            Ok(ChainResult::Failed {
+                code,
+                reason,
+                after_payload,
+            }) => {
+                self.write_deferred_failure(
+                    call,
+                    DeferredFailure {
+                        parent,
+                        code,
+                        reason,
+                        after_payload,
+                    },
+                )
+                .await
+            }
+            Ok(ChainResult::Executed { result }) => {
+                self.write_execution_result(call, parent, Ok(result)).await
+            }
+            Err(join_err) => {
+                self.write_execution_result(call, parent, Err(join_err))
+                    .await
+            }
+        }
+    }
+
+    /// Write a finished execution's result at the call's ordered slot:
+    /// `Completed` on success, `Failed` on a tool error or a panicked task
+    /// (scoped to this call — every other concurrent call is unaffected), then
+    /// the `tool:invoke:after` chain. Runs on the turn task; the execution
+    /// itself already ran, possibly concurrently (`spawn_execution`).
+    async fn write_execution_result(
+        &mut self,
+        call: &ToolCall,
+        parent: EventId,
+        outcome: Result<(crate::tool::ToolResult, std::time::Duration), tokio::task::JoinError>,
+    ) -> Result<(Message, bool), AgentError> {
+        let source = EventSource {
+            kind: SourceKind::Tool,
+            id: call.name.clone(),
+        };
+        let (message, made_progress) = match outcome {
+            Ok((Ok(output), elapsed)) => {
                 // A successful invocation that reports a business-level error
                 // (`is_error`) is not progress — the step is still spinning.
                 let made_progress = !output.is_error;
@@ -1286,7 +1825,7 @@ impl TurnState<'_> {
                     EventPayload::Tool(ToolEvent::Completed {
                         tool_call_event_id: parent.clone(),
                         result: output,
-                        duration_ms: elapsed(started),
+                        duration_ms: duration_ms(elapsed),
                         output_bytes,
                         artifacts_created: Vec::new(),
                     }),
@@ -1301,10 +1840,23 @@ impl TurnState<'_> {
                     made_progress,
                 )
             }
-            Err(err) => {
+            Ok((Err(err), elapsed)) => {
                 let (code, message) = tool_error_parts(&err);
                 let msg =
-                    self.fail_tool(&source, &parent, call, elapsed(started), code, &message)?;
+                    self.fail_tool(&source, &parent, call, duration_ms(elapsed), code, &message)?;
+                (msg, false)
+            }
+            Err(join_err) => {
+                // The execution task panicked or was cancelled: scoped to this
+                // call, the rest of the concurrent batch is unaffected.
+                let msg = self.fail_tool(
+                    &source,
+                    &parent,
+                    call,
+                    0,
+                    "tool_panic",
+                    &format!("tool execution task failed: {join_err}"),
+                )?;
                 (msg, false)
             }
         };
@@ -2962,8 +3514,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ApprovalGate for FixedGate {
-        async fn request(&self, _req: ApprovalRequest) -> ApprovalResolution {
-            self.0
+        async fn request(&self, _req: ApprovalRequest) -> ApprovalOutcome {
+            ApprovalOutcome {
+                resolution: self.0,
+                scope: None,
+            }
         }
     }
 
@@ -3012,10 +3567,12 @@ mod tests {
     }
 
     fn has_failed_code(events: &[CoreEvent], code: &str) -> bool {
-        events.iter().any(|e| matches!(
-            &e.payload,
-            EventPayload::Tool(ToolEvent::Failed { error, .. }) if error.code == code
-        ))
+        events.iter().any(|e| {
+            matches!(
+                &e.payload,
+                EventPayload::Tool(ToolEvent::Failed { error, .. }) if error.code == code
+            )
+        })
     }
 
     fn has_permission_requested(events: &[CoreEvent]) -> bool {
@@ -3052,6 +3609,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let policy = PermissionPolicy {
             deny: vec![deny_rule("shell", &["rm"])], // unrelated to write
+            allow: vec![],
             ask: vec![],
         };
         let (wrote, events) = run_write_under_policy(dir.path(), policy, None).await;
@@ -3071,6 +3629,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let policy = PermissionPolicy {
             deny: vec![deny_rule("write", &[])], // deny the write tool outright
+            allow: vec![],
             ask: vec![],
         };
         let (wrote, events) = run_write_under_policy(dir.path(), policy, None).await;
@@ -3080,7 +3639,10 @@ mod tests {
         // audited (no `Requested`, which would render a spurious approval card —
         // M4). `decided_by` is "policy", not "user".
         assert!(!has_permission_requested(&events));
-        assert!(has_permission_decided(&events, PermissionOutcome::AutoDenied));
+        assert!(has_permission_decided(
+            &events,
+            PermissionOutcome::AutoDenied
+        ));
         assert!(has_decided_by(&events, "policy"));
     }
 
@@ -3092,6 +3654,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let policy = PermissionPolicy {
             deny: vec![],
+            allow: vec![],
             ask: vec![deny_rule("write", &[])],
         };
         let gate = std::sync::Arc::new(FixedGate(ApprovalResolution::Approved));
@@ -3109,6 +3672,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let policy = PermissionPolicy {
             deny: vec![],
+            allow: vec![],
             ask: vec![deny_rule("write", &[])],
         };
         let gate = std::sync::Arc::new(FixedGate(ApprovalResolution::RejectedByUser));
@@ -3126,6 +3690,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let policy = PermissionPolicy {
             deny: vec![],
+            allow: vec![],
             ask: vec![deny_rule("write", &[])],
         };
         let (wrote, events) = run_write_under_policy(dir.path(), policy, None).await;
@@ -3133,12 +3698,657 @@ mod tests {
         // Audited honestly: no human decided, so it is an AutoDenied by the
         // "gate", never a fabricated "user" rejection (M2, `CLAUDE.md` §12). The
         // model-facing code says "no approval received", not "denied by user".
-        assert!(has_permission_decided(&events, PermissionOutcome::AutoDenied));
+        assert!(has_permission_decided(
+            &events,
+            PermissionOutcome::AutoDenied
+        ));
         assert!(has_failed_code(&events, "denied_no_approval"));
         assert!(!has_failed_code(&events, "denied_by_user"));
         assert!(
             !has_decided_by(&events, "user"),
             "a fail-closed denial must not be attributed to a user"
+        );
+    }
+
+    // ── Parallel approvals (two-phase dispatch, `doc/permission.md` §5) ──────
+
+    /// A concurrency-capable fake gate: resolves each request from a per-call
+    /// map and records every request that arrived — driving the two-phase
+    /// dispatch without a front-end.
+    struct ConcurrentGate {
+        resolutions: HashMap<String, ApprovalResolution>,
+        requested: Mutex<Vec<String>>,
+    }
+
+    impl ConcurrentGate {
+        fn approve_all() -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                resolutions: HashMap::new(),
+                requested: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ApprovalGate for ConcurrentGate {
+        async fn request(&self, req: ApprovalRequest) -> ApprovalOutcome {
+            self.requested.lock().unwrap().push(req.call_id.clone());
+            let resolution = self
+                .resolutions
+                .get(&req.call_id)
+                .copied()
+                .unwrap_or(ApprovalResolution::Approved);
+            ApprovalOutcome {
+                resolution,
+                scope: None,
+            }
+        }
+
+        fn supports_concurrent_requests(&self) -> bool {
+            true
+        }
+    }
+
+    /// One model round issuing two `write` calls (block index 0 and 1), so a
+    /// round holds more than one call to dispatch.
+    fn two_write_calls_round(id1: &str, path1: &str, id2: &str, path2: &str) -> Vec<StreamEvent> {
+        let block = |index: u32, id: &str, path: &str| {
+            vec![
+                StreamEvent::BlockStart {
+                    index,
+                    block_type: ContentBlockType::ToolCall {
+                        id: id.to_owned(),
+                        name: "write".to_owned(),
+                    },
+                },
+                StreamEvent::ToolCallDelta {
+                    index,
+                    json_delta: format!(r#"{{"path":"{path}","content":"hi"}}"#),
+                },
+                StreamEvent::BlockStop { index },
+            ]
+        };
+        let mut events = block(0, id1, path1);
+        events.extend(block(1, id2, path2));
+        events.push(StreamEvent::Completed {
+            stop_reason: StopReason::ToolUse,
+            usage: Usage::default(),
+        });
+        events
+    }
+
+    /// Run a scripted turn under `policy` with `gate`, returning the committed
+    /// events. Generalizes `run_write_under_policy` to custom round scripts —
+    /// the parallel-approval tests drive two-call rounds through it.
+    async fn run_rounds_under_policy(
+        dir: &std::path::Path,
+        rounds: Vec<Vec<StreamEvent>>,
+        policy: PermissionPolicy,
+        gate: std::sync::Arc<dyn ApprovalGate>,
+    ) -> Vec<CoreEvent> {
+        let workspace = dir.to_path_buf();
+        let provider = Arc::new(ScriptedProvider::new(rounds));
+        let mut tools = ToolRegistry::new();
+        crate::tool::register_builtin(&mut tools, workspace);
+        let agent = Agent::new(
+            provider,
+            tools,
+            AgentConfig {
+                model: "mock".to_owned(),
+                ..AgentConfig::default()
+            },
+        )
+        .with_permission(policy)
+        .with_approval_gate(gate);
+
+        let store = SessionStore::new(dir.join("sessions"));
+        let mut writer = store
+            .create_new(None, None, vec!["write".to_owned()])
+            .unwrap();
+        let sid = writer.session_id().clone();
+        let mut runtime = SessionRuntime::default();
+        agent
+            .run_turn(&mut writer, &mut runtime, "write files".to_owned())
+            .await
+            .unwrap();
+        drop(writer);
+        store.read_events(&sid).unwrap()
+    }
+
+    /// Two `ask` calls in one round under a concurrency-capable gate: BOTH
+    /// requests are published (`Requested`) before either settles (`Decided`),
+    /// and both approved calls execute in the model's original order. With the
+    /// old serial loop the second call's request never even fired until the
+    /// first was answered.
+    #[tokio::test]
+    async fn parallel_asks_publish_all_requests_before_settling() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = PermissionPolicy {
+            deny: vec![],
+            allow: vec![],
+            ask: vec![deny_rule("write", &[])],
+        };
+        let gate = ConcurrentGate::approve_all();
+        let events = run_rounds_under_policy(
+            dir.path(),
+            vec![
+                two_write_calls_round("c1", "a.txt", "c2", "b.txt"),
+                text_round("done"),
+            ],
+            policy,
+            gate.clone(),
+        )
+        .await;
+
+        // Both asks were approved and executed — both files landed.
+        assert!(dir.path().join("a.txt").exists(), "c1 executed");
+        assert!(dir.path().join("b.txt").exists(), "c2 executed");
+        assert_eq!(
+            gate.requested.lock().unwrap().len(),
+            2,
+            "both asks went out"
+        );
+
+        // Every Requested precedes every Decided.
+        let mut requested_seqs = Vec::new();
+        let mut decided_seqs = Vec::new();
+        for e in &events {
+            match &e.payload {
+                EventPayload::Permission(PermissionEvent::Requested { .. }) => {
+                    requested_seqs.push(e.seq);
+                }
+                EventPayload::Permission(PermissionEvent::Decided { .. }) => {
+                    decided_seqs.push(e.seq);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(requested_seqs.len(), 2, "both asks must be published");
+        assert_eq!(decided_seqs.len(), 2, "both asks settled");
+        let last_requested = requested_seqs.iter().max().unwrap();
+        let first_decided = decided_seqs.iter().min().unwrap();
+        assert!(
+            last_requested < first_decided,
+            "every Requested must precede every Decided: {requested_seqs:?} vs {decided_seqs:?}"
+        );
+
+        // Both approved calls executed — the files asserted above landed. (The
+        // two real `write` tools race to completion, so no commit order is
+        // asserted here; the model still reads results in call order.)
+        assert_eq!(rebuilt_tool_result_ids(&events), ["c1", "c2"]);
+    }
+
+    /// Mixed verdicts on parallel asks: the approved call runs, the rejected
+    /// one is blocked with `denied_by_user`, and both decisions are audited.
+    /// (Decided events land in arrival order — with an instantly-resolving fake
+    /// gate that order is a race, so the assertions are per-call, not ordered.)
+    #[tokio::test]
+    async fn parallel_asks_settle_in_order_with_mixed_verdicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = PermissionPolicy {
+            deny: vec![],
+            allow: vec![],
+            ask: vec![deny_rule("write", &[])],
+        };
+        let gate = std::sync::Arc::new(ConcurrentGate {
+            resolutions: HashMap::from([("c2".to_owned(), ApprovalResolution::RejectedByUser)]),
+            requested: Mutex::new(Vec::new()),
+        });
+        let events = run_rounds_under_policy(
+            dir.path(),
+            vec![
+                two_write_calls_round("c1", "a.txt", "c2", "b.txt"),
+                text_round("done"),
+            ],
+            policy,
+            gate,
+        )
+        .await;
+
+        assert!(dir.path().join("a.txt").exists(), "approved c1 executed");
+        assert!(!dir.path().join("b.txt").exists(), "rejected c2 never ran");
+        assert!(has_failed_code(&events, "denied_by_user"));
+
+        // Each call's decision is audited with its own outcome, whichever
+        // chain's verdict landed first.
+        let outcome_of = |call_id: &str| {
+            events.iter().find_map(|e| match &e.payload {
+                EventPayload::Permission(PermissionEvent::Decided {
+                    call_id: id,
+                    outcome,
+                    ..
+                }) if id == call_id => Some(*outcome),
+                _ => None,
+            })
+        };
+        assert_eq!(outcome_of("c1"), Some(PermissionOutcome::Approved));
+        assert_eq!(outcome_of("c2"), Some(PermissionOutcome::Rejected));
+
+        // …while every call's result event is scoped to its own kind, and the
+        // model reads both results in `tool_call` order.
+        let mut kinds: HashMap<String, String> = result_events_in_order(&events)
+            .into_iter()
+            .map(|(id, _, kind)| (id, kind))
+            .collect();
+        assert_eq!(kinds.remove("c1").as_deref(), Some("completed"));
+        assert_eq!(kinds.remove("c2").as_deref(), Some("denied_by_user"));
+        assert_eq!(rebuilt_tool_result_ids(&events), ["c1", "c2"]);
+    }
+
+    // ── Concurrent execution (two-phase dispatch, `doc/permission.md` §5) ────
+
+    /// A tool that sleeps `delay` before returning a text result, counting its
+    /// invocations — drives the concurrent-execution timing assertions and the
+    /// "rejected calls never execute" check.
+    struct DelayedTool {
+        name: String,
+        delay: std::time::Duration,
+        invocations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tool::Tool for DelayedTool {
+        fn descriptor(&self) -> crate::tool::ToolDescriptor {
+            crate::tool::ToolDescriptor {
+                name: self.name.clone(),
+                description: "sleeps, then answers".to_owned(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        async fn invoke(&self, _input: ToolInput) -> crate::tool::ToolResult {
+            self.invocations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tokio::time::sleep(self.delay).await;
+            Ok(ToolOutput {
+                content: vec![Content::Text(format!("{} done", self.name))],
+                is_error: false,
+                error_code: None,
+            })
+        }
+    }
+
+    /// A tool that always fails with a protocol error — its `Failed` must stay
+    /// scoped to its own call.
+    struct ErrorTool;
+
+    #[async_trait::async_trait]
+    impl crate::tool::Tool for ErrorTool {
+        fn descriptor(&self) -> crate::tool::ToolDescriptor {
+            crate::tool::ToolDescriptor {
+                name: "erratic".to_owned(),
+                description: "always errors".to_owned(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        async fn invoke(&self, _input: ToolInput) -> crate::tool::ToolResult {
+            Err(ToolError::Execution("it broke".to_owned()))
+        }
+    }
+
+    /// A tool that panics mid-invoke — the join error must become this call's
+    /// `Failed` (`tool_panic`), not kill the batch.
+    struct PanicTool;
+
+    #[async_trait::async_trait]
+    impl crate::tool::Tool for PanicTool {
+        fn descriptor(&self) -> crate::tool::ToolDescriptor {
+            crate::tool::ToolDescriptor {
+                name: "panics".to_owned(),
+                description: "always panics".to_owned(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        async fn invoke(&self, _input: ToolInput) -> crate::tool::ToolResult {
+            panic!("boom")
+        }
+    }
+
+    /// One model round issuing one `{}`-argument call per `(id, tool)` pair, in
+    /// order — the concurrent-execution tests drive multi-call rounds with
+    /// heterogeneous tools.
+    fn multi_call_round(calls: &[(&str, &str)]) -> Vec<StreamEvent> {
+        let mut events = Vec::new();
+        for (index, (id, name)) in (0u32..).zip(calls.iter()) {
+            events.extend([
+                StreamEvent::BlockStart {
+                    index,
+                    block_type: ContentBlockType::ToolCall {
+                        id: (*id).to_owned(),
+                        name: (*name).to_owned(),
+                    },
+                },
+                StreamEvent::ToolCallDelta {
+                    index,
+                    json_delta: "{}".to_owned(),
+                },
+                StreamEvent::BlockStop { index },
+            ]);
+        }
+        events.push(StreamEvent::Completed {
+            stop_reason: StopReason::ToolUse,
+            usage: Usage::default(),
+        });
+        events
+    }
+
+    /// Run a scripted turn with an explicit tool registry (custom test tools),
+    /// returning the committed events.
+    async fn run_rounds_with_registry(
+        dir: &std::path::Path,
+        rounds: Vec<Vec<StreamEvent>>,
+        tools: ToolRegistry,
+        policy: PermissionPolicy,
+        gate: std::sync::Arc<dyn ApprovalGate>,
+    ) -> Vec<CoreEvent> {
+        let provider = Arc::new(ScriptedProvider::new(rounds));
+        let agent = Agent::new(
+            provider,
+            tools,
+            AgentConfig {
+                model: "mock".to_owned(),
+                ..AgentConfig::default()
+            },
+        )
+        .with_permission(policy)
+        .with_approval_gate(gate);
+
+        let store = SessionStore::new(dir.join("sessions"));
+        let mut writer = store.create_new(None, None, vec![]).unwrap();
+        let sid = writer.session_id().clone();
+        let mut runtime = SessionRuntime::default();
+        agent
+            .run_turn(&mut writer, &mut runtime, "go".to_owned())
+            .await
+            .unwrap();
+        drop(writer);
+        store.read_events(&sid).unwrap()
+    }
+
+    /// Every call's result event in log order: `(call_id, seq, kind)` where
+    /// kind is `"completed"` or the failure code — asserts the write-back order
+    /// regardless of execution completion order.
+    fn result_events_in_order(events: &[CoreEvent]) -> Vec<(String, u64, String)> {
+        let mut call_ids: HashMap<u64, String> = HashMap::new();
+        for e in events {
+            if let EventPayload::Model(ModelEvent::ContentBlock {
+                content: crate::core::payload::BlockContent::ToolCall { id, .. },
+                ..
+            }) = &e.payload
+            {
+                call_ids.insert(e.seq, id.clone());
+            }
+        }
+        events
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Tool(ToolEvent::Completed {
+                    tool_call_event_id, ..
+                }) => Some((
+                    call_ids[&tool_call_event_id.seq].clone(),
+                    e.seq,
+                    "completed".to_owned(),
+                )),
+                EventPayload::Tool(ToolEvent::Failed {
+                    tool_call_event_id,
+                    error,
+                    ..
+                }) => Some((
+                    call_ids[&tool_call_event_id.seq].clone(),
+                    e.seq,
+                    error.code.clone(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Two 500ms tools in one round must overlap: total wall time stays well
+    /// under the serial floor of 1000ms.
+    #[tokio::test]
+    async fn concurrent_execution_overlaps_slow_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(DelayedTool {
+            name: "slow".to_owned(),
+            delay: std::time::Duration::from_millis(500),
+            invocations: std::sync::Arc::clone(&invocations),
+        }));
+
+        let started = Instant::now();
+        let events = run_rounds_with_registry(
+            dir.path(),
+            vec![
+                multi_call_round(&[("c1", "slow"), ("c2", "slow")]),
+                text_round("done"),
+            ],
+            tools,
+            PermissionPolicy::default(),
+            ConcurrentGate::approve_all(),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(900),
+            "two 500ms tools must overlap (serial would be ≥1000ms): took {elapsed:?}"
+        );
+        assert_eq!(invocations.load(std::sync::atomic::Ordering::Relaxed), 2);
+        let results = result_events_in_order(&events);
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|(_, _, kind)| kind == "completed"));
+    }
+
+    /// The `tool_call_id`s of the `Tool` messages in the rebuilt context — the
+    /// order the model reads results in, which must be the `tool_call` order
+    /// however the result events committed.
+    fn rebuilt_tool_result_ids(events: &[CoreEvent]) -> Vec<String> {
+        let runtime = crate::agent::rebuild_runtime(events, vec![]);
+        runtime
+            .context
+            .iter()
+            .filter_map(|m| match m {
+                Message::Tool { tool_call_id, .. } => Some(tool_call_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Result events commit in *completion* order: the later, faster call's
+    /// `Completed` lands first — the front-end sees it the moment it finishes.
+    /// The model's read order is unaffected: its tool-result messages still
+    /// assemble in `tool_call` order.
+    #[tokio::test]
+    async fn results_commit_in_completion_order_not_call_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = || std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(DelayedTool {
+            name: "slow".to_owned(),
+            delay: std::time::Duration::from_millis(400),
+            invocations: counter(),
+        }));
+        tools.register(Arc::new(DelayedTool {
+            name: "fast".to_owned(),
+            delay: std::time::Duration::ZERO,
+            invocations: counter(),
+        }));
+
+        let events = run_rounds_with_registry(
+            dir.path(),
+            vec![
+                multi_call_round(&[("c1", "slow"), ("c2", "fast")]),
+                text_round("done"),
+            ],
+            tools,
+            PermissionPolicy::default(),
+            ConcurrentGate::approve_all(),
+        )
+        .await;
+
+        let results = result_events_in_order(&events);
+        assert_eq!(
+            results,
+            vec![
+                ("c2".to_owned(), results[0].1, "completed".to_owned()),
+                ("c1".to_owned(), results[1].1, "completed".to_owned()),
+            ],
+            "the faster c2 commits before the slower c1"
+        );
+        // …but the model still reads the results in `tool_call` order.
+        assert_eq!(rebuilt_tool_result_ids(&events), ["c1", "c2"]);
+    }
+
+    /// ask + allow mix: the allowed call executes without waiting and its
+    /// result commits first (completion order); both execute, and the model
+    /// reads both results in `tool_call` order.
+    #[tokio::test]
+    async fn ask_and_allow_mix_executes_and_commits_in_completion_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = || std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(DelayedTool {
+            name: "slow".to_owned(),
+            delay: std::time::Duration::from_millis(100),
+            invocations: counter(),
+        }));
+        tools.register(Arc::new(DelayedTool {
+            name: "fast".to_owned(),
+            delay: std::time::Duration::ZERO,
+            invocations: counter(),
+        }));
+        let policy = PermissionPolicy {
+            deny: vec![],
+            allow: vec![],
+            ask: vec![deny_rule("slow", &[])],
+        };
+
+        let events = run_rounds_with_registry(
+            dir.path(),
+            vec![
+                multi_call_round(&[("c1", "slow"), ("c2", "fast")]),
+                text_round("done"),
+            ],
+            tools,
+            policy,
+            ConcurrentGate::approve_all(),
+        )
+        .await;
+
+        let results = result_events_in_order(&events);
+        assert_eq!(
+            results,
+            vec![
+                ("c2".to_owned(), results[0].1, "completed".to_owned()),
+                ("c1".to_owned(), results[1].1, "completed".to_owned()),
+            ],
+            "the allowed (faster) call commits first — completion order"
+        );
+        assert!(has_permission_decided(&events, PermissionOutcome::Approved));
+        // The model still reads both results in `tool_call` order.
+        assert_eq!(rebuilt_tool_result_ids(&events), ["c1", "c2"]);
+    }
+
+    /// A rejected ask skips execution entirely (the tool is never invoked);
+    /// its `Failed` commits in completion order like any result, while the
+    /// model still reads it at its `tool_call` slot.
+    #[tokio::test]
+    async fn rejected_ask_skips_execution_but_keeps_its_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let slow_invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(DelayedTool {
+            name: "slow".to_owned(),
+            delay: std::time::Duration::ZERO,
+            invocations: std::sync::Arc::clone(&slow_invocations),
+        }));
+        tools.register(Arc::new(DelayedTool {
+            name: "fast".to_owned(),
+            delay: std::time::Duration::ZERO,
+            invocations: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }));
+        let policy = PermissionPolicy {
+            deny: vec![],
+            allow: vec![],
+            ask: vec![deny_rule("slow", &[])],
+        };
+        let gate = std::sync::Arc::new(ConcurrentGate {
+            resolutions: HashMap::from([("c1".to_owned(), ApprovalResolution::RejectedByUser)]),
+            requested: Mutex::new(Vec::new()),
+        });
+
+        let events = run_rounds_with_registry(
+            dir.path(),
+            vec![
+                multi_call_round(&[("c1", "slow"), ("c2", "fast")]),
+                text_round("done"),
+            ],
+            tools,
+            policy,
+            gate,
+        )
+        .await;
+
+        assert_eq!(
+            slow_invocations.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a rejected call must not execute"
+        );
+        let mut kinds: HashMap<String, String> = result_events_in_order(&events)
+            .into_iter()
+            .map(|(id, _, kind)| (id, kind))
+            .collect();
+        assert_eq!(kinds.remove("c1").as_deref(), Some("denied_by_user"));
+        assert_eq!(kinds.remove("c2").as_deref(), Some("completed"));
+        // The LLM message slot is kept: the model reads the rejection at c1's
+        // position, ahead of c2's result.
+        assert_eq!(rebuilt_tool_result_ids(&events), ["c1", "c2"]);
+    }
+
+    /// An erroring tool and a panicking tool fail only their own calls: the
+    /// batch completes, the healthy call commits its result, and every failure
+    /// is scoped to its own call (the model reads them in `tool_call` order).
+    #[tokio::test]
+    async fn tool_error_and_panic_are_scoped_to_their_own_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(DelayedTool {
+            name: "ok".to_owned(),
+            delay: std::time::Duration::ZERO,
+            invocations: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }));
+        tools.register(Arc::new(ErrorTool));
+        tools.register(Arc::new(PanicTool));
+
+        let events = run_rounds_with_registry(
+            dir.path(),
+            vec![
+                multi_call_round(&[("c1", "ok"), ("c2", "erratic"), ("c3", "panics")]),
+                text_round("done"),
+            ],
+            tools,
+            PermissionPolicy::default(),
+            ConcurrentGate::approve_all(),
+        )
+        .await;
+
+        let mut kinds: HashMap<String, String> = result_events_in_order(&events)
+            .into_iter()
+            .map(|(id, _, kind)| (id, kind))
+            .collect();
+        assert_eq!(kinds.remove("c1").as_deref(), Some("completed"));
+        assert_eq!(kinds.remove("c2").as_deref(), Some("execution_failed"));
+        assert_eq!(kinds.remove("c3").as_deref(), Some("tool_panic"));
+        assert!(kinds.is_empty(), "exactly one result per call");
+        assert_eq!(rebuilt_tool_result_ids(&events), ["c1", "c2", "c3"]);
+        // The turn survived the batch and completed.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e.payload, EventPayload::Turn(TurnEvent::Completed { .. })))
         );
     }
 }

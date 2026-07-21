@@ -229,8 +229,8 @@ ominiforge Web 控制台是**开发者每天盯 8 小时的 agent 生产工具**
 | 状态      | `--state-{done,running,error}` + `-bg` + `-text`                | base=pip/边框；bg=徽章底；text=徽章字                                                                                             |
 | reasoning | `--reasoning-border/bg/text`                                    | think 块专用，靛蓝调，刻意「次一级」                                                                                              |
 | user 气泡 | `--user-bg/border`                                              | 用户消息，acid-lime 淡色调                                                                                                        |
-| 代码高亮  | `--syntax-key/str/num/keyword/comment/fn/type`              | 语法高亮：key=变量、str=字符串、num=数字、keyword=关键字、comment=注释、fn=函数、type=类型                                    |
-| plan 卡片 | `--plan-accent`                                              | Plan 卡片专用，靛蓝调，与 reasoning 同系                                                                                         |
+| 代码高亮  | `--syntax-key/str/num/keyword/comment/fn/type`                  | 语法高亮：key=变量、str=字符串、num=数字、keyword=关键字、comment=注释、fn=函数、type=类型                                        |
+| plan 卡片 | `--plan-accent`                                                 | Plan 卡片专用，靛蓝调，与 reasoning 同系                                                                                          |
 
 > 旧变量名（`--bg-primary`/`--surface`/`--border`/`--accent-fg` 等）保留为别名，向后兼容。新代码优先用上表语义名。
 
@@ -332,16 +332,19 @@ ominiforge Web 控制台是**开发者每天盯 8 小时的 agent 生产工具**
 Plan 卡片用于显示任务计划，支持折叠/展开。颜色使用 `--plan-accent`（靛蓝调，与 reasoning 同系）。
 
 **内联版本**（历史记录）：
+
 - 使用 `--canvas-overlay` 背景、`--border-subtle` 边框
 - 头部：Plan 标题 + 进度条 + 展开/折叠箭头
 - 步骤列表：每步包含状态标记 + 内容
 
 **Pinned 版本**（固定在输入区上方）：
+
 - 与输入框共享宽度和内边距（`max-width: 740px`）
 - 使用 `--radius-lg` 圆角、`--border-default` 边框（匹配 input-box）
 - 默认折叠，节省垂直空间
 
 **步骤状态标记**（5 种，颜色+形状冗余表达）：
+
 - `pending`：灰色圆点（`--text-tertiary`）
 - `in_progress`：琥珀色 spinner（`--state-running`）
 - `completed`：绿色勾选图标（`--state-done`）
@@ -381,38 +384,55 @@ layout 的 `main` **不带 padding**（对话页要全屏）。每个内容页�
 
 > 这也顺带覆盖了 compaction / reconfiguration 会话——它们同样有 `context_snapshot.json`，此前也一样看不到继承历史，现在一并显示。
 
-### 4.9 审批面板（approval prompt）
+### 4.9 卡内审批（in-card approval）+ 作用域菜单
 
-权限门控把一次 `ask` 工具调用挂起等人工决定（`doc/permission.md` §8）。用组件
-`ApprovalPrompt.svelte`，**内联**在对话流里（它属于该轮上下文的一次 tool 调用，不做 pinned/全局入口）。
+权限门控把一次 `ask` 工具调用挂起等人工决定（`doc/permission.md` §8）。**没有独立的审批卡**——
+提示附着在被门控的那张 ToolBlock 上（`approvalPending`，`conversation.ts` 按 `callId` 桥接
+`Permission::Requested`）：批准了命令自然执行、tool 卡自然显示结果；拒绝了 tool 卡自然落入
+error（`denied_by_user`）。审批只是 tool 卡的一个瞬态，不是对话流里的另一种条目。
 
-- **surface**：`--canvas-overlay` 卡片 + `--border-strong` hairline——需要注意但不靠大阴影/彩条 slop。
-- **状态冗余**（§1.3）：pending = 琥珀（`--state-running`）**2s 脉冲边框** + 琥珀 pip；approved = 绿
-  （`--state-done`）；rejected = 红（`--state-error`）。pip 形状 + 边框色 + 动效三重表达。
-- **内容**：mono eyebrow（`待审批 · AWAITING APPROVAL`）+ tool 名（mono）+ JSON 参数
-  （`--canvas-float` 底，syntax-tint 复用 tools/RawArgs 的 `.k/.s/.n`）。
-- **动作**：`批准` = **唯一** acid-lime 主操作（`--accent`，§1.2 配给）；`拒绝` = secondary
-  （`--canvas-overlay` + `--border-default`，不用红填充——是按钮不是警报）。
-- **中文**：eyebrow/按钮走默认字体即可（短拉丁+中文混排），JSON/tool 名用 `--font-mono`。
-- **降级**：`prefers-reduced-motion` 关脉冲（颜色+形状仍表达状态）。进入过渡用 `fly(rise())`。
-- 决定经 `client.approve(id, callId, decision)` 送出；item 状态由 committed
-  `Permission::Decided` 事件 fold 回来翻转（不乐观更新）。
+- **待审态**：卡片即 running 家族（琥珀边框脉冲 + pip 涟漪），状态 badge 读「等待批准」，头部右侧
+  渲染 `ApprovalControls.svelte`；卡片强制展开。header 结构是「toggle 按钮 + 控件并列」，
+  交互元素不嵌套。
+- **决定 × 作用域，两个正交控件**：`批准`（acid-lime 主操作）/ `拒绝`（ghost secondary）是纯决定按钮，
+  各一击完成；旁边一个独立的作用域选择器（默认`仅此次`），选中的作用域作用于随后点下的那个决定——
+  非`仅此次`会把决定 pin 成规则（session 写内存策略，profile/gateway 写配置文件，见
+  doc/permission.md §5）。作用域选了非默认时选择器染琥珀色，持久化决定不藏在默认外观后面。
+  `本次会话` 只写内存策略、不落盘，菜单项旁以小字标注「重连/重启后失效」。
+  菜单 `--canvas-float` 底 + hairline + 弹层小阴影（§5 允许），fixed 定位逃出卡片
+  `overflow: hidden` 裁剪，Escape / 点外部关闭。
+- **决议回流**：`client.approve(id, callId, decision, scope)` 送出；`Permission::Decided` 提交后
+  只负责清 pending 标记，终态由配对的 `Tool::Completed/Failed` 驱动（不乐观更新）。发送失败
+  重抛恢复按钮可重试。
+- **降级**：`prefers-reduced-motion` 关脉冲（颜色+形状仍表达状态）。
 
-### 4.10 门控编辑器（permission editor）—— 卡片模型
+### 4.10 门控编辑器（permission rules editor）—— 增量规则列表
 
-配置门控策略的表单，组件 `PermissionEditor.svelte`，**三层复用**（profile / gateway /
-workspace，`doc/permission.md` §3）。核心原则：**磁盘配置结构化给机器读，用户交互零心智负担**。
+配置门控策略的表单，组件 `PermissionRulesEditor.svelte`，**三层复用**（profile / gateway /
+workspace，`doc/permission.md` §3）。核心原则：**磁盘配置结构化给机器读，用户交互零心智负担**；
+**复杂度随用户需求生长**——空层就是空的，而不是把每个工具都列出来。
 
-- **卡片模型**：用户**永不手输工具名/字段名**。组件收 `tools: ToolInfo[]`（来自 `GET /tools`），为每个工具渲染一张卡：
-  - **主控件 = 三档分段开关**（允许 / 询问 / 拒绝），覆盖多数需求，点一下即可。active 段按裁决着色（deny=`--state-error-text`、ask=`--state-running-text`），状态冗余（§1.3）。
-  - **例外区**（可选，`+ 例外`）：用该工具**专属字段下拉**（shell→命令、read/write→路径，来自 catalog）+ 匹配方式（包含 / 以…开头 / 不属于〔白名单〕）+ 值（每行一条 `textarea`）。「不属于」即 `negate` 白名单。
-- **纯函数映射**：卡片 ⇄ `PermissionPolicy` 的编译/反编译在 `permission-cards.ts`（`toCards`/`fromCards`），有 vitest round-trip 测试。无法用卡片表达的规则（通配 `*`、手写异形）进 **advanced 桶原样保留**，绝不静默丢弃用户配置。
-- **无 catalog 项的工具**（如 MCP）回退成通用卡片（无字段下拉，只按整输入匹配），仍可门控。
-- **token 化 / surface**：卡片 `--canvas-base`，分段控件 `--canvas-float`，输入复用 `.in`；靠 `--border-subtle` hairline 分段，不自造层级、不 hardcode。
+- **增量规则列表**：只渲染用户真正添加的规则。空态 = 一行说明（「无规则 —— 继承下层，未命中即允许」）
+  - 「+ 添加规则」按钮。绝不为目录里每个工具预渲染一行（那是旧卡片模型的全量列表病）。
+- **规则行**：折叠态 = 裁决徽标（拒绝=红 / 允许=绿 / 询问=琥珀）+ 大白话摘要（`summaryOf`：「运行命令：
+  当 命令 包含 rm -rf」——徽标已承载裁决，摘要不重复动词）+ 删除钮，整行点击手风琴展开（一次只开一行）。
+  展开区：三档裁决 seg（允许/询问/拒绝）+ 工具下拉（目录 +「任意工具 (\*)」，不手输）+ **默认折叠的条件区**
+  （field 下拉 + 包含/以…开头 + 白名单开关 + 值）。无条件 = bare rule = 该工具在本层的默认裁决。
+  `allow` 规则是「批准×作用域」审批写进来的形态（doc/permission.md §2）：命中即豁免 ask，但不压 deny。
+- **工具默认表**（仅 gateway 层，`showDefaults`）：折叠区块，每个目录工具一紧凑行 + 三态 seg
+  （允许/询问/拒绝），编辑的是 bare rules；与规则列表同源——目录工具的 bare 行由默认表承载，列表不再
+  重复渲染（`*` 与非目录工具的 bare 行仍在列表里）。基线层语义上就该全量看一眼，故只此层提供。
+- **纯函数映射**：规则行 ⇄ `PermissionPolicy` 的编译/反编译在 `permission-rules.ts`
+  （`toRows`/`fromRows`/`summaryOf`/`resolveEffective`），有 vitest round-trip 测试。无法表达的规则
+  （未知 mode、negate 无 patterns 的异形）进 **advanced 桶原样保留**，绝不静默丢弃用户配置。
+- **生效结果视图**：门控 tab 底部的只读折叠区块，`resolveEffective` 前端复刻三层解析（deny 三层并集
+  逐条标注来源层；allow 同样并集且命中豁免 ask；ask 取最高设置层，低层被整表替换时给提示）。
 - **三处复用**（同一组件，不同宿主）：
-  1. **profile 层** — Settings → Profiles tab，`bind:policy={pf.permission}`，随 profile 一起存。
-  2. **gateway 层** — Settings → Gateway tab，编辑 `default_permission`（最低基线）；懒加载，`PUT /gateway/permission` 对新会话即时生效并落 `gateway.toml`。
-  3. **workspace 层** — 工作区侧栏齿轮 → `WorkspaceConfigDialog`（模态，`--z-modal` + `--backdrop`），编辑该 workspace 的 `[permission]`（最高层）+ 网络覆盖；存于网关可信目录。
+  1. **profile 层** — Settings → 门控 tab，选 profile 后 `bind:policy={profile.permission}`，随 profile 一起存。
+  2. **gateway 层** — Settings → 门控 tab，编辑 `default_permission`（最低基线）+ 工具默认表；
+     `PUT /gateway/permission` 对新会话即时生效并落 `gateway.toml`。
+  3. **workspace 层** — Settings → 门控 tab（主场所）+ 工作区侧栏齿轮 `WorkspaceConfigDialog`（快捷入口），
+     编辑该 workspace 的 `[permission]`（最高层）；存于网关可信目录。
 
 ---
 
