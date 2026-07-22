@@ -24,9 +24,7 @@ use crate::agent::{Agent, AgentConfig};
 use crate::config::{ConfigStore, ResolvedModel};
 use crate::context::DEFAULT_COMPACTION_THRESHOLD;
 use crate::session::SessionStore;
-use crate::tool::{
-    EditTool, FindTool, ReadTool, ShellTool, SnapshotStore, ToolRegistry, WriteTool,
-};
+use crate::tool::{EditTool, FindTool, ReadTool, ShellTool, ToolRegistry, WriteTool};
 
 /// Sessions live under `<workspace>/.omini/sessions`.
 pub const SESSIONS_SUBDIR: &str = ".omini/sessions";
@@ -335,31 +333,26 @@ pub async fn assemble(
     })
 }
 
-/// Register the built-in filesystem/shell tools the profile allows. `read` and
-/// `edit` share one [`SnapshotStore`] so an `edit` patch is verified against the
-/// snapshot the preceding `read` recorded. The filesystem tools are rooted at
-/// `workspace`; `shell` runs in the session's `sandbox` (`doc/sandbox.md` §3.2).
+/// Register the built-in filesystem/shell tools the profile allows. The
+/// filesystem tools are rooted at `workspace`; `shell` runs in the session's
+/// `sandbox` (`doc/sandbox.md` §3.2).
 fn register_profile_tools(
     registry: &mut ToolRegistry,
     profile: &crate::config::Profile,
     workspace: PathBuf,
     sandbox: Arc<dyn crate::sandbox::Sandbox>,
 ) {
-    let snapshots = SnapshotStore::new();
     if profile.tools.allows("find") {
         registry.register(Arc::new(FindTool::new(workspace.clone())));
     }
     if profile.tools.allows("read") {
-        registry.register(Arc::new(ReadTool::new(
-            workspace.clone(),
-            snapshots.clone(),
-        )));
+        registry.register(Arc::new(ReadTool::new(workspace.clone())));
     }
     if profile.tools.allows("write") {
         registry.register(Arc::new(WriteTool::new(workspace.clone())));
     }
     if profile.tools.allows("edit") {
-        registry.register(Arc::new(EditTool::new(workspace, snapshots)));
+        registry.register(Arc::new(EditTool::new(workspace)));
     }
     if profile.tools.allows("shell") {
         registry.register(Arc::new(ShellTool::new(sandbox)));

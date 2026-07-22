@@ -12,7 +12,6 @@ mod error;
 mod find;
 mod read;
 mod shell;
-mod snapshot;
 mod write;
 
 pub use edit::EditTool;
@@ -20,7 +19,6 @@ pub use error::ToolError;
 pub use find::FindTool;
 pub use read::ReadTool;
 pub use shell::ShellTool;
-pub use snapshot::SnapshotStore;
 pub use write::WriteTool;
 
 use std::collections::{BTreeMap, HashMap};
@@ -274,23 +272,13 @@ fn resolve_in_workspace(workspace: &Path, requested: &str) -> Result<PathBuf, To
     Ok(normalized)
 }
 
-/// Register the built-in tools (read, write, edit, shell), all scoped to `workspace`.
-///
-/// `read` and `edit` share one [`SnapshotStore`] so an `edit` patch is verified
-/// against the snapshot the preceding `read` recorded.
-///
-/// TODO: The `SnapshotStore` wiring here mirrors `register_profile_tools` in
-/// `app.rs`. If a third tool needs the store, extract a shared helper rather
-/// than duplicating the wiring a third time.
+/// Register the built-in tools (find, read, write, edit, shell), all scoped to
+/// `workspace`.
 pub fn register_builtin(registry: &mut ToolRegistry, workspace: PathBuf) {
-    let snapshots = SnapshotStore::new();
     registry.register(Arc::new(FindTool::new(workspace.clone())));
-    registry.register(Arc::new(ReadTool::new(
-        workspace.clone(),
-        snapshots.clone(),
-    )));
+    registry.register(Arc::new(ReadTool::new(workspace.clone())));
     registry.register(Arc::new(WriteTool::new(workspace.clone())));
-    registry.register(Arc::new(EditTool::new(workspace.clone(), snapshots)));
+    registry.register(Arc::new(EditTool::new(workspace.clone())));
     registry.register(Arc::new(ShellTool::new(Arc::new(
         crate::sandbox::passthrough::PassthroughSandbox::new(workspace, BTreeMap::new()),
     ))));

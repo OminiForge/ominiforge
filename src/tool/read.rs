@@ -4,21 +4,18 @@
 //! A bare path reads the whole file. Provide an optional `range` object to scope
 //! the read to an inclusive 1-based line range.
 //!
-//! Output is anchored for [`edit`](super::EditTool): a
-//! `[path#TAG]` header fingerprints the whole file (the snapshot the later patch
-//! is verified against) and every line is prefixed `N:`. Line numbers are
-//! *absolute* even for a range, so an `edit` patch built off a sliced read still
-//! cites the right lines. The tag is recorded in the shared [`SnapshotStore`]
-//! keyed by the resolved path.
+//! Output is a `[path]` header and every line prefixed `N:`. Line numbers are
+//! *absolute* even for a range, for orientation — they are not an anchor
+//! [`edit`](super::EditTool) needs: `edit` locates the exact text you quote,
+//! not a line number, so there is no snapshot/tag to go stale.
 //!
 //! A path that resolves to a directory lists its entries (sub-directories
-//! suffixed `/`), sorted; directories carry no tag and cannot be edited.
+//! suffixed `/`), sorted.
 
 use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use super::snapshot::{SnapshotStore, tag_of};
 use super::{Tool, ToolDescriptor, ToolError, ToolInput, ToolResult, resolve_in_workspace};
 use crate::core::payload::{Content, ToolOutput};
 
@@ -26,7 +23,6 @@ use crate::core::payload::{Content, ToolOutput};
 #[derive(Debug, Clone)]
 pub struct ReadTool {
     workspace: PathBuf,
-    snapshots: SnapshotStore,
 }
 
 #[derive(Deserialize)]
@@ -51,14 +47,10 @@ struct ParsedArg {
 }
 
 impl ReadTool {
-    /// Create a `read` tool rooted at `workspace`, recording snapshots into the
-    /// shared `snapshots` store that `edit` verifies against.
+    /// Create a `read` tool rooted at `workspace`.
     #[must_use]
-    pub const fn new(workspace: PathBuf, snapshots: SnapshotStore) -> Self {
-        Self {
-            workspace,
-            snapshots,
-        }
+    pub const fn new(workspace: PathBuf) -> Self {
+        Self { workspace }
     }
 }
 
@@ -69,9 +61,10 @@ impl Tool for ReadTool {
             name: "read".to_owned(),
             description: "Read a UTF-8 text file or list a directory, relative to the \
                           workspace root. A bare file path numbers every line (`N:text`) \
-                          under a `[path#TAG]` header; cite that TAG and those numbers \
-                          when calling `edit`. Provide `range: { start, end }` to read \
-                          an inclusive 1-based line range. Line numbers stay absolute \
+                          under a `[path]` header. Line numbers are for orientation only \
+                          — `edit` locates the exact lines you quote, not a line number, \
+                          so don't cite them there. Provide `range: { start, end }` to \
+                          read an inclusive 1-based line range. Line numbers stay absolute \
                           for a range. A directory path lists its entries."
                 .to_owned(),
             input_schema: serde_json::json!({
@@ -134,21 +127,17 @@ impl Tool for ReadTool {
         }
 
         match tokio::fs::read_to_string(&path).await {
-            Ok(content) => {
-                let tag = tag_of(content.as_bytes());
-                self.snapshots.record(&path, tag.clone());
-                match render(&parsed, &tag, &content) {
-                    Ok(text) => Ok(ToolOutput {
-                        content: vec![Content::Text(text)],
-                        is_error: false,
-                        error_code: None,
-                    }),
-                    Err(msg) => Ok(business_error(
-                        "bad_range",
-                        &format!("{}: {msg}", parsed.path),
-                    )),
-                }
-            }
+            Ok(content) => match render(&parsed, &content) {
+                Ok(text) => Ok(ToolOutput {
+                    content: vec![Content::Text(text)],
+                    is_error: false,
+                    error_code: None,
+                }),
+                Err(msg) => Ok(business_error(
+                    "bad_range",
+                    &format!("{}: {msg}", parsed.path),
+                )),
+            },
             // A missing/unreadable file is a business error the model can react
             // to, not a protocol fault.
             Err(e) => Ok(read_failed(&parsed.path, &e.to_string())),
@@ -188,17 +177,17 @@ impl ReadTool {
 
 /// Render file content per the optional range.
 ///
-/// - range: `[path#TAG]` header then absolute `N:text` lines for the slice.
-/// - none: `[path#TAG]` header then every line numbered.
-fn render(parsed: &ParsedArg, tag: &str, content: &str) -> Result<String, String> {
+/// - range: `[path]` header then absolute `N:text` lines for the slice.
+/// - none: `[path]` header then every line numbered.
+fn render(parsed: &ParsedArg, content: &str) -> Result<String, String> {
     match parsed.range {
-        None => Ok(numbered(&parsed.path, tag, content)),
+        None => Ok(numbered(&parsed.path, content)),
         Some(LineRange { start, end }) => {
             let lines: Vec<&str> = content.lines().collect();
             let (lo, hi) = clamp_range(start, end, lines.len())?;
             // lo/hi are 1-based inclusive; slice is 0-based half-open.
             let slice = &lines[lo - 1..hi];
-            let mut parts = vec![format!("[{}#{tag}]", parsed.path)];
+            let mut parts = vec![format!("[{}]", parsed.path)];
             parts.extend(
                 slice
                     .iter()
@@ -226,10 +215,10 @@ fn clamp_range(start: usize, end: usize, n: usize) -> Result<(usize, usize), Str
     Ok((start, end.min(n)))
 }
 
-/// Render the original whole-file form: `[path#TAG]` header then 1-based
+/// Render the original whole-file form: `[path]` header then 1-based
 /// `N:text` lines. An empty file yields just the header.
-fn numbered(path: &str, tag: &str, content: &str) -> String {
-    let mut parts = vec![format!("[{path}#{tag}]")];
+fn numbered(path: &str, content: &str) -> String {
+    let mut parts = vec![format!("[{path}]")];
     parts.extend(
         content
             .lines()
@@ -278,7 +267,7 @@ mod tests {
     }
 
     fn tool(workspace: PathBuf) -> ReadTool {
-        ReadTool::new(workspace, SnapshotStore::new())
+        ReadTool::new(workspace)
     }
 
     fn text(out: &ToolOutput) -> String {
@@ -296,22 +285,7 @@ mod tests {
 
         let out = t.invoke(input("a.txt")).await.unwrap();
         assert!(!out.is_error);
-        let tag = tag_of(b"hello\nworld");
-        assert_eq!(text(&out), format!("[a.txt#{tag}]\n1:hello\n2:world"));
-    }
-
-    /// A successful read records the file's tag in the shared store under the
-    /// resolved path — this is the anchor `edit` later verifies against.
-    #[tokio::test]
-    async fn read_records_snapshot_tag() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.txt"), "hi").unwrap();
-        let store = SnapshotStore::new();
-        let t = ReadTool::new(dir.path().to_path_buf(), store.clone());
-
-        t.invoke(input("a.txt")).await.unwrap();
-        let resolved = dir.path().join("a.txt");
-        assert_eq!(store.get(&resolved), Some(tag_of(b"hi")));
+        assert_eq!(text(&out), "[a.txt]\n1:hello\n2:world");
     }
 
     #[tokio::test]
@@ -336,8 +310,9 @@ mod tests {
 
     // --- range behavior -----------------------------------------------------
 
-    /// A range keeps ABSOLUTE line numbers so an `edit` built off the slice still
-    /// cites the correct lines.
+    /// A range keeps ABSOLUTE line numbers: `edit` anchors on quoted content,
+    /// not line numbers — absolute numbers exist to locate the slice within the
+    /// file for the model and any human reading the output.
     #[tokio::test]
     async fn range_keeps_absolute_line_numbers() {
         let dir = tempfile::tempdir().unwrap();
@@ -346,25 +321,7 @@ mod tests {
 
         let out = t.invoke(range_input("a.txt", 2, 4)).await.unwrap();
         assert!(!out.is_error, "{:?}", out.content);
-        let tag = tag_of(b"l1\nl2\nl3\nl4\nl5\n");
-        assert_eq!(text(&out), format!("[a.txt#{tag}]\n2:l2\n3:l3\n4:l4"));
-    }
-
-    /// The header tag on a sliced read is the WHOLE-file tag, so it matches what
-    /// `edit` verifies against.
-    #[tokio::test]
-    async fn range_header_tag_is_whole_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let body = "a\nb\nc\nd\n";
-        std::fs::write(dir.path().join("a.txt"), body).unwrap();
-        let store = SnapshotStore::new();
-        let t = ReadTool::new(dir.path().to_path_buf(), store.clone());
-
-        t.invoke(range_input("a.txt", 2, 3)).await.unwrap();
-        assert_eq!(
-            store.get(&dir.path().join("a.txt")),
-            Some(tag_of(body.as_bytes()))
-        );
+        assert_eq!(text(&out), "[a.txt]\n2:l2\n3:l3\n4:l4");
     }
 
     /// `end` past EOF clamps to the last line; this is a friendly "to the end".
@@ -375,8 +332,7 @@ mod tests {
         let t = tool(dir.path().to_path_buf());
 
         let out = t.invoke(range_input("a.txt", 1, 99)).await.unwrap();
-        let tag = tag_of(b"a\nb\n");
-        assert_eq!(text(&out), format!("[a.txt#{tag}]\n1:a\n2:b"));
+        assert_eq!(text(&out), "[a.txt]\n1:a\n2:b");
     }
 
     /// `start` past EOF fails loud rather than returning an empty slice.

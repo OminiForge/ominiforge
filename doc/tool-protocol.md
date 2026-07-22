@@ -16,9 +16,9 @@
 ```text
 Tool
 ├── Built-in（Rust 代码，编译进 ominiforge binary）
-│   ├── read        # 读取文件（输出 [path#TAG] + 行号，供 edit 锚定）
+│   ├── read        # 读取文件（输出 [path] + 行号，行号仅供定位）
 │   ├── write       # 整文件写入
-│   ├── edit        # 行锚定 patch，经 snapshot 验证
+│   ├── edit        # 内容锚定替换（old→new，按文本定位，无行号无 tag）
 │   ├── shell       # 执行 shell 命令
 │   ├── search      # 代码搜索
 │   ├── lsp         # Language Server Protocol 交互
@@ -248,63 +248,97 @@ ToolRegistry
 
 Tool schemas 按 name 字母序排列（保障 prefix cache 命中率）。
 
-## 11. edit 工具：结构化 edits 与 snapshot 验证
+## 11. edit 工具：内容锚定替换
 
-`edit` 是 `write` 的局部替代：`write` 重写整文件，`edit` 对已有文件做行锚定修改，
-token 消耗更少，diff 更干净。
+`edit` 是 `write` 的局部替代：`write` 重写整文件，`edit` 对已有文件做定点替换，
+token 消耗更少。定位不靠行号、不靠 snapshot tag，而是靠**被替换文本本身**——
+模型引用要改的确切现有内容（`old`），工具在文件里查找它并换成 `new`。不知道现有
+内容就无法引用，所以“必须先读”是这个设计的自然结果，而非额外记账；文件在别处被
+改动也不会误伤——只要 `old` 引用的那几行还在且唯一，替换就成立。
 
 ### 11.1 使用流程
 
 ```sh
-# 1. read — 获取 [path#TAG] anchor 和行号
+# 1. read — 获取 [path] 和行号（行号仅供人/模型定位，不作 edit 锚点）
 read path="src/lib.rs"
 # 输出：
-# [src/lib.rs#1F2A]
+# [src/lib.rs]
 # 1:fn main() {
 # 2:    println!("hello");
 # 3:}
 
-# 2. edit — 引用 TAG + 行号。优先使用结构化输入；lines 数组一项就是输出的一行。
-edit path="src/lib.rs" tag="1F2A" ops='[
-  { "op": "replace", "start": 2, "end": 2, "lines": ["    println!(\"world\");"] }
+# 2. edit — 引用要替换的确切文本（old），不带行号、不带 tag
+edit edits='[
+  { "path": "src/lib.rs",
+    "old": ["    println!(\"hello\");"],
+    "new": ["    println!(\"world\");"] }
 ]'
 ```
 
 ### 11.2 结构化输入
 
-单文件编辑使用顶层 `path` / `tag` / `ops`；多文件编辑使用 `sections`，每个 section
-包含自己的 `path` / `tag` / `ops`。`lines` 必须是数组，且每项不能内嵌换行；空行用
-`""` 表示。这避免把整段 patch 塞进一个 JSON string 后被模型或 provider 双重转义成一行。
+顶层是 `edits` 数组，每项 `{ path, old, new, replace_all? }`：
 
-| Op | 必填字段 | 说明 |
+| 字段 | 必填 | 说明 |
 |---|---|---|
-| `replace` | `start`, `lines` | 将 `start..end`（含）替换为 `lines`；`end` 缺省为 `start` |
-| `delete` | `start` | 删除 `start..end`（含）；`end` 缺省为 `start`，不能带 `lines` |
-| `insert_after` | `start`, `lines` | 在第 `start` 行之后插入 |
-| `insert_before` | `start`, `lines` | 在第 `start` 行之前插入 |
-| `insert_head` | `lines` | 在文件头插入 |
-| `insert_tail` | `lines` | 在文件尾插入 |
+| `path` | 是 | 相对 workspace 根的文件路径 |
+| `old` | 是 | 要替换的确切现有内容，一项一行（不能内嵌换行）。逐字引用自 `read` 输出，或你刚发出的工具参数（`write` 的 `content`、上一次 `edit` 的 `new`——`edit`/`write` 成功只回一行简报，其输出无可引用内容）。非空 |
+| `new` | 是 | 替换后的内容，一项一行。空数组表示删除 `old` |
+| `replace_all` | 否 | 默认 `false`。true 时替换所有不重叠的匹配，而非要求唯一 |
 
-行号均为 1-based，与 `read` 输出一致。同一 section 内的多 op 按高行号优先应用，
-避免行号漂移。
+`old` / `new` 用数组（一项一行）而非内嵌 `\n` 的字符串，避免整段 patch 塞进一个
+JSON string 后被模型或 provider 双重转义。
 
-### 11.3 Snapshot 验证
+**语义要点：**
 
-`read` 和 `edit` 共享一个 session 级 `SnapshotStore`（`Arc<Mutex<HashMap>>`），
-在 `register_profile_tools` 创建并注入。
+- **替换** = `old` 给现有行，`new` 给替换行。
+- **删除** = `new: []`。
+- **插入** = 在 `old` 和 `new` 里都保留一行不变的锚点行，`new` 额外带上要插入的行。
+  例：`old:["a"]`, `new:["a","A1"]` 在 `a` 之后插入 `A1`。
+- **唯一性**：`old` 必须在文件里恰好匹配一处，否则报 `ambiguous`；除非
+  `replace_all: true`，此时替换每一处不重叠的匹配。
+- **多行 `old`** 按**连续行**匹配。
+- 同一 `path` 可有多个 entry；跨 entry 触碰同一行 → `overlapping_edits`，整体拒绝。
 
-- `read` 成功后记录 `abs_path → tag`（FNV-1a 32-bit 低 16 位，4 位大写 hex）。
-- `edit` 调用时：①引用的 TAG 必须与 store 记录一致；②必须与磁盘当前 bytes 的 TAG 一致。
-  任一不匹配 → 返回 `is_error=true`, `error_code="stale_snapshot"`，文件不改动。
-- 多 file section 的 patch 先全部验证，全部通过才开始写入。验证阶段是 all-or-nothing；
-  写入阶段按 section 顺序依次执行，若中途 I/O 失败，已写入的 section 不会回滚。
-- `edit` 成功写入后，store 更新为新 TAG，同一 turn 内可链式调用。
+### 11.3 匹配与原子性
 
-**关于 §1 "无状态" 原则：** §1 指 tool 是 request/response 操作，不支持 streaming。
-`SnapshotStore` 是构造时注入的 session 级共享状态，不破坏 request/response 语义，
-不属于 §1 禁止的流式状态。
+- 每个 path 只读一次，所有 entry 的 `old` 都对**这一次读到的原始内容**定位（边匹配
+  边不修改），因此多个 entry 的行区间互不漂移——等价于旧行号方案的“锚定同一快照”，
+  只是这里的快照就是“本次调用开头读到的文件”。
+- **定位阶段**是 all-or-nothing：任一 entry 定位失败（`not_found` / `ambiguous` /
+  `overlapping_edits`），**任何文件都不写**。全部通过后才逐 path 写入。但**写入阶段**
+  按 path 顺序执行且不回滚：中途 I/O 失败（`write_failed`）时，已写的文件保持新内容，
+  未写的不再写。
+- 已知限制：`edit` 按行切分并以 LF 重新拼接，CRLF 文件经编辑后行尾会统一为 LF。
+- 错误码：`not_found`（无匹配，含 stale——文件在别处改过导致 `old` 不再存在，与普通
+  找不到同类）、`ambiguous`（多处匹配且未开 `replace_all`）、`overlapping_edits`、
+  `invalid_path`、`read_failed`、`write_failed`。均为 `is_error=true` 的 business
+  error，模型可据此调整重试；`old`/`new` 内嵌换行、空 `old`、空 `edits` 是协议错
+  （malformed input）。
 
-### 11.4 尚未实现
+### 11.4 结果是简报，diff 由前端渲染
+
+成功时 `edit` 只回一行简报，**不回 diff**：
+
+```
+edited src/lib.rs (1 replacement)
+```
+
+理由：模型在自己的 tool call 参数里已经写了 `old` 和 `new`，结果再回一份 diff 就是
+把它刚写的东西读给它自己听（token 浪费）。`write` 同理——成功回
+`wrote PATH (new, N lines)` / `wrote PATH (~, +A -B)` / `wrote PATH (no change)`，
+不带正文。
+
+**前端**据 tool call 参数（`old`/`new` 或 `content`）+ 自己维护的文件内容缓存
+（由 committed 的 `read` 结果 / `write` 参数喂养）自行构建带上下文的 unified diff
+做可视化，并可随 `Delta::ToolArgs` 流式增量渲染。`edit` 刻意不喂养缓存：它自己的
+diff 预览需要 `read`/`write` 留下的 pre-edit 内容作基底，把 `edit` 参数喂进去会污染
+下一次预览的基底。推论：同一文件连续多次 `edit` 且中间无 `read` 时，第二次起的预览
+上下文可能陈旧，或退化为 bare block + 提示——文件真实内容以后端执行结果为准。因此
+本文档同时是后端契约与前端渲染契约的来源：后端负责“落地 + 简报”，前端负责“diff
+可视化”。
+
+### 11.5 尚未实现
 
 - `replace block N`（tree-sitter 语法块替换）：需引入 tree-sitter 依赖，暂缓。
 

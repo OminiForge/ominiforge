@@ -1,166 +1,89 @@
-//! The `edit` built-in tool: apply a line-anchored patch verified against the
-//! per-session snapshot recorded by [`read`](super::ReadTool).
+//! The `edit` built-in tool: apply content-anchored replacements to files.
 //!
-//! Input is structured JSON: a single section (`path`, `tag`, `ops`) or
-//! multiple `sections`. Each replacement line is one string in `lines`, avoiding
-//! the fragile "patch embedded in a JSON string" shape that can double-escape
-//! newlines.
-//!
-//! Before touching a file the tool checks the cited `TAG` against both the
-//! snapshot store and the file's current bytes; a mismatch means the read was
-//! stale, so the patch is rejected rather than applied to the wrong lines. See
-//! `doc/tool-protocol.md`.
+//! Input is structured JSON: `edits: [{ path, old, new, replace_all? }]`. Each
+//! entry's `old` is located as a contiguous run of lines in the target file
+//! (not by line number) and spliced out in favor of `new`. Not knowing the
+//! exact current content of the lines you want to touch is the failure mode —
+//! there is no separate "read this file first" bookkeeping to bypass, and no
+//! whole-file fingerprint to go stale: the model must quote real content, and
+//! a `not_found`/`ambiguous` result means it didn't. See `doc/tool-protocol.md`
+//! §11.
 
-use std::fmt::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use super::snapshot::{SnapshotStore, tag_of};
 use super::{Tool, ToolDescriptor, ToolError, ToolInput, ToolResult, resolve_in_workspace};
 use crate::core::payload::{Content, ToolOutput};
 
-/// Applies line-anchored patches relative to the session workspace, verified
-/// against snapshots from `read`.
+/// Applies content-anchored edits relative to the session workspace.
 #[derive(Debug, Clone)]
 pub struct EditTool {
     workspace: PathBuf,
-    snapshots: SnapshotStore,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EditArgs {
-    /// Single-file structured form.
-    #[serde(default)]
-    path: Option<String>,
-    #[serde(default)]
-    tag: Option<String>,
-    #[serde(default)]
-    ops: Vec<EditOpArg>,
-    /// Multi-file structured form.
-    #[serde(default)]
-    sections: Vec<EditSectionArg>,
+    edits: Vec<EditEntryArg>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct EditSectionArg {
+struct EditEntryArg {
     path: String,
-    tag: String,
-    ops: Vec<EditOpArg>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct EditOpArg {
-    op: String,
+    old: Vec<String>,
+    new: Vec<String>,
     #[serde(default)]
-    start: Option<usize>,
-    #[serde(default)]
-    end: Option<usize>,
-    #[serde(default)]
-    lines: Vec<String>,
+    replace_all: bool,
 }
 
 impl EditTool {
-    /// Create an `edit` tool rooted at `workspace`, verifying against the shared
-    /// `snapshots` store that `read` populates.
+    /// Create an `edit` tool rooted at `workspace`.
     #[must_use]
-    pub const fn new(workspace: PathBuf, snapshots: SnapshotStore) -> Self {
-        Self {
-            workspace,
-            snapshots,
-        }
+    pub const fn new(workspace: PathBuf) -> Self {
+        Self { workspace }
     }
 }
 
-/// Build the edit tool's input schema (op + section schemas, oneOf shape). Extracted
-/// to keep `descriptor()` under clippy's 100-line function limit.
 fn edit_input_schema() -> serde_json::Value {
-    let op_schema = serde_json::json!({
-        "type": "object",
-        "properties": {
-            "op": {
-                "type": "string",
-                "enum": [
-                    "replace",
-                    "delete",
-                    "insert_after",
-                    "insert_before",
-                    "insert_head",
-                    "insert_tail"
-                ],
-                "description": "Operation to apply."
-            },
-            "start": {
-                "type": "integer",
-                "minimum": 1,
-                "description": "1-based line number in the ORIGINAL read snapshot (never re-count for earlier ops in the same call). Required for replace/delete/insert_after/insert_before. replace/delete remove start..=end; insert_after/before place lines relative to this original line."
-            },
-            "end": {
-                "type": "integer",
-                "minimum": 1,
-                "description": "Inclusive 1-based end line (original snapshot) for replace/delete. Defaults to start."
-            },
-            "lines": {
-                "type": "array",
-                "items": { "type": "string" },
-                "description": "Replacement/inserted content, one output line per array item. Do not embed newline characters; use an empty string for a blank line."
-            }
-        },
-        "required": ["op"],
-        "additionalProperties": false
-    });
-    let section_schema = serde_json::json!({
+    let entry_schema = serde_json::json!({
         "type": "object",
         "properties": {
             "path": {
                 "type": "string",
                 "description": "File path relative to the workspace root."
             },
-            "tag": {
-                "type": "string",
-                "description": "Snapshot TAG from the prior read header."
-            },
-            "ops": {
+            "old": {
                 "type": "array",
-                "items": op_schema,
+                "items": { "type": "string" },
                 "minItems": 1,
-                "description": "This section's operations. Line numbers anchor to this file's original read snapshot; ops must not overlap."
+                "description": "The exact current lines to replace, one file line per array item (no embedded newlines). Quote this verbatim from a prior `read`/`edit`/`write` output — a mismatch (not found, or found in more than one place without `replace_all`) is rejected rather than guessed at."
+            },
+            "new": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Replacement lines, one per array item. Empty array deletes `old` outright. To insert, include an unchanged anchor line in both `old` and `new` alongside the inserted lines."
+            },
+            "replace_all": {
+                "type": "boolean",
+                "description": "Replace every non-overlapping occurrence of `old` instead of requiring it to be unique. Defaults to false."
             }
         },
-        "required": ["path", "tag", "ops"],
+        "required": ["path", "old", "new"],
         "additionalProperties": false
     });
     serde_json::json!({
         "type": "object",
         "properties": {
-            "path": {
-                "type": "string",
-                "description": "Single-file form: file path relative to the workspace root."
-            },
-            "tag": {
-                "type": "string",
-                "description": "Single-file form: snapshot TAG from the prior read header."
-            },
-            "ops": {
+            "edits": {
                 "type": "array",
-                "items": op_schema,
+                "items": entry_schema,
                 "minItems": 1,
-                "description": "Single-file form operations. All line numbers anchor to the original read snapshot; ops must not overlap; applied atomically."
-            },
-            "sections": {
-                "type": "array",
-                "items": section_schema,
-                "minItems": 1,
-                "description": "Multi-file form; every section has its own path, tag, and ops."
+                "description": "One or more content-anchored replacements, applied atomically: if any entry fails to resolve, no file is changed. Entries may target the same path (applied together, non-overlapping) or different paths."
             }
         },
-        "oneOf": [
-            { "required": ["path", "tag", "ops"] },
-            { "required": ["sections"] }
-        ],
+        "required": ["edits"],
         "additionalProperties": false
     })
 }
@@ -170,22 +93,19 @@ impl Tool for EditTool {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "edit".to_owned(),
-            description: "Apply line-anchored edits verified against a prior `read` TAG. \
-                          Use `path`, `tag`, and `ops` for one file, or `sections` for \
-                          multiple files. Each `lines` item is one file line, so \
-                          multi-line edits must be arrays, not one string with embedded \
-                          newlines. \
-                          BATCH SEMANTICS (when `ops` has more than one entry): every \
-                          op's line numbers refer to the ORIGINAL file you read — the \
-                          same snapshot the TAG fingerprints — NOT to the file as \
-                          mutated by earlier ops in the same call. So cite every line \
-                          number straight off one `read`; do not shift later ops to \
-                          account for lines an earlier op added or removed. Ops may be \
-                          listed in any order (they are resolved against the original, \
-                          then applied safely). Two ops MUST NOT touch the same line \
-                          (overlapping ranges are rejected as a whole — nothing is \
-                          written). The batch is atomic: if any op or any section fails \
-                          validation, no file is changed."
+            description: "Replace exact lines of text in existing files — no line numbers, \
+                          no prior-read tag. Give `edits: [{ path, old, new, replace_all? }]`: \
+                          `old` is the exact current content you're replacing (quoted \
+                          verbatim from a `read`/`edit`/`write` output, one file line per \
+                          array item), `new` is what it becomes (empty array deletes; an \
+                          insert keeps an unchanged anchor line in both `old` and `new` \
+                          alongside the new lines). `old` must match exactly one place in \
+                          the file unless `replace_all` is set, in which case every \
+                          non-overlapping occurrence is replaced. A patch is atomic across \
+                          all entries (same or different files): if any entry doesn't \
+                          resolve, nothing is written. On success the result reports how \
+                          many replacements were made per file, not a diff — you already \
+                          have the before/after text in this call's own arguments."
                 .to_owned(),
             input_schema: edit_input_schema(),
         }
@@ -195,18 +115,35 @@ impl Tool for EditTool {
         let args: EditArgs = serde_json::from_value(input.input)
             .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
 
-        // Parse errors are protocol faults: the model sent malformed edit input,
-        // so it cannot be retried by reacting to is_error.
-        let sections = sections_from_args(args).map_err(ToolError::InvalidInput)?;
-        if sections.is_empty() {
-            return Err(ToolError::InvalidInput("empty patch".to_owned()));
+        if args.edits.is_empty() {
+            return Err(ToolError::InvalidInput("empty `edits`".to_owned()));
+        }
+        let entries = validate_entries(args.edits).map_err(ToolError::InvalidInput)?;
+
+        // Group by the RESOLVED absolute path, preserving first-seen order, so
+        // the result lists files in the order the model referenced them.
+        // Grouping by the raw path string would split "src/a.rs" and
+        // "./src/a.rs" into two groups planned independently — the later write
+        // would silently clobber the earlier one. A path that fails to resolve
+        // is an `invalid_path` business error; a group's display name is the
+        // first spelling seen.
+        let mut groups: Vec<(String, PathBuf, Vec<Entry>)> = Vec::new();
+        for entry in entries {
+            let abs_path = match resolve_in_workspace(&self.workspace, &entry.path) {
+                Ok(abs_path) => abs_path,
+                Err(e) => return Ok(business_error("invalid_path", &e.to_string())),
+            };
+            match groups.iter_mut().find(|(_, group_abs, _)| *group_abs == abs_path) {
+                Some((_, _, ops)) => ops.push(entry),
+                None => groups.push((entry.path.clone(), abs_path, vec![entry])),
+            }
         }
 
-        // Plan every section first; write nothing until all are validated, so a
+        // Plan every path first; write nothing until all are validated, so a
         // multi-file patch is all-or-nothing.
-        let mut planned: Vec<PlannedWrite> = Vec::with_capacity(sections.len());
-        for section in &sections {
-            match self.plan_section(section).await {
+        let mut planned: Vec<PlannedWrite> = Vec::with_capacity(groups.len());
+        for (rel_path, abs_path, ops) in &groups {
+            match Self::plan_path(rel_path, abs_path, ops).await {
                 Ok(plan) => planned.push(plan),
                 Err(business) => return Ok(business),
             }
@@ -220,13 +157,11 @@ impl Tool for EditTool {
                     &format!("failed to write {}: {e}", plan.rel_path),
                 ));
             }
-            let new_tag = tag_of(plan.new_content.as_bytes());
-            self.snapshots.record(&plan.abs_path, new_tag.clone());
-            // A compact header the model can scan, then a unified diff so both the
-            // model and the UI see exactly which lines changed.
             summaries.push(format!(
-                "edited {} ({} ops) -> {}\n{}",
-                plan.rel_path, plan.op_count, new_tag, plan.diff
+                "edited {} ({} replacement{})",
+                plan.rel_path,
+                plan.replacement_count,
+                if plan.replacement_count == 1 { "" } else { "s" }
             ));
         }
 
@@ -238,425 +173,189 @@ impl Tool for EditTool {
     }
 }
 
-/// A validated section ready to write.
+/// A validated `old`/`new` entry for one path.
+struct Entry {
+    path: String,
+    /// 1-based position in the incoming `edits` array, cited in error
+    /// messages so the model knows which entry to fix.
+    ordinal: usize,
+    old: Vec<String>,
+    new: Vec<String>,
+    replace_all: bool,
+}
+
+/// A validated path's worth of edits, ready to write.
 struct PlannedWrite {
     abs_path: PathBuf,
     rel_path: String,
     new_content: String,
-    op_count: usize,
-    diff: String,
+    replacement_count: usize,
 }
 
 impl EditTool {
-    /// Validate one section against disk + snapshot and compute its new content.
+    /// Validate one path's entries against disk and compute the new content.
     ///
-    /// Returns `Err(ToolOutput)` for a *business* failure (stale tag, missing
-    /// file, bad range) that the model should see and react to.
-    async fn plan_section(&self, section: &Section) -> Result<PlannedWrite, ToolOutput> {
-        let abs_path = resolve_in_workspace(&self.workspace, &section.path)
-            .map_err(|e| business_error("invalid_path", &e.to_string()))?;
-
-        let content = tokio::fs::read_to_string(&abs_path).await.map_err(|e| {
+    /// Returns `Err(ToolOutput)` for a *business* failure (no match, ambiguous
+    /// match, missing file, overlapping edits) that the model should see and
+    /// react to.
+    async fn plan_path(
+        rel_path: &str,
+        abs_path: &Path,
+        ops: &[Entry],
+    ) -> Result<PlannedWrite, ToolOutput> {
+        let content = tokio::fs::read_to_string(abs_path).await.map_err(|e| {
             business_error(
                 "read_failed",
-                &format!("failed to read {} for edit: {e}", section.path),
+                &format!("failed to read {rel_path} for edit: {e}"),
             )
         })?;
-        let current_tag = tag_of(content.as_bytes());
+        let trailing_newline = content.ends_with('\n');
+        let lines: Vec<&str> = content.lines().collect();
 
-        // The cited tag must match both the file on disk now and what `read`
-        // recorded. A `None` recorded tag means the file was never read this
-        // session; either way the model must (re-)read to get a fresh anchor.
-        let recorded = self.snapshots.get(&abs_path);
-        if section.tag != current_tag || recorded.as_deref() != Some(section.tag.as_str()) {
-            return Err(business_error(
-                "stale_snapshot",
-                &format!(
-                    "stale snapshot for {}: patch cites #{}, file is #{current_tag}. \
-                     Re-`read` {} and rebuild the patch against the new TAG.",
-                    section.path, section.tag, section.path
-                ),
-            ));
+        // Resolve every entry's `old` to splices against the ORIGINAL lines
+        // (matching, not mutating, as we go) — same "anchor to one snapshot"
+        // guarantee the old line-number scheme gave, but the snapshot here is
+        // just "the file as read at the top of this call".
+        let mut splices: Vec<(usize, usize, &Entry)> = Vec::new();
+        for entry in ops {
+            let matches = find_matches(&lines, &entry.old);
+            match matches.len() {
+                0 => {
+                    return Err(business_error(
+                        "not_found",
+                        &format!(
+                            "{rel_path}: no match for the given `old` lines (first line: {:?})",
+                            entry.old.first().map_or("", String::as_str)
+                        ),
+                    ));
+                }
+                1 => splices.push((matches[0], matches[0] + entry.old.len(), entry)),
+                _ if entry.replace_all => {
+                    splices.extend(
+                        matches
+                            .into_iter()
+                            .map(|start| (start, start + entry.old.len(), entry)),
+                    );
+                }
+                n => {
+                    return Err(business_error(
+                        "ambiguous",
+                        &format!(
+                            "{rel_path}: `old` matches {n} places; pass `replace_all: true` or narrow \
+                             the quoted lines to make it unique"
+                        ),
+                    ));
+                }
+            }
         }
 
-        let lines: Vec<&str> = content.lines().collect();
-        let new_content = apply_ops(&lines, &section.ops, content.ends_with('\n'))
-            .map_err(|msg| business_error("bad_range", &format!("{}: {msg}", section.path)))?;
-        // Build the diff from the same anchors `apply_ops` validated, so a plan
-        // that produced content also has a matching diff (both fail together).
-        let diff = unified_diff(&lines, &section.ops, DIFF_CONTEXT)
-            .map_err(|msg| business_error("bad_range", &format!("{}: {msg}", section.path)))?;
+        // Overlap check: two entries touching the same line is rejected as a
+        // whole, same as the old op-based scheme. Name the conflicting entries
+        // by their 1-based `edits` position so the model can merge or narrow
+        // them. (Two splices from one `replace_all` entry can't overlap —
+        // `find_matches` skips past each match.)
+        splices.sort_by_key(|&(start, ..)| start);
+        let mut prev_end = 0usize;
+        let mut prev_ordinal = 0usize;
+        for (idx, &(start, end, entry)) in splices.iter().enumerate() {
+            if idx > 0 && start < prev_end {
+                return Err(business_error(
+                    "overlapping_edits",
+                    &format!(
+                        "{rel_path}: entries {prev_ordinal} and {} overlap; merge them into one \
+                         entry or quote disjoint lines",
+                        entry.ordinal
+                    ),
+                ));
+            }
+            prev_end = end;
+            prev_ordinal = entry.ordinal;
+        }
+
+        let replacement_count = splices.len();
+
+        // Apply high-index first so earlier splices' indices stay valid.
+        let mut out: Vec<String> = lines.iter().map(|s| (*s).to_owned()).collect();
+        for (start, end, entry) in splices.into_iter().rev() {
+            out.splice(start..end, entry.new.iter().cloned());
+        }
+
+        let mut new_content = out.join("\n");
+        if trailing_newline && !new_content.is_empty() {
+            new_content.push('\n');
+        }
 
         Ok(PlannedWrite {
-            abs_path,
-            rel_path: section.path.clone(),
+            abs_path: abs_path.to_path_buf(),
+            rel_path: rel_path.to_owned(),
             new_content,
-            op_count: section.ops.len(),
-            diff,
+            replacement_count,
         })
     }
 }
 
-/// One file's worth of the patch.
-#[derive(Debug, PartialEq, Eq)]
-struct Section {
-    path: String,
-    tag: String,
-    ops: Vec<Op>,
-}
-
-/// A single edit operation as parsed from the patch. The `anchor` stores the
-/// user-supplied 1-based descriptor; resolution to a 0-based half-open splice
-/// happens in [`resolve_splice`]. `replace`/`delete` have `end > start`;
-/// inserts are zero-width (`end == start`).
-#[derive(Debug, PartialEq, Eq)]
-struct Op {
-    /// 1-based anchor as written, kept only for error messages.
-    anchor: AnchorRange,
-    payload: Vec<String>,
-}
-
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum AnchorRange {
-    /// Inclusive 1-based line range `start..=end`.
-    Range(usize, usize),
-    /// Insert after the given 1-based line (0 = head, handled separately).
-    After(usize),
-    /// Insert before the given 1-based line.
-    Before(usize),
-    Head,
-    Tail,
-}
-
-/// Convert the structured input form into internal file sections.
-fn sections_from_args(args: EditArgs) -> Result<Vec<Section>, String> {
-    let has_sections = !args.sections.is_empty();
-    let has_single = args.path.is_some() || args.tag.is_some() || !args.ops.is_empty();
-
-    match (has_single, has_sections) {
-        (true, true) => {
-            Err("edit input must use either `path`/`tag`/`ops` or `sections`, not both".to_owned())
+/// Every start index (0-based) at which `needle` occurs as a contiguous run in
+/// `haystack`, scanning left to right and skipping past a match so overlapping
+/// occurrences are not double-counted under `replace_all`.
+fn find_matches(haystack: &[&str], needle: &[String]) -> Vec<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return Vec::new();
+    }
+    let mut starts = Vec::new();
+    let mut i = 0;
+    while i + needle.len() <= haystack.len() {
+        if haystack[i..i + needle.len()]
+            .iter()
+            .zip(needle)
+            .all(|(h, n)| *h == n.as_str())
+        {
+            starts.push(i);
+            i += needle.len();
+        } else {
+            i += 1;
         }
-        (false, false) => {
-            Err("edit input must include `path`/`tag`/`ops` or `sections`".to_owned())
-        }
-        (false, true) => args
-            .sections
-            .into_iter()
-            .map(section_from_arg)
-            .collect::<Result<Vec<_>, _>>(),
-        (true, false) => section_from_parts(
-            args.path
-                .ok_or_else(|| "structured edit requires `path`".to_owned())?,
-            args.tag
-                .ok_or_else(|| "structured edit requires `tag`".to_owned())?,
-            args.ops,
-        )
-        .map(|section| vec![section]),
     }
+    starts
 }
 
-fn section_from_arg(arg: EditSectionArg) -> Result<Section, String> {
-    section_from_parts(arg.path, arg.tag, arg.ops)
-}
-
-fn section_from_parts(path: String, tag: String, ops: Vec<EditOpArg>) -> Result<Section, String> {
-    if path.is_empty() {
-        return Err("structured edit section has empty `path`".to_owned());
-    }
-    if tag.is_empty() {
-        return Err(format!("{path}: structured edit section has empty `tag`"));
-    }
-    if ops.is_empty() {
-        return Err(format!("{path}: structured edit section has no ops"));
-    }
-
-    let ops = ops
+/// Validate the parsed entries: no embedded newlines, non-empty `old`,
+/// non-empty `path`. These are protocol errors (malformed input the model
+/// cannot react to via `is_error`), not business errors.
+fn validate_entries(edits: Vec<EditEntryArg>) -> Result<Vec<Entry>, String> {
+    edits
         .into_iter()
         .enumerate()
-        .map(|(idx, op)| op_from_arg(&path, idx, op))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Section { path, tag, ops })
+        .map(|(idx, e)| {
+            let ctx = format!("edits[{idx}]");
+            if e.path.is_empty() {
+                return Err(format!("{ctx}: empty `path`"));
+            }
+            if e.old.is_empty() {
+                return Err(format!(
+                    "{ctx} ({}): empty `old` — edit requires existing content to replace; use `write` to create a new file",
+                    e.path
+                ));
+            }
+            validate_lines(&ctx, &e.path, &e.old)?;
+            validate_lines(&ctx, &e.path, &e.new)?;
+            Ok(Entry {
+                path: e.path,
+                ordinal: idx + 1,
+                old: e.old,
+                new: e.new,
+                replace_all: e.replace_all,
+            })
+        })
+        .collect()
 }
 
-fn op_from_arg(path: &str, idx: usize, arg: EditOpArg) -> Result<Op, String> {
-    let EditOpArg {
-        op,
-        start,
-        end,
-        lines,
-    } = arg;
-    let ctx = format!("{path} op {} `{op}`", idx + 1);
-    validate_structured_lines(&ctx, &lines)?;
-
-    let anchor = match op.as_str() {
-        "replace" => {
-            let start = required_start(&ctx, start)?;
-            require_lines(&ctx, &lines)?;
-            AnchorRange::Range(start, end.unwrap_or(start))
-        }
-        "delete" => {
-            let start = required_start(&ctx, start)?;
-            reject_lines(&ctx, &lines)?;
-            AnchorRange::Range(start, end.unwrap_or(start))
-        }
-        "insert_after" => {
-            let start = required_start(&ctx, start)?;
-            reject_end(&ctx, end)?;
-            require_lines(&ctx, &lines)?;
-            AnchorRange::After(start)
-        }
-        "insert_before" => {
-            let start = required_start(&ctx, start)?;
-            reject_end(&ctx, end)?;
-            require_lines(&ctx, &lines)?;
-            AnchorRange::Before(start)
-        }
-        "insert_head" => {
-            reject_start(&ctx, start)?;
-            reject_end(&ctx, end)?;
-            require_lines(&ctx, &lines)?;
-            AnchorRange::Head
-        }
-        "insert_tail" => {
-            reject_start(&ctx, start)?;
-            reject_end(&ctx, end)?;
-            require_lines(&ctx, &lines)?;
-            AnchorRange::Tail
-        }
-        _ => return Err(format!("{ctx}: unknown op")),
-    };
-
-    Ok(Op {
-        anchor,
-        payload: lines,
-    })
-}
-
-fn required_start(ctx: &str, start: Option<usize>) -> Result<usize, String> {
-    match start {
-        Some(0) => Err(format!("{ctx}: `start` must be 1-based; 0 is invalid")),
-        Some(n) => Ok(n),
-        None => Err(format!("{ctx}: missing required `start`")),
-    }
-}
-
-fn reject_start(ctx: &str, start: Option<usize>) -> Result<(), String> {
-    if start.is_some() {
-        return Err(format!("{ctx}: `start` is not valid for this op"));
-    }
-    Ok(())
-}
-
-fn reject_end(ctx: &str, end: Option<usize>) -> Result<(), String> {
-    if end.is_some() {
-        return Err(format!("{ctx}: `end` is only valid for replace/delete"));
-    }
-    Ok(())
-}
-
-fn require_lines(ctx: &str, lines: &[String]) -> Result<(), String> {
-    if lines.is_empty() {
-        return Err(format!("{ctx}: missing required `lines`"));
-    }
-    Ok(())
-}
-
-fn reject_lines(ctx: &str, lines: &[String]) -> Result<(), String> {
-    if !lines.is_empty() {
-        return Err(format!("{ctx}: `lines` is not valid for delete"));
-    }
-    Ok(())
-}
-
-fn validate_structured_lines(ctx: &str, lines: &[String]) -> Result<(), String> {
-    if lines
-        .iter()
-        .any(|line| line.contains('\n') || line.contains('\r'))
-    {
+fn validate_lines(ctx: &str, path: &str, lines: &[String]) -> Result<(), String> {
+    if lines.iter().any(|l| l.contains('\n') || l.contains('\r')) {
         return Err(format!(
-            "{ctx}: each `lines` item must be one output line; split multi-line content into multiple array items"
+            "{ctx} ({path}): each line item must be one output line; split multi-line content into multiple array items"
         ));
     }
     Ok(())
-}
-
-/// Apply a section's ops to `lines`, returning the new file content.
-///
-/// Each op becomes a half-open splice `[start, end)` on the 0-based line vector.
-/// Splices are applied high-index first so earlier line numbers stay valid as
-/// later lines are rewritten; overlapping ranges are rejected.
-fn apply_ops(lines: &[&str], ops: &[Op], trailing_newline: bool) -> Result<String, String> {
-    let n = lines.len();
-    // Resolve each op to (start, end, replacement, declaration_order).
-    let mut splices: Vec<(usize, usize, Vec<String>, usize)> = Vec::with_capacity(ops.len());
-    for (order, op) in ops.iter().enumerate() {
-        let (start, end) = resolve_splice(op.anchor, n)?;
-        splices.push((start, end, op.payload.clone(), order));
-    }
-
-    // Sort by start ascending (ties: declaration order) to check for overlap…
-    splices.sort_by(|a, b| a.0.cmp(&b.0).then(a.3.cmp(&b.3)));
-    let mut prev_end: Option<usize> = None;
-    for (start, end, _, _) in &splices {
-        if let Some(pe) = prev_end
-            && *start < pe
-        {
-            return Err(format!(
-                "overlapping edits touch line index {start} more than once"
-            ));
-        }
-        // Zero-width inserts (start == end) don't advance the barrier past a
-        // following real range at the same index.
-        prev_end = Some((*end).max(prev_end.unwrap_or(0)));
-    }
-
-    // …then apply high-index first so indices below an edit are unaffected.
-    splices.sort_by(|a, b| b.0.cmp(&a.0).then(b.3.cmp(&a.3)));
-    let mut out: Vec<String> = lines.iter().map(|s| (*s).to_owned()).collect();
-    for (start, end, replacement, _) in splices {
-        out.splice(start..end, replacement);
-    }
-
-    let mut joined = out.join("\n");
-    if trailing_newline && !joined.is_empty() {
-        joined.push('\n');
-    }
-    Ok(joined)
-}
-
-/// Turn a 1-based anchor into a 0-based half-open `[start, end)` splice over a
-/// file of `n` lines, bounds-checked.
-fn resolve_splice(anchor: AnchorRange, n: usize) -> Result<(usize, usize), String> {
-    match anchor {
-        AnchorRange::Range(a, b) => {
-            if a == 0 || b == 0 {
-                return Err("line numbers are 1-based; 0 is invalid".to_owned());
-            }
-            if a > b {
-                return Err(format!("inverted range {a}..{b}"));
-            }
-            if b > n {
-                return Err(format!("range {a}..{b} past end of file ({n} lines)"));
-            }
-            Ok((a - 1, b))
-        }
-        AnchorRange::After(k) => {
-            if k > n {
-                return Err(format!("`insert after {k}` past end of file ({n} lines)"));
-            }
-            Ok((k, k))
-        }
-        AnchorRange::Before(k) => {
-            if k == 0 || k > n.max(1) {
-                return Err(format!("`insert before {k}` out of range (1..={n})"));
-            }
-            Ok((k - 1, k - 1))
-        }
-        AnchorRange::Head => Ok((0, 0)),
-        AnchorRange::Tail => Ok((n, n)),
-    }
-}
-
-/// Context lines shown on each side of a change hunk in the edit diff.
-const DIFF_CONTEXT: usize = 3;
-
-/// Build a unified-style diff for a section's ops against the old `lines`.
-///
-/// The ops already carry validated 1-based anchors; each resolves to an old
-/// half-open range `[start, end)` that is deleted and a payload that is
-/// inserted. That *is* the diff — no LCS needed. Ranges are sorted ascending
-/// (matching `apply_ops`' overlap rule) and rendered as hunks with up to
-/// [`DIFF_CONTEXT`] unchanged lines on each side; hunks whose context windows
-/// touch are merged so adjacent edits read as one block.
-///
-/// Output shape (one hunk):
-/// ```text
-/// @@ -old_start,old_len +new_start,new_len @@
-///  context line
-/// -removed line
-/// +added line
-/// ```
-/// Line numbers are 1-based. An empty diff (no visible change) yields "".
-#[allow(clippy::unwrap_used)] // writeln! on String never fails
-fn unified_diff(lines: &[&str], ops: &[Op], context: usize) -> Result<String, String> {
-    let n = lines.len();
-    // Resolve every op to (old_start, old_end, payload), sorted ascending. Same
-    // resolution `apply_ops` uses, so a valid patch always yields a valid diff.
-    let mut edits: Vec<(usize, usize, &[String])> = Vec::with_capacity(ops.len());
-    for op in ops {
-        let (start, end) = resolve_splice(op.anchor, n)?;
-        edits.push((start, end, &op.payload));
-    }
-    edits.sort_by_key(|e| e.0);
-
-    // Group edits whose context windows overlap into shared hunks. Each group is
-    // a run of edits where the next edit starts within `context` lines of the
-    // previous edit's end (so their context lines would touch/overlap).
-    let mut hunks: Vec<Vec<(usize, usize, &[String])>> = Vec::new();
-    for edit in edits {
-        let should_merge = hunks
-            .last()
-            .and_then(|g| g.last())
-            .is_some_and(|&(_, end, _)| edit.0 <= end + context * 2);
-        if should_merge {
-            hunks.last_mut().unwrap().push(edit);
-        } else {
-            hunks.push(vec![edit]);
-        }
-    }
-
-    let mut out = String::new();
-    // Running totals of lines added/removed by earlier hunks, so each hunk's `+`
-    // side is numbered correctly after the file grew/shrank above it. Kept as two
-    // usize counters (not a signed delta) to avoid isize casts.
-    let mut cum_added: usize = 0;
-    let mut cum_removed: usize = 0;
-    for group in &hunks {
-        let first_start = group[0].0;
-        let last_end = group[group.len() - 1].1;
-        let ctx_start = first_start.saturating_sub(context);
-        let ctx_end = (last_end + context).min(n);
-
-        // Old span covered by this hunk (context + all edited ranges).
-        let old_len = ctx_end - ctx_start;
-        // New span = old span, minus each edit's removed lines, plus its payload.
-        let mut new_len = old_len;
-        for (s, e, payload) in group {
-            new_len = new_len - (e - s) + payload.len();
-        }
-        let old_start = ctx_start + 1;
-        // New-side start = old start shifted by the net add/remove of prior hunks.
-        let new_start = (ctx_start + cum_added).saturating_sub(cum_removed) + 1;
-        writeln!(out, "@@ -{old_start},{old_len} +{new_start},{new_len} @@").unwrap();
-
-        // Walk the old lines across the hunk, emitting context/removed/added in
-        // order. `cursor` is the next old line index not yet emitted.
-        let mut cursor = ctx_start;
-        for (s, e, payload) in group {
-            for line in &lines[cursor..*s] {
-                writeln!(out, " {line}").unwrap();
-            }
-            for line in &lines[*s..*e] {
-                writeln!(out, "-{line}").unwrap();
-            }
-            for line in *payload {
-                writeln!(out, "+{line}").unwrap();
-            }
-            cursor = *e;
-            cum_added += payload.len();
-            cum_removed += *e - *s;
-        }
-        for line in &lines[cursor..ctx_end] {
-            writeln!(out, " {line}").unwrap();
-        }
-    }
-
-    // Trim the trailing newline so the caller controls final layout.
-    if out.ends_with('\n') {
-        out.pop();
-    }
-    Ok(out)
 }
 
 fn business_error(code: &str, message: &str) -> ToolOutput {
@@ -674,53 +373,47 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    /// Build a tool whose store already holds the current tag for `path`, as if
-    /// `read` had just run — the precondition every real `edit` has.
-    fn primed(dir: &std::path::Path, rel: &str, content: &str) -> EditTool {
-        std::fs::write(dir.join(rel), content).unwrap();
-        let store = SnapshotStore::new();
-        store.record(&dir.join(rel), tag_of(content.as_bytes()));
-        EditTool::new(dir.to_path_buf(), store)
+    fn tool(workspace: PathBuf) -> EditTool {
+        EditTool::new(workspace)
     }
 
-    fn call_edit(path: &str, content: &str, ops: serde_json::Value) -> ToolInput {
-        let mut input = serde_json::Map::new();
-        input.insert(
-            "path".to_owned(),
-            serde_json::Value::String(path.to_owned()),
-        );
-        input.insert("tag".to_owned(), serde_json::Value::String(tag(content)));
-        input.insert("ops".to_owned(), ops);
-        call_json(serde_json::Value::Object(input))
+    fn lines(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_owned()).collect()
     }
 
-    fn call_json(input: serde_json::Value) -> ToolInput {
+    // Takes `edits` by value: it is moved straight into the `json!` object, so a
+    // reference would only force callers to clone. clippy::pedantic flags the
+    // by-value arg regardless, hence the local allow.
+    #[allow(clippy::needless_pass_by_value)]
+    fn call(edits: serde_json::Value) -> ToolInput {
         ToolInput {
             call_id: "c1".to_owned(),
-            input,
+            input: serde_json::json!({ "edits": edits }),
             timeout: Duration::from_secs(5),
         }
     }
 
-    fn tag(content: &str) -> String {
-        tag_of(content.as_bytes())
+    fn text(out: &ToolOutput) -> String {
+        match &out.content[0] {
+            Content::Text(t) => t.clone(),
+            other => panic!("expected text, got {other:?}"),
+        }
     }
 
     #[tokio::test]
-    async fn replace_range_rewrites_lines() {
+    async fn unique_replace_rewrites_lines() {
         let dir = tempfile::tempdir().unwrap();
-        let src = "a\nb\nc\n";
-        let tool = primed(dir.path(), "f.txt", src);
+        std::fs::write(dir.path().join("f.txt"), "a\nb\nc\n").unwrap();
+        let t = tool(dir.path().to_path_buf());
 
-        let out = tool
-            .invoke(call_edit(
-                "f.txt",
-                src,
-                serde_json::json!([{ "op": "replace", "start": 2, "end": 2, "lines": ["B"] }]),
-            ))
+        let out = t
+            .invoke(call(serde_json::json!([
+                { "path": "f.txt", "old": ["b"], "new": ["B"] }
+            ])))
             .await
             .unwrap();
         assert!(!out.is_error, "{:?}", out.content);
+        assert_eq!(text(&out), "edited f.txt (1 replacement)");
         assert_eq!(
             std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
             "a\nB\nc\n"
@@ -728,57 +421,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replace_range_preserves_multiline_payload() {
+    async fn multi_line_old_matches_contiguous_block() {
         let dir = tempfile::tempdir().unwrap();
-        let src = "a\nb\nc\n";
-        let tool = primed(dir.path(), "f.txt", src);
+        std::fs::write(dir.path().join("f.txt"), "a\nb\nc\nd\n").unwrap();
+        let t = tool(dir.path().to_path_buf());
 
-        let out = tool
-            .invoke(call_edit(
-                "f.txt",
-                src,
-                serde_json::json!([{ "op": "replace", "start": 2, "end": 2, "lines": ["B1", "B2"] }]),
-            ))
+        let out = t
+            .invoke(call(serde_json::json!([
+                { "path": "f.txt", "old": ["b", "c"], "new": ["B1", "B2", "B3"] }
+            ])))
             .await
             .unwrap();
         assert!(!out.is_error, "{:?}", out.content);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
-            "a\nB1\nB2\nc\n"
+            "a\nB1\nB2\nB3\nd\n"
         );
     }
 
     #[tokio::test]
-    async fn structured_lines_reject_embedded_newlines() {
+    async fn empty_new_deletes_lines() {
         let dir = tempfile::tempdir().unwrap();
-        let src = "a\nb\nc\n";
-        let tool = primed(dir.path(), "f.txt", src);
-        let input = serde_json::json!({
-            "path": "f.txt",
-            "tag": tag(src),
-            "ops": [
-                { "op": "replace", "start": 2, "lines": ["B1\nB2"] }
-            ]
-        });
+        std::fs::write(dir.path().join("f.txt"), "a\nb\nc\n").unwrap();
+        let t = tool(dir.path().to_path_buf());
 
-        assert!(matches!(
-            tool.invoke(call_json(input)).await,
-            Err(ToolError::InvalidInput(msg)) if msg.contains("one output line")
-        ));
-    }
-
-    #[tokio::test]
-    async fn delete_range_removes_lines() {
-        let dir = tempfile::tempdir().unwrap();
-        let src = "a\nb\nc\n";
-        let tool = primed(dir.path(), "f.txt", src);
-
-        let out = tool
-            .invoke(call_edit(
-                "f.txt",
-                src,
-                serde_json::json!([{ "op": "delete", "start": 2, "end": 2 }]),
-            ))
+        let out = t
+            .invoke(call(serde_json::json!([
+                { "path": "f.txt", "old": ["b"], "new": [] }
+            ])))
             .await
             .unwrap();
         assert!(!out.is_error, "{:?}", out.content);
@@ -788,72 +458,144 @@ mod tests {
         );
     }
 
+    /// Insert = an unchanged anchor line kept in both `old` and `new`, with the
+    /// new lines added alongside it. No dedicated insert op is needed.
     #[tokio::test]
-    async fn insert_after_and_before() {
+    async fn insert_via_anchor_line_kept_in_old_and_new() {
         let dir = tempfile::tempdir().unwrap();
-        let src = "a\nb\n";
-        let tool = primed(dir.path(), "f.txt", src);
+        std::fs::write(dir.path().join("f.txt"), "a\nb\n").unwrap();
+        let t = tool(dir.path().to_path_buf());
 
-        let out = tool
-            .invoke(call_edit(
-                "f.txt",
-                src,
-                serde_json::json!([
-                    { "op": "insert_after", "start": 1, "lines": ["A1"] },
-                    { "op": "insert_before", "start": 1, "lines": ["B0"] }
-                ]),
-            ))
-            .await
-            .unwrap();
-        assert!(!out.is_error, "{:?}", out.content);
-        // before-1 inserts at head, after-1 inserts following the original a.
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
-            "B0\na\nA1\nb\n"
-        );
-    }
-
-    #[tokio::test]
-    async fn insert_head_and_tail() {
-        let dir = tempfile::tempdir().unwrap();
-        let src = "x\n";
-        let tool = primed(dir.path(), "f.txt", src);
-
-        let out = tool
-            .invoke(call_edit(
-                "f.txt",
-                src,
-                serde_json::json!([
-                    { "op": "insert_head", "lines": ["top"] },
-                    { "op": "insert_tail", "lines": ["bottom"] }
-                ]),
-            ))
+        let out = t
+            .invoke(call(serde_json::json!([
+                { "path": "f.txt", "old": ["a"], "new": ["a", "A1"] }
+            ])))
             .await
             .unwrap();
         assert!(!out.is_error, "{:?}", out.content);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
-            "top\nx\nbottom\n"
+            "a\nA1\nb\n"
         );
     }
 
-    /// Multiple ops in one section apply without line-number drift: the high
-    /// line is rewritten first so the low line's number is still valid.
     #[tokio::test]
-    async fn multi_op_no_drift() {
+    async fn replace_all_replaces_every_non_overlapping_occurrence() {
         let dir = tempfile::tempdir().unwrap();
-        let src = "1\n2\n3\n4\n5\n";
-        let tool = primed(dir.path(), "f.txt", src);
+        std::fs::write(dir.path().join("f.txt"), "x\ny\nx\nz\nx\n").unwrap();
+        let t = tool(dir.path().to_path_buf());
 
-        let out = tool
-            .invoke(call_edit(
-                "f.txt",
-                src,
-                serde_json::json!([
-                    { "op": "replace", "start": 1, "end": 1, "lines": ["one"] },
-                    { "op": "replace", "start": 5, "end": 5, "lines": ["five"] }
-                ]),
-            ))
+        let out = t
+            .invoke(call(serde_json::json!([
+                { "path": "f.txt", "old": ["x"], "new": ["X"], "replace_all": true }
+            ])))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{:?}", out.content);
+        assert_eq!(text(&out), "edited f.txt (3 replacements)");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "X\ny\nX\nz\nX\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn not_found_is_business_error_and_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "a\nb\nc\n").unwrap();
+        let t = tool(dir.path().to_path_buf());
+
+        let out = t
+            .invoke(call(serde_json::json!([
+                { "path": "f.txt", "old": ["nope"], "new": ["X"] }
+            ])))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert_eq!(out.error_code.as_deref(), Some("not_found"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "a\nb\nc\n"
+        );
+    }
+
+    /// A stale `old` (file changed out-of-band since the model last saw it) is
+    /// just another `not_found` — no separate staleness mechanism needed.
+    #[tokio::test]
+    async fn stale_old_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "a\nb\nc\n").unwrap();
+        let t = tool(dir.path().to_path_buf());
+        std::fs::write(dir.path().join("f.txt"), "a\nB2\nc\n").unwrap();
+
+        let out = t
+            .invoke(call(serde_json::json!([
+                { "path": "f.txt", "old": ["b"], "new": ["B"] }
+            ])))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert_eq!(out.error_code.as_deref(), Some("not_found"));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_match_without_replace_all_is_business_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "x\ny\nx\n").unwrap();
+        let t = tool(dir.path().to_path_buf());
+
+        let out = t
+            .invoke(call(serde_json::json!([
+                { "path": "f.txt", "old": ["x"], "new": ["X"] }
+            ])))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert_eq!(out.error_code.as_deref(), Some("ambiguous"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "x\ny\nx\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_entry_overlap_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "a\nb\nc\n").unwrap();
+        let t = tool(dir.path().to_path_buf());
+
+        let out = t
+            .invoke(call(serde_json::json!([
+                { "path": "f.txt", "old": ["a", "b"], "new": ["X"] },
+                { "path": "f.txt", "old": ["b", "c"], "new": ["Y"] }
+            ])))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert_eq!(out.error_code.as_deref(), Some("overlapping_edits"));
+        assert!(
+            text(&out).contains("entries 1 and 2"),
+            "overlap error must name the conflicting entries by 1-based `edits` position: {}",
+            text(&out)
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "a\nb\nc\n",
+            "overlap must leave the file untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn disjoint_entries_same_path_both_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "1\n2\n3\n4\n5\n").unwrap();
+        let t = tool(dir.path().to_path_buf());
+
+        let out = t
+            .invoke(call(serde_json::json!([
+                { "path": "f.txt", "old": ["1"], "new": ["one"] },
+                { "path": "f.txt", "old": ["5"], "new": ["five"] }
+            ])))
             .await
             .unwrap();
         assert!(!out.is_error, "{:?}", out.content);
@@ -863,217 +605,238 @@ mod tests {
         );
     }
 
-    /// The core safety property: a file changed on disk after the read (tag no
-    /// longer matches) is rejected with `stale_snapshot`, and left untouched.
-    /// If verification were bypassed this would silently clobber the wrong line.
+    /// A multi-file patch is all-or-nothing: if the second file's edit doesn't
+    /// resolve, the first file must not have been written.
     #[tokio::test]
-    async fn stale_snapshot_is_rejected_and_file_untouched() {
+    async fn multi_file_patch_is_atomic() {
         let dir = tempfile::tempdir().unwrap();
-        let original = "a\nb\nc\n";
-        let tool = primed(dir.path(), "f.txt", original);
-        let input = call_edit(
-            "f.txt",
-            original,
-            serde_json::json!([{ "op": "replace", "start": 2, "end": 2, "lines": ["B"] }]),
-        );
-        // The file changes out-of-band before edit runs.
-        std::fs::write(dir.path().join("f.txt"), "a\nb\nc\nd\n").unwrap();
-
-        let out = tool.invoke(input).await.unwrap();
-        assert!(out.is_error);
-        assert_eq!(out.error_code.as_deref(), Some("stale_snapshot"));
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
-            "a\nb\nc\nd\n",
-            "edit must not modify a stale file"
-        );
-    }
-
-    /// A file never `read` this session has no recorded snapshot, so even a tag
-    /// that happens to match the disk is rejected — the model must read first.
-    #[tokio::test]
-    async fn unread_file_is_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let src = "a\n";
-        std::fs::write(dir.path().join("f.txt"), src).unwrap();
-        // Empty store: never read.
-        let tool = EditTool::new(dir.path().to_path_buf(), SnapshotStore::new());
-
-        let out = tool
-            .invoke(call_edit(
-                "f.txt",
-                src,
-                serde_json::json!([{ "op": "replace", "start": 1, "end": 1, "lines": ["A"] }]),
-            ))
-            .await
-            .unwrap();
-        assert!(out.is_error);
-        assert_eq!(out.error_code.as_deref(), Some("stale_snapshot"));
-    }
-
-    /// A multi-file patch is all-or-nothing: if the second section is stale, the
-    /// first file must not have been written.
-    #[tokio::test]
-    async fn multi_section_is_atomic() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = SnapshotStore::new();
         std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
         std::fs::write(dir.path().join("b.txt"), "b\n").unwrap();
-        store.record(&dir.path().join("a.txt"), tag_of(b"a\n"));
-        // b.txt deliberately NOT recorded -> its section will be stale.
-        let tool = EditTool::new(dir.path().to_path_buf(), store);
-        let input = serde_json::json!({
-            "sections": [
-                {
-                    "path": "a.txt",
-                    "tag": tag("a\n"),
-                    "ops": [{ "op": "replace", "start": 1, "end": 1, "lines": ["A"] }]
-                },
-                {
-                    "path": "b.txt",
-                    "tag": tag("b\n"),
-                    "ops": [{ "op": "replace", "start": 1, "end": 1, "lines": ["B"] }]
-                }
-            ]
-        });
+        let t = tool(dir.path().to_path_buf());
 
-        let out = tool.invoke(call_json(input)).await.unwrap();
+        let out = t
+            .invoke(call(serde_json::json!([
+                { "path": "a.txt", "old": ["a"], "new": ["A"] },
+                { "path": "b.txt", "old": ["nope"], "new": ["B"] }
+            ])))
+            .await
+            .unwrap();
         assert!(out.is_error);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             "a\n",
-            "first file must be untouched when a later section fails"
+            "first file must be untouched when a later path fails"
         );
     }
 
     #[tokio::test]
-    async fn out_of_range_is_bad_range() {
+    async fn embedded_newline_in_old_is_protocol_error() {
         let dir = tempfile::tempdir().unwrap();
-        let src = "a\nb\n";
-        let tool = primed(dir.path(), "f.txt", src);
+        std::fs::write(dir.path().join("f.txt"), "a\n").unwrap();
+        let t = tool(dir.path().to_path_buf());
 
-        let out = tool
-            .invoke(call_edit(
-                "f.txt",
-                src,
-                serde_json::json!([{ "op": "replace", "start": 5, "end": 5, "lines": ["x"] }]),
-            ))
-            .await
-            .unwrap();
-        assert!(out.is_error);
-        assert_eq!(out.error_code.as_deref(), Some("bad_range"));
+        let out = t
+            .invoke(call(serde_json::json!([
+                { "path": "f.txt", "old": ["a\nb"], "new": ["x"] }
+            ])))
+            .await;
+        assert!(matches!(out, Err(ToolError::InvalidInput(msg)) if msg.contains("one output line")));
     }
 
     #[tokio::test]
-    async fn input_field_is_protocol_error() {
+    async fn empty_old_is_protocol_error() {
         let dir = tempfile::tempdir().unwrap();
-        let tool = primed(dir.path(), "f.txt", "a\n");
-        assert!(matches!(
-            tool.invoke(call_json(serde_json::json!({ "input": "not supported" })))
-                .await,
-            Err(ToolError::InvalidInput(_))
-        ));
+        let t = tool(dir.path().to_path_buf());
+
+        let out = t
+            .invoke(call(serde_json::json!([
+                { "path": "f.txt", "old": [], "new": ["x"] }
+            ])))
+            .await;
+        assert!(matches!(out, Err(ToolError::InvalidInput(msg)) if msg.contains("empty `old`")));
+    }
+
+    #[tokio::test]
+    async fn empty_edits_is_protocol_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = tool(dir.path().to_path_buf());
+
+        let out = t.invoke(call(serde_json::json!([]))).await;
+        assert!(matches!(out, Err(ToolError::InvalidInput(_))));
     }
 
     #[tokio::test]
     async fn escaping_path_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let tool = primed(dir.path(), "f.txt", "a\n");
-        let out = tool
-            .invoke(call_json(serde_json::json!({
-                "path": "../escape",
-                "tag": "AAAA",
-                "ops": [{ "op": "replace", "start": 1, "end": 1, "lines": ["x"] }]
-            })))
+        let t = tool(dir.path().to_path_buf());
+
+        let out = t
+            .invoke(call(serde_json::json!([
+                { "path": "../escape", "old": ["a"], "new": ["x"] }
+            ])))
             .await
             .unwrap();
         assert!(out.is_error);
         assert_eq!(out.error_code.as_deref(), Some("invalid_path"));
     }
 
-    // --- unified_diff --------------------------------------------------------
-
-    fn op(anchor: AnchorRange, payload: &[&str]) -> Op {
-        Op {
-            anchor,
-            payload: payload.iter().map(|s| (*s).to_owned()).collect(),
-        }
-    }
-
-    /// A single replace renders one hunk: context lines prefixed ` `, the old
-    /// line `-`, the new line `+`, with correct 1-based @@ ranges. This is the
-    /// shape the frontend colours, so it must be exact.
-    #[test]
-    fn diff_replace_one_line_with_context() {
-        let lines = vec!["a", "b", "c", "d", "e"];
-        let ops = vec![op(AnchorRange::Range(3, 3), &["C"])];
-        let diff = unified_diff(&lines, &ops, 1).unwrap();
-        assert_eq!(diff, "@@ -2,3 +2,3 @@\n b\n-c\n+C\n d");
-    }
-
-    /// An insert removes nothing (no `-` line) and the @@ new-length grows by the
-    /// payload size — verifies the offset math, not just that text appears.
-    #[test]
-    fn diff_insert_after_grows_new_side() {
-        let lines = vec!["a", "b", "c"];
-        let ops = vec![op(AnchorRange::After(2), &["b2"])];
-        let diff = unified_diff(&lines, &ops, 1).unwrap();
-        assert_eq!(diff, "@@ -2,2 +2,3 @@\n b\n+b2\n c");
-    }
-
-    /// Two edits far apart produce two separate hunks; a diff that merged them
-    /// would wrongly bury unchanged lines as context, so the split matters.
-    #[test]
-    fn diff_distant_edits_split_into_two_hunks() {
-        let lines: Vec<&str> = (1..=12).map(|_| "x").collect();
-        let ops = vec![
-            op(AnchorRange::Range(2, 2), &["A"]),
-            op(AnchorRange::Range(11, 11), &["B"]),
-        ];
-        let diff = unified_diff(&lines, &ops, 1).unwrap();
-        assert_eq!(diff.matches("@@ ").count(), 2, "expected two hunks: {diff}");
-    }
-
-    /// Adjacent edits within 2·context of each other collapse into one hunk so
-    /// the reader sees a single continuous block, not two touching ones.
-    #[test]
-    fn diff_close_edits_merge_into_one_hunk() {
-        let lines = vec!["a", "b", "c", "d", "e"];
-        let ops = vec![
-            op(AnchorRange::Range(2, 2), &["B"]),
-            op(AnchorRange::Range(4, 4), &["D"]),
-        ];
-        let diff = unified_diff(&lines, &ops, 3).unwrap();
-        assert_eq!(diff.matches("@@ ").count(), 1, "expected one hunk: {diff}");
-    }
-
-    /// Multiple ops in ONE call anchor to the SAME read snapshot, not to an
-    /// intermediate state. Deleting line 3 and line 10 of a 10-line file must
-    /// drop exactly those two original lines — the second anchor is NOT
-    /// re-indexed by the first delete. This is the guarantee that lets the model
-    /// cite all its line numbers off one `read` without predicting shifts.
     #[tokio::test]
-    async fn multi_delete_anchors_to_original_snapshot() {
+    async fn missing_file_is_read_failed() {
         let dir = tempfile::tempdir().unwrap();
-        let src = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n";
-        let tool = primed(dir.path(), "f.txt", src);
+        let t = tool(dir.path().to_path_buf());
 
-        let out = tool
-            .invoke(call_edit(
-                "f.txt",
-                src,
-                serde_json::json!([
-                    { "op": "delete", "start": 3 },
-                    { "op": "delete", "start": 10 }
-                ]),
-            ))
+        let out = t
+            .invoke(call(serde_json::json!([
+                { "path": "nope.txt", "old": ["a"], "new": ["x"] }
+            ])))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert_eq!(out.error_code.as_deref(), Some("read_failed"));
+    }
+
+    /// Two spellings of one file (`f.txt` vs `./f.txt`) resolve to the same
+    /// absolute path, so they must be planned as ONE group — grouping by the
+    /// raw spelling would write the file twice and let the second write
+    /// silently clobber the first.
+    #[tokio::test]
+    async fn same_file_different_spellings_apply_together() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "a\nb\nc\n").unwrap();
+        let t = tool(dir.path().to_path_buf());
+
+        let out = t
+            .invoke(call(serde_json::json!([
+                { "path": "f.txt", "old": ["a"], "new": ["A"] },
+                { "path": "./f.txt", "old": ["c"], "new": ["C"] }
+            ])))
             .await
             .unwrap();
         assert!(!out.is_error, "{:?}", out.content);
-        // l3 and l10 gone; every other original line intact and in order.
+        assert_eq!(
+            text(&out),
+            "edited f.txt (2 replacements)",
+            "one summary line per resolved file, named by its first spelling"
+        );
         assert_eq!(
             std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
-            "l1\nl2\nl4\nl5\nl6\nl7\nl8\nl9\n"
+            "A\nb\nC\n",
+            "both entries must land — raw-spelling grouping would lose one"
         );
+    }
+
+    /// Overlap detection must hold across spellings too: the two entries are
+    /// one group, so touching the same line is `overlapping_edits`, not two
+    /// independent writes.
+    #[tokio::test]
+    async fn cross_spelling_overlap_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "a\nb\nc\n").unwrap();
+        let t = tool(dir.path().to_path_buf());
+
+        let out = t
+            .invoke(call(serde_json::json!([
+                { "path": "f.txt", "old": ["a", "b"], "new": ["X"] },
+                { "path": "./f.txt", "old": ["b", "c"], "new": ["Y"] }
+            ])))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert_eq!(out.error_code.as_deref(), Some("overlapping_edits"));
+        assert!(
+            text(&out).contains("entries 1 and 2"),
+            "overlap error must name the conflicting entries by 1-based `edits` position: {}",
+            text(&out)
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "a\nb\nc\n",
+            "overlap must leave the file untouched"
+        );
+    }
+
+    // --- trailing newline ---------------------------------------------------
+    // `edit` splits the file into lines and rejoins with `\n`; the original
+    // trailing-newline convention is restored on write. Pin that deliberate
+    // behavior byte-for-byte so a refactor can't silently "normalize" files.
+
+    #[tokio::test]
+    async fn missing_trailing_newline_stays_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "a\nb\nc").unwrap();
+        let t = tool(dir.path().to_path_buf());
+
+        let out = t
+            .invoke(call(serde_json::json!([
+                { "path": "f.txt", "old": ["b"], "new": ["B"] }
+            ])))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{:?}", out.content);
+        assert_eq!(
+            std::fs::read(dir.path().join("f.txt")).unwrap(),
+            b"a\nB\nc",
+            "edit must not add a trailing newline the file never had"
+        );
+    }
+
+    #[tokio::test]
+    async fn trailing_newline_is_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "a\nb\nc\n").unwrap();
+        let t = tool(dir.path().to_path_buf());
+
+        let out = t
+            .invoke(call(serde_json::json!([
+                { "path": "f.txt", "old": ["b"], "new": ["B"] }
+            ])))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{:?}", out.content);
+        assert_eq!(
+            std::fs::read(dir.path().join("f.txt")).unwrap(),
+            b"a\nB\nc\n",
+            "edit must keep the file's trailing newline"
+        );
+    }
+
+    /// Replacing the whole file with nothing yields a 0-byte file, not a lone
+    /// `\n` — the rejoin adds no trailing newline to empty content.
+    #[tokio::test]
+    async fn full_file_old_with_empty_new_yields_zero_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "a\nb\n").unwrap();
+        let t = tool(dir.path().to_path_buf());
+
+        let out = t
+            .invoke(call(serde_json::json!([
+                { "path": "f.txt", "old": ["a", "b"], "new": [] }
+            ])))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{:?}", out.content);
+        assert_eq!(
+            std::fs::read(dir.path().join("f.txt")).unwrap(),
+            b"",
+            "deleting every line must leave a 0-byte file, not a lone newline"
+        );
+    }
+
+    // --- find_matches ----------------------------------------------------
+
+    #[test]
+    fn find_matches_is_non_overlapping() {
+        let hay = ["a", "a", "a"];
+        let needle = lines(&["a", "a"]);
+        // Matches at 0..2, then resumes scanning at 2 — only a single-line "a"
+        // left, no second full match, so exactly one hit.
+        assert_eq!(find_matches(&hay, &needle), vec![0]);
+    }
+
+    #[test]
+    fn find_matches_finds_every_occurrence_for_replace_all() {
+        let hay = ["x", "y", "x", "z", "x"];
+        let needle = lines(&["x"]);
+        assert_eq!(find_matches(&hay, &needle), vec![0, 2, 4]);
     }
 }

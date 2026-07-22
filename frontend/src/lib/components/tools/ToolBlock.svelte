@@ -1,6 +1,7 @@
 <script lang="ts">
 	import type { Item } from '$lib/conversation';
 	import { resultComponent } from '$lib/tools/registry';
+	import { extractArgsPath } from '$lib/tools/utils';
 	import ApprovalControls from '$lib/components/ApprovalControls.svelte';
 	import type { ApprovalScope } from '$lib/types/ApprovalScope';
 
@@ -16,9 +17,13 @@
 	 *  paired Tool::Failed lands it in error). No separate approval card. */
 	let {
 		item,
+		fileCache,
 		onDecide
 	}: {
 		item: Item & { kind: 'tool' };
+		/** The conversation-wide file cache — threaded to EditResult/WriteResult
+		 *  via Body's ResultProps so they can build a contextual diff from args. */
+		fileCache?: Map<string, string[]>;
 		/** Answer a permission `ask` with a decision + scope (Conversation wires
 		 *  `client.approve` through this). Optional: history renders read-only. */
 		onDecide?: (
@@ -70,6 +75,11 @@
 			for (const k of keys) {
 				if (typeof obj[k] === 'string' && obj[k]) return clip(obj[k] as string, 80);
 			}
+			// `edit`'s batch args carry no top-level path key — the path is nested
+			// under `edits[0]`. Reuse the shared extractor (which knows that shape)
+			// so the collapsed header shows the target file, not truncated raw JSON.
+			const path = extractArgsPath(args);
+			if (path) return clip(path, 80);
 			const firstStr = Object.values(obj).find((v) => typeof v === 'string' && v);
 			if (typeof firstStr === 'string') return clip(firstStr, 80);
 		}
@@ -122,6 +132,8 @@
 				result={item.result}
 				status={item.status}
 				error_code={item.error_code}
+				{fileCache}
+				prevLines={item.prevLines}
 			/>
 			{#if item.status === 'running' && !awaiting}
 				<div class="running-indicator">

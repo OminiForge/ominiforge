@@ -1974,9 +1974,9 @@ fn assistant_tool_calls(message: &Message) -> Vec<ToolCall> {
 }
 
 /// Workspace paths a built-in filesystem tool call targets, for nested
-/// project-guidance discovery. `read`/`write` target one path; `edit` may target
-/// one `path` or several `sections`. Other tools have no single path and return
-/// none (`doc/agents-md.md`).
+/// project-guidance discovery. `read`/`write` target one `path`; `edit` targets
+/// the `path` of every entry in its `edits` array. Other tools have no single
+/// path and return none (`doc/agents-md.md`).
 fn touched_paths(call: &ToolCall) -> Vec<String> {
     if !matches!(call.name.as_str(), "read" | "write" | "edit") {
         return Vec::new();
@@ -1996,19 +1996,16 @@ fn touched_paths(call: &ToolCall) -> Vec<String> {
 }
 
 fn edit_touched_paths(args: &serde_json::Value) -> Vec<String> {
-    let mut paths = Vec::new();
-    if let Some(path) = args.get("path").and_then(serde_json::Value::as_str) {
-        paths.push(path.to_owned());
-    }
-    if let Some(sections) = args.get("sections").and_then(serde_json::Value::as_array) {
-        paths.extend(sections.iter().filter_map(|section| {
-            section
-                .get("path")
-                .and_then(serde_json::Value::as_str)
+    args.get("edits")
+        .and_then(serde_json::Value::as_array)
+        .map(|edits| {
+            edits
+                .iter()
+                .filter_map(|e| e.get("path").and_then(serde_json::Value::as_str))
                 .map(ToOwned::to_owned)
-        }));
-    }
-    paths
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Accumulate per-round token usage into a turn total (saturating).
@@ -2208,9 +2205,9 @@ mod tests {
             id: "c1".to_owned(),
             name: "edit".to_owned(),
             arguments: serde_json::json!({
-                "sections": [
-                    { "path": "a/one.txt", "tag": "AAAA", "ops": [] },
-                    { "path": "b/two.txt", "tag": "BBBB", "ops": [] }
+                "edits": [
+                    { "path": "a/one.txt", "old": ["x"], "new": ["y"] },
+                    { "path": "b/two.txt", "old": ["x"], "new": ["y"] }
                 ]
             })
             .to_string(),
@@ -2224,9 +2221,9 @@ mod tests {
             id: "c2".to_owned(),
             name: "edit".to_owned(),
             arguments: serde_json::json!({
-                "path": "c/three.txt",
-                "tag": "CCCC",
-                "ops": []
+                "edits": [
+                    { "path": "c/three.txt", "old": ["x"], "new": ["y"] }
+                ]
             })
             .to_string(),
         };

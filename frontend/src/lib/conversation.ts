@@ -44,6 +44,13 @@ export type Item =
 			 *  card (no separate approval card). Cleared by `Permission::Decided`;
 			 *  the final status then arrives via `Tool::Completed/Failed`. */
 			approvalPending?: boolean;
+			/** For a `write` call only: the file's content as it stood in
+			 *  `fileCache` right before this call's args overwrote that entry —
+			 *  captured on commit because the cache itself is immediately advanced
+			 *  to the new content, so by render time it can no longer supply the
+			 *  "before" side of an overwrite diff. `undefined` for a new file (no
+			 *  prior cache entry) or for any non-`write` tool. */
+			prevLines?: string[];
 	  }
 	/** A plan checklist, folded from `plan` control-tool calls (one card per
 	 *  `init`). `streaming` marks a placeholder shown while the call's args are
@@ -105,6 +112,11 @@ export interface ConversationState {
 	 *  (`doc/frontend.md` B4, CLAUDE.md #12). It deliberately does not drive the
 	 *  INFO Model row, so that row never flickers as subagents switch models. */
 	runtimeModels: Set<string>;
+	/** File content cache (path → lines[]) for building contextual diffs in
+	 *  EditResult/WriteResult. Populated only by committed `read` results (full
+	 *  file) and `write` args (new content) — NOT by `edit`, since edit's own diff
+	 *  rendering needs the pre-edit content that read/write left here. */
+	fileCache: Map<string, string[]>;
 }
 
 export function emptyState(): ConversationState {
@@ -113,7 +125,8 @@ export function emptyState(): ConversationState {
 		open: {},
 		toolSeqs: new Map(),
 		orphanTools: new Map(),
-		runtimeModels: new Set()
+		runtimeModels: new Set(),
+		fileCache: new Map()
 	};
 }
 
@@ -345,6 +358,25 @@ function commitBlock(
 			items = foldPlanOp(items, content.ToolCall.arguments);
 			return { ...state, items, requestCommitted: true, commitBase, committedEnd: items.length };
 		}
+		// `write`'s new content is available the moment the call commits — cache
+		// it immediately rather than waiting for the (now terse) result, so the
+		// diff preview has pre-edit content ready for any `edit` that follows in
+		// the same turn. `edit` deliberately does NOT touch the cache (see
+		// `fileCache`'s doc comment): its own diff needs the pre-edit content
+		// that only read/write leave here.
+		//
+		// Capture the pre-write snapshot on the item itself (`prevLines`) BEFORE
+		// advancing the cache: WriteResult needs the "before" side to render an
+		// overwrite diff, but by render time the cache already holds the new
+		// content (this same commit just moved it forward).
+		const writePrevLines =
+			content.ToolCall.name === 'write'
+				? writePrevLinesFor(state.fileCache, content.ToolCall.arguments)
+				: undefined;
+		const fileCache =
+			content.ToolCall.name === 'write'
+				? cacheWriteArgs(state.fileCache, content.ToolCall.arguments)
+				: state.fileCache;
 		const toolSeqs = new Map(state.toolSeqs);
 		let orphanTools = state.orphanTools;
 		const orphanAt = orphanTools.get(content.ToolCall.id);
@@ -376,13 +408,15 @@ function commitBlock(
 						...cur,
 						seq,
 						name: content.ToolCall.name,
-						args: content.ToolCall.arguments
+						args: content.ToolCall.arguments,
+						prevLines: writePrevLines
 					};
 					return {
 						...state,
 						items,
 						toolSeqs,
 						orphanTools,
+						fileCache,
 						requestCommitted: true,
 						commitBase,
 						committedEnd: items.length
@@ -402,13 +436,15 @@ function commitBlock(
 				name: content.ToolCall.name,
 				args: content.ToolCall.arguments,
 				status: 'running',
-				approvalPending: true
+				approvalPending: true,
+				prevLines: writePrevLines
 			});
 			return {
 				...state,
 				items,
 				toolSeqs,
 				orphanTools,
+				fileCache,
 				requestCommitted: true,
 				commitBase,
 				committedEnd: items.length
@@ -421,13 +457,15 @@ function commitBlock(
 			callId: content.ToolCall.id,
 			name: content.ToolCall.name,
 			args: content.ToolCall.arguments,
-			status: 'running'
+			status: 'running',
+			prevLines: writePrevLines
 		};
 		items.push(item);
 		return {
 			...state,
 			items,
 			toolSeqs,
+			fileCache,
 			requestCommitted: true,
 			commitBase,
 			committedEnd: items.length
@@ -569,7 +607,112 @@ function pairResult(
 		result: text,
 		error_code: output.error_code ?? undefined
 	};
-	return { ...state, items };
+
+	// Populate the file cache from a successful full-file read result.
+	// Format: "[path]\n1:line1\n2:line2\n..."
+	// Only update for full-file reads (no range arg) to avoid storing partial
+	// content that would silently corrupt diff previews for future edits.
+	let fileCache = state.fileCache;
+	if (call.name === 'read' && !failed && !output.is_error) {
+		try {
+			const args = JSON.parse(call.args) as { path?: unknown; range?: unknown };
+			if (!args.range && typeof args.path === 'string') {
+				const cacheLines = parseReadResult(text);
+				if (cacheLines !== null) {
+					fileCache = new Map(fileCache);
+					fileCache.set(args.path, cacheLines);
+				}
+			}
+		} catch {
+			// Malformed args JSON: skip cache update silently (preview degrades
+			// to the cache-miss bare-block path, not a crash).
+		}
+	}
+
+	// A failed `write` (denied, or a `write_failed` business error) never
+	// touched disk, but its commit already advanced the cache to the args'
+	// content (see commitBlock) — roll back to the pre-write snapshot captured
+	// on the item, or a later edit diffs against phantom content. `prevLines
+	// === undefined` means the commit created the key (new file): drop it.
+	if (call.name === 'write' && (failed || output.is_error)) {
+		try {
+			const args = JSON.parse(call.args) as { path?: unknown };
+			if (typeof args.path === 'string') {
+				fileCache = new Map(fileCache);
+				if (call.prevLines === undefined) fileCache.delete(args.path);
+				else fileCache.set(args.path, call.prevLines);
+			}
+		} catch {
+			// Malformed args JSON: commit couldn't have advanced the cache either.
+		}
+	}
+
+	return { ...state, items, fileCache };
+}
+
+/** Parse a `read` tool result (`[path]\n1:line1\n...`) into a lines array.
+ *  Returns `null` if the text doesn't look like a file result (e.g. a directory
+ *  listing) so callers can skip the cache update without special-casing. */
+function parseReadResult(text: string): string[] | null {
+	const lines = text.split('\n');
+	if (lines.length === 0) return null;
+	const header = lines[0];
+	// File header: "[path]" — directory listing header: "[path/]"
+	if (!header.startsWith('[') || !header.endsWith(']') || header.endsWith('/]')) return null;
+	// Strip "N:" prefix from each content line. The colon is the first one found
+	// (safe because line numbers never embed colons).
+	const result: string[] = [];
+	for (let i = 1; i < lines.length; i++) {
+		const colon = lines[i].indexOf(':');
+		if (colon === -1) return null; // unexpected format
+		result.push(lines[i].slice(colon + 1));
+	}
+	return result;
+}
+
+/** Set the file cache from a committed `write` call's args (`{path, content}`),
+ *  splitting the new content into lines. Returns `cache` unchanged if the args
+ *  don't parse as expected (committed args should always be well-formed JSON by
+ *  this point, but a parse failure degrades to the cache-miss preview path
+ *  rather than throwing mid-fold). */
+function cacheWriteArgs(cache: Map<string, string[]>, argsJson: string): Map<string, string[]> {
+	try {
+		const args = JSON.parse(argsJson) as { path?: unknown; content?: unknown };
+		if (typeof args.path === 'string' && typeof args.content === 'string') {
+			const next = new Map(cache);
+			next.set(args.path, splitFileLines(args.content));
+			return next;
+		}
+	} catch {
+		// Malformed args JSON: fall back to the unchanged cache.
+	}
+	return cache;
+}
+
+/** Split file content the way the backend's `str::lines()`-based read path
+ *  does, so a `write` and a `read` of the same bytes leave the identical lines
+ *  array in the cache (a write→edit chain matches tail lines against it):
+ *  no phantom trailing line from a final newline, and each line's `\r`
+ *  stripped (CRLF tolerance). */
+function splitFileLines(content: string): string[] {
+	const lines = content.split('\n');
+	if (lines[lines.length - 1] === '') lines.pop();
+	return lines.map((l) => (l.endsWith('\r') ? l.slice(0, -1) : l));
+}
+
+/** The cache's content for a `write` call's target path *before* this call's
+ *  args advance it — `undefined` for a new file (no prior cache entry) or
+ *  unparseable args. See `Item.prevLines`'s doc comment for why this must be
+ *  captured at commit time rather than read later from the (by-then-advanced)
+ *  cache. */
+function writePrevLinesFor(cache: Map<string, string[]>, argsJson: string): string[] | undefined {
+	try {
+		const args = JSON.parse(argsJson) as { path?: unknown };
+		if (typeof args.path === 'string') return cache.get(args.path);
+	} catch {
+		// Malformed args JSON: no prior content to report.
+	}
+	return undefined;
 }
 
 /// Fold one live streaming delta into the conversation state.
@@ -652,11 +795,10 @@ function applyDelta(
 			}
 			return { ...state, items, open };
 		}
-		// NOTE: The gateway no longer sends tool_args deltas (non-streaming
-		// tool calls — see actor.rs).  This branch is kept for:
-		//  1. TUI path which still uses live tool_args deltas
-		//  2. Defensive handling if a delta ever arrives
-		//  3. Test coverage (conversation.test.ts)
+		// `tool_args` deltas stream partial JSON as the model's call arguments
+		// arrive, letting `diff-builder.ts`'s `parsePartialEdits` build an
+		// incremental preview (`doc/tool-protocol.md` §11.4). Also used by the
+		// TUI's live tool-call rendering path.
 		case 'tool_args': {
 			const pos = open[ev.index];
 			const cur = pos !== undefined ? items[pos] : undefined;

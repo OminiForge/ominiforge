@@ -936,3 +936,241 @@ describe('permission approval fold', () => {
 		expect(state.orphanTools.size).toBe(0);
 	});
 });
+
+// ── File cache: populated by read/write, never by edit ─────────────────────
+//
+// `diff-builder.ts` needs pre-edit file content to render contextual diffs for
+// `edit`/`write` cards. The cache is fed only by committed `read` results and
+// `write` args — never by `edit`, since edit's own diff rendering needs the
+// PRE-edit content that only read/write leave here (`doc/tool-protocol.md`
+// §11.4).
+
+describe('file cache fold', () => {
+	it('a full-file read result populates the cache', () => {
+		const state = fold([
+			contentBlock(1, { ToolCall: { id: 'c1', name: 'read', arguments: '{"path":"a.txt"}' } }),
+			toolCompleted(2, 1, '[a.txt]\n1:hello\n2:world')
+		]);
+		expect(state.fileCache.get('a.txt')).toEqual(['hello', 'world']);
+	});
+
+	it("write's args populate the cache the moment the call commits, before its result arrives", () => {
+		const state = fold([
+			contentBlock(1, {
+				ToolCall: { id: 'c1', name: 'write', arguments: '{"path":"b.txt","content":"x\\ny"}' }
+			})
+		]);
+		expect(state.fileCache.get('b.txt')).toEqual(['x', 'y']);
+		const t = state.items.find((i) => i.kind === 'tool');
+		expect(t?.kind === 'tool' && t.status).toBe('running'); // result hasn't landed yet
+	});
+
+	it('edit does not touch the cache — its own diff render needs the pre-edit content', () => {
+		const state = fold([
+			contentBlock(1, { ToolCall: { id: 'c1', name: 'read', arguments: '{"path":"a.txt"}' } }),
+			toolCompleted(2, 1, '[a.txt]\n1:hello\n2:world'),
+			contentBlock(3, {
+				ToolCall: {
+					id: 'c2',
+					name: 'edit',
+					arguments: '{"edits":[{"path":"a.txt","old":["hello"],"new":["HELLO"]}]}'
+				}
+			}),
+			toolCompleted(4, 3, 'edited a.txt (1 replacement)')
+		]);
+		expect(state.fileCache.get('a.txt')).toEqual(['hello', 'world']);
+	});
+
+	it('a ranged read result does not clobber a previously-cached full-file read', () => {
+		const state = fold([
+			contentBlock(1, { ToolCall: { id: 'c1', name: 'read', arguments: '{"path":"a.txt"}' } }),
+			toolCompleted(2, 1, '[a.txt]\n1:hello\n2:world\n3:!'),
+			contentBlock(3, {
+				ToolCall: {
+					id: 'c2',
+					name: 'read',
+					arguments: '{"path":"a.txt","range":{"start":2,"end":2}}'
+				}
+			}),
+			toolCompleted(4, 3, '[a.txt]\n2:world')
+		]);
+		// The ranged result alone would look like a 1-line file; the full-file
+		// cache entry from the first read must survive untouched.
+		expect(state.fileCache.get('a.txt')).toEqual(['hello', 'world', '!']);
+	});
+
+	it('a directory-listing read result is not mistaken for file content', () => {
+		const state = fold([
+			contentBlock(1, { ToolCall: { id: 'c1', name: 'read', arguments: '{"path":"."}' } }),
+			toolCompleted(2, 1, '[./]\na.txt\nb.txt')
+		]);
+		expect(state.fileCache.has('.')).toBe(false);
+	});
+
+	it('a failed read does not populate the cache', () => {
+		const state = fold([
+			contentBlock(1, { ToolCall: { id: 'c1', name: 'read', arguments: '{"path":"nope.txt"}' } }),
+			{
+				type: 'event',
+				schema_version: 'ominiforge.event.v1',
+				seq: 2,
+				session_id: 's',
+				timestamp: '2026-06-24T00:00:00Z',
+				source: { kind: 'Runtime', id: 'runtime' },
+				parent_event_id: null,
+				turn_id: null,
+				payload: {
+					Tool: {
+						Completed: {
+							tool_call_event_id: { session_id: 's', seq: 1 },
+							result: {
+								content: [{ Text: 'failed to read nope.txt' }],
+								is_error: true,
+								error_code: 'read_failed'
+							}
+						}
+					}
+				}
+			} as unknown as GatewayEvent
+		]);
+		expect(state.fileCache.has('nope.txt')).toBe(false);
+	});
+
+	it('replaying the same event history twice yields an identical cache (pure fold)', () => {
+		const events: GatewayEvent[] = [
+			contentBlock(1, { ToolCall: { id: 'c1', name: 'read', arguments: '{"path":"a.txt"}' } }),
+			toolCompleted(2, 1, '[a.txt]\n1:hello'),
+			contentBlock(3, {
+				ToolCall: { id: 'c2', name: 'write', arguments: '{"path":"b.txt","content":"x"}' }
+			})
+		];
+		const first = fold(events);
+		const second = fold(events);
+		expect([...second.fileCache.entries()]).toEqual([...first.fileCache.entries()]);
+		expect(second.fileCache.get('a.txt')).toEqual(['hello']);
+		expect(second.fileCache.get('b.txt')).toEqual(['x']);
+	});
+
+	// A second `write` to the same path advances the cache to ITS new content
+	// the moment it commits — by the time WriteResult renders, the cache no
+	// longer holds what the file looked like before this call. `prevLines`
+	// captures that "before" snapshot on the item itself at commit time, before
+	// the cache moves on, so the overwrite diff has something to diff against.
+	it('captures the pre-write snapshot as prevLines, since the cache has already moved on by render time', () => {
+		const state = fold([
+			contentBlock(1, {
+				ToolCall: { id: 'c1', name: 'write', arguments: '{"path":"a.txt","content":"one\\ntwo"}' }
+			}),
+			toolCompleted(2, 1, 'wrote a.txt (new, 2 lines)'),
+			contentBlock(3, {
+				ToolCall: { id: 'c2', name: 'write', arguments: '{"path":"a.txt","content":"ONE\\ntwo"}' }
+			})
+		]);
+		const tools = state.items.filter((i) => i.kind === 'tool');
+		expect(tools).toHaveLength(2);
+		// First write: no prior content — nothing to snapshot.
+		expect(tools[0].kind === 'tool' && tools[0].prevLines).toBeUndefined();
+		// Second write: the cache held the FIRST write's content at the moment
+		// this call committed — captured here, even though fileCache itself has
+		// since advanced to this call's own new content.
+		expect(tools[1].kind === 'tool' && tools[1].prevLines).toEqual(['one', 'two']);
+		expect(state.fileCache.get('a.txt')).toEqual(['ONE', 'two']);
+	});
+
+	// A failed write never touches disk, but its commit already advanced the
+	// cache to the args' content (so the streaming preview could diff). The
+	// result pairing must roll that back — otherwise the cache holds phantom
+	// content and a later edit to the same file renders a confidently-wrong
+	// diff against text that was never written.
+	it('a failed write rolls the cache back to its pre-write content', () => {
+		const state = fold([
+			contentBlock(1, { ToolCall: { id: 'c1', name: 'read', arguments: '{"path":"a.txt"}' } }),
+			toolCompleted(2, 1, '[a.txt]\n1:hello\n2:world'),
+			contentBlock(3, {
+				ToolCall: { id: 'c2', name: 'write', arguments: '{"path":"a.txt","content":"phantom"}' }
+			}),
+			{
+				type: 'event',
+				schema_version: 'ominiforge.event.v1',
+				seq: 4,
+				session_id: 's',
+				timestamp: '2026-06-24T00:00:00Z',
+				source: { kind: 'Runtime', id: 'runtime' },
+				parent_event_id: null,
+				turn_id: null,
+				payload: {
+					Tool: {
+						Completed: {
+							tool_call_event_id: { session_id: 's', seq: 3 },
+							result: {
+								content: [{ Text: 'failed to write a.txt' }],
+								is_error: true,
+								error_code: 'write_failed'
+							}
+						}
+					}
+				}
+			} as unknown as GatewayEvent
+		]);
+		expect(state.fileCache.get('a.txt')).toEqual(['hello', 'world']);
+	});
+
+	// The new-file case of the same rollback: the commit created the cache key
+	// (no pre-write snapshot existed), so the denial must remove it entirely —
+	// a surviving phantom-file entry would poison a later edit just the same.
+	it('a denied write of a new file drops the cache key entirely', () => {
+		const state = fold([
+			contentBlock(1, {
+				ToolCall: { id: 'c1', name: 'write', arguments: '{"path":"b.txt","content":"x"}' }
+			}),
+			toolFailed(2, 1, 'denied_by_user')
+		]);
+		expect(state.fileCache.has('b.txt')).toBe(false);
+	});
+
+	// The write path must split content into the same lines shape a read of
+	// those bytes produces (the backend's `str::lines`): no phantom trailing
+	// line from a final newline, `\r` stripped. A different shape would make a
+	// write→edit chain match tail lines against stale content.
+	it("write content splits exactly like a read of the same bytes (trailing newline, CRLF)", () => {
+		const state = fold([
+			contentBlock(1, {
+				ToolCall: {
+					id: 'c1',
+					name: 'write',
+					arguments: '{"path":"w.txt","content":"a\\r\\nb\\n"}'
+				}
+			}),
+			contentBlock(2, { ToolCall: { id: 'c2', name: 'read', arguments: '{"path":"r.txt"}' } }),
+			toolCompleted(3, 2, '[r.txt]\n1:a\n2:b')
+		]);
+		expect(state.fileCache.get('w.txt')).toEqual(['a', 'b']);
+		expect(state.fileCache.get('w.txt')).toEqual(state.fileCache.get('r.txt'));
+	});
+
+	// ── Approval mid-stream: the existing orphanTools mechanism, not new code ──
+
+	it('a permission ask that arrives mid-args-stream still resolves via the orphan mechanism, and the cache still populates on commit', () => {
+		const events: GatewayEvent[] = [
+			reqStarted(0),
+			{ type: 'delta', delta: 'block_start', index: 0, kind: 'tool_call', tool: 'write' },
+			{ type: 'delta', delta: 'tool_args', index: 0, json: '{"path":"x.txt"' },
+			permRequested(1, 'c1', 'write'),
+			{ type: 'delta', delta: 'tool_args', index: 0, json: ',"content":"hi"}' },
+			contentBlock(2, {
+				ToolCall: { id: 'c1', name: 'write', arguments: '{"path":"x.txt","content":"hi"}' }
+			}),
+			permDecided(3, 'c1', 'Approved'),
+			toolCompleted(4, 2, 'wrote x.txt (new, 1 lines)')
+		];
+		const state = fold(events);
+		const tools = state.items.filter((i) => i.kind === 'tool');
+		expect(tools).toHaveLength(1);
+		const t = tools[0];
+		expect(t.kind === 'tool' && t.approvalPending).toBe(false);
+		expect(t.kind === 'tool' && t.status).toBe('done');
+		expect(t.kind === 'tool' && t.result).toContain('wrote x.txt');
+		expect(state.orphanTools.size).toBe(0);
+		expect(state.fileCache.get('x.txt')).toEqual(['hi']);
+	});
+});

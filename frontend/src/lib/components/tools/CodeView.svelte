@@ -2,15 +2,15 @@
 	import { browser } from '$app/environment';
 	import { highlightBlock } from '$lib/tools/highlight';
 
-	/** Renders a `read` file body: a `[path#TAG]` chip over a numbered gutter
-	 *  beside the syntax-highlighted source. `lines` are the raw `N:content` rows
-	 *  from the tool output (header already stripped by the caller).
+	/** Renders a `read` file body: a `[path]` chip over a numbered gutter beside
+	 *  the syntax-highlighted source. `lines` are the raw `N:content` rows from
+	 *  the tool output (header already stripped by the caller).
 	 *
 	 *  The body is highlighted as ONE block (not per-line) so multi-line hljs
 	 *  constructs don't break; the gutter is a separate non-selectable `<pre>` so
 	 *  a copy grabs only code. Only the hljs markup (itself pre-escaped) reaches
 	 *  `{@html}`. */
-	let { path, tag, lines }: { path: string; tag?: string; lines: string[] } = $props();
+	let { path, lines }: { path: string; lines: string[] } = $props();
 
 	interface Split {
 		nums: string;
@@ -42,7 +42,6 @@
 
 <div class="head">
 	<span class="path">{path}</span>
-	{#if tag}<span class="tag">#{tag}</span>{/if}
 </div>
 <div class="wrap">
 	<pre class="gutter" aria-hidden="true">{split.nums}</pre>
@@ -67,10 +66,6 @@
 	.path {
 		color: var(--accent-ink);
 		font-weight: 500;
-	}
-	.tag {
-		color: var(--text-tertiary);
-		font-size: 10.5px;
 	}
 	.wrap {
 		display: flex;

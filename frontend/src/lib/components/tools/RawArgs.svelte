@@ -1,11 +1,15 @@
 <script lang="ts">
-	/** Debug-only view of a tool call's raw JSON arguments. Collapsed by default —
-	 *  the tool-specific header already surfaces what matters (path/command/…);
-	 *  this is here for when you need to inspect the exact call. Pretty-prints +
-	 *  syntax-tints the JSON; falls back to escaped raw text when args aren't
-	 *  valid JSON. Only the tint markup (built from escaped text) reaches
-	 *  `{@html}`. */
-	let { args }: { args: string } = $props();
+	/** Debug-only view of a tool call's raw JSON arguments, and — when the caller
+	 *  passes one — its terse result text. Collapsed by default: the tool-specific
+	 *  header already surfaces what matters (path/command/diff/…); this is here
+	 *  for when you need to inspect the exact call. `result` is optional because
+	 *  most tools still render it as their primary content — only `edit`/`write`
+	 *  (whose result is now a terse confirmation, not a diff — see
+	 *  `doc/tool-protocol.md` §11.4) pass it here instead. Pretty-prints +
+	 *  syntax-tints JSON; falls back to escaped raw text when a value isn't valid
+	 *  JSON (true for `result`, which is always plain text). Only the tint markup
+	 *  (built from escaped text) reaches `{@html}`. */
+	let { args, result }: { args: string; result?: string } = $props();
 
 	let open = $state(false);
 
@@ -13,21 +17,23 @@
 		return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 	}
 
-	const html = $derived.by(() => {
-		let pretty = args;
+	function tintJson(text: string): string {
+		let pretty = text;
 		try {
-			pretty = JSON.stringify(JSON.parse(args), null, 2);
+			pretty = JSON.stringify(JSON.parse(text), null, 2);
 		} catch {
-			return escapeHtml(args);
+			return escapeHtml(text);
 		}
 		return escapeHtml(pretty)
 			.replace(/&quot;([^&]*?)&quot;(\s*:)/g, '<span class="k">&quot;$1&quot;</span>$2')
 			.replace(/:\s*&quot;([^&]*?)&quot;/g, ': <span class="s">&quot;$1&quot;</span>')
 			.replace(/:\s*(-?\d+(?:\.\d+)?)/g, ': <span class="n">$1</span>');
-	});
+	}
+
+	const argsHtml = $derived(tintJson(args));
 </script>
 
-{#if args && args !== '{}'}
+{#if (args && args !== '{}') || result}
 	<div class="raw" class:open>
 		<button class="toggle" onclick={() => (open = !open)} aria-expanded={open}>
 			<svg
@@ -41,11 +47,19 @@
 			>
 				<polyline points="4,2 8,6 4,10" />
 			</svg>
-			<span class="label">debug · args</span>
+			<span class="label">debug · args{result ? ' + result' : ''}</span>
 		</button>
 		{#if open}
-			<!-- eslint-disable-next-line svelte/no-at-html-tags -->
-			<pre class="body">{@html html}</pre>
+			<div class="body">
+				{#if args && args !== '{}'}
+					<!-- eslint-disable-next-line svelte/no-at-html-tags -->
+					<pre class="pre">{@html argsHtml}</pre>
+				{/if}
+				{#if result}
+					<div class="section-label">result</div>
+					<pre class="pre">{result}</pre>
+				{/if}
+			</div>
 		{/if}
 	</div>
 {/if}
@@ -86,8 +100,18 @@
 		font-family: var(--font-mono);
 	}
 	.body {
-		margin: 0;
 		padding: 0 var(--space-4) var(--space-3);
+	}
+	.section-label {
+		font-size: 10px;
+		font-weight: 510;
+		letter-spacing: 0.08em;
+		text-transform: uppercase;
+		color: var(--text-tertiary);
+		margin-top: var(--space-2);
+	}
+	.pre {
+		margin: 0;
 		font-family: var(--font-mono);
 		font-size: 11.5px;
 		color: var(--text-secondary);
@@ -96,13 +120,13 @@
 		overflow-x: auto;
 		max-height: 200px;
 	}
-	.body :global(.k) {
+	.pre :global(.k) {
 		color: var(--syntax-key);
 	}
-	.body :global(.s) {
+	.pre :global(.s) {
 		color: var(--syntax-str);
 	}
-	.body :global(.n) {
+	.pre :global(.n) {
 		color: var(--syntax-num);
 	}
 </style>

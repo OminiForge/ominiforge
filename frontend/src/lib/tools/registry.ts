@@ -19,6 +19,14 @@ export interface ResultProps {
 	result?: string;
 	status: 'running' | 'done' | 'error';
 	error_code?: string;
+	/** The conversation-wide file cache (`conversation.ts`'s `fileCache`) — used
+	 *  by EditResult/WriteResult to build a contextual diff from args, since the
+	 *  backend result no longer carries one (`doc/tool-protocol.md` §11.4). */
+	fileCache?: Map<string, string[]>;
+	/** For `write` only: the pre-write content snapshot (`Item.prevLines`) — the
+	 *  cache itself has already advanced to this call's new content by the time
+	 *  this renders, so the "before" side has to travel on the item. */
+	prevLines?: string[];
 }
 
 const REGISTRY: Record<string, Component<ResultProps>> = {

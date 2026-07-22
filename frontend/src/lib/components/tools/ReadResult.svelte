@@ -12,7 +12,6 @@
 	interface Parsed {
 		kind: 'file' | 'dir' | 'plain';
 		path?: string;
-		tag?: string;
 		body: string[];
 	}
 
@@ -24,18 +23,19 @@
 			return { kind: 'plain', body: [] };
 		}
 		const lines = text.split('\n');
-		const head = /^\[(.+?)(?:#([^#\]]+))?\]$/.exec(lines[0]);
+		// Old histories may carry a snapshot tag (`[path#3F2A]`); strip it for display.
+		const head = /^\[(.+?)(?:#[0-9A-F]{4})?\]$/.exec(lines[0]);
 		if (!head) return { kind: 'plain', body: lines };
 		const path = head[1];
 		const body = lines.slice(1);
 		if (path.endsWith('/')) return { kind: 'dir', path, body };
-		return { kind: 'file', path, tag: head[2], body };
+		return { kind: 'file', path, body };
 	});
 </script>
 
 <div class="result">
 	{#if parsed.kind === 'file' && parsed.path}
-		<CodeView path={parsed.path} tag={parsed.tag} lines={parsed.body} />
+		<CodeView path={parsed.path} lines={parsed.body} />
 	{:else if parsed.kind === 'dir' && parsed.path}
 		<div class="head"><span class="path">{parsed.path}</span></div>
 		<ul class="dir">

@@ -1,53 +1,76 @@
 <script lang="ts">
 	import Diff from './Diff.svelte';
 	import RawArgs from './RawArgs.svelte';
-	import { extractArgsPath } from '$lib/tools/utils';
+	import { buildFileDiff, parsePartialEdits, type EditEntry } from '$lib/tools/diff-builder';
 
-	/** `edit` result: a `edited PATH (N ops) -> TAG` header over a unified diff.
-	 *  An unrecognized first line is a business error (e.g. stale snapshot) — show
-	 *  it error-tinted rather than faking a success header. */
-	let { args, result, status }: { args: string; result?: string; status: 'running' | 'done' | 'error' } = $props();
+	/** `edit` result: rendered from this call's own `edits` args (full or still
+	 *  streaming) plus the conversation's file cache — NOT from `result`, which the
+	 *  backend now returns as a terse confirmation only (`edited PATH (N
+	 *  replacements)`, no diff — see `doc/tool-protocol.md` §11.4). Building the
+	 *  diff from args is what lets it render incrementally as `Delta::ToolArgs`
+	 *  streams in, per entry, instead of waiting for the call to finish.
+	 *
+	 *  The success confirmation moves to the debug fold (RawArgs) since it is
+	 *  redundant with what's already rendered here. A failure's message (e.g.
+	 *  `not_found`/`ambiguous`) is NOT redundant — it's diagnostic detail the
+	 *  model needed to react to — so it stays in the primary view. */
+	let {
+		args,
+		result,
+		status,
+		fileCache
+	}: {
+		args: string;
+		result?: string;
+		status: 'running' | 'done' | 'error';
+		fileCache?: Map<string, string[]>;
+	} = $props();
 
-	interface Parsed {
-		ok: boolean;
-		running?: boolean;
-		path?: string;
-		ops?: string;
-		tag?: string;
+	interface PathDiff {
+		path: string;
 		diff: string;
-		error?: string;
+		note?: string;
 	}
 
-	const parsed = $derived.by<Parsed>(() => {
-		const text = result ?? '';
-		if (status === 'running' && !text) {
-			const p = extractArgsPath(args);
-			if (p) return { ok: true, running: true, path: p, diff: '' };
-			return { ok: false, diff: '' };
+	/** Group entries by path, first-seen order — mirrors `edit.rs`'s own grouping
+	 *  so a multi-path call renders one block per file in the order referenced. */
+	function groupByPath(entries: EditEntry[]): Array<[string, EditEntry[]]> {
+		const groups: Array<[string, EditEntry[]]> = [];
+		for (const e of entries) {
+			const g = groups.find(([p]) => p === e.path);
+			if (g) g[1].push(e);
+			else groups.push([e.path, [e]]);
 		}
-		const nl = text.indexOf('\n');
-		const head = nl === -1 ? text : text.slice(0, nl);
-		const body = nl === -1 ? '' : text.slice(nl + 1);
-		const m = /^edited (.+?) \((\d+) ops\) -> (\S+)$/.exec(head);
-		if (!m) return { ok: false, diff: '', error: text };
-		return { ok: true, path: m[1], ops: m[2], tag: m[3], diff: body };
-	});
+		return groups;
+	}
+
+	const entries = $derived(parsePartialEdits(args));
+	const pathDiffs = $derived<PathDiff[]>(
+		groupByPath(entries).map(([path, es]) => {
+			const built = buildFileDiff(fileCache?.get(path), es);
+			return { path, diff: built.diff, note: built.note };
+		})
+	);
+	const errorText = $derived(status === 'error' ? result : undefined);
 </script>
 
 <div class="result">
-	{#if parsed.ok}
-		<div class="sum">
-			<span class="verb" class:running={parsed.running}>{parsed.running ? 'editing' : 'edited'}</span>
-			<span class="path">{parsed.path}</span>
-			{#if parsed.ops}<span class="meta"><span class="n">{parsed.ops}</span> ops</span>{/if}
-			{#if parsed.tag}<span class="tag">#{parsed.tag}</span>{/if}
+	<div class="sum">
+		<span class="verb" class:running={status === 'running'} class:error={status === 'error'}>
+			{status === 'running' ? 'editing' : status === 'error' ? 'edit failed' : 'edited'}
+		</span>
+	</div>
+	{#if errorText}<div class="err">{errorText}</div>{/if}
+	{#each pathDiffs as pd (pd.path)}
+		<div class="file">
+			<div class="path">{pd.path}</div>
+			{#if pd.diff}<Diff text={pd.diff} />{/if}
+			{#if pd.note}<div class="note">{pd.note}</div>{/if}
 		</div>
-		{#if parsed.diff}<Diff text={parsed.diff} />{/if}
-	{:else}
-		<div class="err">{parsed.error}</div>
-	{/if}
+	{/each}
 </div>
-<RawArgs {args} />
+<RawArgs {args} result={status === 'done' ? result : undefined} />
+
 <style>
 	.result {
 		padding: var(--space-3) var(--space-4);
@@ -82,20 +105,23 @@
 		color: var(--state-running-text);
 		border-color: color-mix(in srgb, var(--state-running) 25%, transparent);
 	}
+	.verb.error {
+		background: var(--state-error-bg);
+		color: var(--state-error-text);
+		border-color: color-mix(in srgb, var(--state-error) 25%, transparent);
+	}
+	.file {
+		display: grid;
+		gap: var(--space-1);
+	}
 	.path {
 		color: var(--accent-ink);
 		font-weight: 500;
 	}
-	.meta {
-		color: var(--text-tertiary);
-	}
-	.meta .n {
-		color: var(--syntax-num);
-	}
-	.tag {
+	.note {
 		color: var(--text-tertiary);
 		font-size: 10.5px;
-		margin-left: auto;
+		font-family: var(--font-chinese);
 	}
 	.err {
 		color: var(--state-error-text);

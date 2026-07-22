@@ -28,6 +28,7 @@
 		"vitest": "^3.0.0"
 	},
 	"dependencies": {
+		"diff": "^8.0.2",
 		"dompurify": "^3.4.11",
 		"highlight.js": "^11.11.1",
 		"layerchart": "^1.0.0",
