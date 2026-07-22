@@ -123,7 +123,7 @@ pub fn builtin_catalog() -> Vec<ToolInfo> {
             label: Some("找文件".to_owned()),
             description: Some("按 glob 通配符查找工作区内的文件（遵循 .gitignore）".to_owned()),
             fields: vec![ToolField {
-                key: "pattern".to_owned(),
+                key: "patterns".to_owned(),
                 label: "通配符".to_owned(),
                 is_path: false,
             }],
