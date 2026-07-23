@@ -1,17 +1,25 @@
 //! The `write` built-in tool: write a UTF-8 file within the workspace.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde::Deserialize;
 
-use super::{Tool, ToolDescriptor, ToolError, ToolInput, ToolResult, resolve_in_workspace};
+use super::{
+    Tool, ToolDescriptor, ToolError, ToolInput, ToolResult, append_diagnostics,
+    resolve_in_workspace,
+};
 use crate::core::payload::{Content, ToolOutput};
+use crate::lsp::LspManager;
 
 /// Writes a text file relative to the session workspace, creating parent
 /// directories as needed.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WriteTool {
     workspace: PathBuf,
+    /// Optional LSP assist: when set, a successful write appends the touched
+    /// file's diagnostics to the result (`doc/lsp.md`).
+    lsp: Option<Arc<LspManager>>,
 }
 
 #[derive(Deserialize)]
@@ -24,7 +32,17 @@ impl WriteTool {
     /// Create a `write` tool rooted at `workspace`.
     #[must_use]
     pub const fn new(workspace: PathBuf) -> Self {
-        Self { workspace }
+        Self {
+            workspace,
+            lsp: None,
+        }
+    }
+
+    /// Attach an [`LspManager`] so successful writes carry diagnostics.
+    #[must_use]
+    pub fn with_lsp(mut self, lsp: Option<Arc<LspManager>>) -> Self {
+        self.lsp = lsp;
+        self
     }
 }
 
@@ -69,15 +87,26 @@ impl Tool for WriteTool {
             return Ok(business_error(&args.path, &e));
         }
         match tokio::fs::write(&path, args.content.as_bytes()).await {
-            Ok(()) => Ok(ToolOutput {
-                content: vec![Content::Text(write_summary(
+            Ok(()) => {
+                let mut output = ToolOutput {
+                    content: vec![Content::Text(write_summary(
+                        &args.path,
+                        old.as_deref(),
+                        &args.content,
+                    ))],
+                    is_error: false,
+                    error_code: None,
+                };
+                append_diagnostics(
+                    self.lsp.as_ref(),
+                    &mut output,
+                    &path,
                     &args.path,
-                    old.as_deref(),
                     &args.content,
-                ))],
-                is_error: false,
-                error_code: None,
-            }),
+                )
+                .await;
+                Ok(output)
+            }
             Err(e) => Ok(business_error(&args.path, &e)),
         }
     }

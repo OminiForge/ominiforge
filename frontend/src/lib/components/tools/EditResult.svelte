@@ -17,11 +17,13 @@
 	let {
 		args,
 		result,
+		diagnostics,
 		status,
 		fileCache
 	}: {
 		args: string;
 		result?: string;
+		diagnostics?: string;
 		status: 'running' | 'done' | 'error';
 		fileCache?: Map<string, string[]>;
 	} = $props();
@@ -69,7 +71,7 @@
 		</div>
 	{/each}
 </div>
-<RawArgs {args} result={status === 'done' ? result : undefined} />
+<RawArgs {args} result={status === 'done' ? result : undefined} {diagnostics} />
 
 <style>
 	.result {

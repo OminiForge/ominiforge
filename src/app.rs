@@ -14,7 +14,6 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -61,6 +60,10 @@ pub struct Assembled {
     pub resolved: ResolvedModel,
     /// Live MCP subprocess clients; hold these for the session's lifetime.
     pub mcp_clients: Vec<Arc<crate::mcp::McpClient>>,
+    /// The session's LSP manager (diagnostics assist), if any server is
+    /// configured. Hold it for the session's lifetime — dropping it kills the
+    /// language-server subprocesses (mirrors `mcp_clients`).
+    pub lsp_manager: Option<Arc<crate::lsp::LspManager>>,
 }
 
 /// Resolve a session's sandbox network policy from the precedence chain
@@ -158,12 +161,24 @@ pub async fn assemble(
     let store = config;
 
     // Activate workspace env before registering tools, unless disabled. The
-    // overlay is passed to subprocesses (shell/MCP) so commands run inside the
-    // workspace's development environment without requiring `direnv exec`.
+    // overlay is passed to subprocesses (shell/MCP/LSP) so commands run inside
+    // the workspace's development environment without requiring `direnv exec`.
+    // Assembly never blocks on a slow direnv evaluation: a fast export, else
+    // the last snapshot while a background refresh re-warms (`doc/env.md`).
     let env_overlay = if no_dotenv {
         BTreeMap::new()
     } else {
-        let env = activate_direnv(&workspace, on_warn).await;
+        let env_cache = store
+            .roots()
+            .first()
+            .map(|root| crate::env::WorkspaceEnvCache::anchored_at(root));
+        let env = crate::env::session_env(
+            &workspace,
+            env_cache.as_ref(),
+            &crate::env::EnvActivation::default(),
+            on_warn,
+        )
+        .await;
         load_dotenv(store.roots(), &workspace, on_warn);
         env
     };
@@ -223,11 +238,24 @@ pub async fn assemble(
         (sandbox, descriptor)
     };
 
+    // Language servers for the diagnostics assist (doc/lsp.md):
+    // load `lsp.toml`, build one manager per session. `None` when no server is
+    // configured, so read/edit/write pay nothing. Nothing spawns here — servers
+    // start lazily on the first file of their language.
+    let lsp_manager = crate::lsp::LspConfig::load(store.roots())
+        .context("failed to load lsp.toml")
+        .map(|cfg| {
+            crate::lsp::LspManager::new(&cfg, workspace.clone(), env_overlay.clone(), &|msg| {
+                on_warn(msg);
+            })
+        })?;
+
     register_profile_tools(
         &mut tools,
         &profile,
         workspace.clone(),
         Arc::clone(&sandbox),
+        lsp_manager.clone(),
     );
 
     // Connect configured MCP servers and register their tools alongside the
@@ -330,6 +358,7 @@ pub async fn assemble(
         sandbox_descriptor,
         resolved,
         mcp_clients,
+        lsp_manager,
     })
 }
 
@@ -341,18 +370,23 @@ fn register_profile_tools(
     profile: &crate::config::Profile,
     workspace: PathBuf,
     sandbox: Arc<dyn crate::sandbox::Sandbox>,
+    lsp: Option<Arc<crate::lsp::LspManager>>,
 ) {
     if profile.tools.allows("find") {
         registry.register(Arc::new(FindTool::new(workspace.clone())));
     }
     if profile.tools.allows("read") {
-        registry.register(Arc::new(ReadTool::new(workspace.clone())));
+        registry.register(Arc::new(
+            ReadTool::new(workspace.clone()).with_lsp(lsp.clone()),
+        ));
     }
     if profile.tools.allows("write") {
-        registry.register(Arc::new(WriteTool::new(workspace.clone())));
+        registry.register(Arc::new(
+            WriteTool::new(workspace.clone()).with_lsp(lsp.clone()),
+        ));
     }
     if profile.tools.allows("edit") {
-        registry.register(Arc::new(EditTool::new(workspace)));
+        registry.register(Arc::new(EditTool::new(workspace).with_lsp(lsp)));
     }
     if profile.tools.allows("shell") {
         registry.register(Arc::new(ShellTool::new(sandbox)));
@@ -368,99 +402,6 @@ pub fn resolve_workspace(requested: &Path) -> Result<PathBuf> {
     requested
         .canonicalize()
         .with_context(|| format!("workspace does not exist: {}", requested.display()))
-}
-
-/// Activate `<workspace>/.envrc` through direnv, if present.
-///
-/// direnv remains the source of truth for trust (`direnv allow`) and evaluation;
-/// this returns `direnv export json` as an environment overlay for subprocesses
-/// that need the workspace development environment. Failures are warnings: a
-/// blocked or missing direnv should explain itself without making unrelated
-/// workspaces unusable.
-pub(crate) async fn activate_direnv(
-    workspace: &Path,
-    on_warn: &(dyn Fn(&str) + Sync),
-) -> BTreeMap<String, Option<String>> {
-    let envrc = workspace.join(".envrc");
-    if !envrc.is_file() {
-        return BTreeMap::new();
-    }
-
-    let output = tokio::time::timeout(
-        Duration::from_secs(10),
-        tokio::process::Command::new("direnv")
-            .arg("export")
-            .arg("json")
-            .current_dir(workspace)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output(),
-    )
-    .await;
-
-    let output = match output {
-        Ok(Ok(output)) => output,
-        Ok(Err(e)) => {
-            on_warn(&format!(
-                "warning: failed to run direnv for {}: {e}",
-                envrc.display()
-            ));
-            return BTreeMap::new();
-        }
-        Err(_) => {
-            on_warn(&format!(
-                "warning: timed out activating {} with direnv",
-                envrc.display()
-            ));
-            return BTreeMap::new();
-        }
-    };
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        on_warn(&format!(
-            "warning: direnv failed for {}: {}",
-            envrc.display(),
-            stderr.trim()
-        ));
-        return BTreeMap::new();
-    }
-
-    match parse_direnv_json(&output.stdout) {
-        Ok(env) => {
-            on_warn(&format!(
-                "loaded {} env vars from {} via direnv",
-                env.len(),
-                envrc.display()
-            ));
-            env
-        }
-        Err(e) => {
-            on_warn(&format!(
-                "warning: failed to import direnv env for {}: {e}",
-                envrc.display()
-            ));
-            BTreeMap::new()
-        }
-    }
-}
-
-pub(crate) fn parse_direnv_json(bytes: &[u8]) -> Result<BTreeMap<String, Option<String>>> {
-    if bytes.iter().all(u8::is_ascii_whitespace) {
-        return Ok(BTreeMap::new());
-    }
-    let env: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(bytes)?;
-    Ok(env
-        .into_iter()
-        .filter_map(|(key, value)| {
-            if value.is_null() {
-                Some((key, None))
-            } else {
-                value.as_str().map(|value| (key, Some(value.to_owned())))
-            }
-        })
-        .collect())
 }
 
 /// Load a single `.env` file into the environment, if one is found.
@@ -498,28 +439,6 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-
-    /// direnv's JSON export becomes a per-workspace subprocess environment
-    /// overlay; non-string bookkeeping values are ignored.
-    #[test]
-    fn direnv_json_parses_string_env_overlay() {
-        assert!(parse_direnv_json(b"").unwrap().is_empty());
-
-        let json = br#"{"OMINI_SIMPLE":"a","OMINI_COMPLEX":"quote: \" slash: \\ line:\n","OMINI_UNSET":null,"IGNORED":false}"#;
-
-        let env = parse_direnv_json(json).unwrap();
-
-        assert_eq!(
-            env.get("OMINI_SIMPLE").and_then(|value| value.as_deref()),
-            Some("a")
-        );
-        assert_eq!(
-            env.get("OMINI_COMPLEX").and_then(|value| value.as_deref()),
-            Some("quote: \" slash: \\ line:\n")
-        );
-        assert_eq!(env.get("OMINI_UNSET"), Some(&None));
-        assert!(!env.contains_key("IGNORED"));
-    }
 
     /// `pick_dotenv_path` prefers a config root's `.env` over the workspace's.
     #[test]
@@ -571,6 +490,7 @@ mod tests {
                 PathBuf::from("/tmp/ws"),
                 BTreeMap::new(),
             )),
+            None,
         );
         let names: Vec<String> = reg.descriptors().into_iter().map(|d| d.name).collect();
         assert_eq!(names, vec!["edit", "find", "read", "shell", "write"]);
@@ -591,6 +511,7 @@ mod tests {
                 PathBuf::from("/tmp/ws"),
                 BTreeMap::new(),
             )),
+            None,
         );
         let names: Vec<String> = reg.descriptors().into_iter().map(|d| d.name).collect();
         assert_eq!(names, vec!["read", "write"]);

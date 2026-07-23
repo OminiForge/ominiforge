@@ -130,6 +130,7 @@
 				name={item.name}
 				args={item.args}
 				result={item.result}
+				diagnostics={item.diagnostics}
 				status={item.status}
 				error_code={item.error_code}
 				{fileCache}

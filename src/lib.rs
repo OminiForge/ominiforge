@@ -16,12 +16,14 @@ pub mod app;
 pub mod cli;
 pub mod config;
 pub mod context;
+pub mod env;
 pub mod eval;
 pub mod evolution;
 #[cfg(feature = "gateway")]
 pub mod gateway;
 pub mod hook;
 pub mod llm;
+pub mod lsp;
 pub mod mcp;
 pub mod memory;
 pub mod monitor;

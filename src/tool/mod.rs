@@ -26,7 +26,30 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::core::payload::{ToolOutput, ToolSource};
+use crate::core::payload::{Content, ToolOutput, ToolSource};
+use crate::lsp::LspManager;
+
+/// Append LSP diagnostics for `abs_path` (with current `text`) to `output`, if a
+/// language server handles it. Best-effort: a missing manager, unsupported
+/// extension, or a server that yields nothing all leave `output` untouched. The
+/// diagnostics ride on a *successful* file op — see the assist design in
+/// `doc/lsp.md`. `label` is the workspace-relative path the tool
+/// already prints, so the diagnostics block names the same file the model sees.
+async fn append_diagnostics(
+    lsp: Option<&Arc<LspManager>>,
+    output: &mut ToolOutput,
+    abs_path: &Path,
+    label: &str,
+    text: &str,
+) {
+    let Some(lsp) = lsp else { return };
+    if let Some(diagnostics) = lsp.diagnostics(abs_path, text).await {
+        let block = crate::lsp::render_diagnostics(label, &diagnostics);
+        if !block.is_empty() {
+            output.content.push(Content::Text(block));
+        }
+    }
+}
 
 /// The outcome of a tool invocation: either a [`ToolOutput`] (possibly a
 /// business-level error) or a protocol-level [`ToolError`].

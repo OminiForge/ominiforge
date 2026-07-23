@@ -1,15 +1,22 @@
 <script lang="ts">
 	/** Debug-only view of a tool call's raw JSON arguments, and — when the caller
-	 *  passes one — its terse result text. Collapsed by default: the tool-specific
-	 *  header already surfaces what matters (path/command/diff/…); this is here
-	 *  for when you need to inspect the exact call. `result` is optional because
-	 *  most tools still render it as their primary content — only `edit`/`write`
-	 *  (whose result is now a terse confirmation, not a diff — see
-	 *  `doc/tool-protocol.md` §11.4) pass it here instead. Pretty-prints +
-	 *  syntax-tints JSON; falls back to escaped raw text when a value isn't valid
-	 *  JSON (true for `result`, which is always plain text). Only the tint markup
-	 *  (built from escaped text) reaches `{@html}`. */
-	let { args, result }: { args: string; result?: string } = $props();
+	 *  passes one — its terse result text and/or LSP diagnostics. Collapsed by
+	 *  default: the tool-specific header already surfaces what matters
+	 *  (path/command/diff/…); this is here for when you need to inspect the exact
+	 *  call. `result` is optional because most tools still render it as their
+	 *  primary content — only `edit`/`write` (whose result is now a terse
+	 *  confirmation, not a diff — see `doc/tool-protocol.md` §11.4) pass it here
+	 *  instead. `diagnostics` is the LSP block a tool appended (`doc/lsp.md` §5): it went to
+	 *  the model, so it's shown here for transparency — never in the primary view,
+	 *  where it would pollute the file body / diff. Pretty-prints + syntax-tints
+	 *  JSON; falls back to escaped raw text when a value isn't valid JSON (true
+	 *  for `result`/`diagnostics`, which are always plain text). Only the tint
+	 *  markup (built from escaped text) reaches `{@html}`. */
+	let {
+		args,
+		result,
+		diagnostics
+	}: { args: string; result?: string; diagnostics?: string } = $props();
 
 	let open = $state(false);
 
@@ -33,7 +40,7 @@
 	const argsHtml = $derived(tintJson(args));
 </script>
 
-{#if (args && args !== '{}') || result}
+{#if (args && args !== '{}') || result || diagnostics}
 	<div class="raw" class:open>
 		<button class="toggle" onclick={() => (open = !open)} aria-expanded={open}>
 			<svg
@@ -47,7 +54,9 @@
 			>
 				<polyline points="4,2 8,6 4,10" />
 			</svg>
-			<span class="label">debug · args{result ? ' + result' : ''}</span>
+			<span class="label"
+				>debug · args{result ? ' + result' : ''}{diagnostics ? ' + diagnostics' : ''}</span
+			>
 		</button>
 		{#if open}
 			<div class="body">
@@ -58,6 +67,12 @@
 				{#if result}
 					<div class="section-label">result</div>
 					<pre class="pre">{result}</pre>
+				{/if}
+				{#if diagnostics}
+					<div class="section-label">
+						diagnostics <span class="cn">· 已发送给模型（上方未显示）</span>
+					</div>
+					<pre class="pre">{diagnostics}</pre>
 				{/if}
 			</div>
 		{/if}
@@ -109,6 +124,14 @@
 		text-transform: uppercase;
 		color: var(--text-tertiary);
 		margin-top: var(--space-2);
+	}
+	/* Chinese annotation inside a section label: per DESIGN.md §3 Chinese must
+	   use --font-chinese, never the Inter fallback; undo the label's latin
+	   uppercase/tracking so the note reads naturally. */
+	.section-label .cn {
+		font-family: var(--font-chinese);
+		text-transform: none;
+		letter-spacing: 0;
 	}
 	.pre {
 		margin: 0;

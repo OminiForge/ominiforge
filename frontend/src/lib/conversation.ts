@@ -35,6 +35,12 @@ export type Item =
 			args: string;
 			status: 'running' | 'done' | 'error';
 			result?: string;
+			/** Supplementary, debug-only content a tool appended after its primary
+			 *  result (currently: LSP diagnostics on read/edit/write —
+			 *  `doc/lsp.md` §5). Reaches the model like any other tool
+			 *  output; here it's kept out of `result` so it renders only in the
+			 *  `RawArgs` debug fold, never mixed into a tool's primary view. */
+			diagnostics?: string;
 			error_code?: string;
 			/** The model-assigned tool-call id — bridges `Permission::Requested`
 			 *  (which keys on it) to this card. Present on committed tool items. */
@@ -598,13 +604,35 @@ function pairResult(
 	const items = [...state.items];
 	const call = items[pos];
 	if (call?.kind !== 'tool') return state;
-	const text = output.content
-		.map((c) => ('Text' in (c as object) ? (c as { Text: string }).Text : '[binary]'))
-		.join('');
+	// `content[0]` is the tool's primary result (what every tool has always
+	// returned) — this is what `result` means everywhere else in the UI
+	// (ReadResult parses it as the file body; the fileCache below parses it as
+	// cacheable lines). ONLY the built-in file tools append supplementary
+	// content after it (LSP diagnostics riding on read/edit/write,
+	// `doc/lsp.md` §5); for those, entries after content[0] are the
+	// debug-only diagnostics block. Every other tool (notably MCP tools that
+	// legitimately return text+image or multi-text) keeps the historical
+	// behavior: all entries joined into the primary result — splitting them
+	// would silently hide real content in the debug fold. The split is
+	// therefore gated on the tool name, not on positional index.
+	const isAssistTool = call.name === 'read' || call.name === 'write' || call.name === 'edit';
+	const parts = output.content.map((c) =>
+		'Text' in (c as object) ? (c as { Text: string }).Text : '[binary]'
+	);
+	let text: string;
+	let diagnostics: string | undefined;
+	if (isAssistTool && parts.length > 1) {
+		text = parts[0] ?? '';
+		diagnostics = parts.slice(1).join('');
+	} else {
+		text = parts.join('');
+		diagnostics = undefined;
+	}
 	items[pos] = {
 		...call,
 		status: failed || output.is_error ? 'error' : 'done',
 		result: text,
+		diagnostics,
 		error_code: output.error_code ?? undefined
 	};
 

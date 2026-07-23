@@ -32,12 +32,14 @@
 	let {
 		args,
 		result,
+		diagnostics,
 		status,
 		fileCache,
 		prevLines
 	}: {
 		args: string;
 		result?: string;
+		diagnostics?: string;
 		status: 'running' | 'done' | 'error';
 		fileCache?: Map<string, string[]>;
 		prevLines?: string[];
@@ -109,7 +111,7 @@
 	{#if parsed.diff}<Diff text={parsed.diff} />{/if}
 	{#if parsed.note}<div class="note">{parsed.note}</div>{/if}
 </div>
-<RawArgs {args} result={status === 'done' ? result : undefined} />
+<RawArgs {args} result={status === 'done' ? result : undefined} {diagnostics} />
 
 <style>
 	.result {

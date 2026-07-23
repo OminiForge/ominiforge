@@ -17,6 +17,9 @@ export interface ResultProps {
 	name: string;
 	args: string;
 	result?: string;
+	/** Debug-only supplementary content (e.g. LSP diagnostics) — never a tool's
+	 *  primary content; components that accept it forward it to `RawArgs`. */
+	diagnostics?: string;
 	status: 'running' | 'done' | 'error';
 	error_code?: string;
 	/** The conversation-wide file cache (`conversation.ts`'s `fileCache`) — used

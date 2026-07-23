@@ -7,7 +7,19 @@
 	 *  source, via CodeView) or a directory listing (entries, sub-dirs tinted).
 	 *  Both start with a `[header]` line the tool emits. Raw args are tucked into
 	 *  the debug fold. */
-	let { name, args, result, status }: { name: string; args: string; result?: string; status: 'running' | 'done' | 'error' } = $props();
+	let {
+		name,
+		args,
+		result,
+		diagnostics,
+		status
+	}: {
+		name: string;
+		args: string;
+		result?: string;
+		diagnostics?: string;
+		status: 'running' | 'done' | 'error';
+	} = $props();
 
 	interface Parsed {
 		kind: 'file' | 'dir' | 'plain';
@@ -47,7 +59,7 @@
 		<pre class="plain">{result ?? ''}</pre>
 	{/if}
 </div>
-<RawArgs {args} />
+<RawArgs {args} {diagnostics} />
 
 <style>
 	.result {

@@ -490,7 +490,7 @@ workspace，`doc/permission.md` §3）。核心原则：**磁盘配置结构化�
 ## 8. 路线图（详见 `~/.claude/plans/robust-toasting-moon.md`）
 
 - **B1** 后端 gateway 暴露 resolved provider/model → Detail Rail INFO 显示真 model
-- **B2** 后端探测 workspace env（flake.nix/Cargo.toml…）→ Detail Rail INFO 显示 env
-- **B3** 前端 Detail Rail 接 B1/B2 真数据（组件已写成「有值才渲染」，后端就绪即自动出现）
+- **B2** ✅ 已实现（方式有变：探测激活后的环境变量 `IN_NIX_SHELL`/`VIRTUAL_ENV` 等 —— `runtime_info` → `detect_env`，而非文件嗅探）→ Detail Rail INFO 显示 env。环境激活链路见 `doc/env.md`
+- **B3** ✅（env 部分）前端 Detail Rail 接 B1/B2 真数据（组件已写成「有值才渲染」，后端就绪即自动出现）
 - **B4** 运行层校验：从事件流 `ModelEvent::RequestStarted` 提取实际 model，与配置层比对，不一致 fail loud（不替换显示源）
 - **C** monitor + evolution 铺满 v2 设计语言（含 monitor 的 `.error` 样式统一为全框红边）

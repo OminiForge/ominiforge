@@ -1174,3 +1174,88 @@ describe('file cache fold', () => {
 		expect(state.fileCache.get('x.txt')).toEqual(['hi']);
 	});
 });
+
+/** A `Tool::Completed` whose result carries MULTIPLE content blocks — the shape
+ *  a tool produces when it appends supplementary content (LSP diagnostics) after
+ *  its primary result. */
+function toolCompletedMulti(seq: number, callSeq: number, texts: string[]): GatewayEvent {
+	return {
+		type: 'event',
+		schema_version: 'ominiforge.event.v1',
+		seq,
+		session_id: 's',
+		timestamp: '2026-06-24T00:00:00Z',
+		source: { kind: 'Runtime', id: 'runtime' },
+		parent_event_id: null,
+		turn_id: null,
+		payload: {
+			Tool: {
+				Completed: {
+					tool_call_event_id: { session_id: 's', seq: callSeq },
+					result: {
+						content: texts.map((t) => ({ Text: t })),
+						is_error: false,
+						error_code: null
+					}
+				}
+			}
+		}
+	} as unknown as GatewayEvent;
+}
+
+describe('tool diagnostics split (LSP assist)', () => {
+	// The primary result (content[0]) stays `result`; anything appended after it
+	// (LSP diagnostics) goes to `diagnostics` — kept out of the primary view so
+	// it renders only in the debug fold, while still reaching the model via the
+	// backend's content flattening. See doc/lsp.md §5.
+	it('splits a diagnostics block off the primary result', () => {
+		const state = fold([
+			contentBlock(1, { ToolCall: { id: 'c1', name: 'write', arguments: '{"path":"a.rs","content":"fn f(){}"}' } }),
+			toolCompletedMulti(2, 1, ['wrote a.rs (new, 1 lines)', '\n[diagnostics: a.rs] 1 issue(s)\n  1:9 error: expected type'])
+		]);
+		const t = state.items.find((i) => i.kind === 'tool');
+		expect(t?.kind === 'tool' && t.result).toBe('wrote a.rs (new, 1 lines)');
+		expect(t?.kind === 'tool' && t.diagnostics).toContain('error: expected type');
+		// The diagnostics text must NOT leak into `result` (primary view).
+		expect(t?.kind === 'tool' && t.result).not.toContain('diagnostics');
+	});
+
+	// A read with diagnostics: the file cache must be built from content[0] only,
+	// never the appended diagnostics — otherwise a later edit diffs against a
+	// polluted "before".
+	it('a read with a trailing diagnostics block still caches only the file body', () => {
+		const state = fold([
+			contentBlock(1, { ToolCall: { id: 'c1', name: 'read', arguments: '{"path":"a.rs"}' } }),
+			toolCompletedMulti(2, 1, ['[a.rs]\n1:fn f(){}', '\n[diagnostics: a.rs] 1 issue(s)\n  1:9 error: boom'])
+		]);
+		expect(state.fileCache.get('a.rs')).toEqual(['fn f(){}']);
+		const t = state.items.find((i) => i.kind === 'tool');
+		expect(t?.kind === 'tool' && t.diagnostics).toContain('boom');
+	});
+
+	// The common case — a single content block — leaves `diagnostics` undefined,
+	// so nothing changes for tools without the LSP assist.
+	it('a single-block result has no diagnostics field', () => {
+		const state = fold([
+			contentBlock(1, { ToolCall: { id: 'c1', name: 'read', arguments: '{"path":"a.txt"}' } }),
+			toolCompleted(2, 1, '[a.txt]\n1:hello')
+		]);
+		const t = state.items.find((i) => i.kind === 'tool');
+		expect(t?.kind === 'tool' && t.diagnostics).toBeUndefined();
+	});
+
+	// The split is gated on the tool NAME, not positional index: a non-assist
+	// tool (e.g. an MCP tool returning text+something) that legitimately emits
+	// multiple content entries must keep ALL of them in the primary result, not
+	// silently relegate the tail to the debug fold. Regression guard for the
+	// tool-agnostic-split bug.
+	it('a non-assist tool with multiple content blocks keeps them all in result', () => {
+		const state = fold([
+			contentBlock(1, { ToolCall: { id: 'c1', name: 'search', arguments: '{"q":"x"}' } }),
+			toolCompletedMulti(2, 1, ['hit one', 'hit two'])
+		]);
+		const t = state.items.find((i) => i.kind === 'tool');
+		expect(t?.kind === 'tool' && t.result).toBe('hit onehit two');
+		expect(t?.kind === 'tool' && t.diagnostics).toBeUndefined();
+	});
+});

@@ -13,16 +13,26 @@
 //! suffixed `/`), sorted.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde::Deserialize;
 
-use super::{Tool, ToolDescriptor, ToolError, ToolInput, ToolResult, resolve_in_workspace};
+use super::{
+    Tool, ToolDescriptor, ToolError, ToolInput, ToolResult, append_diagnostics,
+    resolve_in_workspace,
+};
 use crate::core::payload::{Content, ToolOutput};
+use crate::lsp::LspManager;
 
 /// Reads a text file (or lists a directory) relative to the session workspace.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ReadTool {
     workspace: PathBuf,
+    /// Optional LSP assist: when set, reading a whole file appends its
+    /// diagnostics to the result (`doc/lsp.md`). A ranged read
+    /// attaches nothing — syncing a partial file would corrupt the server's
+    /// view of the document.
+    lsp: Option<Arc<LspManager>>,
 }
 
 #[derive(Deserialize)]
@@ -50,7 +60,17 @@ impl ReadTool {
     /// Create a `read` tool rooted at `workspace`.
     #[must_use]
     pub const fn new(workspace: PathBuf) -> Self {
-        Self { workspace }
+        Self {
+            workspace,
+            lsp: None,
+        }
+    }
+
+    /// Attach an [`LspManager`] so whole-file reads carry diagnostics.
+    #[must_use]
+    pub fn with_lsp(mut self, lsp: Option<Arc<LspManager>>) -> Self {
+        self.lsp = lsp;
+        self
     }
 }
 
@@ -128,11 +148,26 @@ impl Tool for ReadTool {
 
         match tokio::fs::read_to_string(&path).await {
             Ok(content) => match render(&parsed, &content) {
-                Ok(text) => Ok(ToolOutput {
-                    content: vec![Content::Text(text)],
-                    is_error: false,
-                    error_code: None,
-                }),
+                Ok(text) => {
+                    let mut output = ToolOutput {
+                        content: vec![Content::Text(text)],
+                        is_error: false,
+                        error_code: None,
+                    };
+                    // Only a whole-file read (no range) is safe to sync — a
+                    // partial slice would give the server a truncated document.
+                    if parsed.range.is_none() {
+                        append_diagnostics(
+                            self.lsp.as_ref(),
+                            &mut output,
+                            &path,
+                            &parsed.path,
+                            &content,
+                        )
+                        .await;
+                    }
+                    Ok(output)
+                }
                 Err(msg) => Ok(business_error(
                     "bad_range",
                     &format!("{}: {msg}", parsed.path),
