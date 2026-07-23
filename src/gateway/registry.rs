@@ -445,7 +445,23 @@ impl SessionRegistry {
             .workspaces
             .lock()
             .map_err(|_| anyhow!("workspace map lock poisoned"))?;
-        ws.record(path)
+        let id = ws.record(path)?;
+        let canonical = ws.path_for(&id);
+        drop(ws);
+        // Prepare the workspace's direnv environment in the background
+        // (`doc/env.md`): the first session here then finds a warm snapshot
+        // and never pays the (possibly minutes-long) evaluation cost.
+        if !self.inner.defaults.no_dotenv
+            && let Some(canonical) = canonical
+            && let Some(root) = self.inner.defaults.config.roots().first()
+        {
+            crate::env::spawn_refresh(
+                canonical,
+                crate::env::WorkspaceEnvCache::anchored_at(root),
+                crate::env::EnvActivation::default(),
+            );
+        }
+        Ok(id)
     }
 
     /// Resolve a workspace id to its canonical path, seeding from session metadata
@@ -494,7 +510,16 @@ impl SessionRegistry {
         self.inner
             .workspace_config
             .delete(id)
-            .with_context(|| format!("failed to delete workspace config `{}`", id.0))
+            .with_context(|| format!("failed to delete workspace config `{}`", id.0))?;
+        // The workspace's env snapshot shares the config's lifecycle
+        // (`doc/env.md` §4). Best-effort: an unresolvable path or a missing
+        // file is not a deletion failure.
+        if let Some(path) = self.resolve_or_seed_workspace_id(id)
+            && let Some(root) = self.inner.defaults.config.roots().first()
+        {
+            crate::env::WorkspaceEnvCache::anchored_at(root).remove(&path);
+        }
+        Ok(())
     }
 
     /// The gateway-wide baseline permission policy (bottom tier of the three-tier
@@ -902,11 +927,21 @@ impl SessionRegistry {
         if !self.inner.defaults.no_dotenv
             && let Some(workspace) = workspace
         {
+            let env_cache = self
+                .inner
+                .defaults
+                .config
+                .roots()
+                .first()
+                .map(|root| crate::env::WorkspaceEnvCache::anchored_at(root));
             apply_overlay(
                 &mut env,
-                crate::app::activate_direnv(workspace, &|msg| {
-                    eprintln!("gateway: {msg}");
-                })
+                crate::env::session_env(
+                    workspace,
+                    env_cache.as_ref(),
+                    &crate::env::EnvActivation::default(),
+                    &|msg| eprintln!("gateway: {msg}"),
+                )
                 .await,
             );
         }

@@ -53,15 +53,10 @@ impl WorkspaceId {
 /// FNV-1a 64-bit hash of `bytes`, lower-hex encoded to 16 chars. A fixed,
 /// version-stable algorithm (offset basis + prime are constants), so a persisted
 /// workspace id derived from a path stays the same across builds and toolchains.
+/// The implementation is shared with the env snapshot cache (`crate::env`) —
+/// do not change the algorithm.
 fn fnv1a_hex(bytes: &[u8]) -> String {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = OFFSET;
-    for &b in bytes {
-        hash ^= u64::from(b);
-        hash = hash.wrapping_mul(PRIME);
-    }
-    format!("{hash:016x}")
+    crate::env::fnv1a_hex(bytes)
 }
 
 /// A persisted `hash → canonical path` map, stored as JSON at
