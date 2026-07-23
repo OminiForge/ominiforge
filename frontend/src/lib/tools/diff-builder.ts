@@ -73,6 +73,36 @@ interface Splice {
 	payload: string[];
 }
 
+/** Strip the common leading/trailing lines an edit shares between `old` and
+ *  `new`, returning the narrowed core. A model routinely pads both with extra
+ *  context lines for anchoring (e.g. quotes 10 lines where only 1 changed);
+ *  rendered whole, every padded line shows as a `-`/`+` pair — the card looks
+ *  like the edit rewrote (duplicated) far more than it did, and the real
+ *  change is visually buried wherever it happened to fall in the block. The
+ *  strip is purely presentational: matching still runs against the FULL `old`
+ *  (the splice lands where the backend applied it), and the stripped lines
+ *  simply fall back to ordinary context in the hunk. */
+function stripCommon(
+	start: number,
+	old: string[],
+	replacement: string[]
+): Splice {
+	let pre = 0;
+	const maxPre = Math.min(old.length, replacement.length);
+	while (pre < maxPre && old[pre] === replacement[pre]) pre += 1;
+
+	let suf = 0;
+	const maxSuf = Math.min(old.length - pre, replacement.length - pre);
+	while (suf < maxSuf && old[old.length - 1 - suf] === replacement[replacement.length - 1 - suf])
+		suf += 1;
+
+	return {
+		start: start + pre,
+		end: start + old.length - suf,
+		payload: replacement.slice(pre, replacement.length - suf || undefined)
+	};
+}
+
 /** Build the unified-diff text for one file, given its cached lines (or
  *  `undefined` on a cache miss) and every edit entry targeting it.
  *
@@ -108,12 +138,11 @@ export function buildFileDiff(
 		}
 		if (matches.length > 1 && !e.replace_all) {
 			ambiguous = true;
-			const start = matches[0];
-			splices.push({ start, end: start + e.old.length, payload: e.new });
+			splices.push(stripCommon(matches[0], e.old, e.new));
 			continue;
 		}
 		for (const start of matches) {
-			splices.push({ start, end: start + e.old.length, payload: e.new });
+			splices.push(stripCommon(start, e.old, e.new));
 		}
 	}
 
@@ -132,10 +161,19 @@ export function buildFileDiff(
 	return diff;
 }
 
-/** A context-less `-old`/`+new` block for an entry that can't be located. */
+/** A context-less `-old`/`+new` block for an entry that can't be located in
+ *  the cache. Even without a file to anchor against, the common head/tail the
+ *  entry shares between `old` and `new` is stripped (same as a placed splice),
+ *  so a padded quote renders as its real change plus context, not a wall of
+ *  `-`/`+` pairs on identical lines. Stripped lines are emitted as context
+ *  (space-prefixed) so the block still reads as a patch fragment. */
 function bareBlock(e: EditEntry): string {
-	const lines = [...e.old.map((l) => `-${l}`), ...e.new.map((l) => `+${l}`)];
-	return lines.join('\n');
+	const { start, end, payload } = stripCommon(0, e.old, e.new);
+	const head = e.old.slice(0, start).map((l) => ` ${l}`);
+	const removed = e.old.slice(start, end).map((l) => `-${l}`);
+	const added = payload.map((l) => `+${l}`);
+	const tail = e.old.slice(end).map((l) => ` ${l}`);
+	return [...head, ...removed, ...added, ...tail].join('\n');
 }
 
 /** Render sorted splices into unified-diff hunks with `context` lines on each
@@ -143,9 +181,14 @@ function bareBlock(e: EditEntry): string {
  *  ported from the old backend's diff renderer, since deleted); `lines` is the
  *  file's pre-edit content. */
 function renderHunks(lines: string[], splicesIn: Splice[], context: number): string {
-	if (splicesIn.length === 0) return '';
+	// Drop no-op splices (old identical to new after stripping): nothing
+	// changed, so there is nothing to diff — rendering one would emit a hunk of
+	// pure context with a misleading `@@` header.
+	const splices = [...splicesIn]
+		.filter((s) => s.end > s.start || s.payload.length > 0)
+		.sort((a, b) => a.start - b.start);
+	if (splices.length === 0) return '';
 	const n = lines.length;
-	const splices = [...splicesIn].sort((a, b) => a.start - b.start);
 
 	// Group edits whose context windows overlap into shared hunks.
 	const groups: Splice[][] = [];

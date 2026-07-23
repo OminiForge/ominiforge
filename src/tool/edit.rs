@@ -6,20 +6,30 @@
 //! exact current content of the lines you want to touch is the failure mode —
 //! there is no separate "read this file first" bookkeeping to bypass, and no
 //! whole-file fingerprint to go stale: the model must quote real content, and
-//! a `not_found`/`ambiguous` result means it didn't. See `doc/tool-protocol.md`
-//! §11.
+//! a `not_found`/`ambiguous` result means it didn't. Line arrays are
+//! normalized (embedded newlines split) before matching, so a pasted
+//! multi-line block in one array item works the same as one-item-per-line.
+//! See `doc/tool-protocol.md` §11.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::Deserialize;
 
-use super::{Tool, ToolDescriptor, ToolError, ToolInput, ToolResult, resolve_in_workspace};
+use super::{
+    Tool, ToolDescriptor, ToolError, ToolInput, ToolResult, append_diagnostics,
+    resolve_in_workspace,
+};
 use crate::core::payload::{Content, ToolOutput};
+use crate::lsp::LspManager;
 
 /// Applies content-anchored edits relative to the session workspace.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EditTool {
     workspace: PathBuf,
+    /// Optional LSP assist: when set, a successful edit appends each written
+    /// file's diagnostics to the result (`doc/lsp.md`).
+    lsp: Option<Arc<LspManager>>,
 }
 
 #[derive(Deserialize)]
@@ -42,7 +52,17 @@ impl EditTool {
     /// Create an `edit` tool rooted at `workspace`.
     #[must_use]
     pub const fn new(workspace: PathBuf) -> Self {
-        Self { workspace }
+        Self {
+            workspace,
+            lsp: None,
+        }
+    }
+
+    /// Attach an [`LspManager`] so successful edits carry diagnostics.
+    #[must_use]
+    pub fn with_lsp(mut self, lsp: Option<Arc<LspManager>>) -> Self {
+        self.lsp = lsp;
+        self
     }
 }
 
@@ -58,12 +78,12 @@ fn edit_input_schema() -> serde_json::Value {
                 "type": "array",
                 "items": { "type": "string" },
                 "minItems": 1,
-                "description": "The exact current lines to replace, one file line per array item (no embedded newlines). Quote this verbatim from a prior `read`/`edit`/`write` output — a mismatch (not found, or found in more than one place without `replace_all`) is rejected rather than guessed at."
+                "description": "The exact current lines to replace, one file line per array item. Quote this verbatim from a prior `read`/`edit`/`write` output — a mismatch (not found, or found in more than one place without `replace_all`) is rejected rather than guessed at. (An item containing a newline is split into lines for you, but one-per-item is the canonical form.)"
             },
             "new": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "Replacement lines, one per array item. Empty array deletes `old` outright. To insert, include an unchanged anchor line in both `old` and `new` alongside the inserted lines."
+                "description": "Replacement lines, one per array item. Empty array deletes `old` outright. To insert, include an unchanged anchor line in both `old` and `new` alongside the inserted lines. (Newlines inside an item are split as for `old`.)"
             },
             "replace_all": {
                 "type": "boolean",
@@ -133,7 +153,10 @@ impl Tool for EditTool {
                 Ok(abs_path) => abs_path,
                 Err(e) => return Ok(business_error("invalid_path", &e.to_string())),
             };
-            match groups.iter_mut().find(|(_, group_abs, _)| *group_abs == abs_path) {
+            match groups
+                .iter_mut()
+                .find(|(_, group_abs, _)| *group_abs == abs_path)
+            {
                 Some((_, _, ops)) => ops.push(entry),
                 None => groups.push((entry.path.clone(), abs_path, vec![entry])),
             }
@@ -150,6 +173,9 @@ impl Tool for EditTool {
         }
 
         let mut summaries = Vec::with_capacity(planned.len());
+        // Remember what we wrote (abs path, display name, final text) so the LSP
+        // assist can request diagnostics per file after all writes land.
+        let mut written: Vec<(PathBuf, String, String)> = Vec::with_capacity(planned.len());
         for plan in planned {
             if let Err(e) = tokio::fs::write(&plan.abs_path, plan.new_content.as_bytes()).await {
                 return Ok(business_error(
@@ -163,13 +189,25 @@ impl Tool for EditTool {
                 plan.replacement_count,
                 if plan.replacement_count == 1 { "" } else { "s" }
             ));
+            written.push((plan.abs_path, plan.rel_path, plan.new_content));
         }
 
-        Ok(ToolOutput {
+        let mut output = ToolOutput {
             content: vec![Content::Text(summaries.join("\n"))],
             is_error: false,
             error_code: None,
-        })
+        };
+        for (abs_path, rel_path, new_content) in &written {
+            append_diagnostics(
+                self.lsp.as_ref(),
+                &mut output,
+                abs_path,
+                rel_path,
+                new_content,
+            )
+            .await;
+        }
+        Ok(output)
     }
 }
 
@@ -318,9 +356,15 @@ fn find_matches(haystack: &[&str], needle: &[String]) -> Vec<usize> {
     starts
 }
 
-/// Validate the parsed entries: no embedded newlines, non-empty `old`,
-/// non-empty `path`. These are protocol errors (malformed input the model
-/// cannot react to via `is_error`), not business errors.
+/// Validate and normalize the parsed entries: non-empty `path`, non-empty
+/// `old` after normalization. Normalization SPLITS any array item containing
+/// an embedded newline into one item per line — a model frequently pastes a
+/// whole multi-line block as a single `old`/`new` element, and rejecting that
+/// taught callers to route around the tool instead of fixing the call
+/// (`doc/lsp.md`-era lesson: a tool people bypass is worse than a tolerant
+/// one). The canonical form stays "one file line per array item"; the split
+/// just stops a malformed-but-unambiguous call from failing. Only structural
+/// problems remain protocol errors.
 fn validate_entries(edits: Vec<EditEntryArg>) -> Result<Vec<Entry>, String> {
     edits
         .into_iter()
@@ -330,32 +374,50 @@ fn validate_entries(edits: Vec<EditEntryArg>) -> Result<Vec<Entry>, String> {
             if e.path.is_empty() {
                 return Err(format!("{ctx}: empty `path`"));
             }
-            if e.old.is_empty() {
+            let old = split_lines(e.old);
+            let new = split_lines(e.new);
+            if old.is_empty() {
                 return Err(format!(
                     "{ctx} ({}): empty `old` — edit requires existing content to replace; use `write` to create a new file",
                     e.path
                 ));
             }
-            validate_lines(&ctx, &e.path, &e.old)?;
-            validate_lines(&ctx, &e.path, &e.new)?;
             Ok(Entry {
                 path: e.path,
                 ordinal: idx + 1,
-                old: e.old,
-                new: e.new,
+                old,
+                new,
                 replace_all: e.replace_all,
             })
         })
         .collect()
 }
 
-fn validate_lines(ctx: &str, path: &str, lines: &[String]) -> Result<(), String> {
-    if lines.iter().any(|l| l.contains('\n') || l.contains('\r')) {
-        return Err(format!(
-            "{ctx} ({path}): each line item must be one output line; split multi-line content into multiple array items"
-        ));
-    }
-    Ok(())
+/// Flatten an `old`/`new` array to one element per line: items containing
+/// `\n` are split, and a trailing `\r` on each resulting line is stripped so
+/// CRLF-pasted content matches the file's lines (which `str::lines` already
+/// yields without a `\r`). Blank pieces are preserved — a blank line is real
+/// content; only the array itself being empty is meaningful. A multi-line
+/// block pasted as one item is split for you, but one-item-per-line stays
+/// the canonical form this module's docs and schema describe.
+fn split_lines(lines: Vec<String>) -> Vec<String> {
+    lines
+        .into_iter()
+        .flat_map(|item| {
+            let mut pieces: Vec<&str> = item.split('\n').collect();
+            // An item ENDING in a newline ("a\nb\n") splits into a trailing
+            // empty piece that is an artifact of the terminator, not a real
+            // blank line — drop it. (A blank line in the MIDDLE is real
+            // content and is preserved.)
+            if pieces.last() == Some(&"") {
+                pieces.pop();
+            }
+            pieces
+                .into_iter()
+                .map(|piece| piece.strip_suffix('\r').unwrap_or(piece).to_owned())
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 fn business_error(code: &str, message: &str) -> ToolOutput {
@@ -629,18 +691,48 @@ mod tests {
         );
     }
 
+    /// A multi-line block pasted as ONE `old`/`new` array item (the most
+    /// common malformed call) is normalized by splitting on newlines, so the
+    /// edit applies exactly as if the caller had passed one item per line.
     #[tokio::test]
-    async fn embedded_newline_in_old_is_protocol_error() {
+    async fn embedded_newlines_in_items_are_split_not_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("f.txt"), "a\n").unwrap();
+        std::fs::write(dir.path().join("f.txt"), "a\nb\nc\n").unwrap();
         let t = tool(dir.path().to_path_buf());
 
         let out = t
             .invoke(call(serde_json::json!([
-                { "path": "f.txt", "old": ["a\nb"], "new": ["x"] }
+                { "path": "f.txt", "old": ["a\nb"], "new": ["x\ny\nz"] }
             ])))
-            .await;
-        assert!(matches!(out, Err(ToolError::InvalidInput(msg)) if msg.contains("one output line")));
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "x\ny\nz\nc\n"
+        );
+    }
+
+    /// CRLF-pasted content: a trailing `\r` per split line is stripped, so a
+    /// block copied from a Windows-style source still matches the file's
+    /// lines (which `str::lines` yields without `\r`).
+    #[tokio::test]
+    async fn crlf_pasted_block_matches_lf_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "a\nb\n").unwrap();
+        let t = tool(dir.path().to_path_buf());
+
+        let out = t
+            .invoke(call(serde_json::json!([
+                { "path": "f.txt", "old": ["a\r\nb\r\n"], "new": ["X"] }
+            ])))
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "X\n"
+        );
     }
 
     #[tokio::test]

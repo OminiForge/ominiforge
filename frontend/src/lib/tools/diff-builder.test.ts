@@ -44,13 +44,63 @@ describe('buildFileDiff', () => {
 		expect(out.diff).toBe('@@ -1,5 +1,5 @@\n a\n-b\n+B\n c\n-d\n+D\n e');
 	});
 
-	it('an insert keeps the anchor line in both old and new (rendered as a whole-block replace, not a sub-line match)', () => {
+	it('an insert keeps the anchor line in both old and new (the anchor renders as context, not a remove+add pair)', () => {
 		const cache = ['a', 'b'];
 		const out = buildFileDiff(cache, [{ path: 'f', old: ['a'], new: ['a', 'A1'] }], 1);
-		// The splice is one mechanical block: the whole `old` range is `-`, the
-		// whole `new` payload is `+` — the renderer doesn't sub-diff a splice's
-		// payload against what it replaced.
-		expect(out.diff).toBe('@@ -1,2 +1,3 @@\n-a\n+a\n+A1\n b');
+		// The shared prefix `a` is stripped from the splice core, so it shows as
+		// a context line and only the truly-inserted line is `+`.
+		expect(out.diff).toBe('@@ -1,2 +1,3 @@\n a\n+A1\n b');
+	});
+
+	// A model that quotes MORE than it actually changed (a common behavior —
+	// it pads `old`/`new` with surrounding lines for anchoring) must not render
+	// those unchanged lines as a `-`/`+` pair: the common head and tail of
+	// `old`/`new` are stripped so only the real change shows as a diff, and the
+	// padded lines render as ordinary context. Otherwise the card looks like
+	// the edit rewrote (duplicated) far more text than it did.
+	it('common prefix/suffix lines of old/new render as context, not remove+add pairs', () => {
+		const cache = ['p1', 'p2', 'old-mid', 'p3', 'p4'];
+		const out = buildFileDiff(
+			cache,
+			[{ path: 'f', old: ['p1', 'p2', 'old-mid', 'p3', 'p4'], new: ['p1', 'p2', 'new-mid', 'p3', 'p4'] }],
+			1
+		);
+		expect(out.diff).toBe('@@ -2,3 +2,3 @@\n p2\n-old-mid\n+new-mid\n p3');
+	});
+
+	// Prefix-only sharing (an insertion padded with an anchor line AFTER the
+	// change): the shared tail renders as context, the inserted head as `+`.
+	it('a change with only a shared suffix strips the tail, not the head', () => {
+		const cache = ['x', 'anchor'];
+		const out = buildFileDiff(
+			cache,
+			[{ path: 'f', old: ['x', 'anchor'], new: ['X1', 'X2', 'anchor'] }],
+			1
+		);
+		expect(out.diff).toBe('@@ -1,2 +1,3 @@\n-x\n+X1\n+X2\n anchor');
+	});
+
+	// Stripping is per-entry: the place-in-file anchor (findMatches against the
+	// FULL old) is unaffected, so a stripped splice still lands exactly where
+	// the backend applied it — only the rendered hunk narrows.
+	it('stripping never moves where the hunk is anchored', () => {
+		const cache = ['pre', 'mid-old', 'post', 'other'];
+		const out = buildFileDiff(
+			cache,
+			[{ path: 'f', old: ['pre', 'mid-old', 'post'], new: ['pre', 'mid-new', 'post'] }],
+			0
+		);
+		// context 0 → only the changed line, no padding.
+		expect(out.diff).toBe('@@ -2,1 +2,1 @@\n-mid-old\n+mid-new');
+	});
+
+	// Identical old/new (a no-op edit) strips to nothing at all: emitting a
+	// hunk of pure context with an `@@` header would claim a change happened
+	// where none did, so the diff is empty and the card shows no diff block.
+	it('identical old and new renders no diff at all', () => {
+		const cache = ['a', 'b', 'c'];
+		const out = buildFileDiff(cache, [{ path: 'f', old: ['b'], new: ['b'] }], 1);
+		expect(out.diff).toBe('');
 	});
 
 	it('replace_all replaces every non-overlapping occurrence', () => {
@@ -67,6 +117,21 @@ describe('buildFileDiff', () => {
 		const out = buildFileDiff(undefined, [{ path: 'f', old: ['a'], new: ['b'] }]);
 		expect(out.diff).toBe('-a\n+b');
 		expect(out.note).toBe('无上下文（该文件未在本会话读取）');
+	});
+
+	// The real-world case behind the bare-block path: the file CHANGED on disk
+	// after it was read into the cache (e.g. another edit or an external
+	// write), so the model's quoted `old` no longer matches the cached lines.
+	// Even here, lines the entry shares between `old` and `new` must NOT render
+	// as `-`/`+` pairs — strip them to context, leaving only the true change.
+	it('a stale-cache entry still strips lines shared by old and new', () => {
+		const cache = ['anything', 'else']; // entry's old is absent → bare path
+		const out = buildFileDiff(
+			cache,
+			[{ path: 'f', old: ['head', 'mid-old', 'tail'], new: ['head', 'mid-new', 'tail'] }]
+		);
+		expect(out.diff).toBe(' head\n-mid-old\n+mid-new\n tail');
+		expect(out.note).toBe('部分内容未在当前缓存中定位（可能已过时）');
 	});
 
 	it('an old that matches nowhere in the cache is a stale preview, not a crash', () => {
