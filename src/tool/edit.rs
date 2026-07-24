@@ -35,17 +35,61 @@ pub struct EditTool {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EditArgs {
+    /// A model wrapping a single replacement as a bare object instead of a
+    /// one-element array is unambiguous — normalize it (`doc/tool-protocol.md`
+    /// §11.2). Untagged representation tries the canonical form first, so
+    /// well-formed calls parse exactly as before.
+    #[serde(deserialize_with = "one_or_many")]
     edits: Vec<EditEntryArg>,
+}
+
+/// Accept either `edits: [ {...}, ... ]` or a single `edits: {...}`.
+fn one_or_many<'de, D>(deserializer: D) -> Result<Vec<EditEntryArg>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        Many(Vec<EditEntryArg>),
+        One(Box<EditEntryArg>),
+    }
+    match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::Many(v) => Ok(v),
+        OneOrMany::One(e) => Ok(vec![*e]),
+    }
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EditEntryArg {
     path: String,
+    /// The canonical form is an array with one file line per item; a single
+    /// string is accepted and split on newlines (same normalization as
+    /// `split_lines` applies to multi-line items).
+    #[serde(deserialize_with = "string_or_lines")]
     old: Vec<String>,
+    #[serde(deserialize_with = "string_or_lines")]
     new: Vec<String>,
     #[serde(default)]
     replace_all: bool,
+}
+
+/// Accept either `"old": ["line1", ...]` or a single `"old": "line1\nline2"`.
+fn string_or_lines<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrLines {
+        Lines(Vec<String>),
+        One(String),
+    }
+    match StringOrLines::deserialize(deserializer)? {
+        StringOrLines::Lines(v) => Ok(v),
+        StringOrLines::One(s) => Ok(vec![s]),
+    }
 }
 
 impl EditTool {
@@ -78,7 +122,7 @@ fn edit_input_schema() -> serde_json::Value {
                 "type": "array",
                 "items": { "type": "string" },
                 "minItems": 1,
-                "description": "The exact current lines to replace, one file line per array item. Quote this verbatim from a prior `read`/`edit`/`write` output — a mismatch (not found, or found in more than one place without `replace_all`) is rejected rather than guessed at. (An item containing a newline is split into lines for you, but one-per-item is the canonical form.)"
+                "description": "The exact current lines to replace, one file line per array item. Quote this verbatim from a FRESH `read` — paraphrasing a long line from memory almost always diffs by one character and is rejected rather than guessed at (a `not_found` result names the first differing line so you can repair the quote). A single string is accepted and split on newlines; an array item containing a newline is likewise split, but one-per-item stays the canonical form."
             },
             "new": {
                 "type": "array",
@@ -100,7 +144,7 @@ fn edit_input_schema() -> serde_json::Value {
                 "type": "array",
                 "items": entry_schema,
                 "minItems": 1,
-                "description": "One or more content-anchored replacements, applied atomically: if any entry fails to resolve, no file is changed. Entries may target the same path (applied together, non-overlapping) or different paths."
+                "description": "One or more content-anchored replacements, applied atomically: if any entry fails to resolve, no file is changed. Entries may target the same path (applied together, non-overlapping) or different paths. A bare single object is accepted and wrapped as a one-element array. To rewrite most of a file, use `write` instead."
             }
         },
         "required": ["edits"],
@@ -119,13 +163,19 @@ impl Tool for EditTool {
                           verbatim from a `read`/`edit`/`write` output, one file line per \
                           array item), `new` is what it becomes (empty array deletes; an \
                           insert keeps an unchanged anchor line in both `old` and `new` \
-                          alongside the new lines). `old` must match exactly one place in \
-                          the file unless `replace_all` is set, in which case every \
+                          alongside the new lines). Quote `old` from a FRESH `read` — \
+                          paraphrasing or recalling a long line from memory almost always \
+                          diffs by one character and is rejected rather than guessed at. \
+                          `old` must match exactly one place in the file unless \
+                          `replace_all` is set, in which case every \
                           non-overlapping occurrence is replaced. A patch is atomic across \
                           all entries (same or different files): if any entry doesn't \
                           resolve, nothing is written. On success the result reports how \
                           many replacements were made per file, not a diff — you already \
-                          have the before/after text in this call's own arguments."
+                          have the before/after text in this call's own arguments. \
+                          Rewriting most of a file, or replacing very long lines you \
+                          cannot quote exactly? Use `write` with the full new content \
+                          instead — do not fight `edit` over it."
                 .to_owned(),
             input_schema: edit_input_schema(),
         }
@@ -261,10 +311,7 @@ impl EditTool {
                 0 => {
                     return Err(business_error(
                         "not_found",
-                        &format!(
-                            "{rel_path}: no match for the given `old` lines (first line: {:?})",
-                            entry.old.first().map_or("", String::as_str)
-                        ),
+                        &not_found_message(rel_path, &lines, entry),
                     ));
                 }
                 1 => splices.push((matches[0], matches[0] + entry.old.len(), entry)),
@@ -354,6 +401,124 @@ fn find_matches(haystack: &[&str], needle: &[String]) -> Vec<usize> {
         }
     }
     starts
+}
+
+/// Build the `not_found` message with a located diagnosis that mirrors
+/// `find_matches`' contiguous-block semantics: from the leftmost start with
+/// the longest verbatim prefix of `old`, report the first line where the
+/// block breaks, `old` vs file side by side, plus the first differing
+/// character. Turns "no match" into "line N differs from file line M like
+/// this", so a one-character misquote costs one retry, not a full re-read.
+fn not_found_message(rel_path: &str, lines: &[&str], entry: &Entry) -> String {
+    let header = format!(
+        "{rel_path}: no match for the given `old` lines (entry {})",
+        entry.ordinal
+    );
+
+    // From every candidate start line, how many leading lines of `old` match
+    // verbatim? Keep the leftmost attempt with the longest prefix. (The
+    // greedy "earliest match per line" walk this replaced could anchor on a
+    // scattered match and blame the wrong `old` line.) The Z algorithm gives
+    // every start's prefix length in O(M+N) instead of a naive O(MN) — same
+    // matched-region reuse idea as KMP, but Z answers "prefix length at each
+    // start" where KMP answers "where full matches end".
+    let prefix_lens = z_prefix_lengths(&entry.old, lines);
+    // Empty `lines` yields no start; (0, 0) still reports `old` line #1.
+    let (best_start, best_len) = prefix_lens
+        .iter()
+        .enumerate()
+        .max_by_key(|&(_, &len)| len)
+        .map_or((0, 0), |(start, &len)| (start, len));
+
+    let breaking_old = &entry.old[best_len];
+    let mut msg = format!(
+        "{header}\nfirst unmatched `old` line is #{}: {breaking_old:?}",
+        best_len + 1
+    );
+    let break_file_idx = best_start + best_len;
+    if break_file_idx < lines.len() {
+        // The file has a line exactly where the block breaks — that is the
+        // closest look-alike by construction, no fuzzy search needed.
+        use std::fmt::Write;
+        let _ = write!(
+            msg,
+            "\nclosest file line is #{}: {:?}{}",
+            break_file_idx + 1,
+            lines[break_file_idx],
+            char_hint(breaking_old, lines[break_file_idx])
+        );
+    } else {
+        msg.push_str("\nthe file ends there; the quoted `old` has extra lines");
+    }
+    msg
+}
+
+/// For every start line in `text`, the number of leading `pattern` lines
+/// that match verbatim — via the Z algorithm on `pattern ++ [sentinel] ++
+/// text`, so `z[pattern.len() + 1 + start]` is exactly the prefix length at
+/// `start`. O(M+N) line comparisons, all inside the Z-box when possible.
+/// Only invoked on the not-found path, so `pattern` never fully matches.
+fn z_prefix_lengths(pattern: &[String], text: &[&str]) -> Vec<usize> {
+    let total = pattern.len() + 1 + text.len();
+    // None is the sentinel: pattern/text lines are all Some, so the sentinel
+    // can never match one, keeping z[i] from overrunning a segment.
+    let line_at = |i: usize| -> Option<&str> {
+        match i.cmp(&pattern.len()) {
+            std::cmp::Ordering::Less => Some(&pattern[i]),
+            std::cmp::Ordering::Equal => None,
+            std::cmp::Ordering::Greater => Some(text[i - pattern.len() - 1]),
+        }
+    };
+    let mut z = vec![0usize; total];
+    let (mut l, mut r) = (0usize, 0usize); // rightmost Z-box [l, r)
+    for i in 1..total {
+        if i < r {
+            z[i] = (r - i).min(z[i - l]);
+        }
+        while i + z[i] < total && line_at(z[i]) == line_at(i + z[i]) {
+            z[i] += 1;
+        }
+        if i + z[i] > r {
+            l = i;
+            r = i + z[i];
+        }
+    }
+    text.iter()
+        .enumerate()
+        .map(|(start, _)| z[pattern.len() + 1 + start].min(pattern.len()))
+        .collect()
+}
+
+/// Pinpoint the first differing character between the quoted line and the
+/// candidate file line, when they share a prefix. Empty when no useful hint
+/// (identical prefix length 0, or one is a prefix of the other without
+/// extra context worth citing).
+fn char_hint(old_line: &str, file_line: &str) -> String {
+    let mut old_chars = old_line.chars();
+    let mut file_chars = file_line.chars();
+    let mut col = 0usize;
+    loop {
+        match (old_chars.next(), file_chars.next()) {
+            (Some(a), Some(b)) if a == b => col += 1,
+            (a, b) => {
+                use std::fmt::Write;
+                let mut hint = format!("\nfirst difference at char {}", col + 1);
+                match (a, b) {
+                    (Some(x), Some(y)) => {
+                        let _ = write!(hint, ": `old` has {x:?}, file has {y:?}");
+                    }
+                    (Some(x), None) => {
+                        let _ = write!(hint, ": `old` continues with {x:?}, file line ends here");
+                    }
+                    (None, Some(y)) => {
+                        let _ = write!(hint, ": `old` line ends here, file continues with {y:?}");
+                    }
+                    (None, None) => return String::new(),
+                }
+                return hint;
+            }
+        }
+    }
 }
 
 /// Validate and normalize the parsed entries: non-empty `path`, non-empty
@@ -746,6 +911,170 @@ mod tests {
             ])))
             .await;
         assert!(matches!(out, Err(ToolError::InvalidInput(msg)) if msg.contains("empty `old`")));
+    }
+
+    // --- tolerant parsing (schema-canonical forms still win) ---------------
+
+    /// A bare single object for `edits` (not wrapped in an array) is
+    /// unambiguous — normalize it instead of failing the call.
+    #[tokio::test]
+    async fn bare_object_edits_is_wrapped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "a\nb\n").unwrap();
+        let t = tool(dir.path().to_path_buf());
+
+        let input = ToolInput {
+            call_id: "c1".to_owned(),
+            input: serde_json::json!({ "edits": { "path": "f.txt", "old": ["b"], "new": ["B"] } }),
+            timeout: Duration::from_secs(5),
+        };
+        let out = t.invoke(input).await.unwrap();
+        assert!(!out.is_error, "{:?}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "a\nB\n"
+        );
+    }
+
+    /// A single string for `old`/`new` (not an array) splits on newlines and
+    /// otherwise behaves identically to the canonical array form.
+    #[tokio::test]
+    async fn string_old_new_split_into_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "a\nb\nc\n").unwrap();
+        let t = tool(dir.path().to_path_buf());
+
+        let out = t
+            .invoke(call(serde_json::json!([
+                { "path": "f.txt", "old": "b", "new": "B1\nB2" }
+            ])))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{:?}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "a\nB1\nB2\nc\n"
+        );
+    }
+
+    // --- not_found diagnostics ---------------------------------------------
+
+    /// A one-character misquote must be located, not just "no match": the
+    /// message names the breaking `old` line, the closest file line, and the
+    /// first differing character — so a retry fixes the quote instead of
+    /// re-reading the whole file.
+    #[tokio::test]
+    async fn not_found_locates_first_differing_line() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "alpha\nbeta\ngamma\n").unwrap();
+        let t = tool(dir.path().to_path_buf());
+
+        let out = t
+            .invoke(call(serde_json::json!([
+                { "path": "f.txt", "old": ["alpha", "bete", "gamma"], "new": ["x"] }
+            ])))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert_eq!(out.error_code.as_deref(), Some("not_found"));
+        let msg = text(&out);
+        assert!(
+            msg.contains("first unmatched `old` line is #2: \"bete\""),
+            "{msg}"
+        );
+        assert!(msg.contains("closest file line is #2: \"beta\""), "{msg}");
+        assert!(msg.contains("first difference at char 4"), "{msg}");
+        // The failed entry must leave the file untouched.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "alpha\nbeta\ngamma\n"
+        );
+    }
+
+    /// When quoted lines exist in the file but are not adjacent, the
+    /// diagnosis must name the line where the contiguous block breaks — not
+    /// skip ahead to a later match and blame a line further down.
+    #[tokio::test]
+    async fn not_found_names_the_breaking_line_not_a_scattered_match() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "a\nx\nb\ny\nc\n").unwrap();
+        let t = tool(dir.path().to_path_buf());
+
+        let out = t
+            .invoke(call(serde_json::json!([
+                { "path": "f.txt", "old": ["a", "b", "c"], "new": ["z"] }
+            ])))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert_eq!(out.error_code.as_deref(), Some("not_found"));
+        let msg = text(&out);
+        assert!(msg.contains("first unmatched `old` line is #2: \"b\""), "{msg}");
+        assert!(msg.contains("closest file line is #2: \"x\""), "{msg}");
+    }
+
+    /// When the quoted `old` is a verbatim prefix of the file's tail but has
+    /// extra trailing lines, the message says the file ran out rather than
+    /// blaming a nonexistent line.
+    #[tokio::test]
+    async fn not_found_reports_file_end_when_old_runs_past_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "alpha\nbeta\n").unwrap();
+        let t = tool(dir.path().to_path_buf());
+
+        let out = t
+            .invoke(call(serde_json::json!([
+                { "path": "f.txt", "old": ["beta", "gamma"], "new": ["z"] }
+            ])))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert_eq!(out.error_code.as_deref(), Some("not_found"));
+        let msg = text(&out);
+        assert!(msg.contains("first unmatched `old` line is #2: \"gamma\""), "{msg}");
+        assert!(msg.contains("file ends there"), "{msg}");
+    }
+
+    /// The Z-based prefix lengths must agree with the naive per-start count
+    /// on adversarial shapes: highly repetitive lines are exactly where the
+    /// naive scan degrades to O(MN) and where Z-box reuse is easiest to get
+    /// wrong.
+    #[test]
+    fn z_prefix_lengths_matches_naive_on_repetitive_inputs() {
+        let alphabet = ["a", "b", " "];
+        // Deterministic LCG so the test is reproducible without a dev-dep.
+        let mut state = 0x1234_5678_u64;
+        let mut next = move || {
+            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (state >> 33) as usize
+        };
+        for _case in 0..50 {
+            let pat_len = 1 + next() % 5;
+            let text_len = 1 + next() % 30;
+            let pattern: Vec<String> = (0..pat_len)
+                .map(|_| alphabet[next() % alphabet.len()].to_string())
+                .collect();
+            let text: Vec<&str> = (0..text_len)
+                .map(|_| alphabet[next() % alphabet.len()])
+                .collect();
+            let naive: Vec<usize> = (0..text.len())
+                .map(|start| {
+                    let mut m = 0;
+                    while m < pattern.len()
+                        && start + m < text.len()
+                        && text[start + m] == pattern[m]
+                    {
+                        m += 1;
+                    }
+                    m
+                })
+                .collect();
+            assert_eq!(
+                z_prefix_lengths(&pattern, &text),
+                naive,
+                "pattern={pattern:?} text={text:?}"
+            );
+        }
     }
 
     #[tokio::test]

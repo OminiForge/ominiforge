@@ -289,6 +289,11 @@ edit edits='[
 `old` / `new` 用数组（一项一行）而非内嵌 `\n` 的字符串，避免整段 patch 塞进一个
 JSON string 后被模型或 provider 双重转义。
 
+**解析宽容性（实现行为，非放宽契约）**：数组始终是唯一规范形态；工具在解析时对
+两类常见笔误做规范化而非拒绝——`edits` 给单个对象时自动包装成单元素数组，`old` /
+`new` 给单个字符串时按换行拆成行。规范化只对无歧义的输入生效，schema 描述与
+multi-line item 拆分（`split_lines`）维持不变。
+
 **语义要点：**
 
 - **替换** = `old` 给现有行，`new` 给替换行。
@@ -310,15 +315,18 @@ JSON string 后被模型或 provider 双重转义。
   按 path 顺序执行且不回滚：中途 I/O 失败（`write_failed`）时，已写的文件保持新内容，
   未写的不再写。
 - 已知限制：`edit` 按行切分并以 LF 重新拼接，CRLF 文件经编辑后行尾会统一为 LF。
+- **`not_found` 报定位诊断**：报错指出首个无法在锚点之后匹配的行号、文件中与其
+  最接近的一行、以及首个差异字符，模型据此精修引用而非整段重读。若 `old` 每行
+  都能在文件里找到但并不连续，报错会明说「行散落各处，并非相邻」，与「某行根本
+  不存在」区分开。
 - 错误码：`not_found`（无匹配，含 stale——文件在别处改过导致 `old` 不再存在，与普通
   找不到同类）、`ambiguous`（多处匹配且未开 `replace_all`）、`overlapping_edits`、
   `invalid_path`、`read_failed`、`write_failed`。均为 `is_error=true` 的 business
-  error，模型可据此调整重试；`old`/`new` 内嵌换行、空 `old`、空 `edits` 是协议错
-  （malformed input）。
+  error，模型可据此调整重试；空 `old`、空 `edits` 是协议错（malformed input）。
 
-### 11.4 结果是简报，diff 由前端渲染
+### 11.4 结果是简报，diff 由后端以 view 下发
 
-成功时 `edit` 只回一行简报，**不回 diff**：
+成功时 `edit` 只回一行简报，**不在 result 里回 diff**：
 
 ```
 edited src/lib.rs (1 replacement)
@@ -329,14 +337,10 @@ edited src/lib.rs (1 replacement)
 `wrote PATH (new, N lines)` / `wrote PATH (~, +A -B)` / `wrote PATH (no change)`，
 不带正文。
 
-**前端**据 tool call 参数（`old`/`new` 或 `content`）+ 自己维护的文件内容缓存
-（由 committed 的 `read` 结果 / `write` 参数喂养）自行构建带上下文的 unified diff
-做可视化，并可随 `Delta::ToolArgs` 流式增量渲染。`edit` 刻意不喂养缓存：它自己的
-diff 预览需要 `read`/`write` 留下的 pre-edit 内容作基底，把 `edit` 参数喂进去会污染
-下一次预览的基底。推论：同一文件连续多次 `edit` 且中间无 `read` 时，第二次起的预览
-上下文可能陈旧，或退化为 bare block + 提示——文件真实内容以后端执行结果为准。因此
-本文档同时是后端契约与前端渲染契约的来源：后端负责“落地 + 简报”，前端负责“diff
-可视化”。
+UI 需要的 diff **不再由前端构建**，而是后端在执行时（握着真实 pre-edit 内容）产出，
+作为 `ToolEvent::Completed` 的 `view` 字段随事件下发——见
+[`tool-view.md`](./tool-view.md)。旧方案（前端复刻匹配算法 + 文件缓存自建 diff）
+已废弃，废弃理由与该契约的完整定义见该文档。
 
 ### 11.5 尚未实现
 
