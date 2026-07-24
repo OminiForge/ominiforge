@@ -1,115 +1,77 @@
 <script lang="ts">
 	import Diff from './Diff.svelte';
+	import CodeView from './CodeView.svelte';
 	import RawArgs from './RawArgs.svelte';
-	import { buildWriteDiff } from '$lib/tools/diff-builder';
+	import { splitViewFiles } from '$lib/tools/view';
 	import { extractArgsPath } from '$lib/tools/utils';
 
-	/** `write` result: rendered from this call's own `content` arg plus the
-	 *  conversation's file cache — NOT from `result`, which the backend now
-	 *  returns as a terse confirmation only (`wrote PATH (new, N lines)` /
-	 *  `(~, +A -B)` / `(no change)`, no body — see `doc/tool-protocol.md` §11.4).
-	 *
-	 *  The confirmation header still tells us definitively which of the three
-	 *  cases applies (new/overwrite/no-change) — cheap and authoritative, so we
-	 *  parse just that first line to pick the render mode, then build the actual
-	 *  diff body ourselves:
-	 *  - new: every line of `content` shown as an addition (no real "before" to
-	 *    diff against — that's what "new" means).
-	 *  - overwrite: a real line diff (`diff-builder.buildWriteDiff`) against
-	 *    `prevLines` — the pre-write snapshot captured on this item at commit
-	 *    time (see `Item.prevLines`'s doc comment for why the file cache itself
-	 *    can no longer supply this by render time).
-	 *  - no change: nothing to show.
-	 *  While running (no result yet), only the path is known — `content` is
-	 *  still-streaming partial JSON that likely doesn't even parse yet, so no
-	 *  diff preview is attempted (matches `edit`'s graceful no-preview state,
-	 *  just without a diff-builder cache-miss note since there's nothing to
-	 *  degrade FROM).
-	 *
-	 *  A failure's message (e.g. `write_failed`) is NOT redundant with args — it's
-	 *  diagnostic detail — so it stays in the primary view; the success
-	 *  confirmation moves to the debug fold (RawArgs). */
+	/** `write` result: rendered from the backend's UI view (`doc/tool-view.md`).
+	 *  An overwrite's view is the exact old→new unified diff (rendered via
+	 *  `Diff`); a new file's view is the full content (rendered via `CodeView`,
+	 *  not a diff — there is no "before" side). `result` is only the terse
+	 *  confirmation (`wrote PATH (new, N lines)` / `(~, +A -B)` / `(no change)`),
+	 *  so we parse its first line for the meta and move the confirmation itself
+	 *  to the debug fold. A failure's message (`write_failed`) is diagnostic
+	 *  detail and stays in the primary view. While running there is no view
+	 *  yet — the streaming args remain visible in the debug fold. */
 	let {
 		args,
 		result,
 		diagnostics,
 		status,
-		fileCache,
-		prevLines
+		view,
+		preview
 	}: {
 		args: string;
 		result?: string;
 		diagnostics?: string;
 		status: 'running' | 'done' | 'error';
-		fileCache?: Map<string, string[]>;
-		prevLines?: string[];
+		view?: string;
+		/** The approval-gate would-be diff/content, shown while the call awaits a
+		 *  human decision. Same shape as `view`. */
+		preview?: string;
 	} = $props();
 
-	interface Parsed {
-		path?: string;
-		meta?: string;
-		diff: string;
-		note?: string;
-		error?: string;
-	}
+	const path = $derived(extractArgsPath(args) ?? undefined);
 
-	function newContentLines(): string[] | undefined {
-		try {
-			const a = JSON.parse(args) as { content?: unknown };
-			if (typeof a.content === 'string') return a.content.split('\n');
-		} catch {
-			// Still streaming or malformed — no content to diff yet.
-		}
-		return undefined;
-	}
+	// While awaiting approval there is no executed `view` — show the gate's
+	// preview. The preview's shape (diff vs raw content) is decided by its
+	// headers, not by `meta` (which only exists on the executed result).
+	const shown = $derived(view ?? preview);
+	const isDiff = $derived(shown?.startsWith('--- a/') ?? false);
 
-	const parsed = $derived.by<Parsed>(() => {
-		const path = extractArgsPath(args) ?? undefined;
-		if (status === 'running') return { path, diff: '' };
-
-		const text = result ?? '';
-		const nl = text.indexOf('\n');
-		const head = nl === -1 ? text : text.slice(0, nl);
-		const m = /^wrote (.+?) \((new, \d+ lines|~, \+\d+ -\d+|no change)\)$/.exec(head);
-		if (!m) return { path, diff: '', error: text }; // business error (write_failed)
-		const meta = m[2];
-
-		if (meta === 'no change') return { path, meta, diff: '' };
-
-		const newLines = newContentLines();
-		if (!newLines) return { path, meta, diff: '' };
-
-		if (meta.startsWith('new,')) {
-			return { path, meta, diff: newLines.map((l) => `+${l}`).join('\n') };
-		}
-		// Overwrite: diff against the pre-write snapshot captured on this item.
-		// Without one (the file was never read/written this session) there is no
-		// "before" to diff against — show only the meta + a caveat note; rendering
-		// the whole new content as `+` lines would contradict the `~, +A -B` meta
-		// (which says this was an overwrite, not a new file).
-		if (!prevLines) {
-			return {
-				path,
-				meta,
-				diff: '',
-				note: '无上下文（该文件在本会话未被读取或写入，无法展示逐行差异）'
-			};
-		}
-		return { path, meta, diff: buildWriteDiff(prevLines, newLines).diff };
+	/** The `wrote PATH (meta)` header's meta fragment, when `result` is the
+	 *  success confirmation (not a business error). */
+	const meta = $derived.by<string | undefined>(() => {
+		if (status !== 'done') return undefined;
+		const head = (result ?? '').split('\n')[0];
+		const m = /^wrote .+? \((new, \d+ lines|~, \+\d+ -\d+|no change)\)$/.exec(head);
+		return m?.[1];
 	});
+	const errorText = $derived(status === 'error' ? result : undefined);
+	const pending = $derived(!view && preview !== undefined && status === 'running');
+
+	// A diff (overwrite, executed or preview) carries `--- a/PATH` headers and is
+	// split per file; a new file's shown text is raw content for CodeView.
+	const files = $derived(shown && isDiff ? splitViewFiles(shown) : []);
 </script>
 
 <div class="result">
 	<div class="sum">
 		<span class="verb" class:running={status === 'running'} class:error={status === 'error'}>
-			{status === 'running' ? 'writing' : status === 'error' ? 'write failed' : 'wrote'}
+			{pending ? 'awaiting approval' : status === 'running' ? 'writing' : status === 'error' ? 'write failed' : 'wrote'}
 		</span>
-		{#if parsed.path}<span class="path">{parsed.path}</span>{/if}
-		{#if parsed.meta}<span class="meta">{parsed.meta}</span>{/if}
+		{#if path}<span class="path">{path}</span>{/if}
+		{#if meta}<span class="meta">{meta}</span>{/if}
 	</div>
-	{#if parsed.error}<div class="err">{parsed.error}</div>{/if}
-	{#if parsed.diff}<Diff text={parsed.diff} />{/if}
-	{#if parsed.note}<div class="note">{parsed.note}</div>{/if}
+	{#if errorText}<div class="err">{errorText}</div>{/if}
+	{#if files.length}
+		{#each files as f (f.path)}
+			{#if f.diff}<Diff text={f.diff} />{/if}
+		{/each}
+	{:else if shown && !isDiff && path}
+		<CodeView code={shown} {path} />
+	{/if}
 </div>
 <RawArgs {args} result={status === 'done' ? result : undefined} {diagnostics} />
 
@@ -158,11 +120,6 @@
 	}
 	.meta {
 		color: var(--text-tertiary);
-	}
-	.note {
-		color: var(--text-tertiary);
-		font-size: 10.5px;
-		font-family: var(--font-chinese);
 	}
 	.err {
 		color: var(--state-error-text);

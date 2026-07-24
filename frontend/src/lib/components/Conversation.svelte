@@ -1199,7 +1199,7 @@
 							{/if}
 						{:else if item.kind === 'tool'}
 							<div class="item" in:fly|local={itemEnter}>
-								<ToolBlock {item} fileCache={convo.fileCache} onDecide={decideApproval} />
+								<ToolBlock {item} onDecide={decideApproval} />
 							</div>
 						{:else if item.kind === 'plan'}
 							<!-- Streaming placeholders (item.streaming) render nothing: a flashing

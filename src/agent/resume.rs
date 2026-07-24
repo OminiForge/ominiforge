@@ -448,6 +448,73 @@ mod tests {
         })
     }
 
+    /// A `Completed` whose result also carries a `TextView` (UI diff) block.
+    fn tool_completed_with_view(call_event_seq: u64, text: &str, view: &str) -> EventPayload {
+        EventPayload::Tool(ToolEvent::Completed {
+            tool_call_event_id: EventId {
+                session_id: sid(),
+                seq: call_event_seq,
+            },
+            result: ToolOutput {
+                content: vec![
+                    Content::Text(text.to_owned()),
+                    Content::TextView {
+                        text: view.to_owned(),
+                        audience: "ui".to_owned(),
+                    },
+                ],
+                is_error: false,
+                error_code: None,
+            },
+            duration_ms: 1,
+            output_bytes: text.len() + view.len(),
+            artifacts_created: vec![],
+        })
+    }
+
+    /// The `doc/tool-view.md` §3 invariant: a `TextView` block NEVER reaches
+    /// the model. Replay a tool result that carries one and assert the rebuilt
+    /// `Message::Tool` is byte-identical to the same result without the view.
+    #[test]
+    fn text_view_never_enters_the_model_context() {
+        let with_view = vec![
+            ev(0, model_src(), tool_call_block("r", "c1", "edit", "{}")),
+            ev(
+                1,
+                tool_src("edit"),
+                tool_completed_with_view(
+                    0,
+                    "edited f (1 replacement)",
+                    "--- a/f
++++ b/f
+@@ ...",
+                ),
+            ),
+        ];
+        let without_view = vec![
+            ev(0, model_src(), tool_call_block("r", "c1", "edit", "{}")),
+            ev(
+                1,
+                tool_src("edit"),
+                tool_completed(0, "edited f (1 replacement)"),
+            ),
+        ];
+        let a = rebuild_runtime(&with_view, vec![]);
+        let b = rebuild_runtime(&without_view, vec![]);
+        assert_eq!(a.context, b.context);
+        // And specifically: the tool message holds only the summary.
+        let tool_msg = a
+            .context
+            .iter()
+            .find(|m| matches!(m, Message::Tool { .. }))
+            .unwrap();
+        let Message::Tool { content, .. } = tool_msg else {
+            unreachable!()
+        };
+        assert_eq!(content, "edited f (1 replacement)");
+        assert!(!content.contains("@@"));
+    }
+
     fn plan_started(input: serde_json::Value) -> EventPayload {
         EventPayload::Tool(ToolEvent::Started {
             tool_call_event_id: EventId {

@@ -88,7 +88,10 @@ impl Tool for FindTool {
             .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
 
         if args.patterns.is_empty() {
-            return Ok(business_error("bad_pattern", "at least one pattern is required"));
+            return Ok(business_error(
+                "bad_pattern",
+                "at least one pattern is required",
+            ));
         }
 
         // Compile every pattern into one `GlobSet`: a single matcher that is a
@@ -108,10 +111,7 @@ impl Tool for FindTool {
                     builder.add(g);
                 }
                 Err(e) => {
-                    return Ok(business_error(
-                        "bad_pattern",
-                        &format!("{pattern}: {e}"),
-                    ));
+                    return Ok(business_error("bad_pattern", &format!("{pattern}: {e}")));
                 }
             }
         }

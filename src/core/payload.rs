@@ -251,6 +251,19 @@ pub struct ToolOutput {
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub enum Content {
     Text(String),
+    /// A UI-only rendering of this call's own `Text` result (e.g. the precise
+    /// diff an `edit`/`write` produced against the real pre-edit content).
+    /// Produced by the tool at execution time and persisted with the event, so
+    /// a history replay keeps it; the front-end renders it verbatim instead of
+    /// rebuilding anything client-side (`doc/tool-view.md`). NEVER fed to the
+    /// model — `render_output` skips it — and it must only re-present what the
+    /// `Text` result already says, never carry information the result lacks.
+    /// `audience` is `"ui"` today; the field exists so a future audience
+    /// (e.g. a TUI-specific view) does not need a new variant.
+    TextView {
+        text: String,
+        audience: String,
+    },
     Image {
         media_type: String,
         data: Vec<u8>,
@@ -260,6 +273,9 @@ pub enum Content {
         media_type: String,
     },
 }
+
+/// The [`Content::TextView`] audience the web/desktop front-end renders.
+pub const AUDIENCE_UI: &str = "ui";
 
 /// Session lifecycle. `Created` is always the first event and snapshots the
 /// initial config so replay is self-contained. See `doc/event-schema.md` §7
@@ -409,6 +425,14 @@ pub enum PermissionEvent {
         call_id: String,
         tool_name: String,
         input: serde_json::Value,
+        /// The would-be UI diff for content tools (`edit`/`write`), computed
+        /// against the file as it is *now* so the human approves the actual
+        /// change, not abstract args. `None` for other tools or when the
+        /// preview can't be computed (the gate then shows raw args). Optional
+        /// so older logs deserialize; the executed `TextView` stays the source
+        /// of truth once approved (`doc/permission.md` §6).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preview: Option<String>,
     },
     /// The gate resolved. `decided_by` is `"user"` (a human answered an ask) or
     /// `"policy"` (a deny rule, or the fail-closed default, auto-resolved it).

@@ -50,13 +50,19 @@ export type Item =
 			 *  card (no separate approval card). Cleared by `Permission::Decided`;
 			 *  the final status then arrives via `Tool::Completed/Failed`. */
 			approvalPending?: boolean;
-			/** For a `write` call only: the file's content as it stood in
-			 *  `fileCache` right before this call's args overwrote that entry —
-			 *  captured on commit because the cache itself is immediately advanced
-			 *  to the new content, so by render time it can no longer supply the
-			 *  "before" side of an overwrite diff. `undefined` for a new file (no
-			 *  prior cache entry) or for any non-`write` tool. */
-			prevLines?: string[];
+			/** The backend's UI-only rendering of this call's result
+			 *  (`Content::TextView`, `doc/tool-view.md`): the precise diff for
+			 *  `edit`/`write`, or the full content for a `write` new file.
+			 *  Rendered verbatim by the result component — never rebuilt
+			 *  client-side. Absent while running and for tools that produce none. */
+			view?: string;
+			/** The approval-gate preview (`Permission::Requested.preview`): the
+			 *  would-be diff for `edit`/`write`, computed at ask time so the human
+			 *  approves the actual change. Shown while `approvalPending`; once the
+			 *  executed `view` arrives it takes over (identical when the file didn't
+			 *  change in between — the preview is the same plan). Absent for tools
+			 *  without a diff preview. */
+			preview?: string;
 	  }
 	/** A plan checklist, folded from `plan` control-tool calls (one card per
 	 *  `init`). `streaming` marks a placeholder shown while the call's args are
@@ -118,11 +124,6 @@ export interface ConversationState {
 	 *  (`doc/frontend.md` B4, CLAUDE.md #12). It deliberately does not drive the
 	 *  INFO Model row, so that row never flickers as subagents switch models. */
 	runtimeModels: Set<string>;
-	/** File content cache (path → lines[]) for building contextual diffs in
-	 *  EditResult/WriteResult. Populated only by committed `read` results (full
-	 *  file) and `write` args (new content) — NOT by `edit`, since edit's own diff
-	 *  rendering needs the pre-edit content that read/write left here. */
-	fileCache: Map<string, string[]>;
 }
 
 export function emptyState(): ConversationState {
@@ -131,8 +132,7 @@ export function emptyState(): ConversationState {
 		open: {},
 		toolSeqs: new Map(),
 		orphanTools: new Map(),
-		runtimeModels: new Set(),
-		fileCache: new Map()
+		runtimeModels: new Set()
 	};
 }
 
@@ -261,11 +261,14 @@ function applyCommitted(
 			// register it as an orphan so the late ContentBlock completes THIS
 			// card instead of pushing a duplicate (see commitBlock).
 			const r = perm.Requested;
+			// The would-be diff the gate computed for content tools (`edit`/`write`)
+			// — shown in the card while it awaits the human's decision.
+			const preview = r.preview ?? undefined;
 			const pos = next.items.findIndex((it) => it.kind === 'tool' && it.callId === r.call_id);
 			if (pos >= 0) {
 				const items = [...next.items];
 				const it = items[pos];
-				if (it.kind === 'tool') items[pos] = { ...it, approvalPending: true };
+				if (it.kind === 'tool') items[pos] = { ...it, approvalPending: true, preview };
 				return { ...next, items };
 			}
 			const orphanTools = new Map(next.orphanTools);
@@ -277,7 +280,8 @@ function applyCommitted(
 				name: r.tool_name,
 				args: JSON.stringify(r.input),
 				status: 'running',
-				approvalPending: true
+				approvalPending: true,
+				preview
 			});
 			return { ...pushed, orphanTools };
 		}
@@ -364,25 +368,6 @@ function commitBlock(
 			items = foldPlanOp(items, content.ToolCall.arguments);
 			return { ...state, items, requestCommitted: true, commitBase, committedEnd: items.length };
 		}
-		// `write`'s new content is available the moment the call commits — cache
-		// it immediately rather than waiting for the (now terse) result, so the
-		// diff preview has pre-edit content ready for any `edit` that follows in
-		// the same turn. `edit` deliberately does NOT touch the cache (see
-		// `fileCache`'s doc comment): its own diff needs the pre-edit content
-		// that only read/write leave here.
-		//
-		// Capture the pre-write snapshot on the item itself (`prevLines`) BEFORE
-		// advancing the cache: WriteResult needs the "before" side to render an
-		// overwrite diff, but by render time the cache already holds the new
-		// content (this same commit just moved it forward).
-		const writePrevLines =
-			content.ToolCall.name === 'write'
-				? writePrevLinesFor(state.fileCache, content.ToolCall.arguments)
-				: undefined;
-		const fileCache =
-			content.ToolCall.name === 'write'
-				? cacheWriteArgs(state.fileCache, content.ToolCall.arguments)
-				: state.fileCache;
 		const toolSeqs = new Map(state.toolSeqs);
 		let orphanTools = state.orphanTools;
 		const orphanAt = orphanTools.get(content.ToolCall.id);
@@ -414,15 +399,13 @@ function commitBlock(
 						...cur,
 						seq,
 						name: content.ToolCall.name,
-						args: content.ToolCall.arguments,
-						prevLines: writePrevLines
+						args: content.ToolCall.arguments
 					};
 					return {
 						...state,
 						items,
 						toolSeqs,
 						orphanTools,
-						fileCache,
 						requestCommitted: true,
 						commitBase,
 						committedEnd: items.length
@@ -442,15 +425,13 @@ function commitBlock(
 				name: content.ToolCall.name,
 				args: content.ToolCall.arguments,
 				status: 'running',
-				approvalPending: true,
-				prevLines: writePrevLines
+				approvalPending: true
 			});
 			return {
 				...state,
 				items,
 				toolSeqs,
 				orphanTools,
-				fileCache,
 				requestCommitted: true,
 				commitBase,
 				committedEnd: items.length
@@ -463,15 +444,13 @@ function commitBlock(
 			callId: content.ToolCall.id,
 			name: content.ToolCall.name,
 			args: content.ToolCall.arguments,
-			status: 'running',
-			prevLines: writePrevLines
+			status: 'running'
 		};
 		items.push(item);
 		return {
 			...state,
 			items,
 			toolSeqs,
-			fileCache,
 			requestCommitted: true,
 			commitBase,
 			committedEnd: items.length
@@ -604,28 +583,39 @@ function pairResult(
 	const items = [...state.items];
 	const call = items[pos];
 	if (call?.kind !== 'tool') return state;
-	// `content[0]` is the tool's primary result (what every tool has always
-	// returned) — this is what `result` means everywhere else in the UI
-	// (ReadResult parses it as the file body; the fileCache below parses it as
-	// cacheable lines). ONLY the built-in file tools append supplementary
-	// content after it (LSP diagnostics riding on read/edit/write,
-	// `doc/lsp.md` §5); for those, entries after content[0] are the
-	// debug-only diagnostics block. Every other tool (notably MCP tools that
-	// legitimately return text+image or multi-text) keeps the historical
-	// behavior: all entries joined into the primary result — splitting them
-	// would silently hide real content in the debug fold. The split is
+	// Content blocks partition by role (`doc/tool-view.md` §3): `Text` is the
+	// model-facing result; `TextView` (audience "ui") is the backend's UI-only
+	// rendering of that same result — the diff/code view this card shows
+	// verbatim; trailing `Text` on the built-in file tools is the debug-only
+	// LSP diagnostics block (`doc/lsp.md` §5).
+	//
+	// `content[0]` (Text) is the tool's primary result — what `result` means
+	// everywhere else in the UI (ReadResult parses it as the file body). Only
+	// the built-in file tools append supplementary content after it; every
+	// other tool (notably MCP tools that legitimately return text+image or
+	// multi-text) keeps all entries joined into the primary result — splitting
+	// them would silently hide real content. The diagnostics split is
 	// therefore gated on the tool name, not on positional index.
 	const isAssistTool = call.name === 'read' || call.name === 'write' || call.name === 'edit';
-	const parts = output.content.map((c) =>
-		'Text' in (c as object) ? (c as { Text: string }).Text : '[binary]'
-	);
+	const texts: string[] = [];
+	let view: string | undefined;
+	for (const c of output.content) {
+		if ('TextView' in (c as object)) {
+			const tv = (c as { TextView: { text: string; audience: string } }).TextView;
+			if (tv.audience === 'ui') view = tv.text;
+		} else if ('Text' in (c as object)) {
+			texts.push((c as { Text: string }).Text);
+		} else {
+			texts.push('[binary]');
+		}
+	}
 	let text: string;
 	let diagnostics: string | undefined;
-	if (isAssistTool && parts.length > 1) {
-		text = parts[0] ?? '';
-		diagnostics = parts.slice(1).join('');
+	if (isAssistTool && texts.length > 1) {
+		text = texts[0] ?? '';
+		diagnostics = texts.slice(1).join('');
 	} else {
-		text = parts.join('');
+		text = texts.join('');
 		diagnostics = undefined;
 	}
 	items[pos] = {
@@ -633,49 +623,15 @@ function pairResult(
 		status: failed || output.is_error ? 'error' : 'done',
 		result: text,
 		diagnostics,
+		// The executed view takes over from the approval preview. When the call
+		// produced no view (a no-op edit, or a failure) keep the preview so the
+		// card never flashes empty between approve and settle — the preview was
+		// the same plan, and on a rejected/failed call it is all there is.
+		view: view ?? call.preview,
 		error_code: output.error_code ?? undefined
 	};
 
-	// Populate the file cache from a successful full-file read result.
-	// Format: "[path]\n1:line1\n2:line2\n..."
-	// Only update for full-file reads (no range arg) to avoid storing partial
-	// content that would silently corrupt diff previews for future edits.
-	let fileCache = state.fileCache;
-	if (call.name === 'read' && !failed && !output.is_error) {
-		try {
-			const args = JSON.parse(call.args) as { path?: unknown; range?: unknown };
-			if (!args.range && typeof args.path === 'string') {
-				const cacheLines = parseReadResult(text);
-				if (cacheLines !== null) {
-					fileCache = new Map(fileCache);
-					fileCache.set(args.path, cacheLines);
-				}
-			}
-		} catch {
-			// Malformed args JSON: skip cache update silently (preview degrades
-			// to the cache-miss bare-block path, not a crash).
-		}
-	}
-
-	// A failed `write` (denied, or a `write_failed` business error) never
-	// touched disk, but its commit already advanced the cache to the args'
-	// content (see commitBlock) — roll back to the pre-write snapshot captured
-	// on the item, or a later edit diffs against phantom content. `prevLines
-	// === undefined` means the commit created the key (new file): drop it.
-	if (call.name === 'write' && (failed || output.is_error)) {
-		try {
-			const args = JSON.parse(call.args) as { path?: unknown };
-			if (typeof args.path === 'string') {
-				fileCache = new Map(fileCache);
-				if (call.prevLines === undefined) fileCache.delete(args.path);
-				else fileCache.set(args.path, call.prevLines);
-			}
-		} catch {
-			// Malformed args JSON: commit couldn't have advanced the cache either.
-		}
-	}
-
-	return { ...state, items, fileCache };
+	return { ...state, items };
 }
 
 /** Parse a `read` tool result (`[path]\n1:line1\n...`) into a lines array.
@@ -824,9 +780,9 @@ function applyDelta(
 			return { ...state, items, open };
 		}
 		// `tool_args` deltas stream partial JSON as the model's call arguments
-		// arrive, letting `diff-builder.ts`'s `parsePartialEdits` build an
-		// incremental preview (`doc/tool-protocol.md` §11.4). Also used by the
-		// TUI's live tool-call rendering path.
+		// arrive, keeping the raw args visible live in the debug fold while the
+		// call runs. The diff view itself arrives with the committed result
+		// (`doc/tool-view.md`) — it is not previewed mid-stream.
 		case 'tool_args': {
 			const pos = open[ev.index];
 			const cur = pos !== undefined ? items[pos] : undefined;

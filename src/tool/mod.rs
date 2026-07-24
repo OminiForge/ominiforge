@@ -7,6 +7,7 @@
 //! the artifact store once that exists (Phase 2); for now it is returned
 //! inline. See `doc/tool-protocol.md`.
 
+pub(crate) mod diffview;
 mod edit;
 mod error;
 mod find;
@@ -71,6 +72,16 @@ pub trait Tool: Send + Sync {
 
     /// Execute the tool to completion.
     async fn invoke(&self, input: ToolInput) -> ToolResult;
+
+    /// Render the would-be UI diff of this call WITHOUT executing it — the
+    /// approval-gate preview (`doc/permission.md` §6). Only tools whose result
+    /// is a content diff (`edit`/`write`) override this; the default is `None`,
+    /// so the gate falls back to showing the raw args. Runs the same plan the
+    /// real execute uses, against the file as it is *now*; the executed
+    /// `TextView` remains the source of truth once approved.
+    async fn preview(&self, _input: &serde_json::Value) -> Option<String> {
+        None
+    }
 }
 
 /// What the model is told about a tool.

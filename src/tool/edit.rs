@@ -182,47 +182,16 @@ impl Tool for EditTool {
     }
 
     async fn invoke(&self, input: ToolInput) -> ToolResult {
-        let args: EditArgs = serde_json::from_value(input.input)
-            .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
-
-        if args.edits.is_empty() {
-            return Err(ToolError::InvalidInput("empty `edits`".to_owned()));
-        }
-        let entries = validate_entries(args.edits).map_err(ToolError::InvalidInput)?;
-
-        // Group by the RESOLVED absolute path, preserving first-seen order, so
-        // the result lists files in the order the model referenced them.
-        // Grouping by the raw path string would split "src/a.rs" and
-        // "./src/a.rs" into two groups planned independently — the later write
-        // would silently clobber the earlier one. A path that fails to resolve
-        // is an `invalid_path` business error; a group's display name is the
-        // first spelling seen.
-        let mut groups: Vec<(String, PathBuf, Vec<Entry>)> = Vec::new();
-        for entry in entries {
-            let abs_path = match resolve_in_workspace(&self.workspace, &entry.path) {
-                Ok(abs_path) => abs_path,
-                Err(e) => return Ok(business_error("invalid_path", &e.to_string())),
-            };
-            match groups
-                .iter_mut()
-                .find(|(_, group_abs, _)| *group_abs == abs_path)
-            {
-                Some((_, _, ops)) => ops.push(entry),
-                None => groups.push((entry.path.clone(), abs_path, vec![entry])),
-            }
-        }
-
-        // Plan every path first; write nothing until all are validated, so a
-        // multi-file patch is all-or-nothing.
-        let mut planned: Vec<PlannedWrite> = Vec::with_capacity(groups.len());
-        for (rel_path, abs_path, ops) in &groups {
-            match Self::plan_path(rel_path, abs_path, ops).await {
-                Ok(plan) => planned.push(plan),
-                Err(business) => return Ok(business),
-            }
-        }
+        let planned = match self.plan_all(input.input).await {
+            Ok(planned) => planned,
+            Err(PlanErr::Protocol(e)) => return Err(e),
+            Err(PlanErr::Business(out)) => return Ok(out),
+        };
 
         let mut summaries = Vec::with_capacity(planned.len());
+        // Render the UI diff from the plan BEFORE consuming it for the writes
+        // (the plan's captured pre-edit lines + splices are the view's data).
+        let view_text = plan_view(&planned);
         // Remember what we wrote (abs path, display name, final text) so the LSP
         // assist can request diagnostics per file after all writes land.
         let mut written: Vec<(PathBuf, String, String)> = Vec::with_capacity(planned.len());
@@ -247,6 +216,16 @@ impl Tool for EditTool {
             is_error: false,
             error_code: None,
         };
+        // The UI diff view rides as a `TextView` block after the model-facing
+        // summary: rendered by the front-end, skipped by `render_output`, so
+        // the model never pays tokens for a diff of its own arguments
+        // (`doc/tool-view.md`).
+        if !view_text.is_empty() {
+            output.content.push(Content::TextView {
+                text: view_text,
+                audience: crate::core::payload::AUDIENCE_UI.to_owned(),
+            });
+        }
         for (abs_path, rel_path, new_content) in &written {
             append_diagnostics(
                 self.lsp.as_ref(),
@@ -258,6 +237,112 @@ impl Tool for EditTool {
             .await;
         }
         Ok(output)
+    }
+
+    /// Compute the UI diff this call would produce WITHOUT writing — the
+    /// approval-gate preview (`doc/permission.md`). Runs the same plan the
+    /// real execute uses, so the preview matches the eventual diff when the
+    /// file hasn't changed in between; any business failure (bad args, no
+    /// match) yields `None` — the gate then shows the raw args, and the real
+    /// execute reports the error after approval.
+    async fn preview(&self, input: &serde_json::Value) -> Option<String> {
+        let planned = self.plan_all(input.clone()).await.ok()?;
+        let text = plan_view(&planned);
+        (!text.is_empty()).then_some(text)
+    }
+}
+
+/// Render the planned files' diff views into the `--- a/PATH`/`+++ b/PATH`
+/// block format the front-end splits per file (same shape as the executed
+/// `TextView`). Shared by `invoke` (post-write view) and `preview`.
+fn plan_view(planned: &[PlannedWrite]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for plan in planned {
+        if let Some(view) = &plan.view {
+            let body = super::diffview::render_hunks(
+                &view.lines,
+                &view
+                    .splices
+                    .iter()
+                    .map(|(s, e, p)| (*s, *e, p.as_slice()))
+                    .collect::<Vec<_>>(),
+                super::diffview::default_context(),
+            );
+            if !body.is_empty() {
+                parts.push(format!(
+                    "--- a/{}\n+++ b/{}\n{body}",
+                    plan.rel_path, plan.rel_path
+                ));
+            }
+        }
+    }
+    parts.join("\n")
+}
+
+/// The two failure channels of [`EditTool::plan_all`]: a protocol error means
+/// the input itself was malformed (surfaced as `Err(ToolError)`); a business
+/// error means the input was well-formed but didn't match the file (surfaced
+/// as an `is_error` `ToolOutput` the model reacts to).
+enum PlanErr {
+    Protocol(ToolError),
+    Business(ToolOutput),
+}
+
+impl EditTool {
+    /// Parse, validate, group and plan every entry — everything short of
+    /// writing. Shared by `invoke` (which then writes) and `preview` (which
+    /// only renders the would-be diff). Malformed input (bad JSON, empty
+    /// `edits`, an invalid entry) is a PROTOCOL error; a content failure
+    /// (no match, ambiguous, overlapping, invalid path) is a BUSINESS error
+    /// the model reacts to.
+    async fn plan_all(&self, input: serde_json::Value) -> Result<Vec<PlannedWrite>, PlanErr> {
+        let args: EditArgs = serde_json::from_value(input)
+            .map_err(|e| PlanErr::Protocol(ToolError::InvalidInput(e.to_string())))?;
+        if args.edits.is_empty() {
+            return Err(PlanErr::Protocol(ToolError::InvalidInput(
+                "empty `edits`".to_owned(),
+            )));
+        }
+        let entries = validate_entries(args.edits)
+            .map_err(|e| PlanErr::Protocol(ToolError::InvalidInput(e)))?;
+
+        // Group by the RESOLVED absolute path, preserving first-seen order, so
+        // the result lists files in the order the model referenced them.
+        // Grouping by the raw path string would split "src/a.rs" and
+        // "./src/a.rs" into two groups planned independently — the later write
+        // would silently clobber the earlier one. A path that fails to resolve
+        // is an `invalid_path` business error; a group's display name is the
+        // first spelling seen.
+        let mut groups: Vec<(String, PathBuf, Vec<Entry>)> = Vec::new();
+        for entry in entries {
+            let abs_path = match resolve_in_workspace(&self.workspace, &entry.path) {
+                Ok(abs_path) => abs_path,
+                Err(e) => {
+                    return Err(PlanErr::Business(business_error(
+                        "invalid_path",
+                        &e.to_string(),
+                    )));
+                }
+            };
+            match groups
+                .iter_mut()
+                .find(|(_, group_abs, _)| *group_abs == abs_path)
+            {
+                Some((_, _, ops)) => ops.push(entry),
+                None => groups.push((entry.path.clone(), abs_path, vec![entry])),
+            }
+        }
+
+        // Plan every path first; write nothing until all are validated, so a
+        // multi-file patch is all-or-nothing.
+        let mut planned: Vec<PlannedWrite> = Vec::with_capacity(groups.len());
+        for (rel_path, abs_path, ops) in &groups {
+            match Self::plan_path(rel_path, abs_path, ops).await {
+                Ok(plan) => planned.push(plan),
+                Err(business) => return Err(PlanErr::Business(business)),
+            }
+        }
+        Ok(planned)
     }
 }
 
@@ -272,12 +357,22 @@ struct Entry {
     replace_all: bool,
 }
 
+/// The data needed to render one file's UI diff view after the write lands:
+/// pre-edit lines plus the exact resolved splices, so the view shows the
+/// tool's own matching result — not a re-match against possibly-stale
+/// content (`doc/tool-view.md` §4).
+struct ViewData {
+    lines: Vec<String>,
+    splices: Vec<(usize, usize, Vec<String>)>,
+}
+
 /// A validated path's worth of edits, ready to write.
 struct PlannedWrite {
     abs_path: PathBuf,
     rel_path: String,
     new_content: String,
     replacement_count: usize,
+    view: Option<ViewData>,
 }
 
 impl EditTool {
@@ -359,6 +454,30 @@ impl EditTool {
 
         let replacement_count = splices.len();
 
+        // Capture the UI diff view BEFORE applying: the original lines plus
+        // the resolved (start, end, new) splices. Skipped when nothing
+        // actually changes (identical old/new) — an empty diff renders no
+        // block, matching the summary-only contract.
+        let view = {
+            let owned_lines: Vec<String> = lines.iter().map(|s| (*s).to_owned()).collect();
+            let owned_splices: Vec<(usize, usize, Vec<String>)> = splices
+                .iter()
+                .map(|&(start, end, entry)| (start, end, entry.new.clone()))
+                .collect();
+            let text = super::diffview::render_hunks(
+                &owned_lines,
+                &owned_splices
+                    .iter()
+                    .map(|(s, e, p)| (*s, *e, p.as_slice()))
+                    .collect::<Vec<_>>(),
+                super::diffview::default_context(),
+            );
+            (!text.is_empty()).then_some(ViewData {
+                lines: owned_lines,
+                splices: owned_splices,
+            })
+        };
+
         // Apply high-index first so earlier splices' indices stay valid.
         let mut out: Vec<String> = lines.iter().map(|s| (*s).to_owned()).collect();
         for (start, end, entry) in splices.into_iter().rev() {
@@ -375,6 +494,7 @@ impl EditTool {
             rel_path: rel_path.to_owned(),
             new_content,
             replacement_count,
+            view,
         })
     }
 }
@@ -625,6 +745,131 @@ mod tests {
             Content::Text(t) => t.clone(),
             other => panic!("expected text, got {other:?}"),
         }
+    }
+
+    /// The `TextView` block of a successful edit, if it produced one.
+    fn view(out: &ToolOutput) -> Option<&str> {
+        out.content.iter().find_map(|c| match c {
+            Content::TextView { text, audience } if audience == "ui" => Some(text.as_str()),
+            _ => None,
+        })
+    }
+
+    /// A single-line replacement yields the model-facing summary PLUS a
+    /// `TextView` with the exact unified diff (headers + hunk), and the view
+    /// never leaks into the model-facing `Text` (`doc/tool-view.md` §2–§3).
+    #[tokio::test]
+    async fn successful_edit_carries_a_ui_diff_view() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("f.txt"),
+            "a
+b
+c
+d
+e
+",
+        )
+        .unwrap();
+        let out = tool(dir.path().to_path_buf())
+            .invoke(call(
+                serde_json::json!([{ "path": "f.txt", "old": ["c"], "new": ["C"] }]),
+            ))
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert_eq!(text(&out), "edited f.txt (1 replacement)");
+        assert_eq!(
+            view(&out).unwrap(),
+            "--- a/f.txt
++++ b/f.txt
+@@ -1,5 +1,5 @@
+ a
+ b
+-c
++C
+ d
+ e"
+        );
+    }
+
+    /// A business failure (no match) carries only the error text — no view
+    /// (the error brief is the whole story; the debug fold shows it).
+    #[tokio::test]
+    async fn failed_edit_has_no_view() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("f.txt"),
+            "a
+b
+",
+        )
+        .unwrap();
+        let out = tool(dir.path().to_path_buf())
+            .invoke(call(
+                serde_json::json!([{ "path": "f.txt", "old": ["zzz"], "new": ["Z"] }]),
+            ))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(view(&out).is_none());
+    }
+
+    /// An identical old→new (a no-op edit) produces no view block: emitting
+    /// an empty diff would claim a change where none happened.
+    #[tokio::test]
+    async fn noop_edit_has_no_view() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("f.txt"),
+            "a
+b
+",
+        )
+        .unwrap();
+        let out = tool(dir.path().to_path_buf())
+            .invoke(call(
+                serde_json::json!([{ "path": "f.txt", "old": ["b"], "new": ["b"] }]),
+            ))
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert!(view(&out).is_none());
+    }
+
+    /// The approval-gate preview renders the would-be diff WITHOUT touching the
+    /// file (`doc/permission.md` §6): same body the executed `TextView` would
+    /// carry, but the on-disk content is unchanged.
+    #[tokio::test]
+    async fn preview_renders_diff_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "a\nb\nc\n").unwrap();
+        let t = tool(dir.path().to_path_buf());
+        let input =
+            serde_json::json!({ "edits": [{ "path": "f.txt", "old": ["b"], "new": ["B"] }] });
+        let preview = t.preview(&input).await.unwrap();
+        assert_eq!(
+            preview,
+            "--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c"
+        );
+        // Not written: the preview is a dry-run.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "a\nb\nc\n"
+        );
+    }
+
+    /// A preview the planner can't resolve (no match) yields `None` — the gate
+    /// falls back to raw args and the real execute reports the error after
+    /// approval.
+    #[tokio::test]
+    async fn preview_is_none_when_edit_would_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "a\nb\n").unwrap();
+        let t = tool(dir.path().to_path_buf());
+        let input =
+            serde_json::json!({ "edits": [{ "path": "f.txt", "old": ["zzz"], "new": ["Z"] }] });
+        assert!(t.preview(&input).await.is_none());
     }
 
     #[tokio::test]
@@ -1009,7 +1254,10 @@ mod tests {
         assert!(out.is_error);
         assert_eq!(out.error_code.as_deref(), Some("not_found"));
         let msg = text(&out);
-        assert!(msg.contains("first unmatched `old` line is #2: \"b\""), "{msg}");
+        assert!(
+            msg.contains("first unmatched `old` line is #2: \"b\""),
+            "{msg}"
+        );
         assert!(msg.contains("closest file line is #2: \"x\""), "{msg}");
     }
 
@@ -1031,7 +1279,10 @@ mod tests {
         assert!(out.is_error);
         assert_eq!(out.error_code.as_deref(), Some("not_found"));
         let msg = text(&out);
-        assert!(msg.contains("first unmatched `old` line is #2: \"gamma\""), "{msg}");
+        assert!(
+            msg.contains("first unmatched `old` line is #2: \"gamma\""),
+            "{msg}"
+        );
         assert!(msg.contains("file ends there"), "{msg}");
     }
 
@@ -1045,7 +1296,9 @@ mod tests {
         // Deterministic LCG so the test is reproducible without a dev-dep.
         let mut state = 0x1234_5678_u64;
         let mut next = move || {
-            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
             (state >> 33) as usize
         };
         for _case in 0..50 {

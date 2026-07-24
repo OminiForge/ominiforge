@@ -237,10 +237,17 @@ gate 的 `supports_concurrent_requests()` 为 true（gateway）时，一轮里�
 
 ```rust
 pub enum PermissionEvent {
-    Requested { call_id, tool_name, input },
+    Requested { call_id, tool_name, input, preview },  // preview: Option<String>
     Decided   { call_id, outcome, decided_by, scope },  // outcome: Approved|Rejected|AutoDenied
 }
 ```
+
+- `preview: Option<String>`（serde default + None 不序列化）：内容工具（`edit`/`write`）的
+  **would-be diff**，由 `Tool::preview` 在 ask 时对当前文件 dry-run 算出（复用真实执行的 plan，
+  不写盘）。让人审批的是「这个文件将被改成这样」，而非抽象 args。审批停留期间文件被外部改动时，
+  预览与实际执行的 diff 可能不同——**批准后 `ToolEvent::Completed` 的 `TextView` 才是事实**，预览
+  只是决策依据。非内容工具或 preview 算不出（如 no-match）时为 `None`，门退化为显示原始 args。
+  旧日志无此字段仍可正常反序列化。
 
 - `scope: Option<ApprovalScope>`（serde default + None 不序列化）：人做了决定时记录其作用域
   （含 `once`，审计统一）；policy deny、fail-closed 兜底、以及 `CliApprovalGate`（终端提示无作用域

@@ -1116,6 +1116,7 @@ impl TurnState<'_> {
         &mut self,
         call: &ToolCall,
         input: &serde_json::Value,
+        preview: Option<String>,
     ) -> Result<(), AgentError> {
         self.writer.append(
             runtime_source(),
@@ -1123,6 +1124,7 @@ impl TurnState<'_> {
                 call_id: call.id.clone(),
                 tool_name: call.name.clone(),
                 input: input.clone(),
+                preview,
             }),
             None,
             Some(self.turn_id.clone()),
@@ -1470,8 +1472,14 @@ impl TurnState<'_> {
                     // An `ask` genuinely requests a human decision — audit the
                     // request now, so every ask of a round is published before
                     // any of them settles; the gate itself is awaited in the
-                    // settle half (`doc/permission.md` §6).
-                    self.record_permission_requested(call, &args)?;
+                    // settle half (`doc/permission.md` §6). For content tools
+                    // (`edit`/`write`) attach the would-be diff so the human
+                    // approves the actual change, not abstract args.
+                    let preview = match self.agent.tools.get(&call.name) {
+                        Some(tool) => tool.preview(&args).await,
+                        None => None,
+                    };
+                    self.record_permission_requested(call, &args, preview)?;
                     return Ok(PreparedCall::Ask {
                         parent,
                         args,
@@ -2024,6 +2032,8 @@ const fn add_usage(acc: Usage, round: Usage) -> Usage {
 
 /// Flatten tool output content into the text fed back to the model. Artifact
 /// references become a placeholder until the artifact store lands (Phase 2).
+/// `Content::TextView` is skipped: it is a UI-only rendering, never model input
+/// (`doc/tool-view.md` §3).
 fn render_output(output: &ToolOutput) -> String {
     use std::fmt::Write;
 
@@ -2031,6 +2041,7 @@ fn render_output(output: &ToolOutput) -> String {
     for content in &output.content {
         match content {
             Content::Text(t) => text.push_str(t),
+            Content::TextView { .. } => {}
             Content::Image { media_type, .. } => {
                 let _ = write!(text, "[image {media_type}]");
             }
@@ -2051,7 +2062,7 @@ fn output_bytes(output: &ToolOutput) -> usize {
         .content
         .iter()
         .map(|c| match c {
-            Content::Text(t) => t.len(),
+            Content::Text(t) | Content::TextView { text: t, .. } => t.len(),
             Content::Image { data, .. } => data.len(),
             Content::ArtifactRef { .. } => 0,
         })
@@ -3873,6 +3884,74 @@ mod tests {
         // two real `write` tools race to completion, so no commit order is
         // asserted here; the model still reads results in call order.)
         assert_eq!(rebuilt_tool_result_ids(&events), ["c1", "c2"]);
+    }
+
+    /// An `ask` on a content tool carries the would-be diff in `Requested.preview`
+    /// (`doc/permission.md` §6): the human approves the actual change, not
+    /// abstract args. The preview is computed at gate time and must NOT have
+    /// written the file yet (the gate is still pending).
+    #[tokio::test]
+    async fn ask_on_write_carries_a_diff_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        // Pre-existing file so the write is an overwrite with a real diff.
+        std::fs::write(dir.path().join("a.txt"), "old\n").unwrap();
+        let policy = PermissionPolicy {
+            deny: vec![],
+            allow: vec![],
+            ask: vec![deny_rule("write", &[])],
+        };
+        let gate = ConcurrentGate::approve_all();
+        let events = run_rounds_under_policy(
+            dir.path(),
+            vec![
+                vec![
+                    StreamEvent::BlockStart {
+                        index: 0,
+                        block_type: ContentBlockType::ToolCall {
+                            id: "c1".to_owned(),
+                            name: "write".to_owned(),
+                        },
+                    },
+                    StreamEvent::ToolCallDelta {
+                        index: 0,
+                        json_delta: r#"{"path":"a.txt","content":"new\n"}"#.to_owned(),
+                    },
+                    StreamEvent::BlockStop { index: 0 },
+                    StreamEvent::Completed {
+                        stop_reason: StopReason::ToolUse,
+                        usage: Usage::default(),
+                    },
+                ],
+                text_round("done"),
+            ],
+            policy,
+            gate,
+        )
+        .await;
+
+        let preview = events.iter().find_map(|e| match &e.payload {
+            EventPayload::Permission(PermissionEvent::Requested { preview, .. }) => preview.clone(),
+            _ => None,
+        });
+        let preview = preview.expect("Requested carries a preview for write");
+        assert!(
+            preview.contains("--- a/a.txt") && preview.contains("-old") && preview.contains("+new"),
+            "preview is the old→new diff: {preview}"
+        );
+    }
+
+    /// Older logs lack `Requested.preview` — the field is optional and defaults
+    /// to `None`, so a pre-preview event still deserializes (`doc/event-schema.md`).
+    #[test]
+    fn requested_without_preview_deserializes() {
+        let v = serde_json::json!({
+            "Requested": { "call_id": "c1", "tool_name": "write", "input": {"path":"a.txt"} }
+        });
+        let ev: PermissionEvent = serde_json::from_value(v).unwrap();
+        match ev {
+            PermissionEvent::Requested { preview, .. } => assert_eq!(preview, None),
+            PermissionEvent::Decided { .. } => panic!("expected Requested"),
+        }
     }
 
     /// Mixed verdicts on parallel asks: the approved call runs, the rejected

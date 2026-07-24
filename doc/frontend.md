@@ -121,6 +121,7 @@ ominiforge/
 | Rust event schema 改了前端没跟 | ts-rs 生成 + CI `git diff` gate | schema 真变时按提示重生成提交 |
 | transport 契约漂移 | REST req/resp 也走 ts-rs；端点路径集中常量 | schema 变时一处改 |
 | 新 event variant 没处理 | TS discriminated union + exhaustive `never` 兜底 | 加 UI 渲染分支 |
+| tool 结果呈现漂移 | `ToolView` 由后端产出、ts-rs 导出，前端只做 variant→组件映射（`doc/tool-view.md`） | 新增 view variant 时加渲染分支 |
 | 依赖腐烂 / CVE | renovate/dependabot 自动 PR + CI 验 | 仅 merge |
 | 设计漂移 | design token 单一来源（uipro 出一次 → tokens.css），组件强制引用 | 加新组件时 |
 

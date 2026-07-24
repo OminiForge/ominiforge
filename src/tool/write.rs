@@ -97,6 +97,29 @@ impl Tool for WriteTool {
                     is_error: false,
                     error_code: None,
                 };
+                // UI view: an overwrite diffs old→new (`similar`, same engine
+                // `write_summary` counts with); a new file's view is its full
+                // content. Skipped for a no-change write (empty diff = no
+                // block). Never model input (`doc/tool-view.md`).
+                let view = match old.as_deref() {
+                    Some(old) if old != args.content => {
+                        let body = super::diffview::write_diff(
+                            old,
+                            &args.content,
+                            super::diffview::default_context(),
+                        );
+                        (!body.is_empty())
+                            .then(|| format!("--- a/{}\n+++ b/{}\n{body}", args.path, args.path))
+                    }
+                    None if !args.content.is_empty() => Some(args.content.clone()),
+                    _ => None,
+                };
+                if let Some(text) = view {
+                    output.content.push(Content::TextView {
+                        text,
+                        audience: crate::core::payload::AUDIENCE_UI.to_owned(),
+                    });
+                }
                 append_diagnostics(
                     self.lsp.as_ref(),
                     &mut output,
@@ -108,6 +131,30 @@ impl Tool for WriteTool {
                 Ok(output)
             }
             Err(e) => Ok(business_error(&args.path, &e)),
+        }
+    }
+
+    /// Render the would-be UI diff WITHOUT writing — the approval-gate preview
+    /// (`doc/permission.md` §6). Mirrors `invoke`'s view logic against the file
+    /// as it is now: an overwrite diffs old→new; a new file's preview is its
+    /// full content. Unresolvable path / unparsable args yield `None` (the gate
+    /// shows raw args; the real execute reports the error after approval).
+    async fn preview(&self, input: &serde_json::Value) -> Option<String> {
+        let args: WriteArgs = serde_json::from_value(input.clone()).ok()?;
+        let path = resolve_in_workspace(&self.workspace, &args.path).ok()?;
+        let old = tokio::fs::read_to_string(&path).await.ok();
+        match old.as_deref() {
+            Some(old) if old != args.content => {
+                let body = super::diffview::write_diff(
+                    old,
+                    &args.content,
+                    super::diffview::default_context(),
+                );
+                (!body.is_empty())
+                    .then(|| format!("--- a/{}\n+++ b/{}\n{body}", args.path, args.path))
+            }
+            None if !args.content.is_empty() => Some(args.content.clone()),
+            _ => None,
         }
     }
 }
@@ -185,6 +232,130 @@ mod tests {
             tool.invoke(input("../escape", "x")).await,
             Err(ToolError::InvalidInput(_))
         ));
+    }
+
+    fn view(out: &ToolOutput) -> Option<&str> {
+        out.content.iter().find_map(|c| match c {
+            Content::TextView { text, audience } if audience == "ui" => Some(text.as_str()),
+            _ => None,
+        })
+    }
+
+    /// The approval-gate preview for an overwrite diffs old→new WITHOUT
+    /// writing (`doc/permission.md` §6); for a new file it is the full content.
+    #[tokio::test]
+    async fn preview_diffs_overwrite_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "a\nb\nc\n").unwrap();
+        let tool = WriteTool::new(dir.path().to_path_buf());
+        let input = serde_json::json!({ "path": "f.txt", "content": "a\nB\nc\n" });
+        let preview = tool.preview(&input).await.unwrap();
+        assert_eq!(
+            preview,
+            "--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c"
+        );
+        // Dry-run: the file is unchanged.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "a\nb\nc\n"
+        );
+    }
+
+    /// A new-file write previews as the full content (no "before" side).
+    #[tokio::test]
+    async fn preview_new_file_is_full_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = WriteTool::new(dir.path().to_path_buf());
+        let input = serde_json::json!({ "path": "new.txt", "content": "hello\nworld\n" });
+        assert_eq!(tool.preview(&input).await.unwrap(), "hello\nworld\n");
+        assert!(!dir.path().join("new.txt").exists());
+    }
+
+    /// A new file's view is its full content (the front-end renders it as a
+    /// code view, not a diff — there is no "before" side).
+    #[tokio::test]
+    async fn new_file_view_is_the_full_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = WriteTool::new(dir.path().to_path_buf())
+            .invoke(input(
+                "n.rs",
+                "fn main() {}
+",
+            ))
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert_eq!(
+            view(&out).unwrap(),
+            "fn main() {}
+"
+        );
+    }
+
+    /// An overwrite's view is the exact old→new unified diff, built from the
+    /// real pre-write content — never a front-end reconstruction
+    /// (`doc/tool-view.md` §4).
+    #[tokio::test]
+    async fn overwrite_view_is_the_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("f.txt"),
+            "a
+b
+c
+d
+e
+",
+        )
+        .unwrap();
+        let out = WriteTool::new(dir.path().to_path_buf())
+            .invoke(input(
+                "f.txt",
+                "a
+b
+C
+d
+e
+",
+            ))
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert_eq!(
+            view(&out).unwrap(),
+            "--- a/f.txt
++++ b/f.txt
+@@ -1,5 +1,5 @@
+ a
+ b
+-c
++C
+ d
+ e"
+        );
+    }
+
+    /// A no-change write produces no view (the "no change" summary is the
+    /// whole story), and a failed write (escaping path is a protocol error,
+    /// but a business failure likewise) never carries one.
+    #[tokio::test]
+    async fn no_change_write_has_no_view() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("f.txt"),
+            "same
+",
+        )
+        .unwrap();
+        let out = WriteTool::new(dir.path().to_path_buf())
+            .invoke(input(
+                "f.txt", "same
+",
+            ))
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert!(view(&out).is_none());
     }
 
     // --- write_summary -------------------------------------------------------

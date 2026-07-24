@@ -5,4 +5,4 @@ import type { ArtifactId } from "./ArtifactId";
  * A unit of tool output. Payloads over 64KB are spilled to the artifact store
  * by the runtime and referenced via [`Content::ArtifactRef`].
  */
-export type Content = { "Text": string } | { "Image": { media_type: string, data: Array<number>, } } | { "ArtifactRef": { artifact_id: ArtifactId, media_type: string, } };
+export type Content = { "Text": string } | { "TextView": { text: string, audience: string, } } | { "Image": { media_type: string, data: Array<number>, } } | { "ArtifactRef": { artifact_id: ArtifactId, media_type: string, } };

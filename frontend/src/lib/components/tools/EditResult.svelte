@@ -1,73 +1,52 @@
 <script lang="ts">
 	import Diff from './Diff.svelte';
 	import RawArgs from './RawArgs.svelte';
-	import { buildFileDiff, parsePartialEdits, type EditEntry } from '$lib/tools/diff-builder';
+	import { splitViewFiles } from '$lib/tools/view';
 
-	/** `edit` result: rendered from this call's own `edits` args (full or still
-	 *  streaming) plus the conversation's file cache — NOT from `result`, which the
-	 *  backend now returns as a terse confirmation only (`edited PATH (N
-	 *  replacements)`, no diff — see `doc/tool-protocol.md` §11.4). Building the
-	 *  diff from args is what lets it render incrementally as `Delta::ToolArgs`
-	 *  streams in, per entry, instead of waiting for the call to finish.
-	 *
-	 *  The success confirmation moves to the debug fold (RawArgs) since it is
-	 *  redundant with what's already rendered here. A failure's message (e.g.
-	 *  `not_found`/`ambiguous`) is NOT redundant — it's diagnostic detail the
-	 *  model needed to react to — so it stays in the primary view. */
+	/** `edit` result: rendered from the backend's UI view (`doc/tool-view.md`)
+	 *  — the exact unified diff the tool produced against the real pre-edit
+	 *  content — NOT rebuilt client-side. `result` is only the terse
+	 *  confirmation (`edited PATH (N replacements)`), so it moves to the debug
+	 *  fold; a failure's message (e.g. `not_found`/`ambiguous`) is diagnostic
+	 *  detail and stays in the primary view. While running there is no view
+	 *  yet — the streaming args remain visible in the debug fold. */
 	let {
 		args,
 		result,
 		diagnostics,
 		status,
-		fileCache
+		view,
+		preview
 	}: {
 		args: string;
 		result?: string;
 		diagnostics?: string;
 		status: 'running' | 'done' | 'error';
-		fileCache?: Map<string, string[]>;
+		view?: string;
+		/** The approval-gate would-be diff, shown while the call awaits a human
+		 *  decision (`Permission::Requested.preview`). Same shape as `view`. */
+		preview?: string;
 	} = $props();
 
-	interface PathDiff {
-		path: string;
-		diff: string;
-		note?: string;
-	}
-
-	/** Group entries by path, first-seen order — mirrors `edit.rs`'s own grouping
-	 *  so a multi-path call renders one block per file in the order referenced. */
-	function groupByPath(entries: EditEntry[]): Array<[string, EditEntry[]]> {
-		const groups: Array<[string, EditEntry[]]> = [];
-		for (const e of entries) {
-			const g = groups.find(([p]) => p === e.path);
-			if (g) g[1].push(e);
-			else groups.push([e.path, [e]]);
-		}
-		return groups;
-	}
-
-	const entries = $derived(parsePartialEdits(args));
-	const pathDiffs = $derived<PathDiff[]>(
-		groupByPath(entries).map(([path, es]) => {
-			const built = buildFileDiff(fileCache?.get(path), es);
-			return { path, diff: built.diff, note: built.note };
-		})
-	);
+	// While the card awaits approval there is no executed `view` yet — show the
+	// gate's preview diff so the human approves the actual change. Once the call
+	// runs, the executed `view` (identical when the file didn't change) replaces it.
+	const files = $derived(splitViewFiles(view ?? preview ?? ''));
 	const errorText = $derived(status === 'error' ? result : undefined);
+	const pending = $derived(!view && preview !== undefined && status === 'running');
 </script>
 
 <div class="result">
 	<div class="sum">
 		<span class="verb" class:running={status === 'running'} class:error={status === 'error'}>
-			{status === 'running' ? 'editing' : status === 'error' ? 'edit failed' : 'edited'}
+			{pending ? 'awaiting approval' : status === 'running' ? 'editing' : status === 'error' ? 'edit failed' : 'edited'}
 		</span>
 	</div>
 	{#if errorText}<div class="err">{errorText}</div>{/if}
-	{#each pathDiffs as pd (pd.path)}
+	{#each files as f (f.path)}
 		<div class="file">
-			<div class="path">{pd.path}</div>
-			{#if pd.diff}<Diff text={pd.diff} />{/if}
-			{#if pd.note}<div class="note">{pd.note}</div>{/if}
+			<div class="path">{f.path}</div>
+			{#if f.diff}<Diff text={f.diff} />{/if}
 		</div>
 	{/each}
 </div>
@@ -119,11 +98,6 @@
 	.path {
 		color: var(--accent-ink);
 		font-weight: 500;
-	}
-	.note {
-		color: var(--text-tertiary);
-		font-size: 10.5px;
-		font-family: var(--font-chinese);
 	}
 	.err {
 		color: var(--state-error-text);

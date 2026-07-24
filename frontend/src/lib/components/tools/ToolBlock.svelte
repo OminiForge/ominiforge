@@ -17,13 +17,9 @@
 	 *  paired Tool::Failed lands it in error). No separate approval card. */
 	let {
 		item,
-		fileCache,
 		onDecide
 	}: {
 		item: Item & { kind: 'tool' };
-		/** The conversation-wide file cache — threaded to EditResult/WriteResult
-		 *  via Body's ResultProps so they can build a contextual diff from args. */
-		fileCache?: Map<string, string[]>;
 		/** Answer a permission `ask` with a decision + scope (Conversation wires
 		 *  `client.approve` through this). Optional: history renders read-only. */
 		onDecide?: (
@@ -133,8 +129,8 @@
 				diagnostics={item.diagnostics}
 				status={item.status}
 				error_code={item.error_code}
-				{fileCache}
-				prevLines={item.prevLines}
+				view={item.view}
+				preview={item.approvalPending ? item.preview : undefined}
 			/>
 			{#if item.status === 'running' && !awaiting}
 				<div class="running-indicator">

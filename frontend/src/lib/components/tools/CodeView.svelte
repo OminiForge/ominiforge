@@ -6,11 +6,13 @@
 	 *  the syntax-highlighted source. `lines` are the raw `N:content` rows from
 	 *  the tool output (header already stripped by the caller).
 	 *
+	 *
 	 *  The body is highlighted as ONE block (not per-line) so multi-line hljs
 	 *  constructs don't break; the gutter is a separate non-selectable `<pre>` so
 	 *  a copy grabs only code. Only the hljs markup (itself pre-escaped) reaches
-	 *  `{@html}`. */
-	let { path, lines }: { path: string; lines: string[] } = $props();
+	 *  `{@html}`. Alternatively pass raw `code` (e.g. a `write` new-file view,
+	 *  `doc/tool-view.md`) — it is numbered 1..N itself. */
+	let { path, lines, code }: { path: string; lines?: string[]; code?: string } = $props();
 
 	interface Split {
 		nums: string;
@@ -20,7 +22,14 @@
 	const split = $derived.by<Split>(() => {
 		const nums: string[] = [];
 		const codes: string[] = [];
-		for (const l of lines) {
+		if (code !== undefined) {
+			code.split('\n').forEach((l, i) => {
+				nums.push(String(i + 1));
+				codes.push(l);
+			});
+			return { nums: nums.join('\n'), code: codes.join('\n') };
+		}
+		for (const l of lines ?? []) {
 			const m = /^(\d+):([\s\S]*)$/.exec(l);
 			if (m) {
 				nums.push(m[1]);

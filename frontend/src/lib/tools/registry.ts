@@ -22,14 +22,17 @@ export interface ResultProps {
 	diagnostics?: string;
 	status: 'running' | 'done' | 'error';
 	error_code?: string;
-	/** The conversation-wide file cache (`conversation.ts`'s `fileCache`) — used
-	 *  by EditResult/WriteResult to build a contextual diff from args, since the
-	 *  backend result no longer carries one (`doc/tool-protocol.md` §11.4). */
-	fileCache?: Map<string, string[]>;
-	/** For `write` only: the pre-write content snapshot (`Item.prevLines`) — the
-	 *  cache itself has already advanced to this call's new content by the time
-	 *  this renders, so the "before" side has to travel on the item. */
-	prevLines?: string[];
+	/** The backend's UI-only rendering of this call's result (`Content::TextView`,
+	 *  `doc/tool-view.md`): the precise diff for `edit`/`write`, or the full
+	 *  content for a `write` new file. The front-end renders it verbatim — it
+	 *  never rebuilds diffs client-side. `undefined` while running (no view yet)
+	 *  and for tools that produce none. */
+	view?: string;
+	/** The approval-gate preview (`Permission::Requested.preview`): the would-be
+	 *  diff/content for `edit`/`write`, shown while the call awaits a human
+	 *  decision. Same shape as `view`; the executed `view` replaces it. Only set
+	 *  while `approvalPending`. */
+	preview?: string;
 }
 
 const REGISTRY: Record<string, Component<ResultProps>> = {

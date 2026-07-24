@@ -19,7 +19,16 @@ export type PermissionEvent = { "Requested": {
  * The model-assigned tool-call id, correlating this to the `Decided`
  * event and the underlying `ToolEvent`.
  */
-call_id: string, tool_name: string, input: JsonValue, } } | { "Decided": { call_id: string, outcome: PermissionOutcome, decided_by: string, 
+call_id: string, tool_name: string, input: JsonValue, 
+/**
+ * The would-be UI diff for content tools (`edit`/`write`), computed
+ * against the file as it is *now* so the human approves the actual
+ * change, not abstract args. `None` for other tools or when the
+ * preview can't be computed (the gate then shows raw args). Optional
+ * so older logs deserialize; the executed `TextView` stays the source
+ * of truth once approved (`doc/permission.md` §6).
+ */
+preview?: string | null, } } | { "Decided": { call_id: string, outcome: PermissionOutcome, decided_by: string, 
 /**
  * How far a human's decision reaches (`once` / `session` / `profile` /
  * `gateway`); `None` when no human decided (a policy deny or a

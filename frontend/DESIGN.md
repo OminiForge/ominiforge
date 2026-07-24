@@ -284,7 +284,7 @@ ominiforge Web 控制台是**开发者每天盯 8 小时的 agent 生产工具**
   - `done` 绿 pip + 绿徽章 + 绿边框
   - `running` 琥珀 pip(涟漪) + spinner + 琥珀徽章 + **2s 脉冲边框**
   - `error` 红 pip + 红徽章 + 红边框
-  - 展开 = params(JSON 语法高亮) + result。
+  - 展开 = 主呈现（后端 `ToolView`，如 edit/write 的 diff——见 `doc/tool-view.md`，前端只渲染不构建）+ debug 折层（原始 args + model-facing result，全过程透明）。
 - **流式光标**：2px `--accent` 竖条，`cursor-blink` 1.1s。
 
 ### 4.2 输入区
