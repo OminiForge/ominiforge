@@ -511,6 +511,9 @@ enum ChainResult {
 enum PhaseBOutcome {
     /// No chain — write this failure right away.
     Failed(DeferredFailure),
+    /// A `plan` control call already handled in Phase A: no chain, no deferred
+    /// failure — its message is taken from `plan_results` in the write-back.
+    Plan,
     /// A running chain: the call awaits only its *own* gate answer (an `ask`)
     /// and executes the moment it is approved — an `allow` chain went straight
     /// to execution — never waiting on any other call's decision.
@@ -559,6 +562,13 @@ enum PreparedCall {
         args: serde_json::Value,
         gate: Option<tokio::task::JoinHandle<ApprovalOutcome>>,
     },
+    /// A `plan` control call, intercepted before the chain machinery: it is a
+    /// synchronous state op with no file/sandbox/permission concerns, so it
+    /// never spawns a chain. The concurrent path must intercept it just like
+    /// the serial `dispatch` does — otherwise it falls through to the leaf
+    /// registry lookup and fails `unknown_tool` (plan is a control tool, never
+    /// registered). The rendered plan message is produced in Phase A.
+    Plan,
 }
 
 /// Map a gate answer to what the call may do. Pure — usable inside a spawned
@@ -705,9 +715,23 @@ impl TurnState<'_> {
                 // finishes. Only the messages fed back to the model wait —
                 // they assemble afterwards, strictly in call order.
                 let mut prepared: Vec<PreparedCall> = Vec::with_capacity(tool_calls.len());
-                for call in &tool_calls {
+                // Plan results ride through Phase B untouched: a plan call is a
+                // synchronous control op, intercepted BEFORE prepare/chain
+                // (mirroring the serial path's `dispatch` intercept). Without
+                // this the concurrent path skipped the intercept and landed in
+                // `execute_tool`'s registry lookup — `unknown_tool`, so a plan
+                // op never applied and its card rendered as a failed tool.
+                let mut plan_results: Vec<Option<Message>> =
+                    (0..tool_calls.len()).map(|_| None).collect();
+                for (slot, call) in tool_calls.iter().enumerate() {
                     let event_id = outcome.tool_call_event_ids.get(&call.id).cloned();
                     touched.extend(touched_paths(call));
+                    if call.name == PLAN_TOOL_NAME {
+                        let message = self.dispatch_plan(call, event_id)?;
+                        plan_results[slot] = Some(message);
+                        prepared.push(PreparedCall::Plan);
+                        continue;
+                    }
                     let mut prep = self.prepare_tool(call, event_id).await?;
                     if let PreparedCall::Ask { args, gate, .. } = &mut prep {
                         let approval = Arc::clone(&self.agent.approval);
@@ -740,6 +764,11 @@ impl TurnState<'_> {
                         abort_handles.push(abort);
                     }
                     match outcome {
+                        // Plan was executed in Phase A; its message joins the
+                        // ordered results here (plan ops never count as progress).
+                        PhaseBOutcome::Plan => {
+                            results[slot] = plan_results[slot].take();
+                        }
                         // Settled in phase A (bad args, hook block, policy deny):
                         // no chain to wait on — the failure writes immediately.
                         PhaseBOutcome::Failed(failure) => {
@@ -1502,6 +1531,11 @@ impl TurnState<'_> {
         match prepared {
             PreparedCall::Settled(failure) => self.write_deferred_failure(call, failure).await,
             PreparedCall::Run { parent, args } => self.execute_tool(call, parent, args).await,
+            // `Plan` is only produced by the concurrent dispatcher, which
+            // intercepts plan calls before `prepare_tool`; the serial path
+            // reaches `settle_prepared` via `dispatch`, whose own intercept
+            // routes plan away first. A `Plan` here is unreachable.
+            PreparedCall::Plan => unreachable!("plan calls never reach settle_prepared"),
             PreparedCall::Ask { parent, args, gate } => {
                 let answer = match gate {
                     // A join error means the gate task panicked: nobody decided,
@@ -1675,6 +1709,9 @@ impl TurnState<'_> {
     ) -> (PhaseBOutcome, Option<tokio::task::AbortHandle>) {
         match prep {
             PreparedCall::Settled(failure) => (PhaseBOutcome::Failed(failure), None),
+            // Already handled in Phase A (its message is in `plan_results`):
+            // nothing to execute, no chain to join.
+            PreparedCall::Plan => (PhaseBOutcome::Plan, None),
             PreparedCall::Run { parent, args } => {
                 let tool = self.agent.tools.get(&call.name);
                 let tool_name = call.name.clone();
@@ -4216,6 +4253,62 @@ mod tests {
         let results = result_events_in_order(&events);
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|(_, _, kind)| kind == "completed"));
+    }
+
+    /// Regression: a `plan` call in a CONCURRENT round must be intercepted and
+    /// applied, not fall through to the leaf registry (`unknown_tool`). The
+    /// concurrent dispatcher used to skip the serial path's `dispatch` plan
+    /// intercept, so a plan op landed in `execute_tool`'s registry lookup and
+    /// failed — the plan never advanced and its card rendered as a failed tool.
+    #[tokio::test]
+    async fn concurrent_dispatch_intercepts_plan_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::new();
+        crate::tool::register_builtin(&mut tools, dir.path().to_path_buf());
+
+        // One round mixing a plan op with a leaf write — enough to take the
+        // concurrent two-phase path (the gate supports concurrent requests).
+        let events = run_rounds_with_registry(
+            dir.path(),
+            vec![
+                multi_tool_call_round(&[
+                    (
+                        "p1",
+                        "plan",
+                        r#"{"op":"init","steps":[{"content":"only step"}]}"#,
+                    ),
+                    ("w1", "write", r#"{"path":"f.txt","content":"hi"}"#),
+                    ("p2", "plan", r#"{"op":"complete","id":"1"}"#),
+                ]),
+                text_round("done"),
+            ],
+            tools,
+            PermissionPolicy::default(),
+            ConcurrentGate::approve_all(),
+        )
+        .await;
+
+        // The plan ops succeeded — no `unknown_tool` failure for `plan`.
+        assert!(
+            !has_failed_code(&events, "unknown_tool"),
+            "plan must not hit unknown_tool on the concurrent path"
+        );
+        // Both plan ops produced a successful `Completed` (the rendered plan),
+        // and the leaf write executed too.
+        let plan_completions = events
+            .iter()
+            .filter(|e| {
+                matches!(&e.payload, EventPayload::Tool(ToolEvent::Completed { .. }))
+                    && e.source.kind == SourceKind::Tool
+                    && e.source.id == "plan"
+            })
+            .count();
+        assert_eq!(plan_completions, 2, "both plan ops applied");
+        assert!(dir.path().join("f.txt").exists(), "leaf write executed");
+        // The rebuilt runtime holds the plan in its terminal state.
+        let runtime = crate::agent::rebuild_runtime(&events, vec![]);
+        assert_eq!(runtime.plan.len(), 1);
+        assert!(runtime.plan.iter().all(|s| s.status.is_terminal()));
     }
 
     /// The `tool_call_id`s of the `Tool` messages in the rebuilt context — the
