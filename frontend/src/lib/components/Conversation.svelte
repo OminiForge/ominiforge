@@ -874,34 +874,46 @@
 	 *  highlight-only plugin throws away. The emitted markup is a wrapper holding
 	 *  a label + the usual <pre><code>; hljs output is pre-escaped and the whole
 	 *  thing is DOMPurify-sanitized downstream. */
-	const md = new Marked();
-	md.use({
-		renderer: {
-			code({ text, lang }) {
-				const tag = (lang ?? '').trim().split(/\s+/)[0];
-				let label: string;
-				let html: string;
-				if (tag && hljs.getLanguage(tag)) {
-					label = tag;
-					html = hljs.highlight(text, { language: tag, ignoreIllegals: true }).value;
-				} else {
-					const auto = hljs.highlightAuto(text);
-					label = auto.language ?? 'text';
-					html = auto.value;
-				}
-				return (
-					`<div class="code-block">` +
-					`<div class="code-lang">${escapeHtml(label)}</div>` +
-					`<pre><code class="hljs language-${escapeHtml(label)}">${html}</code></pre>` +
-					`</div>`
-				);
+	const mdRenderer = {
+		code({ text, lang }: { text: string; lang?: string }) {
+			const tag = (lang ?? '').trim().split(/\s+/)[0];
+			let label: string;
+			let html: string;
+			if (tag && hljs.getLanguage(tag)) {
+				label = tag;
+				html = hljs.highlight(text, { language: tag, ignoreIllegals: true }).value;
+			} else {
+				const auto = hljs.highlightAuto(text);
+				label = auto.language ?? 'text';
+				html = auto.value;
 			}
+			return (
+				`<div class="code-block">` +
+				`<div class="code-lang">${escapeHtml(label)}</div>` +
+				`<pre><code class="hljs language-${escapeHtml(label)}">${html}</code></pre>` +
+				`</div>`
+			);
 		}
-	});
+	};
+	const md = new Marked();
+	md.use({ renderer: mdRenderer });
+	// User messages get the same renderer plus GFM line breaks: chat input is
+	// not a markdown document, so a single newline from the textarea must stay
+	// a line break (GitHub-comment behaviour) instead of collapsing per strict
+	// markdown semantics.
+	const mdUser = new Marked({ breaks: true });
+	mdUser.use({ renderer: mdRenderer });
 
 	function renderMarkdown(text: string): string {
 		if (!browser) return escapeHtml(text);
 		const raw = md.parse(text, { async: false }) as string;
+		return DOMPurify.sanitize(raw);
+	}
+
+	/** Same pipeline as renderMarkdown but with `breaks: true` — see mdUser. */
+	function renderUserMarkdown(text: string): string {
+		if (!browser) return escapeHtml(text);
+		const raw = mdUser.parse(text, { async: false }) as string;
 		return DOMPurify.sanitize(raw);
 	}
 
@@ -1422,7 +1434,14 @@
 							{#each inherited as it, k (k)}
 								{#if it.kind === 'user'}
 									<div class="item item-user">
-										<div class="user-bubble">{it.text}</div>
+										<div class="user-bubble item-text">
+											{#if browser}
+												<!-- eslint-disable-next-line svelte/no-at-html-tags -->
+												{@html renderUserMarkdown(it.text)}
+											{:else}
+												{it.text}
+											{/if}
+										</div>
 									</div>
 								{:else if it.kind === 'text'}
 									<div class="item item-text inherited-text">
@@ -1490,7 +1509,14 @@
 										</button>
 									</div>
 								{/if}
-								<div class="user-bubble">{item.text}</div>
+								<div class="user-bubble item-text">
+									{#if browser}
+										<!-- eslint-disable-next-line svelte/no-at-html-tags -->
+										{@html renderUserMarkdown(item.text)}
+									{:else}
+										{item.text}
+									{/if}
+								</div>
 							</div>
 						{:else if item.kind === 'text'}
 							{#if item.text.trim()}
@@ -2904,9 +2930,12 @@
 		border: 1px solid var(--user-border);
 		border-radius: var(--radius-lg);
 		padding: var(--space-3) var(--space-4);
+		/* Also carries .item-text for the markdown content styles; keep the
+		   bubble's own compact metrics (item-text's 13.5px/1.75 is tuned for
+		   long-form assistant prose, not a chat bubble). */
 		font-size: 13px;
-		color: var(--text-primary);
 		line-height: 1.6;
+		color: var(--text-primary);
 		font-family: var(--font-chinese);
 		text-wrap: pretty;
 		word-break: break-word;
