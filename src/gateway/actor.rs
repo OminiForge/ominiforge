@@ -183,7 +183,16 @@ type Session = (SessionWriter, SessionRuntime);
 /// What a finished turn task returns: the writer+runtime to resume with, plus
 /// the outcome. An `Err` means the turn failed hard (provider/persistence) and
 /// the session was consumed.
-type TurnResult = Result<(SessionWriter, SessionRuntime, TurnOutcome), crate::agent::AgentError>;
+/// What a finished turn task returns: the writer+runtime to resume with, plus
+/// the outcome. The writer rides along on the error path too (the run failed,
+/// the log is intact) so `on_turn_done` never has to reopen the session — every
+/// `store.open` is another fd on the same events.jsonl, and in-process flock
+/// never excludes itself.
+type TurnResult = (
+    SessionWriter,
+    SessionRuntime,
+    Result<TurnOutcome, crate::agent::AgentError>,
+);
 
 /// One live session's driver. Spawned by the registry; runs until idle-evicted
 /// or told to shut down.
@@ -427,10 +436,10 @@ impl SessionActor {
             let mut writer = writer;
             let mut runtime = runtime;
             let mut sink = BroadcastSink { tx: outbound };
-            agent
+            let result = agent
                 .run_turn_with_sink(&mut writer, &mut runtime, text, &mut sink)
-                .await
-                .map(|outcome| (writer, runtime, outcome))
+                .await;
+            (writer, runtime, result)
         });
 
         loop {
@@ -486,8 +495,18 @@ impl SessionActor {
         // longer running. Publish before the match so every outcome path (incl.
         // auto-compact below) leaves the list showing `Idle` for this session.
         self.publish_status(ActivityStatus::Idle);
-        match res {
-            Ok(Ok((writer, runtime, outcome))) => {
+        let (writer, runtime, result) = match res {
+            Ok(triple) => triple,
+            Err(join_err) => {
+                // The task panicked or was cancelled out from under us.
+                let _ = self.outbound.send(GatewayEvent::Notice {
+                    message: format!("turn task ended unexpectedly: {join_err}"),
+                });
+                return self.reopen_after_abort();
+            }
+        };
+        match result {
+            Ok(outcome) => {
                 let incomplete = outcome.incomplete.as_ref().map(|r| format!("{r:?}"));
                 let _ = self.outbound.send(GatewayEvent::TurnSettled { incomplete });
 
@@ -500,18 +519,13 @@ impl SessionActor {
                     Some((writer, runtime))
                 }
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 let _ = self.outbound.send(GatewayEvent::Notice {
                     message: format!("turn failed: {e}"),
                 });
-                self.reopen_after_abort()
-            }
-            Err(join_err) => {
-                // The task panicked or was cancelled out from under us.
-                let _ = self.outbound.send(GatewayEvent::Notice {
-                    message: format!("turn task ended unexpectedly: {join_err}"),
-                });
-                self.reopen_after_abort()
+                // The turn task already handed the writer back (its lock is
+                // live): reuse it instead of opening another fd on the same log.
+                Some(self.resume_with(writer))
             }
         }
     }
@@ -528,6 +542,11 @@ impl SessionActor {
     /// turn ended, leaving a turn-running UI (e.g. a stale Cancel button) stuck on.
     /// Writing the committed terminator makes the stop durable. Reopening to append
     /// is safe: the aborted task already released the lock.
+    ///
+    /// One `store.open` serves the backfill, the terminator, AND the resumed
+    /// session: every open is another fd on the same events.jsonl (in-process
+    /// flock never excludes itself), so a gateway that cancels often would
+    /// otherwise leak descriptors toward EMFILE.
     async fn cancel_turn(&self, handle: JoinHandle<TurnResult>) -> Option<Session> {
         self.clear_pending();
         handle.abort();
@@ -538,13 +557,20 @@ impl SessionActor {
         // The task is dead, so nothing more can commit: backfill any tool call
         // it left dangling (the abort can win the race against the fail-closed
         // gate writing `denied_no_approval`) *before* the terminator, so the
-        // Interrupted event stays the log's tail.
-        self.record_cancelled_tool_calls();
-        self.record_interrupted();
-        // The turn is over. Publish after `record_interrupted` so the status'
-        // `latest_seq` includes the committed Interrupted terminator.
+        // Interrupted event stays the log's tail. A failed open is best-effort:
+        // skip the backfill and let `reopen_after_abort` surface the error.
+        let Ok(writer) = self.store.open(&self.session_id) else {
+            self.publish_status(ActivityStatus::Idle);
+            return self.reopen_after_abort();
+        };
+        let mut writer = writer.with_bus(self.bus.clone());
+        if let Some(last_seq) = self.record_cancelled_tool_calls(&mut writer) {
+            self.record_interrupted(&mut writer, last_seq);
+        }
+        // The turn is over. Publish after the terminator so the status'
+        // `latest_seq` includes it.
         self.publish_status(ActivityStatus::Idle);
-        self.reopen_after_abort()
+        Some(self.resume_with(writer))
     }
 
     /// Backfill a `ToolEvent::Failed { code: "cancelled" }` for every tool call
@@ -560,10 +586,14 @@ impl SessionActor {
     /// settled set and skipped. Best-effort like [`record_interrupted`]: a
     /// reopen/append failure leaves the pre-existing behavior, and
     /// `rebuild_runtime` synthesizes the missing result on read either way.
-    fn record_cancelled_tool_calls(&self) {
+    ///
+    /// Both writers share one `store.open` (one fd — see `cancel_turn`); the
+    /// terminator's seq lands in `latest_seq` for the `Idle` status that
+    /// follows.
+    fn record_cancelled_tool_calls(&self, writer: &mut SessionWriter) -> Option<u64> {
         let events = self.store.read_events(&self.session_id).unwrap_or_default();
         let Some(turn_id) = open_turn_id(&events) else {
-            return; // no open turn — nothing can be dangling
+            return None; // no open turn — nothing can be dangling
         };
         // The universe is the open turn's tool-call content blocks (block seq →
         // tool name); a call is settled when any `Completed`/`Failed` points at
@@ -597,44 +627,41 @@ impl SessionActor {
             .into_iter()
             .filter(|(seq, _)| !settled.contains(seq))
             .collect();
-        if dangling.is_empty() {
-            return;
-        }
-        // Reopen to append: the aborted task already released the writer lock.
-        let Ok(writer) = self.store.open(&self.session_id) else {
-            return;
-        };
-        let mut writer = writer.with_bus(self.bus.clone());
+        let mut last_seq = None;
         for (seq, tool_name) in dangling {
             let call_event = EventId {
                 session_id: self.session_id.clone(),
                 seq,
             };
-            let _ = writer.append(
-                EventSource {
-                    kind: SourceKind::Tool,
-                    id: tool_name,
-                },
-                EventPayload::Tool(ToolEvent::Failed {
-                    tool_call_event_id: call_event.clone(),
-                    duration_ms: 0,
-                    error: ErrorDetail {
-                        code: "cancelled".to_owned(),
-                        message: "turn cancelled by user".to_owned(),
-                        severity: ErrorSeverity::Error,
-                        retryable: false,
-                        source_event_id: Some(call_event.clone()),
-                        provider_raw: None,
+            last_seq = writer
+                .append(
+                    EventSource {
+                        kind: SourceKind::Tool,
+                        id: tool_name,
                     },
-                }),
-                Some(call_event),
-                Some(turn_id.clone()),
-            );
+                    EventPayload::Tool(ToolEvent::Failed {
+                        tool_call_event_id: call_event.clone(),
+                        duration_ms: 0,
+                        error: ErrorDetail {
+                            code: "cancelled".to_owned(),
+                            message: "turn cancelled by user".to_owned(),
+                            severity: ErrorSeverity::Error,
+                            retryable: false,
+                            source_event_id: Some(call_event.clone()),
+                            provider_raw: None,
+                        },
+                    }),
+                    Some(call_event),
+                    Some(turn_id.clone()),
+                )
+                .ok();
         }
+        Some(last_seq.unwrap_or_else(|| writer.next_seq().saturating_sub(1)))
     }
 
     /// Append a committed `TurnEvent::Interrupted` for the turn left open by an
-    /// abort.
+    /// abort. `last_seq` is the seq the terminator points at (the last cancelled
+    /// tool call, or the log's tail when nothing dangled).
     ///
     /// This makes the stop durable: history replay carries a turn terminator, so
     /// a reconnecting client (which never re-sees the live `TurnSettled`) can tell
@@ -643,37 +670,32 @@ impl SessionActor {
     /// pre-existing dangling-turn behavior, not a crash. The append publishes on
     /// the bus, so live clients also receive the terminator (the forwarder turns
     /// it into an outbound committed `Event`).
-    fn record_interrupted(&self) {
+    fn record_interrupted(&self, writer: &mut SessionWriter, last_seq: u64) {
         let events = self.store.read_events(&self.session_id).unwrap_or_default();
         let Some(turn_id) = open_turn_id(&events) else {
             return; // no turn open (already terminated) — nothing to record
         };
         let interrupted_at = EventId {
             session_id: self.session_id.clone(),
-            seq: events.last().map_or(0, |e| e.seq),
+            seq: last_seq,
         };
-        // Reopen to append: the aborted task already released the writer lock.
-        if let Ok(writer) = self.store.open(&self.session_id) {
-            let mut writer = writer.with_bus(self.bus.clone());
-            if let Ok(seq) = writer.append(
-                EventSource {
-                    kind: SourceKind::Runtime,
-                    id: "ominiforge".to_owned(),
-                },
-                EventPayload::Turn(TurnEvent::Interrupted {
-                    turn_id: turn_id.clone(),
-                    interrupted_at_event_id: interrupted_at,
-                }),
-                None,
-                Some(turn_id),
-            ) {
-                // Advance the cached tail synchronously, so the `Idle` status that
-                // `cancel_turn` publishes right after carries this terminator's seq
-                // without waiting on the async forwarder to catch up.
-                self.latest_seq.fetch_max(seq, Ordering::Relaxed);
-            }
+        if let Ok(seq) = writer.append(
+            EventSource {
+                kind: SourceKind::Runtime,
+                id: "ominiforge".to_owned(),
+            },
+            EventPayload::Turn(TurnEvent::Interrupted {
+                turn_id: turn_id.clone(),
+                interrupted_at_event_id: interrupted_at,
+            }),
+            None,
+            Some(turn_id),
+        ) {
+            // Advance the cached tail synchronously, so the `Idle` status that
+            // `cancel_turn` publishes right after carries this terminator's seq
+            // without waiting on the async forwarder to catch up.
+            self.latest_seq.fetch_max(seq, Ordering::Relaxed);
         }
-        // A reopen failure is surfaced by the reopen_after_abort that follows.
     }
 
     /// Reopen the current session and rebuild its runtime from the event log,
@@ -681,10 +703,8 @@ impl SessionActor {
     /// `None` if the session cannot be reopened (e.g. the lock is somehow still
     /// held) — the actor stops rather than panic.
     fn reopen_after_abort(&self) -> Option<Session> {
-        let events = self.store.read_events(&self.session_id).unwrap_or_default();
-        let runtime = crate::agent::rebuild_runtime(&events, self.system.clone());
         match self.store.open(&self.session_id) {
-            Ok(writer) => Some((writer.with_bus(self.bus.clone()), runtime)),
+            Ok(writer) => Some(self.resume_with(writer)),
             Err(e) => {
                 let _ = self.outbound.send(GatewayEvent::Notice {
                     message: format!("could not reopen session after abort: {e}"),
@@ -692,6 +712,15 @@ impl SessionActor {
                 None
             }
         }
+    }
+
+    /// Attach the bus to `writer` and rebuild the runtime from the log — the
+    /// session to resume with after a turn's live pair was consumed (abort,
+    /// hard error) or is simply being reused.
+    fn resume_with(&self, writer: SessionWriter) -> Session {
+        let events = self.store.read_events(&self.session_id).unwrap_or_default();
+        let runtime = crate::agent::rebuild_runtime(&events, self.system.clone());
+        (writer.with_bus(self.bus.clone()), runtime)
     }
 
     /// Summarize and switch to a compaction session, following it as the actor's
