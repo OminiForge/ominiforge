@@ -138,6 +138,30 @@ struct Flat {
     new_idx: i64,
 }
 
+/// Build a JSON envelope `{ kind: "diff", files: [{ path, patch }] }` for a
+/// `write` overwrite, given the pre-write file content and the new content.
+/// Unlike [`render_hunks_json`] (which renders the tool's already-anchored
+/// splices), a `write` has only the new full content with no anchor
+/// correspondence to the old, so this runs a real line-level diff (`similar`,
+/// Myers) and windows it into hunks.
+///
+/// Returns `""` when the contents are identical (a no-change write renders no
+/// diff block, same as the old front-end).
+pub fn write_diff_json(path: &str, old: &str, new: &str, context: usize) -> String {
+    let body = write_diff(old, new, context);
+    if body.is_empty() {
+        return String::new();
+    }
+    serde_json::json!({
+        "kind": "diff",
+        "files": [{
+            "path": path,
+            "patch": body,
+        }],
+    })
+    .to_string()
+}
+
 /// Build a unified-diff hunk text for a `write` overwrite, given the pre-write
 /// file content and the new content. Unlike [`render_hunks`] (which renders
 /// the tool's already-anchored splices), a `write` has only the new full

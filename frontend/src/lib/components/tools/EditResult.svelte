@@ -1,15 +1,15 @@
 <script lang="ts">
 	import Diff from './Diff.svelte';
 	import RawArgs from './RawArgs.svelte';
-	import { splitViewFiles } from '$lib/tools/view';
+	import { parseView } from '$lib/tools/view';
 
-	/** `edit` result: rendered from the backend's UI view (`doc/tool-view.md`)
-	 *  — the exact unified diff the tool produced against the real pre-edit
-	 *  content — NOT rebuilt client-side. `result` is only the terse
-	 *  confirmation (`edited PATH (N replacements)`), so it moves to the debug
-	 *  fold; a failure's message (e.g. `not_found`/`ambiguous`) is diagnostic
-	 *  detail and stays in the primary view. While running there is no view
-	 *  yet — the streaming args remain visible in the debug fold. */
+	/** `edit` result: rendered from the backend's structured UI view
+	 *  (`doc/tool-view.md`) — the exact unified diff the tool produced against
+	 *  the real pre-edit content — NOT rebuilt client-side. `result` is only the
+	 *  terse confirmation (`edited PATH (N replacements)`), so it moves to the
+	 *  debug fold; a failure's message (e.g. `not_found`/`ambiguous`) is
+	 *  diagnostic detail and stays in the primary view. While running there is
+	 *  no view yet — the streaming args remain visible in the debug fold. */
 	let {
 		args,
 		result,
@@ -31,7 +31,9 @@
 	// While the card awaits approval there is no executed `view` yet — show the
 	// gate's preview diff so the human approves the actual change. Once the call
 	// runs, the executed `view` (identical when the file didn't change) replaces it.
-	const files = $derived(splitViewFiles(view ?? preview ?? ''));
+	const shown = $derived(view ?? preview);
+	const parsed = $derived(shown ? parseView(shown) : null);
+	const files = $derived(parsed?.kind === 'diff' ? parsed.files : []);
 	const errorText = $derived(status === 'error' ? result : undefined);
 	const pending = $derived(!view && preview !== undefined && status === 'running');
 </script>
@@ -46,7 +48,7 @@
 	{#each files as f (f.path)}
 		<div class="file">
 			<div class="path">{f.path}</div>
-			{#if f.diff}<Diff text={f.diff} />{/if}
+			<Diff text={f.patch} />
 		</div>
 	{/each}
 </div>

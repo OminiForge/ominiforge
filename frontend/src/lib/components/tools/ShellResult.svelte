@@ -1,41 +1,40 @@
 <script lang="ts">
 	import RawArgs from './RawArgs.svelte';
+	import { parseView } from '$lib/tools/view';
 
-	/** `shell` result: the command's combined stdout/stderr as plain monospace.
-	 *  An error with empty output (e.g. `exit 3`, no stderr) must stay visible, so
-	 *  it falls back to showing the error code instead of a blank body. */
+	/** `shell` result: rendered from the backend's structured UI view
+	 *  (`doc/tool-view.md`) — the command's combined stdout/stderr as plain
+	 *  monospace, with command + exit code from the structured envelope. An error
+	 *  with empty output (e.g. `exit 3`, no stderr) must stay visible, so it
+	 *  falls back to showing the error code instead of a blank body. */
 	let {
 		args,
 		result,
 		status,
-		error_code
+		error_code,
+		view
 	}: {
 		args: string;
 		result?: string;
 		status: 'running' | 'done' | 'error';
 		error_code?: string;
+		view?: string;
 	} = $props();
 
-	/** Extract the command string from the shell tool's JSON args. */
-	const command = $derived.by(() => {
-		try {
-			const obj = JSON.parse(args) as Record<string, unknown>;
-			for (const k of ['command', 'cmd', 'script']) {
-				if (typeof obj[k] === 'string' && obj[k]) return obj[k] as string;
-			}
-		} catch { /* partial or invalid JSON */ }
-		return null;
-	});
+	const parsed = $derived(view ? parseView(view) : null);
+	const command = $derived(parsed?.kind === 'terminal' ? parsed.command : null);
+	const output = $derived(parsed?.kind === 'terminal' ? parsed.output : result);
+	const exitCode = $derived(parsed?.kind === 'terminal' ? parsed.exit_code : undefined);
 </script>
 
 <div class="result">
 	{#if command}
 		<div class="cmd">{command}</div>
 	{/if}
-	{#if result}
-		<pre class="out">{result}</pre>
+	{#if output}
+		<pre class="out">{output}</pre>
 	{:else if status === 'error'}
-		<div class="empty">无输出 · <span class="code">{error_code ?? 'error'}</span></div>
+		<div class="empty">无输出 · <span class="code">{error_code ?? exitCode ?? 'error'}</span></div>
 	{/if}
 </div>
 <RawArgs {args} />

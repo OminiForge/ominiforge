@@ -2,8 +2,7 @@
 	import Diff from './Diff.svelte';
 	import CodeView from './CodeView.svelte';
 	import RawArgs from './RawArgs.svelte';
-	import { splitViewFiles } from '$lib/tools/view';
-	import { extractArgsPath } from '$lib/tools/utils';
+	import { parseView } from '$lib/tools/view';
 
 	/** `write` result: rendered from the backend's UI view (`doc/tool-view.md`).
 	 *  An overwrite's view is the exact old→new unified diff (rendered via
@@ -32,28 +31,19 @@
 		preview?: string;
 	} = $props();
 
-	const path = $derived(extractArgsPath(args) ?? undefined);
-
 	// While awaiting approval there is no executed `view` — show the gate's
 	// preview. The preview's shape (diff vs raw content) is decided by its
-	// headers, not by `meta` (which only exists on the executed result).
+	// `kind`, not by `meta` (which only exists on the executed result).
 	const shown = $derived(view ?? preview);
-	const isDiff = $derived(shown?.startsWith('--- a/') ?? false);
+	const parsed = $derived(shown ? parseView(shown) : null);
 
-	/** The `wrote PATH (meta)` header's meta fragment, when `result` is the
-	 *  success confirmation (not a business error). */
-	const meta = $derived.by<string | undefined>(() => {
-		if (status !== 'done') return undefined;
-		const head = (result ?? '').split('\n')[0];
-		const m = /^wrote .+? \((new, \d+ lines|~, \+\d+ -\d+|no change)\)$/.exec(head);
-		return m?.[1];
-	});
 	const errorText = $derived(status === 'error' ? result : undefined);
 	const pending = $derived(!view && preview !== undefined && status === 'running');
 
-	// A diff (overwrite, executed or preview) carries `--- a/PATH` headers and is
-	// split per file; a new file's shown text is raw content for CodeView.
-	const files = $derived(shown && isDiff ? splitViewFiles(shown) : []);
+	// A diff (overwrite, executed or preview) carries `kind: "diff"`; a new
+	// file's shown text is `kind: "code"`.
+	const files = $derived(parsed?.kind === 'diff' ? parsed.files : []);
+	const code = $derived(parsed?.kind === 'code' ? parsed : null);
 </script>
 
 <div class="result">
@@ -61,16 +51,14 @@
 		<span class="verb" class:running={status === 'running'} class:error={status === 'error'}>
 			{pending ? 'awaiting approval' : status === 'running' ? 'writing' : status === 'error' ? 'write failed' : 'wrote'}
 		</span>
-		{#if path}<span class="path">{path}</span>{/if}
-		{#if meta}<span class="meta">{meta}</span>{/if}
 	</div>
 	{#if errorText}<div class="err">{errorText}</div>{/if}
 	{#if files.length}
 		{#each files as f (f.path)}
-			{#if f.diff}<Diff text={f.diff} />{/if}
+			<Diff text={f.patch} />
 		{/each}
-	{:else if shown && !isDiff && path}
-		<CodeView code={shown} {path} />
+	{:else if code}
+		<CodeView code={code.content} path={code.path} />
 	{/if}
 </div>
 <RawArgs {args} result={status === 'done' ? result : undefined} {diagnostics} />
@@ -113,13 +101,6 @@
 		background: var(--state-error-bg);
 		color: var(--state-error-text);
 		border-color: color-mix(in srgb, var(--state-error) 25%, transparent);
-	}
-	.path {
-		color: var(--accent-ink);
-		font-weight: 500;
-	}
-	.meta {
-		color: var(--text-tertiary);
 	}
 	.err {
 		color: var(--state-error-text);

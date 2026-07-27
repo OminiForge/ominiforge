@@ -252,14 +252,14 @@ impl Tool for EditTool {
     }
 }
 
-/// Render the planned files' diff views into the `--- a/PATH`/`+++ b/PATH`
-/// block format the front-end splits per file (same shape as the executed
+/// Render the planned files' diff views into a JSON envelope
+/// `{ kind: "diff", files: [{ path, patch }] }` (same shape as the executed
 /// `TextView`). Shared by `invoke` (post-write view) and `preview`.
 fn plan_view(planned: &[PlannedWrite]) -> String {
-    let mut parts: Vec<String> = Vec::new();
+    let mut files: Vec<serde_json::Value> = Vec::new();
     for plan in planned {
         if let Some(view) = &plan.view {
-            let body = super::diffview::render_hunks(
+            let patch = super::diffview::render_hunks(
                 &view.lines,
                 &view
                     .splices
@@ -268,15 +268,22 @@ fn plan_view(planned: &[PlannedWrite]) -> String {
                     .collect::<Vec<_>>(),
                 super::diffview::default_context(),
             );
-            if !body.is_empty() {
-                parts.push(format!(
-                    "--- a/{}\n+++ b/{}\n{body}",
-                    plan.rel_path, plan.rel_path
-                ));
+            if !patch.is_empty() {
+                files.push(serde_json::json!({
+                    "path": plan.rel_path,
+                    "patch": patch,
+                }));
             }
         }
     }
-    parts.join("\n")
+    if files.is_empty() {
+        return String::new();
+    }
+    serde_json::json!({
+        "kind": "diff",
+        "files": files,
+    })
+    .to_string()
 }
 
 /// The two failure channels of [`EditTool::plan_all`]: a protocol error means
@@ -779,17 +786,13 @@ e
             .unwrap();
         assert!(!out.is_error);
         assert_eq!(text(&out), "edited f.txt (1 replacement)");
+        // The view is a JSON envelope `{ kind: "diff", files: [{ path, patch }] }`.
+        let view_json: serde_json::Value = serde_json::from_str(view(&out).unwrap()).unwrap();
+        assert_eq!(view_json["kind"], "diff");
+        assert_eq!(view_json["files"][0]["path"], "f.txt");
         assert_eq!(
-            view(&out).unwrap(),
-            "--- a/f.txt
-+++ b/f.txt
-@@ -1,5 +1,5 @@
- a
- b
--c
-+C
- d
- e"
+            view_json["files"][0]["patch"].as_str().unwrap(),
+            "@@ -1,5 +1,5 @@\n a\n b\n-c\n+C\n d\n e"
         );
     }
 
@@ -848,9 +851,13 @@ b
         let input =
             serde_json::json!({ "edits": [{ "path": "f.txt", "old": ["b"], "new": ["B"] }] });
         let preview = t.preview(&input).await.unwrap();
+        // The preview is the same JSON envelope the executed `TextView` carries.
+        let preview_json: serde_json::Value = serde_json::from_str(&preview).unwrap();
+        assert_eq!(preview_json["kind"], "diff");
+        assert_eq!(preview_json["files"][0]["path"], "f.txt");
         assert_eq!(
-            preview,
-            "--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c"
+            preview_json["files"][0]["patch"].as_str().unwrap(),
+            "@@ -1,3 +1,3 @@\n a\n-b\n+B\n c"
         );
         // Not written: the preview is a dry-run.
         assert_eq!(

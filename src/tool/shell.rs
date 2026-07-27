@@ -68,13 +68,14 @@ impl Tool for ShellTool {
                 other => ToolError::Execution(other.to_string()),
             })?;
 
-        Ok(render_output(&output))
+        Ok(render_output(&args.command, &output))
     }
 }
 
 /// Combine a finished command's streams into a tool output, flagging non-zero
-/// exits as business errors.
-fn render_output(output: &ExecOutput) -> ToolOutput {
+/// exits as business errors. The UI view is a structured terminal envelope so
+/// the front-end renders command + output + exit code without parsing text.
+fn render_output(command: &str, output: &ExecOutput) -> ToolOutput {
     let mut text = output.stdout.clone();
     if !output.stderr.is_empty() {
         if !text.is_empty() && !text.ends_with('\n') {
@@ -90,8 +91,22 @@ fn render_output(output: &ExecOutput) -> ToolOutput {
             .map_or_else(|| "signal".to_owned(), |c| format!("exit_{c}"))
     });
 
+    let view = serde_json::json!({
+        "kind": "terminal",
+        "command": command,
+        "output": text,
+        "exit_code": output.exit_code,
+    })
+    .to_string();
+
     ToolOutput {
-        content: vec![Content::Text(text)],
+        content: vec![
+            Content::Text(text),
+            Content::TextView {
+                text: view,
+                audience: crate::core::payload::AUDIENCE_UI.to_owned(),
+            },
+        ],
         is_error: !success,
         error_code,
     }
@@ -130,7 +145,17 @@ mod tests {
             .await
             .unwrap();
         assert!(!out.is_error);
-        assert_eq!(out.content, vec![Content::Text("hello\n".to_owned())]);
+        // The model-facing text is the raw output; the UI view is a structured
+        // terminal envelope.
+        assert_eq!(out.content[0], Content::Text("hello\n".to_owned()));
+        let view_json: serde_json::Value = match &out.content[1] {
+            Content::TextView { text, .. } => serde_json::from_str(text).unwrap(),
+            _ => panic!("expected TextView"),
+        };
+        assert_eq!(view_json["kind"], "terminal");
+        assert_eq!(view_json["command"], "echo hello");
+        assert_eq!(view_json["output"], "hello\n");
+        assert_eq!(view_json["exit_code"], 0);
     }
 
     #[tokio::test]
@@ -178,7 +203,14 @@ mod tests {
             .await
             .unwrap();
         assert!(!out.is_error);
-        assert_eq!(out.content, vec![Content::Text("active".to_owned())]);
+        assert_eq!(out.content[0], Content::Text("active".to_owned()));
+        // The UI view is a structured terminal envelope.
+        let view_json: serde_json::Value = match &out.content[1] {
+            Content::TextView { text, .. } => serde_json::from_str(text).unwrap(),
+            _ => panic!("expected TextView"),
+        };
+        assert_eq!(view_json["kind"], "terminal");
+        assert_eq!(view_json["output"], "active");
     }
 
     #[tokio::test]

@@ -167,6 +167,13 @@ pub enum BlockContent {
         id: String,
         name: String,
         arguments: String,
+        /// One-line summary of the call's args for the collapsed header — the
+        /// most meaningful field (path/command/pattern) as plain text, produced
+        /// by the tool itself (`Tool::summarize`). The front-end renders it
+        /// verbatim instead of guessing from the JSON. Optional so older logs
+        /// deserialize; the front-end falls back to truncated args when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
     },
 }
 
@@ -251,15 +258,14 @@ pub struct ToolOutput {
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub enum Content {
     Text(String),
-    /// A UI-only rendering of this call's own `Text` result (e.g. the precise
-    /// diff an `edit`/`write` produced against the real pre-edit content).
-    /// Produced by the tool at execution time and persisted with the event, so
-    /// a history replay keeps it; the front-end renders it verbatim instead of
-    /// rebuilding anything client-side (`doc/tool-view.md`). NEVER fed to the
-    /// model — `render_output` skips it — and it must only re-present what the
-    /// `Text` result already says, never carry information the result lacks.
-    /// `audience` is `"ui"` today; the field exists so a future audience
-    /// (e.g. a TUI-specific view) does not need a new variant.
+    /// A UI-only structured view of this call's result, produced by the tool
+    /// at execution time and persisted with the event. The front-end renders
+    /// it verbatim — it never rebuilds anything client-side (`doc/tool-view.md`).
+    /// NEVER fed to the model — `render_output` skips it. The `text` field is a
+    /// JSON envelope `{ kind, ... }` where `kind` is one of the closed variants
+    /// (`diff`/`code`/`terminal`/`listing`/`markdown`/`plain`); the front-end
+    /// dispatches on `kind` to the matching renderer. `audience` is `"ui"`
+    /// today; the field exists so a future audience does not need a new variant.
     TextView {
         text: String,
         audience: String,

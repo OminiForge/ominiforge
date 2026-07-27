@@ -99,21 +99,8 @@ impl Tool for WriteTool {
                 };
                 // UI view: an overwrite diffs old→new (`similar`, same engine
                 // `write_summary` counts with); a new file's view is its full
-                // content. Skipped for a no-change write (empty diff = no
-                // block). Never model input (`doc/tool-view.md`).
-                let view = match old.as_deref() {
-                    Some(old) if old != args.content => {
-                        let body = super::diffview::write_diff(
-                            old,
-                            &args.content,
-                            super::diffview::default_context(),
-                        );
-                        (!body.is_empty())
-                            .then(|| format!("--- a/{}\n+++ b/{}\n{body}", args.path, args.path))
-                    }
-                    None if !args.content.is_empty() => Some(args.content.clone()),
-                    _ => None,
-                };
+                // content. Never model input (`doc/tool-view.md`).
+                let view = write_view(&args.path, old.as_deref(), &args.content);
                 if let Some(text) = view {
                     output.content.push(Content::TextView {
                         text,
@@ -143,19 +130,35 @@ impl Tool for WriteTool {
         let args: WriteArgs = serde_json::from_value(input.clone()).ok()?;
         let path = resolve_in_workspace(&self.workspace, &args.path).ok()?;
         let old = tokio::fs::read_to_string(&path).await.ok();
-        match old.as_deref() {
-            Some(old) if old != args.content => {
-                let body = super::diffview::write_diff(
-                    old,
-                    &args.content,
-                    super::diffview::default_context(),
-                );
-                (!body.is_empty())
-                    .then(|| format!("--- a/{}\n+++ b/{}\n{body}", args.path, args.path))
-            }
-            None if !args.content.is_empty() => Some(args.content.clone()),
-            _ => None,
+        write_view(&args.path, old.as_deref(), &args.content)
+    }
+}
+
+/// The write UI view as a JSON envelope (`doc/tool-view.md`): an overwrite is a
+/// `diff` of old→new; a new file is its full `code` content. `None` for a
+/// no-change write (empty diff = no block) or an empty new file. Shared by
+/// `invoke` (executed `TextView`) and `preview` (approval gate), so the gate
+/// shows exactly what the executed card will.
+fn write_view(path: &str, old: Option<&str>, content: &str) -> Option<String> {
+    match old {
+        Some(old) if old != content => {
+            let body = super::diffview::write_diff_json(
+                path,
+                old,
+                content,
+                super::diffview::default_context(),
+            );
+            (!body.is_empty()).then_some(body)
         }
+        None if !content.is_empty() => Some(
+            serde_json::json!({
+                "kind": "code",
+                "path": path,
+                "content": content,
+            })
+            .to_string(),
+        ),
+        _ => None,
     }
 }
 
@@ -242,7 +245,8 @@ mod tests {
     }
 
     /// The approval-gate preview for an overwrite diffs old→new WITHOUT
-    /// writing (`doc/permission.md` §6); for a new file it is the full content.
+    /// writing (`doc/permission.md` §6); the envelope matches the executed
+    /// `TextView` so the gate shows what the card will.
     #[tokio::test]
     async fn preview_diffs_overwrite_without_writing() {
         let dir = tempfile::tempdir().unwrap();
@@ -250,9 +254,12 @@ mod tests {
         let tool = WriteTool::new(dir.path().to_path_buf());
         let input = serde_json::json!({ "path": "f.txt", "content": "a\nB\nc\n" });
         let preview = tool.preview(&input).await.unwrap();
+        let json: serde_json::Value = serde_json::from_str(&preview).unwrap();
+        assert_eq!(json["kind"], "diff");
+        assert_eq!(json["files"][0]["path"], "f.txt");
         assert_eq!(
-            preview,
-            "--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c"
+            json["files"][0]["patch"].as_str().unwrap(),
+            "@@ -1,3 +1,3 @@\n a\n-b\n+B\n c"
         );
         // Dry-run: the file is unchanged.
         assert_eq!(
@@ -261,13 +268,18 @@ mod tests {
         );
     }
 
-    /// A new-file write previews as the full content (no "before" side).
+    /// A new-file write previews as the full content (no "before" side), as a
+    /// `code` envelope.
     #[tokio::test]
     async fn preview_new_file_is_full_content() {
         let dir = tempfile::tempdir().unwrap();
         let tool = WriteTool::new(dir.path().to_path_buf());
         let input = serde_json::json!({ "path": "new.txt", "content": "hello\nworld\n" });
-        assert_eq!(tool.preview(&input).await.unwrap(), "hello\nworld\n");
+        let preview = tool.preview(&input).await.unwrap();
+        let json: serde_json::Value = serde_json::from_str(&preview).unwrap();
+        assert_eq!(json["kind"], "code");
+        assert_eq!(json["path"], "new.txt");
+        assert_eq!(json["content"], "hello\nworld\n");
         assert!(!dir.path().join("new.txt").exists());
     }
 
@@ -285,11 +297,11 @@ mod tests {
             .await
             .unwrap();
         assert!(!out.is_error);
-        assert_eq!(
-            view(&out).unwrap(),
-            "fn main() {}
-"
-        );
+        // The view is a JSON envelope `{ kind: "code", path, content }`.
+        let view_json: serde_json::Value = serde_json::from_str(view(&out).unwrap()).unwrap();
+        assert_eq!(view_json["kind"], "code");
+        assert_eq!(view_json["path"], "n.rs");
+        assert_eq!(view_json["content"], "fn main() {}\n");
     }
 
     /// An overwrite's view is the exact old→new unified diff, built from the
@@ -321,17 +333,13 @@ e
             .await
             .unwrap();
         assert!(!out.is_error);
+        // The view is a JSON envelope `{ kind: "diff", files: [{ path, patch }] }`.
+        let view_json: serde_json::Value = serde_json::from_str(view(&out).unwrap()).unwrap();
+        assert_eq!(view_json["kind"], "diff");
+        assert_eq!(view_json["files"][0]["path"], "f.txt");
         assert_eq!(
-            view(&out).unwrap(),
-            "--- a/f.txt
-+++ b/f.txt
-@@ -1,5 +1,5 @@
- a
- b
--c
-+C
- d
- e"
+            view_json["files"][0]["patch"].as_str().unwrap(),
+            "@@ -1,5 +1,5 @@\n a\n b\n-c\n+C\n d\n e"
         );
     }
 

@@ -1,57 +1,39 @@
 <script lang="ts">
 	import CodeView from './CodeView.svelte';
 	import RawArgs from './RawArgs.svelte';
-	import { extractArgsPath } from '$lib/tools/utils';
+	import { parseView } from '$lib/tools/view';
 
-	/** `read` result: a file body (path chip + numbered gutter + highlighted
-	 *  source, via CodeView) or a directory listing (entries, sub-dirs tinted).
-	 *  Both start with a `[header]` line the tool emits. Raw args are tucked into
+	/** `read` result: rendered from the backend's structured UI view
+	 *  (`doc/tool-view.md`) — a file body (`kind: "code"`, path chip + numbered
+	 *  gutter + highlighted source, via CodeView) or a directory listing
+	 *  (`kind: "listing"`, entries, sub-dirs tinted). Raw args are tucked into
 	 *  the debug fold. */
 	let {
 		name,
 		args,
 		result,
 		diagnostics,
-		status
+		status,
+		view
 	}: {
 		name: string;
 		args: string;
 		result?: string;
 		diagnostics?: string;
 		status: 'running' | 'done' | 'error';
+		view?: string;
 	} = $props();
 
-	interface Parsed {
-		kind: 'file' | 'dir' | 'plain';
-		path?: string;
-		body: string[];
-	}
-
-	const parsed = $derived.by<Parsed>(() => {
-		const text = result ?? '';
-		if (status === 'running' && !text) {
-			const p = extractArgsPath(args);
-			if (p) return { kind: 'file', path: p, body: [] };
-			return { kind: 'plain', body: [] };
-		}
-		const lines = text.split('\n');
-		// Old histories may carry a snapshot tag (`[path#3F2A]`); strip it for display.
-		const head = /^\[(.+?)(?:#[0-9A-F]{4})?\]$/.exec(lines[0]);
-		if (!head) return { kind: 'plain', body: lines };
-		const path = head[1];
-		const body = lines.slice(1);
-		if (path.endsWith('/')) return { kind: 'dir', path, body };
-		return { kind: 'file', path, body };
-	});
+	const parsed = $derived(view ? parseView(view) : null);
 </script>
 
 <div class="result">
-	{#if parsed.kind === 'file' && parsed.path}
-		<CodeView path={parsed.path} lines={parsed.body} />
-	{:else if parsed.kind === 'dir' && parsed.path}
+	{#if parsed?.kind === 'code'}
+		<CodeView path={parsed.path} code={parsed.content} />
+	{:else if parsed?.kind === 'listing'}
 		<div class="head"><span class="path">{parsed.path}</span></div>
 		<ul class="dir">
-			{#each parsed.body as entry (entry)}
+			{#each parsed.entries as entry (entry)}
 				<li class="entry" class:is-dir={entry.endsWith('/')}>{entry}</li>
 			{/each}
 		</ul>

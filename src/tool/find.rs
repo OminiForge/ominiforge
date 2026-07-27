@@ -204,7 +204,9 @@ fn rel_to_slash(rel: &std::path::Path) -> String {
 }
 
 /// Format the outcome: a header line with the count, then one path per line. On
-/// truncation the header names the true total and how many are shown.
+/// truncation the header names the true total and how many are shown. The UI
+/// view is a `listing` envelope so the front-end renders the match list
+/// directly, without parsing the header line.
 fn render(outcome: &Outcome) -> ToolOutput {
     let header = if outcome.total > outcome.matches.len() {
         format!(
@@ -220,8 +222,20 @@ fn render(outcome: &Outcome) -> ToolOutput {
         text.push('\n');
         text.push_str(path);
     }
+    let view = serde_json::json!({
+        "kind": "listing",
+        "path": "",
+        "entries": outcome.matches,
+    })
+    .to_string();
     ToolOutput {
-        content: vec![Content::Text(text)],
+        content: vec![
+            Content::Text(text),
+            Content::TextView {
+                text: view,
+                audience: crate::core::payload::AUDIENCE_UI.to_owned(),
+            },
+        ],
         is_error: false,
         error_code: None,
     }

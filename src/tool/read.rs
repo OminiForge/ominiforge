@@ -154,6 +154,19 @@ impl Tool for ReadTool {
                         is_error: false,
                         error_code: None,
                     };
+                    // UI view: structured code content for the front-end to
+                    // highlight (tree-sitter). The model-facing `Text` keeps the
+                    // `[path]` + `N:line` anchor format the model needs for edit.
+                    let view = serde_json::json!({
+                        "kind": "code",
+                        "path": parsed.path,
+                        "content": content,
+                    })
+                    .to_string();
+                    output.content.push(Content::TextView {
+                        text: view,
+                        audience: crate::core::payload::AUDIENCE_UI.to_owned(),
+                    });
                     // Only a whole-file read (no range) is safe to sync — a
                     // partial slice would give the server a truncated document.
                     if parsed.range.is_none() {
@@ -201,9 +214,21 @@ impl ReadTool {
         }
         names.sort();
         let mut parts = vec![format!("[{}/]", rel.trim_end_matches('/'))];
-        parts.extend(names);
+        parts.extend(names.clone());
+        let view = serde_json::json!({
+            "kind": "listing",
+            "path": rel,
+            "entries": names,
+        })
+        .to_string();
         ToolOutput {
-            content: vec![Content::Text(parts.join("\n"))],
+            content: vec![
+                Content::Text(parts.join("\n")),
+                Content::TextView {
+                    text: view,
+                    audience: crate::core::payload::AUDIENCE_UI.to_owned(),
+                },
+            ],
             is_error: false,
             error_code: None,
         }

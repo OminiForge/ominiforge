@@ -52,12 +52,24 @@ pub enum Content {
 - **ts-rs**：`Content` 已在导出链路，前端 TS union 自动获得 `TextView` 变体，
   渲染分支 exhaustive 兜底。
 
-### 语义约束（防滥用）
+### 语义约束（2024-12 修正版）
 
-`TextView` 只允许是**同一调用 result 内容的另一种呈现**（diff / 高亮基底），不允许
-承载 result 里没有的信息。理由：view 不进模型上下文、不在 debug 折层的「args +
-result = 全过程」透明承诺内；一旦它开始承载独有信息，该承诺就破了。需要新信息 =
-改 `Text` result（进上下文、可被模型用），不是塞进 view。
+**旧约束（已废弃）**：「view 只是 result 的另一种呈现」——这条从未被遵守：edit/write 的
+diff 根本不在 result 里，read 的行号也是 model 通道需要、UI 通道不需要。view 和 result
+是两个通道的事实，不是重复。
+
+**新约束**：
+
+1. **view 是 UI 的事实通道**，可含 result 没有的信息（行号、上下文、完整内容、结构化
+   元数据）。view 与 result 的分工：result 是「模型的事实 + 操作承诺」，view 是「UI 的
+   事实」。
+2. **view 永不进模型上下文**——这是唯一要守住的边界（`render_output` 只取 `Text`，
+   见 §3）。
+3. **view 只存 diff + 上下文**（与改动量成正比，不随文件大小膨胀）。`write` 新建存完整
+   内容（必要——新建即全部）。超大文件 + 频繁改动不会炸，因为日志大小与改动量成正比。
+4. **view 结构化**：`TextView.text` 存 JSON 信封 `{ kind, ... }`，`kind` 为封闭变体集
+   （Diff/Code/Terminal/Listing/Markdown/Plain），前端按 `kind` 分发到渲染组件，不再
+   解析 model-facing 文本格式。
 
 ## 3. 渲染边界：view 永不到达模型
 

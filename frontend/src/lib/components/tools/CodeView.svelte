@@ -1,17 +1,17 @@
 <script lang="ts">
 	import { browser } from '$app/environment';
-	import { highlightBlock } from '$lib/tools/highlight';
+	import { onMount } from 'svelte';
+	import { highlighter, langFromPath, captureToClass } from '$lib/tools/highlight-ts';
 
 	/** Renders a `read` file body: a `[path]` chip over a numbered gutter beside
 	 *  the syntax-highlighted source. `lines` are the raw `N:content` rows from
 	 *  the tool output (header already stripped by the caller).
 	 *
-	 *
-	 *  The body is highlighted as ONE block (not per-line) so multi-line hljs
+	 *  The body is highlighted as ONE block (not per-line) so multi-line
 	 *  constructs don't break; the gutter is a separate non-selectable `<pre>` so
-	 *  a copy grabs only code. Only the hljs markup (itself pre-escaped) reaches
-	 *  `{@html}`. Alternatively pass raw `code` (e.g. a `write` new-file view,
-	 *  `doc/tool-view.md`) — it is numbered 1..N itself. */
+	 *  a copy grabs only code. Only the tree-sitter markup (itself pre-escaped)
+	 *  reaches `{@html}`. Alternatively pass raw `code` (e.g. a `write` new-file
+	 *  view, `doc/tool-view.md`) — it is numbered 1..N itself. */
 	let { path, lines, code }: { path: string; lines?: string[]; code?: string } = $props();
 
 	interface Split {
@@ -46,7 +46,50 @@
 		return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 	}
 
-	const bodyHtml = $derived(browser ? highlightBlock(split.code, path) : escapeHtml(split.code));
+	/** Highlight the code with tree-sitter, returning escaped HTML with spans
+	 *  mapped to design-token classes. Falls back to plain escaped text when the
+	 *  grammar is unavailable or tree-sitter fails. */
+	async function highlightTs(codeText: string, lang: string): Promise<string> {
+		const spans = await highlighter.highlight(codeText, lang, path);
+		if (spans.length === 0) return escapeHtml(codeText);
+
+		let html = '';
+		let last = 0;
+		for (const span of spans) {
+			// Emit plain text before the span, then the span itself.
+			if (span.start > last) {
+				html += escapeHtml(codeText.slice(last, span.start));
+			}
+			const cls = captureToClass(span.capture);
+			html += `<span class="${cls}">${escapeHtml(codeText.slice(span.start, span.end))}</span>`;
+			last = span.end;
+		}
+		if (last < codeText.length) {
+			html += escapeHtml(codeText.slice(last));
+		}
+		return html;
+	}
+
+	let bodyHtml = $state('');
+
+	$effect(() => {
+		bodyHtml = escapeHtml(split.code);
+	});
+
+	onMount(() => {
+		if (!browser) return;
+		const lang = langFromPath(path);
+		if (!lang) return;
+		let cancelled = false;
+		void highlightTs(split.code, lang).then((html) => {
+			// Don't write to state after the component is gone (rapid unmount
+			// while the WASM grammar was still loading).
+			if (!cancelled) bodyHtml = html;
+		});
+		return () => {
+			cancelled = true;
+		};
+	});
 </script>
 
 <div class="head">
@@ -55,7 +98,7 @@
 <div class="wrap">
 	<pre class="gutter" aria-hidden="true">{split.nums}</pre>
 	<!-- eslint-disable-next-line svelte/no-at-html-tags -->
-	<pre class="code"><code class="hljs">{@html bodyHtml}</code></pre>
+	<pre class="code"><code>{@html bodyHtml}</code></pre>
 </div>
 
 <style>
@@ -106,72 +149,28 @@
 		white-space: pre;
 	}
 
-	/* hljs token → design token (scoped). Covers the classes that appear in the
-	   source files this repo reads: keywords, types, attributes/decorators,
-	   operators, template substitutions. */
-	.code :global(.hljs-comment),
-	.code :global(.hljs-quote) {
+	/* tree-sitter capture → design token (scoped). The classes are emitted by
+	   `captureToClass` in `highlight-ts.ts`. */
+	.code :global(.syntax-comment) {
 		color: var(--syntax-comment);
 		font-style: italic;
 	}
-	.code :global(.hljs-keyword),
-	.code :global(.hljs-selector-tag),
-	.code :global(.hljs-literal),
-	.code :global(.hljs-section),
-	.code :global(.hljs-doctag),
-	.code :global(.hljs-name) {
+	.code :global(.syntax-keyword) {
 		color: var(--syntax-keyword);
 	}
-	.code :global(.hljs-string),
-	.code :global(.hljs-regexp),
-	.code :global(.hljs-char),
-	.code :global(.hljs-char.escape_),
-	.code :global(.hljs-selector-attr),
-	.code :global(.hljs-selector-pseudo),
-	.code :global(.hljs-meta .hljs-string) {
+	.code :global(.syntax-str) {
 		color: var(--syntax-str);
 	}
-	.code :global(.hljs-number),
-	.code :global(.hljs-bullet) {
+	.code :global(.syntax-num) {
 		color: var(--syntax-num);
 	}
-	.code :global(.hljs-title),
-	.code :global(.hljs-title.function_),
-	.code :global(.hljs-function .hljs-title),
-	.code :global(.hljs-built_in) {
+	.code :global(.syntax-fn) {
 		color: var(--syntax-fn);
 	}
-	.code :global(.hljs-type),
-	.code :global(.hljs-title.class_),
-	.code :global(.hljs-class .hljs-title),
-	.code :global(.hljs-attr),
-	.code :global(.hljs-attribute),
-	.code :global(.hljs-property),
-	.code :global(.hljs-selector-class),
-	.code :global(.hljs-selector-id) {
+	.code :global(.syntax-type) {
 		color: var(--syntax-type);
 	}
-	.code :global(.hljs-variable),
-	.code :global(.hljs-template-variable),
-	.code :global(.hljs-params),
-	.code :global(.hljs-symbol) {
+	.code :global(.syntax-key) {
 		color: var(--syntax-key);
-	}
-	.code :global(.hljs-meta),
-	.code :global(.hljs-meta .hljs-keyword) {
-		color: var(--syntax-fn);
-	}
-	.code :global(.hljs-operator),
-	.code :global(.hljs-punctuation) {
-		color: var(--text-tertiary);
-	}
-	.code :global(.hljs-subst) {
-		color: var(--text-secondary);
-	}
-	.code :global(.hljs-emphasis) {
-		font-style: italic;
-	}
-	.code :global(.hljs-strong) {
-		font-weight: 600;
 	}
 </style>
