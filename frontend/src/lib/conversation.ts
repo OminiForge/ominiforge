@@ -141,6 +141,14 @@ export function emptyState(): ConversationState {
 }
 
 export function apply(state: ConversationState, ev: GatewayEvent): ConversationState {
+	// Dedup committed events by seq. The gateway subscribes to the live broadcast
+	// BEFORE reading its replay log, so an event committed in that gap is
+	// delivered twice (once in the replay, once live). Dropping any committed
+	// event whose seq was already folded makes that overlap harmless. seqs are
+	// monotonic, so `<= lastSeq` is exactly "already seen".
+	if (ev.type === 'event' && state.lastSeq !== undefined && Number(ev.seq) <= state.lastSeq) {
+		return state;
+	}
 	switch (ev.type) {
 		case 'event':
 			return applyCommitted(state, ev);

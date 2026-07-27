@@ -978,8 +978,14 @@ async fn sse_events(
         Err(e) => return conflict_or_not_found(&e),
     };
 
-    let replay = replay_events(&state.registry, &sid, last_seen);
+    // Subscribe BEFORE reading the log. An event committed between the read and
+    // the subscribe would otherwise be lost — not yet in the log at read time,
+    // and already broadcast before the subscription existed. Subscribing first
+    // means such an event lands in the broadcast buffer; the replay read then
+    // also includes it (it committed before the read), so it is delivered twice.
+    // The frontend dedups committed events by seq, making the overlap harmless.
     let live = live_event_stream(handle.subscribe());
+    let replay = replay_events(&state.registry, &sid, last_seen);
 
     let stream = tokio_stream::iter(replay).chain(live);
     Sse::new(stream)

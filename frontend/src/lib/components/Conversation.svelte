@@ -288,26 +288,11 @@
 	// user can collapse it to give the conversation the full width.
 	let detailOpen = $state(true);
 	let copied = $state(false);
-	// Whether we're in the initial event-replay phase (loading existing history
-	// from the durable log). During replay, events arrive in rapid bursts and we
-	// use instant scroll instead of `behavior: 'smooth'` to avoid the visually
-	// uncomfortable rapid-scrolling animation through the entire conversation.
-	let isReplaying = $state(false);
-	let replayDebounce: ReturnType<typeof setTimeout> | undefined;
-	/** Enter animation for stream items (DESIGN.md §3.2). The replay burst pours
-	 *  history in faster than any animation, so duration collapses to 0 while
-	 *  `isReplaying`; only post-replay items (a live turn's output, a freshly
-	 *  sent bubble) get the 8px rise. Evaluated when each intro triggers. */
-	const itemEnter = $derived(isReplaying ? { duration: 0 } : rise(8, 200));
-	/** Cached conversation state per session. Preserves streaming content
-	 *  (e.g. in-progress reasoning) across session switches. Live deltas are
-	 *  not replayed on re-subscribe (gateway-transport.ts §reconnect), so without
-	 *  this cache, switching away during a stream and back would truncate it. */
-	const sessionCache = new Map<
-		string,
-		{ convo: ConversationState; collapsed: Record<number, boolean> }
-	>();
-	let prevSessionId: string | undefined;
+	/** Enter animation for stream items (DESIGN.md §3.2). History is now folded
+	 *  in one batch before the first paint (see subscribe), so every item that
+	 *  animates in is a genuinely new one — a live turn's output or a freshly
+	 *  sent bubble. */
+	const itemEnter = rise(8, 200);
 
 	function toggleDetail() {
 		detailOpen = !detailOpen;
@@ -526,124 +511,82 @@
 
 	function subscribe(id: string) {
 		sub?.close();
-		// Restore cached state if available (preserves streaming content across
-		// session switches); otherwise start fresh.
-		const cached = sessionCache.get(id);
-		if (cached) {
-			convo = cached.convo;
-			collapsed = cached.collapsed;
-			sessionCache.delete(id);
-		} else {
-			convo = emptyState();
-			collapsed = {};
-			rawLog = [];
-			inspectTick = 0;
-		}
+		// There is no session cache — switching away drops the in-memory
+		// conversation, so every mount/switch rebuilds from the durable log.
+		convo = emptyState();
+		collapsed = {};
+		rawLog = [];
+		inspectTick = 0;
 		context = null;
 		// Restore this session's persisted pending queue (survives a mid-turn
 		// refresh). Keyed by id, so switching sessions swaps the right queue in.
 		queued = loadQueue(id);
 		// A new subscription means fresh content – start auto-scrolling.
 		shouldAutoScroll = true;
-		// Enter replay mode: the gateway will replay committed events in rapid
-		// succession. During replay we use instant scroll (no smooth animation)
-		// and debounce — once events stop arriving we consider replay done.
-		isReplaying = true;
-		clearTimeout(replayDebounce);
-		if (cached) {
-			// A cached restore subscribes `since` lastSeq — there is no replay
-			// burst to wait out. Close the replay window even when the gateway
-			// sends nothing, otherwise every `!isReplaying` gate (summary
-			// refresh, item enter animation) stays stuck off on an idle session.
-			replayDebounce = setTimeout(() => {
-				isReplaying = false;
-			}, 300);
-		}
-		sub = client.subscribeEvents(
-			id,
-			{
-				onEvent: (ev) => {
-					convo = apply(convo, ev);
-					// Inspect mode: keep the raw committed events for the timeline.
-					// Deltas are transient and not replayed, so only `type: 'event'`
-					// entries are stored. Mutate (no spread) + batched tick: during
-					// replay this is called thousands of times and must stay O(1).
-					if (ev.type === 'event') {
-						rawLog.push(ev);
-						scheduleInspectTick();
+
+		// Open the SSE stream with no Last-Event-ID: the gateway replays the full
+		// committed log over it, then attaches the live stream. This single stream
+		// is the only event source — subscribing immediately (rather than fetching
+		// history first) is what keeps a just-sent turn's live deltas from falling
+		// in the gap, since deltas are never persisted or replayed. An archived
+		// session is served replay-only by the gateway (it has no actor to attach),
+		// which is exactly the read-only history it needs.
+		sub = client.subscribeEvents(id, {
+			onEvent: (ev) => {
+				convo = apply(convo, ev);
+				// Inspect mode: keep the raw committed events for the timeline.
+				// Deltas are transient and not replayed, so only `type: 'event'`
+				// entries are stored. Mutate (no spread) + batched tick: this is
+				// called once per committed event and must stay O(1).
+				if (ev.type === 'event') {
+					rawLog.push(ev);
+					scheduleInspectTick();
+				}
+				if (ev.type === 'compacted') {
+					// Compaction swaps the live session for a fresh one. Navigate to
+					// its route; page.params.id updates → the sync $effect re-subscribes
+					// and reloads meta for the new id (and the sidebar highlights it).
+					void goto(`/workspaces/${workspaceId}/sessions/${ev.new_session_id}`);
+				}
+				// A settled turn means the fold's aggregates changed — refresh the
+				// STATS snapshot so turns/cost/tokens track the live conversation.
+				if (ev.type === 'turn_settled') {
+					void refreshSummary(id);
+					// The turn is done: release the next queued message (if any). One
+					// per settle keeps the gateway's own defer-queue empty, so every
+					// still-pending message stays here — visible and cancellable.
+					void flushQueue(id);
+				}
+				// Live context occupancy (per round): drive the STATS context bar.
+				if (ev.type === 'context_updated') {
+					context = { tokens: ev.tokens, window: ev.window, threshold: ev.threshold };
+				}
+				// Per-request STATS refresh (Q2): a committed RequestCompleted means a
+				// model round's usage landed, so the aggregates moved mid-turn.
+				// Debounced; history already folded above is excluded by the seq dedup.
+				if (ev.type === 'event') {
+					const p = ev.payload;
+					if ('Model' in p && 'RequestCompleted' in p.Model) {
+						scheduleSummaryRefresh(id);
 					}
-					if (ev.type === 'compacted') {
-						// Compaction swaps the live session for a fresh one. Navigate to
-						// its route; page.params.id updates → the sync $effect re-subscribes
-						// and reloads meta for the new id (and the sidebar highlights it).
-						// The new session's committed events replay over the fresh stream,
-						// so nothing is lost in the brief gap.
-						void goto(`/workspaces/${workspaceId}/sessions/${ev.new_session_id}`);
-					}
-					// A settled turn means the fold's aggregates changed — refresh the
-					// STATS snapshot so turns/cost/tokens track the live conversation.
-					if (ev.type === 'turn_settled') {
-						void refreshSummary(id);
-						// The turn is done: release the next queued message (if any). One
-						// per settle keeps the gateway's own defer-queue empty, so every
-						// still-pending message stays here — visible and cancellable.
-						void flushQueue(id);
-					}
-					// Live context occupancy (per round): drive the STATS context bar.
-					if (ev.type === 'context_updated') {
-						context = { tokens: ev.tokens, window: ev.window, threshold: ev.threshold };
-					}
-					// Per-request STATS refresh (Q2): a committed RequestCompleted means a
-					// model round's usage landed, so the aggregates moved mid-turn. Debounced,
-					// and skipped during history replay (loadMeta already refreshed on load).
-					if (!isReplaying && ev.type === 'event') {
-						const p = ev.payload;
-						if ('Model' in p && 'RequestCompleted' in p.Model) {
-							scheduleSummaryRefresh(id);
-						}
-					}
-					if (isReplaying) {
-						// During replay: snap to bottom instantly (no animation) to
-						// avoid the uncomfortable rapid smooth-scrolling visual.
-						requestAnimationFrame(() => {
-							if (streamEl) streamEl.scrollTop = streamEl.scrollHeight;
-						});
-						// Reset the debounce timer — when events stop arriving for
-						// 300 ms we consider the replay phase complete.
-						clearTimeout(replayDebounce);
-						replayDebounce = setTimeout(() => {
-							isReplaying = false;
-							// Final instant snap to ensure we're at the bottom.
-							requestAnimationFrame(() => {
-								if (streamEl) streamEl.scrollTop = streamEl.scrollHeight;
-							});
-						}, 300);
-					} else if (shouldAutoScroll) {
-						// Live event: smooth scroll only when the user is already at
-						// (or near) the bottom. This prevents yanking them back to
-						// the latest message while they're reading history.
-						requestAnimationFrame(() => {
-							streamEl?.scrollTo({ top: streamEl.scrollHeight, behavior: 'smooth' });
-						});
-					}
-				},
-				onError: (e) => {
-					error = e instanceof Error ? e.message : String(e);
+				}
+				if (shouldAutoScroll) {
+					// Live event: smooth scroll only when the user is already at
+					// (or near) the bottom. This prevents yanking them back to
+					// the latest message while they're reading history.
+					requestAnimationFrame(() => {
+						streamEl?.scrollTo({ top: streamEl.scrollHeight, behavior: 'smooth' });
+					});
 				}
 			},
-			cached ? convo.lastSeq : undefined
-		);
+			onError: (e) => {
+				error = e instanceof Error ? e.message : String(e);
+			}
+		});
 	}
 
 	$effect(() => {
 		const id = sessionId;
-		// Save previous session's conversation state before switching.
-		// Preserves streaming content (e.g. in-progress reasoning) that would
-		// otherwise be lost — live deltas are not replayed on re-subscribe.
-		if (prevSessionId !== undefined && prevSessionId !== DRAFT_ID && prevSessionId !== id) {
-			sessionCache.set(prevSessionId, { convo, collapsed });
-		}
-		prevSessionId = id;
 		// Draft: show an empty conversation, don't subscribe or load meta. The
 		// real session doesn't exist yet — it's created on the first send().
 		if (id === DRAFT_ID) {
@@ -713,7 +656,6 @@
 
 	onDestroy(() => {
 		sub?.close();
-		clearTimeout(replayDebounce);
 		clearTimeout(summaryDebounce);
 	});
 

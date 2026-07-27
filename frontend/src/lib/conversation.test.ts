@@ -103,6 +103,25 @@ function turnInterrupted(seq: number): GatewayEvent {
 }
 
 describe('conversation fold', () => {
+	// ── Dedup by seq (cold-path overlap) ────────────────────────────────
+
+	it('dedup: a committed event with seq <= lastSeq is folded only once', () => {
+		// The cold path folds fetched history (up to lastSeq) then resumes live via
+		// SSE; the gateway subscribes to the live broadcast BEFORE reading its
+		// replay log, so an event committed in the gap arrives twice — once in the
+		// replay, once live. The fold must apply it once, not duplicate the item.
+		const events: GatewayEvent[] = [
+			turnStarted(1, 'hi'),
+			turnStarted(1, 'hi'), // the duplicated gap event (same seq)
+			turnStarted(2, 'there') // a genuinely new event still folds
+		];
+
+		const state = fold(events);
+		const users = state.items.filter((i) => i.kind === 'user');
+		expect(users).toHaveLength(2);
+		expect(state.lastSeq).toBe(2);
+	});
+
 	// ── Streaming: temporal ordering ───────────────────────────────────
 
 	it('streaming: reasoning appears before text when provider opens text block first', () => {
