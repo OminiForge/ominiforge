@@ -7,4 +7,12 @@
  * [`ContentBlockType`] + deltas: instead of one event per token, the collector
  * accumulates a block and records it once, here, with its complete content.
  */
-export type BlockContent = { "Text": { text: string, } } | { "Reasoning": { text: string, } } | { "ToolCall": { id: string, name: string, arguments: string, } };
+export type BlockContent = { "Text": { text: string, } } | { "Reasoning": { text: string, } } | { "ToolCall": { id: string, name: string, arguments: string, 
+/**
+ * One-line summary of the call's args for the collapsed header — the
+ * most meaningful field (path/command/pattern) as plain text, produced
+ * by the tool itself (`Tool::summarize`). The front-end renders it
+ * verbatim instead of guessing from the JSON. Optional so older logs
+ * deserialize; the front-end falls back to truncated args when absent.
+ */
+summary?: string | null, } };

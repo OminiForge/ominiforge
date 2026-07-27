@@ -174,10 +174,23 @@ impl<'a> Collector<'a> {
                         name: name.clone(),
                         arguments: arguments.clone(),
                     });
+                    // Fill the one-line summary so the front-end header renders
+                    // it verbatim instead of guessing from the JSON. An empty
+                    // summary becomes `None` so the front-end falls back to a
+                    // truncated args dump rather than showing a blank header.
+                    let summary = crate::tool::summarize_by_name(
+                        &name,
+                        &serde_json::from_str(&arguments).unwrap_or_default(),
+                    );
                     BlockContent::ToolCall {
                         id: id.clone(),
                         name,
                         arguments,
+                        summary: if summary.is_empty() {
+                            None
+                        } else {
+                            Some(summary)
+                        },
                     }
                 }
             };

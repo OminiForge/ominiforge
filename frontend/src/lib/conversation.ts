@@ -34,6 +34,10 @@ export type Item =
 			name: string;
 			args: string;
 			status: 'running' | 'done' | 'error';
+			/** One-line summary of the call's args for the collapsed header —
+			 *  produced by the tool itself (`Tool::summarize`), rendered verbatim.
+			 *  Falls back to truncated raw args when absent (legacy logs). */
+			summary?: string;
 			result?: string;
 			/** Supplementary, debug-only content a tool appended after its primary
 			 *  result (currently: LSP diagnostics on read/edit/write —
@@ -399,7 +403,8 @@ function commitBlock(
 						...cur,
 						seq,
 						name: content.ToolCall.name,
-						args: content.ToolCall.arguments
+						args: content.ToolCall.arguments,
+						summary: content.ToolCall.summary ?? undefined
 					};
 					return {
 						...state,
@@ -425,6 +430,7 @@ function commitBlock(
 				name: content.ToolCall.name,
 				args: content.ToolCall.arguments,
 				status: 'running',
+				summary: content.ToolCall.summary ?? undefined,
 				approvalPending: true
 			});
 			return {
@@ -444,7 +450,8 @@ function commitBlock(
 			callId: content.ToolCall.id,
 			name: content.ToolCall.name,
 			args: content.ToolCall.arguments,
-			status: 'running'
+			status: 'running',
+			summary: content.ToolCall.summary ?? undefined
 		};
 		items.push(item);
 		return {
@@ -460,11 +467,13 @@ function commitBlock(
 	return { ...state, items, requestCommitted: true, commitBase, committedEnd: items.length };
 }
 
-/// Decoded `plan` op, mirroring `PlanOp` in `src/agent/plan.rs` (externally
-/// tagged on `op`). Only the fields each op needs are read; the rest are
-/// ignored, matching serde's tolerance on the wire.
-type PlanOp =
-	| { op: 'init'; steps?: Array<{ content: string }> }
+/// Decoded `plan` call, mirroring `PlanOp`/`LeafOp` in `src/agent/plan.rs`.
+/// Two shapes only: `init` establishes the plan, `ops` mutates it (a single
+/// change is a one-element array). Only the fields each op needs are read;
+/// the rest are ignored, matching serde's tolerance on the wire.
+type PlanCall = { op: 'init'; steps?: Array<{ content: string }> } | { ops?: LeafOp[] };
+
+type LeafOp =
 	| { op: 'start'; id: string }
 	| { op: 'complete'; id: string }
 	| { op: 'cancel'; id: string; reason?: string }
@@ -474,26 +483,26 @@ type PlanOp =
 /// Fold one committed `plan` tool call into the items list.
 ///
 /// Strategy mirrors the backend (`src/agent/plan.rs`): `init` replaces the plan
-/// with a fresh card; every other op mutates the *latest* plan card in place.
-/// The frontend keeps one card per `init` (not a single global plan) so the
-/// conversation preserves the plan of each turn as history — the newest card is
-/// always the live one that subsequent ops target.
+/// with a fresh card; every op in `ops` mutates the *latest* plan card in
+/// place, in array order. The frontend keeps one card per `init` (not a single
+/// global plan) so the conversation preserves the plan of each turn as history
+/// — the newest card is always the live one that subsequent ops target.
 ///
 /// Robustness: the args are authoritative committed JSON, but a malformed op or
 /// a mutation with no card to target is ignored (the items list is returned
 /// unchanged), mirroring the backend's benign `is_error` handling — the model
 /// corrects itself next round and we never throw mid-fold.
 function foldPlanOp(items: Item[], args: string): Item[] {
-	let op: PlanOp;
+	let call: PlanCall;
 	try {
-		op = JSON.parse(args) as PlanOp;
+		call = JSON.parse(args) as PlanCall;
 	} catch {
 		return items;
 	}
-	if (!op || typeof op !== 'object' || typeof op.op !== 'string') return items;
+	if (!call || typeof call !== 'object') return items;
 
-	if (op.op === 'init') {
-		const steps: PlanStep[] = (op.steps ?? []).map((s, i) => ({
+	if ('op' in call && call.op === 'init') {
+		const steps: PlanStep[] = (call.steps ?? []).map((s, i) => ({
 			id: String(i + 1),
 			content: s.content,
 			status: 'pending'
@@ -501,22 +510,28 @@ function foldPlanOp(items: Item[], args: string): Item[] {
 		return [...items, { kind: 'plan', steps, streaming: false }];
 	}
 
+	if (!('ops' in call) || !Array.isArray(call.ops)) return items;
+
 	// Mutate the latest plan card. No card → benign no-op (model misused plan).
 	const pos = lastPlanIndex(items);
 	if (pos === -1) return items;
 	const card = items[pos];
 	if (card.kind !== 'plan') return items;
-	const steps = applyPlanOp(card.steps, op);
+	let steps = card.steps;
+	for (const op of call.ops) {
+		steps = applyLeafOp(steps, op);
+	}
 	if (steps === card.steps) return items; // unchanged (unknown id / anchor)
 	const next = [...items];
 	next[pos] = { kind: 'plan', steps, streaming: false };
 	return next;
 }
 
-/// Apply a non-init op to a step list, returning a new list (or the same
+/// Apply one leaf op to a step list, returning a new list (or the same
 /// reference unchanged when the target id/anchor is absent — a benign no-op
 /// matching the backend's `PlanError` → `is_error` path).
-function applyPlanOp(steps: PlanStep[], op: PlanOp): PlanStep[] {
+function applyLeafOp(steps: PlanStep[], op: LeafOp): PlanStep[] {
+	if (!op || typeof op !== 'object') return steps;
 	switch (op.op) {
 		case 'start':
 			return setStatus(steps, op.id, 'in_progress');

@@ -623,13 +623,30 @@ describe('plan fold', () => {
 			reqStarted(1),
 			planCall(2, { op: 'init', steps: [{ content: 'a' }, { content: 'b' }] }),
 			reqStarted(3),
-			planCall(4, { op: 'start', id: '1' }),
+			planCall(4, { ops: [{ op: 'start', id: '1' }] }),
 			reqStarted(5),
-			planCall(6, { op: 'complete', id: '1' })
+			planCall(6, { ops: [{ op: 'complete', id: '1' }] })
 		]);
 		const steps = planSteps(state);
 		expect(steps[0].status).toBe('completed');
 		expect(steps[1].status).toBe('pending');
+	});
+
+	it('one call carrying several ops applies them all in order', () => {
+		const state = fold([
+			reqStarted(1),
+			planCall(2, { op: 'init', steps: [{ content: 'a' }, { content: 'b' }, { content: 'c' }] }),
+			reqStarted(3),
+			planCall(4, {
+				ops: [
+					{ op: 'start', id: '1' },
+					{ op: 'complete', id: '1' },
+					{ op: 'start', id: '2' }
+				]
+			})
+		]);
+		const steps = planSteps(state);
+		expect(steps.map((s) => s.status)).toEqual(['completed', 'in_progress', 'pending']);
 	});
 
 	it('cancel and block record their reason', () => {
@@ -637,9 +654,9 @@ describe('plan fold', () => {
 			reqStarted(1),
 			planCall(2, { op: 'init', steps: [{ content: 'a' }, { content: 'b' }] }),
 			reqStarted(3),
-			planCall(4, { op: 'cancel', id: '1', reason: 'no such tool' }),
+			planCall(4, { ops: [{ op: 'cancel', id: '1', reason: 'no such tool' }] }),
 			reqStarted(5),
-			planCall(6, { op: 'block', id: '2', reason: 'needs API key' })
+			planCall(6, { ops: [{ op: 'block', id: '2', reason: 'needs API key' }] })
 		]);
 		const steps = planSteps(state);
 		expect(steps[0].status).toBe('cancelled');
@@ -653,9 +670,9 @@ describe('plan fold', () => {
 			reqStarted(1),
 			planCall(2, { op: 'init', steps: [{ content: 'a' }, { content: 'b' }] }),
 			reqStarted(3),
-			planCall(4, { op: 'add', content: 'end' }),
+			planCall(4, { ops: [{ op: 'add', content: 'end' }] }),
 			reqStarted(5),
-			planCall(6, { op: 'add', content: 'mid', after_id: '1' })
+			planCall(6, { ops: [{ op: 'add', content: 'mid', after_id: '1' }] })
 		]);
 		const steps = planSteps(state);
 		expect(steps.map((s) => s.content)).toEqual(['a', 'mid', 'b', 'end']);
@@ -665,7 +682,7 @@ describe('plan fold', () => {
 	});
 
 	it('a non-init op with no prior plan is a benign no-op', () => {
-		const state = fold([reqStarted(1), planCall(2, { op: 'start', id: '1' })]);
+		const state = fold([reqStarted(1), planCall(2, { ops: [{ op: 'start', id: '1' }] })]);
 		expect(state.items.filter((i) => i.kind === 'plan')).toHaveLength(0);
 		expect(state.items.filter((i) => i.kind === 'tool')).toHaveLength(0);
 	});
@@ -675,7 +692,7 @@ describe('plan fold', () => {
 			reqStarted(1),
 			planCall(2, { op: 'init', steps: [{ content: 'a' }] }),
 			reqStarted(3),
-			planCall(4, { op: 'start', id: '99' })
+			planCall(4, { ops: [{ op: 'start', id: '99' }] })
 		]);
 		expect(planSteps(state)[0].status).toBe('pending');
 	});
@@ -685,7 +702,7 @@ describe('plan fold', () => {
 			reqStarted(1),
 			planCall(2, { op: 'init', steps: [{ content: 'a' }] }),
 			reqStarted(3),
-			planCall(4, { op: 'complete', id: '1' }),
+			planCall(4, { ops: [{ op: 'complete', id: '1' }] }),
 			reqStarted(5),
 			planCall(6, { op: 'init', steps: [{ content: 'x' }, { content: 'y' }] })
 		]);
@@ -719,7 +736,7 @@ describe('plan fold', () => {
 			turnCompleted(4),
 			turnStarted(5, 'continue'),
 			reqStarted(6),
-			planCall(7, { op: 'complete', id: '1' })
+			planCall(7, { ops: [{ op: 'complete', id: '1' }] })
 		]);
 		const steps = planSteps(state);
 		expect(steps[0].status).toBe('completed');

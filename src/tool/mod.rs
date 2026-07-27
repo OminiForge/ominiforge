@@ -84,6 +84,69 @@ pub trait Tool: Send + Sync {
     }
 }
 
+/// Static dispatch for `summarize` by tool name.
+///
+/// Used by the collector (which has no tool instance) to fill
+/// `BlockContent::ToolCall.summary`. Built-ins declare their primary field;
+/// MCP tools fall back to the default truncated JSON dump.
+#[must_use]
+pub fn summarize_by_name(name: &str, input: &serde_json::Value) -> String {
+    match name {
+        "read" | "write" => input
+            .get("path")
+            .and_then(|p| p.as_str())
+            .unwrap_or("")
+            .to_owned(),
+        "edit" => {
+            if let Some(path) = input.get("path").and_then(|p| p.as_str()) {
+                return path.to_owned();
+            }
+            if let Some(path) = input
+                .get("edits")
+                .and_then(|e| e.as_array())
+                .and_then(|edits| edits.first())
+                .and_then(|first| first.get("path"))
+                .and_then(|p| p.as_str())
+            {
+                return path.to_owned();
+            }
+            String::new()
+        }
+        "shell" => input
+            .get("command")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_owned(),
+        "find" => input
+            .get("patterns")
+            .and_then(|p| p.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default(),
+        _ => {
+            let s = input.to_string();
+            if s.len() > 80 {
+                // Byte-slice at a char boundary: tool input can be arbitrary
+                // UTF-8 (e.g. CJK plan steps), and `&s[..80]` panics when 80
+                // lands inside a multi-byte char.
+                let end = s
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .take_while(|&i| i <= 80)
+                    .last()
+                    .unwrap_or(0);
+                format!("{}…", &s[..end])
+            } else {
+                s
+            }
+        }
+    }
+}
+
 /// What the model is told about a tool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolDescriptor {
@@ -337,6 +400,17 @@ mod tests {
         let ws = Path::new("/home/user/project");
         assert!(resolve_in_workspace(ws, "../secret").is_err());
         assert!(resolve_in_workspace(ws, "src/../../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn summarize_truncates_multibyte_without_panic() {
+        // Regression: `&s[..80]` panicked when byte 80 fell inside a CJK char
+        // ("end byte index 80 is not a char boundary"). The summary is a
+        // human-facing label; it must degrade gracefully, not kill the task.
+        let input = serde_json::json!({ "steps": "测试测试测试测试测试测试测试测试测试测试测试测试测试测试测试测试测试测试测试测试" });
+        let summary = summarize_by_name("plan", &input);
+        assert!(summary.len() <= 80 + '…'.len_utf8());
+        assert!(summary.ends_with('…'));
     }
 
     #[test]
