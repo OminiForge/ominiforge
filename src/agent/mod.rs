@@ -2386,9 +2386,9 @@ mod tests {
                 "c1",
                 r#"{"op":"init","steps":[{"content":"step one"},{"content":"step two"}]}"#,
             ),
-            plan_round("c2", r#"{"op":"start","id":"1"}"#),
-            plan_round("c3", r#"{"op":"complete","id":"1"}"#),
-            plan_round("c4", r#"{"op":"complete","id":"2"}"#),
+            plan_round("c2", r#"{"ops":[{"op":"start","id":"1"}]}"#),
+            plan_round("c3", r#"{"ops":[{"op":"complete","id":"1"}]}"#),
+            plan_round("c4", r#"{"ops":[{"op":"complete","id":"2"}]}"#),
             text_round("all done"),
         ]));
         let agent = planning_agent(provider);
@@ -2437,7 +2437,7 @@ mod tests {
             // Model tries to stop with the step still pending — gate nudges.
             text_round("I think I'm done"),
             // After the nudge it finishes the step, then answers.
-            plan_round("c2", r#"{"op":"complete","id":"1"}"#),
+            plan_round("c2", r#"{"ops":[{"op":"complete","id":"1"}]}"#),
             text_round("actually done now"),
         ]));
         let agent = planning_agent(provider);
@@ -2524,7 +2524,9 @@ mod tests {
             "c0",
             r#"{"op":"init","steps":[{"content":"endless"}]}"#,
         ))
-        .chain((0..10).map(|i| plan_round(&format!("s{i}"), r#"{"op":"start","id":"1"}"#)))
+        .chain(
+            (0..10).map(|i| plan_round(&format!("s{i}"), r#"{"ops":[{"op":"start","id":"1"}]}"#)),
+        )
         .collect();
         let provider = Arc::new(ScriptedProvider::new(rounds));
         let agent = Agent::new(
@@ -2576,9 +2578,12 @@ mod tests {
         let provider = Arc::new(ScriptedProvider::new(vec![
             plan_round("c1", r#"{"op":"init","steps":[{"content":"a step"}]}"#),
             // cancel without a reason — rejected at decode.
-            plan_round("c2", r#"{"op":"cancel","id":"1"}"#),
+            plan_round("c2", r#"{"ops":[{"op":"cancel","id":"1"}]}"#),
             // recovers with a proper reason.
-            plan_round("c3", r#"{"op":"cancel","id":"1","reason":"no such tool"}"#),
+            plan_round(
+                "c3",
+                r#"{"ops":[{"op":"cancel","id":"1","reason":"no such tool"}]}"#,
+            ),
             text_round("cancelled it"),
         ]));
         let agent = planning_agent(provider);
@@ -2619,7 +2624,7 @@ mod tests {
             plan_round("c1", r#"{"op":"init","steps":[{"content":"needs a key"}]}"#),
             plan_round(
                 "c2",
-                r#"{"op":"block","id":"1","reason":"set OPENAI_API_KEY"}"#,
+                r#"{"ops":[{"op":"block","id":"1","reason":"set OPENAI_API_KEY"}]}"#,
             ),
             text_round("blocked on your input"),
         ]));
@@ -2655,12 +2660,18 @@ mod tests {
         // tool-bearing round, and `start id=1` is idempotent.
         let mut rounds = vec![
             plan_round("c0", r#"{"op":"init","steps":[{"content":"long step"}]}"#),
-            plan_round("c1", r#"{"op":"start","id":"1"}"#),
+            plan_round("c1", r#"{"ops":[{"op":"start","id":"1"}]}"#),
         ];
         for i in 0..STUCK_THRESHOLD {
-            rounds.push(plan_round(&format!("s{i}"), r#"{"op":"start","id":"1"}"#));
+            rounds.push(plan_round(
+                &format!("s{i}"),
+                r#"{"ops":[{"op":"start","id":"1"}]}"#,
+            ));
         }
-        rounds.push(plan_round("done", r#"{"op":"complete","id":"1"}"#));
+        rounds.push(plan_round(
+            "done",
+            r#"{"ops":[{"op":"complete","id":"1"}]}"#,
+        ));
         rounds.push(text_round("finished"));
         let provider = Arc::new(ScriptedProvider::new(rounds));
         let agent = planning_agent(provider);
@@ -2703,7 +2714,7 @@ mod tests {
                 "c0",
                 r#"{"op":"init","steps":[{"content":"long but productive"}]}"#,
             ),
-            plan_round("c1", r#"{"op":"start","id":"1"}"#),
+            plan_round("c1", r#"{"ops":[{"op":"start","id":"1"}]}"#),
         ];
         for i in 0..(STUCK_THRESHOLD + 2) {
             rounds.push(tool_call_round(
@@ -2712,7 +2723,10 @@ mod tests {
                 r#"{"path":"note.txt"}"#,
             ));
         }
-        rounds.push(plan_round("done", r#"{"op":"complete","id":"1"}"#));
+        rounds.push(plan_round(
+            "done",
+            r#"{"ops":[{"op":"complete","id":"1"}]}"#,
+        ));
         rounds.push(text_round("finished"));
         let provider = Arc::new(ScriptedProvider::new(rounds));
 
@@ -3971,8 +3985,12 @@ mod tests {
             _ => None,
         });
         let preview = preview.expect("Requested carries a preview for write");
+        // The preview is the same JSON envelope the executed `TextView` carries.
+        let json: serde_json::Value = serde_json::from_str(&preview).unwrap();
+        assert_eq!(json["kind"], "diff");
+        let patch = json["files"][0]["patch"].as_str().unwrap();
         assert!(
-            preview.contains("--- a/a.txt") && preview.contains("-old") && preview.contains("+new"),
+            json["files"][0]["path"] == "a.txt" && patch.contains("-old") && patch.contains("+new"),
             "preview is the old→new diff: {preview}"
         );
     }
@@ -4278,7 +4296,7 @@ mod tests {
                         r#"{"op":"init","steps":[{"content":"only step"}]}"#,
                     ),
                     ("w1", "write", r#"{"path":"f.txt","content":"hi"}"#),
-                    ("p2", "plan", r#"{"op":"complete","id":"1"}"#),
+                    ("p2", "plan", r#"{"ops":[{"op":"complete","id":"1"}]}"#),
                 ]),
                 text_round("done"),
             ],

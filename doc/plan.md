@@ -68,10 +68,16 @@ cancel/block，只有客观障碍才合法**。`Blocked` 让 turn 能在"需要�
 
 ## 5. Plan Tool（操作式）
 
-单个 built-in tool（名 `plan`），通过 `op` 字段区分操作：`init` / `start` / `complete` /
-`cancel`(reason) / `block`(reason) / `add`(after_id?)。每次操作返回当前完整清单的渲染作为
-tool result，模型始终看得到最新状态。非法输入（schema 错、缺 reason、id 不存在）走现有 tool
-error 回路，模型下一 round 自行改正。
+单个 built-in tool（名 `plan`），只有两种调用形态（schema 为 `oneOf` 两分支，与其他叶子
+工具同风格）：`{"op": "init", "steps": [...]}` 建立计划；`{"ops": [...]}` 变更计划，
+`ops` 数组按序应用多个 leaf op（`start` / `complete` / `cancel`(reason) / `block`(reason) /
+`add`(after_id?)），遇错即停、之前的 op 保留，单个变更就是单元素数组——改多步不用发多个
+并行 plan 调用。`init` 不能出现在 `ops` 里（`LeafOp` 枚举不含此变体，反序列化直接拒绝，
+无需运行时检查）；leaf op 的 schema 精确到每个 op 只声明自己的字段
+（`additionalProperties: false`）。descriptor 的 description 只写行为/使用规范，结构事实
+（有哪些 op、各带什么字段）由 schema 唯一承载，不再散文重复。每次调用返回当前完整清单的
+渲染作为 tool result，模型始终看得到最新状态。非法输入（schema 错、缺 reason、id 不存在）
+走现有 tool error 回路，模型下一 round 自行改正。
 
 ### 与叶子工具的区别：loop 拦截
 

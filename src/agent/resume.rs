@@ -229,6 +229,7 @@ impl ContextRebuilder {
                 id,
                 name,
                 arguments,
+                ..
             } => {
                 pending.tool_calls.push(ToolCall {
                     id: id.clone(),
@@ -427,6 +428,7 @@ mod tests {
                 id: id.to_owned(),
                 name: name.to_owned(),
                 arguments: args.to_owned(),
+                summary: None,
             },
         })
     }
@@ -735,18 +737,18 @@ mod tests {
             ev(
                 2,
                 tool_src(PLAN_TOOL_NAME),
-                plan_started(serde_json::json!({"op": "start", "id": "1"})),
+                plan_started(serde_json::json!({"ops": [{"op": "start", "id": "1"}]})),
             ),
             // Malformed op (cancel without reason) — must be skipped, not panic.
             ev(
                 3,
                 tool_src(PLAN_TOOL_NAME),
-                plan_started(serde_json::json!({"op": "cancel", "id": "2"})),
+                plan_started(serde_json::json!({"ops": [{"op": "cancel", "id": "2"}]})),
             ),
             ev(
                 4,
                 tool_src(PLAN_TOOL_NAME),
-                plan_started(serde_json::json!({"op": "complete", "id": "1"})),
+                plan_started(serde_json::json!({"ops": [{"op": "complete", "id": "1"}]})),
             ),
         ];
 

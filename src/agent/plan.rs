@@ -70,17 +70,32 @@ impl StepStatus {
     }
 }
 
-/// A single plan mutation, decoded from the model's tool-call arguments.
+/// One `plan` tool call, decoded from the model's arguments.
 ///
-/// Externally tagged on `op`, matching the `plan` tool schema. Missing required
-/// fields (e.g. `reason` on `cancel`/`block`) fail to deserialize and surface as
-/// a tool error the model corrects next round (`doc/plan.md` §5).
+/// Two shapes only: `{"op": "init", "steps": [...]}` establishes the plan, and
+/// `{"ops": [...]}` mutates it — a single change is a one-element `ops` array,
+/// matching the batch-first shape of the other tools. `init` cannot appear
+/// inside `ops`: [`LeafOp`] has no such variant, so nesting is rejected at
+/// deserialization with no runtime check (`doc/plan.md` §5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(untagged)]
 pub enum PlanOp {
     /// Establish the plan from scratch; any existing plan is replaced. Ids are
     /// assigned by the runtime, not the model.
     Init { steps: Vec<NewStep> },
+    /// Apply several leaf ops in array order. Stops at the first error; the
+    /// ops before it stay applied.
+    Ops { ops: Vec<LeafOp> },
+}
+
+/// A single plan mutation — the only element allowed inside [`PlanOp::Ops`].
+///
+/// Externally tagged on `op`. Missing required fields (e.g. `reason` on
+/// `cancel`/`block`) fail to deserialize and surface as a tool error the model
+/// corrects next round (`doc/plan.md` §5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum LeafOp {
     /// Mark a step `in_progress`.
     Start { id: String },
     /// Mark a step `completed`.
@@ -111,11 +126,15 @@ pub enum PlanError {
     UnknownStep(String),
     #[error("no plan step with id {0:?} to insert after")]
     UnknownAnchor(String),
+    /// One op inside `ops` failed (1-based position). The ops before it were
+    /// applied; it and the rest were not.
+    #[error("op {index} failed: {source}")]
+    OpFailed { index: usize, source: Box<Self> },
 }
 
-/// Apply one operation to `plan` in place. On success returns nothing; the
-/// caller renders the updated plan as the tool result. On failure the plan is
-/// left unchanged.
+/// Apply one call to `plan` in place. On success returns nothing; the caller
+/// renders the updated plan as the tool result. On failure the plan holds
+/// whatever the ops before the failing one applied.
 ///
 /// Id assignment: `init` numbers steps "1".."N"; `add` takes the max numeric id
 /// seen plus one, so ids stay unique and stable even after cancellations.
@@ -137,15 +156,29 @@ pub fn apply_plan_op(plan: &mut Vec<PlanStep>, op: PlanOp) -> Result<(), PlanErr
                 })
                 .collect();
         }
-        PlanOp::Start { id } => set_status(plan, &id, StepStatus::InProgress, None)?,
-        PlanOp::Complete { id } => set_status(plan, &id, StepStatus::Completed, None)?,
-        PlanOp::Cancel { id, reason } => {
-            set_status(plan, &id, StepStatus::Cancelled, Some(reason))?;
+        // Sequential, stop-at-first-error: earlier ops stay applied (so an
+        // `add` may be referenced by a later op in the same call), and the
+        // error names the failing position.
+        PlanOp::Ops { ops } => {
+            for (i, op) in ops.into_iter().enumerate() {
+                apply_leaf_op(plan, op).map_err(|e| PlanError::OpFailed {
+                    index: i + 1,
+                    source: Box::new(e),
+                })?;
+            }
         }
-        PlanOp::Block { id, reason } => {
-            set_status(plan, &id, StepStatus::Blocked, Some(reason))?;
-        }
-        PlanOp::Add { content, after_id } => {
+    }
+    Ok(())
+}
+
+/// Apply one leaf op to `plan` in place.
+fn apply_leaf_op(plan: &mut Vec<PlanStep>, op: LeafOp) -> Result<(), PlanError> {
+    match op {
+        LeafOp::Start { id } => set_status(plan, &id, StepStatus::InProgress, None),
+        LeafOp::Complete { id } => set_status(plan, &id, StepStatus::Completed, None),
+        LeafOp::Cancel { id, reason } => set_status(plan, &id, StepStatus::Cancelled, Some(reason)),
+        LeafOp::Block { id, reason } => set_status(plan, &id, StepStatus::Blocked, Some(reason)),
+        LeafOp::Add { content, after_id } => {
             let step = PlanStep {
                 id: next_id(plan),
                 content,
@@ -153,18 +186,21 @@ pub fn apply_plan_op(plan: &mut Vec<PlanStep>, op: PlanOp) -> Result<(), PlanErr
                 reason: None,
             };
             match after_id {
-                None => plan.push(step),
+                None => {
+                    plan.push(step);
+                    Ok(())
+                }
                 Some(anchor) => {
                     let pos = plan
                         .iter()
                         .position(|s| s.id == anchor)
                         .ok_or(PlanError::UnknownAnchor(anchor))?;
                     plan.insert(pos + 1, step);
+                    Ok(())
                 }
             }
         }
     }
-    Ok(())
 }
 
 /// Set a step's status (and reason), or [`PlanError::UnknownStep`] if absent.
@@ -246,7 +282,9 @@ pub fn render_incomplete(plan: &[PlanStep]) -> String {
 /// The `plan` tool descriptor the agent loop broadcasts alongside leaf tools.
 ///
 /// Behavioral guidance lives here in the `description` (not the profile's system
-/// prompt): tool usage is the tool's concern (`doc/plan.md` §9).
+/// prompt): tool usage is the tool's concern (`doc/plan.md` §9). Structural
+/// facts (which ops exist, which fields each takes) belong to the schema alone
+/// — the description does not repeat them.
 #[must_use]
 pub fn descriptor() -> ToolSchema {
     ToolSchema {
@@ -261,8 +299,15 @@ Maintain a working plan for the current task. This tool only tracks plan state; 
 it performs no actions (no file or command access).
 
 Usage:
-- For a multi-step task, first call `init` with the ordered steps, then drive \
-them: `start` a step before working on it, `complete` it when done.
+- For a multi-step task, first call with `init`, then drive the steps: \
+`start` a step before working on it, `complete` it when done. Mutations go \
+through `ops` — one call, in order; do not fire several parallel plan calls. \
+A single change is a one-element `ops` array.
+- Step ids are assigned by the runtime, never by you: `init`'s `steps` carry \
+`content` only; refer to steps by the ids the tool result shows. The result \
+re-renders the full plan after every call, so it always reflects current state.
+- Ops apply in order and stop at the first error; the ones before it stay \
+applied.
 - Trivial single-step tasks need no plan.
 - `cancel` a step ONLY when it is objectively unreachable (no such tool, no \
 permission); `reason` must be specific.
@@ -271,47 +316,104 @@ variable, a decision, an external command); `reason` must say what the user \
 must do.
 - NEVER cancel or block a step merely because it is hard or you would rather \
 not do it.
-- `add` inserts a new step at the end, or after `after_id`.
 - Every step must reach a terminal state (completed / cancelled / blocked) \
 before the task can finish.";
 
-/// JSON Schema for the `plan` tool's single object argument.
+/// JSON Schema for the `plan` tool arguments: two shapes, `oneOf`.
+///
+/// - `{"op": "init", "steps": [...]}` — establish the plan.
+/// - `{"ops": [leaf, ...]}` — mutate it; each leaf is exactly one op with
+///   only its own fields (`oneOf` per op, `additionalProperties: false`), so
+///   `init` cannot nest and a malformed leaf fails schema validation.
 fn schema() -> serde_json::Value {
+    let id_prop =
+        |description: &str| serde_json::json!({ "type": "string", "description": description });
+    let leaf = |op: &str, extra: serde_json::Value, required: &[&str]| {
+        let mut properties = serde_json::Map::new();
+        properties.insert("op".to_owned(), serde_json::json!({ "const": op }));
+        if let serde_json::Value::Object(map) = extra {
+            properties.extend(map);
+        }
+        let mut req = vec!["op"];
+        req.extend_from_slice(required);
+        serde_json::json!({
+            "type": "object",
+            "properties": serde_json::Value::Object(properties),
+            "required": req,
+            "additionalProperties": false
+        })
+    };
+    let start = leaf(
+        "start",
+        serde_json::json!({ "id": id_prop("Step id to mark in_progress.") }),
+        &["id"],
+    );
+    let complete = leaf(
+        "complete",
+        serde_json::json!({ "id": id_prop("Step id to mark completed.") }),
+        &["id"],
+    );
+    let cancel = leaf(
+        "cancel",
+        serde_json::json!({
+            "id": id_prop("Step id to mark cancelled."),
+            "reason": { "type": "string", "description": "Why the step is objectively unreachable; be specific." }
+        }),
+        &["id", "reason"],
+    );
+    let block = leaf(
+        "block",
+        serde_json::json!({
+            "id": id_prop("Step id to mark blocked."),
+            "reason": { "type": "string", "description": "What the user must provide or decide; be specific." }
+        }),
+        &["id", "reason"],
+    );
+    let add = leaf(
+        "add",
+        serde_json::json!({
+            "content": { "type": "string", "description": "The new step's text." },
+            "after_id": id_prop("Insert after this step id (default: append at the end).")
+        }),
+        &["content"],
+    );
+
     serde_json::json!({
         "type": "object",
-        "required": ["op"],
-        "properties": {
-            "op": {
-                "type": "string",
-                "enum": ["init", "start", "complete", "cancel", "block", "add"],
-                "description": "Which plan operation to perform."
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "op": { "const": "init" },
+                    "steps": {
+                        "type": "array",
+                        "minItems": 1,
+                        "description": "The ordered steps (content only; ids are assigned by the runtime).",
+                        "items": {
+                            "type": "object",
+                            "properties": { "content": { "type": "string" } },
+                            "required": ["content"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["op", "steps"],
+                "additionalProperties": false
             },
-            "steps": {
-                "type": "array",
-                "description": "For `init`: the ordered steps (content only; ids are assigned).",
-                "items": {
-                    "type": "object",
-                    "required": ["content"],
-                    "properties": { "content": { "type": "string" } }
-                }
-            },
-            "id": {
-                "type": "string",
-                "description": "Step id for start/complete/cancel/block."
-            },
-            "reason": {
-                "type": "string",
-                "description": "Required for cancel/block; a specific, concrete reason."
-            },
-            "content": {
-                "type": "string",
-                "description": "For `add`: the new step's text."
-            },
-            "after_id": {
-                "type": "string",
-                "description": "For `add`: insert after this step id (default: append at end)."
+            {
+                "type": "object",
+                "properties": {
+                    "ops": {
+                        "type": "array",
+                        "minItems": 1,
+                        "description": "The ops to apply in order.",
+                        "items": { "oneOf": [start, complete, cancel, block, add] }
+                    }
+                },
+                "required": ["ops"],
+                "additionalProperties": false
             }
-        }
+        ]
     })
 }
 
@@ -359,8 +461,8 @@ mod tests {
     #[test]
     fn status_transitions_apply() {
         let mut plan = init_three();
-        apply_plan_op(&mut plan, op(r#"{"op":"start","id":"1"}"#)).unwrap();
-        apply_plan_op(&mut plan, op(r#"{"op":"complete","id":"1"}"#)).unwrap();
+        apply_plan_op(&mut plan, op(r#"{"ops":[{"op":"start","id":"1"}]}"#)).unwrap();
+        apply_plan_op(&mut plan, op(r#"{"ops":[{"op":"complete","id":"1"}]}"#)).unwrap();
         assert_eq!(plan[0].status, StepStatus::Completed);
         assert!(plan[0].status.is_terminal());
     }
@@ -370,12 +472,12 @@ mod tests {
         let mut plan = init_three();
         apply_plan_op(
             &mut plan,
-            op(r#"{"op":"cancel","id":"2","reason":"no such tool"}"#),
+            op(r#"{"ops":[{"op":"cancel","id":"2","reason":"no such tool"}]}"#),
         )
         .unwrap();
         apply_plan_op(
             &mut plan,
-            op(r#"{"op":"block","id":"3","reason":"needs API key"}"#),
+            op(r#"{"ops":[{"op":"block","id":"3","reason":"needs API key"}]}"#),
         )
         .unwrap();
         assert_eq!(plan[1].status, StepStatus::Cancelled);
@@ -386,9 +488,9 @@ mod tests {
 
     #[test]
     fn cancel_missing_reason_fails_to_deserialize() {
-        let err = serde_json::from_str::<PlanOp>(r#"{"op":"cancel","id":"1"}"#);
+        let err = serde_json::from_str::<PlanOp>(r#"{"ops":[{"op":"cancel","id":"1"}]}"#);
         assert!(err.is_err(), "cancel without reason must be rejected");
-        let err = serde_json::from_str::<PlanOp>(r#"{"op":"block","id":"1"}"#);
+        let err = serde_json::from_str::<PlanOp>(r#"{"ops":[{"op":"block","id":"1"}]}"#);
         assert!(err.is_err(), "block without reason must be rejected");
     }
 
@@ -396,21 +498,24 @@ mod tests {
     fn unknown_id_is_an_error() {
         let mut plan = init_three();
         assert_eq!(
-            apply_plan_op(&mut plan, op(r#"{"op":"start","id":"99"}"#)),
-            Err(PlanError::UnknownStep("99".to_owned()))
+            apply_plan_op(&mut plan, op(r#"{"ops":[{"op":"start","id":"99"}]}"#)),
+            Err(PlanError::OpFailed {
+                index: 1,
+                source: Box::new(PlanError::UnknownStep("99".to_owned()))
+            })
         );
     }
 
     #[test]
     fn add_appends_and_inserts_after() {
         let mut plan = init_three();
-        apply_plan_op(&mut plan, op(r#"{"op":"add","content":"end"}"#)).unwrap();
+        apply_plan_op(&mut plan, op(r#"{"ops":[{"op":"add","content":"end"}]}"#)).unwrap();
         assert_eq!(plan.last().unwrap().id, "4");
         assert_eq!(plan.last().unwrap().content, "end");
 
         apply_plan_op(
             &mut plan,
-            op(r#"{"op":"add","content":"mid","after_id":"1"}"#),
+            op(r#"{"ops":[{"op":"add","content":"mid","after_id":"1"}]}"#),
         )
         .unwrap();
         // Inserted right after step "1".
@@ -420,24 +525,92 @@ mod tests {
     }
 
     #[test]
+    fn ops_apply_in_order() {
+        let mut plan = init_three();
+        apply_plan_op(
+            &mut plan,
+            op(r#"{"ops":[
+                {"op":"start","id":"1"},
+                {"op":"complete","id":"1"},
+                {"op":"cancel","id":"2","reason":"obsolete"}
+            ]}"#),
+        )
+        .unwrap();
+        assert_eq!(plan[0].status, StepStatus::Completed);
+        assert_eq!(plan[1].status, StepStatus::Cancelled);
+        assert_eq!(plan[1].reason.as_deref(), Some("obsolete"));
+        assert_eq!(plan[2].status, StepStatus::Pending);
+    }
+
+    #[test]
+    fn ops_stop_at_first_error_keeping_earlier_ops() {
+        let mut plan = init_three();
+        let err = apply_plan_op(
+            &mut plan,
+            op(r#"{"ops":[
+                {"op":"complete","id":"1"},
+                {"op":"start","id":"99"},
+                {"op":"complete","id":"3"}
+            ]}"#),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            PlanError::OpFailed {
+                index: 2,
+                source: Box::new(PlanError::UnknownStep("99".to_owned()))
+            }
+        );
+        // Op 1 landed; op 3 never ran.
+        assert_eq!(plan[0].status, StepStatus::Completed);
+        assert_eq!(plan[2].status, StepStatus::Pending);
+    }
+
+    #[test]
+    fn ops_can_start_a_step_added_in_the_same_call() {
+        let mut plan = init_three();
+        apply_plan_op(
+            &mut plan,
+            op(r#"{"ops":[
+                {"op":"add","content":"new"},
+                {"op":"start","id":"4"}
+            ]}"#),
+        )
+        .unwrap();
+        assert_eq!(plan[3].content, "new");
+        assert_eq!(plan[3].status, StepStatus::InProgress);
+    }
+
+    #[test]
+    fn init_cannot_nest_inside_ops() {
+        // `init` is not a `LeafOp` variant, so it surfaces as the usual
+        // "unknown variant" tool error — no runtime check needed.
+        let err = serde_json::from_str::<PlanOp>(r#"{"ops":[{"op":"init","steps":[]}]}"#);
+        assert!(err.is_err(), "init must not nest inside ops");
+    }
+
+    #[test]
     fn add_after_unknown_anchor_errors() {
         let mut plan = init_three();
         assert_eq!(
             apply_plan_op(
                 &mut plan,
-                op(r#"{"op":"add","content":"x","after_id":"nope"}"#)
+                op(r#"{"ops":[{"op":"add","content":"x","after_id":"nope"}]}"#)
             ),
-            Err(PlanError::UnknownAnchor("nope".to_owned()))
+            Err(PlanError::OpFailed {
+                index: 1,
+                source: Box::new(PlanError::UnknownAnchor("nope".to_owned()))
+            })
         );
     }
 
     #[test]
     fn render_lists_every_step_with_status_and_reason() {
         let mut plan = init_three();
-        apply_plan_op(&mut plan, op(r#"{"op":"start","id":"1"}"#)).unwrap();
+        apply_plan_op(&mut plan, op(r#"{"ops":[{"op":"start","id":"1"}]}"#)).unwrap();
         apply_plan_op(
             &mut plan,
-            op(r#"{"op":"block","id":"2","reason":"needs key"}"#),
+            op(r#"{"ops":[{"op":"block","id":"2","reason":"needs key"}]}"#),
         )
         .unwrap();
         let text = render(&plan);
@@ -449,8 +622,12 @@ mod tests {
     #[test]
     fn render_incomplete_only_lists_non_terminal() {
         let mut plan = init_three();
-        apply_plan_op(&mut plan, op(r#"{"op":"complete","id":"1"}"#)).unwrap();
-        apply_plan_op(&mut plan, op(r#"{"op":"cancel","id":"2","reason":"x"}"#)).unwrap();
+        apply_plan_op(&mut plan, op(r#"{"ops":[{"op":"complete","id":"1"}]}"#)).unwrap();
+        apply_plan_op(
+            &mut plan,
+            op(r#"{"ops":[{"op":"cancel","id":"2","reason":"x"}]}"#),
+        )
+        .unwrap();
         let text = render_incomplete(&plan);
         assert!(!text.contains("— a"));
         assert!(!text.contains("— b"));
@@ -462,6 +639,20 @@ mod tests {
         let d = descriptor();
         assert_eq!(d.name, PLAN_TOOL_NAME);
         assert!(d.description.contains("terminal state"));
-        assert_eq!(d.parameters["properties"]["op"]["enum"][0], "init");
+        assert_eq!(d.parameters["type"], "object");
+        let one_of = d.parameters["oneOf"].as_array().unwrap();
+        assert_eq!(one_of.len(), 2, "init branch and ops branch");
+        // init branch: only op + steps.
+        assert_eq!(one_of[0]["properties"]["op"]["const"], "init");
+        assert_eq!(one_of[0]["required"], serde_json::json!(["op", "steps"]));
+        // ops branch: each leaf is one of the five ops, no init nesting.
+        let leaf_ops = one_of[1]["properties"]["ops"]["items"]["oneOf"]
+            .as_array()
+            .unwrap();
+        let consts: Vec<&str> = leaf_ops
+            .iter()
+            .map(|l| l["properties"]["op"]["const"].as_str().unwrap())
+            .collect();
+        assert_eq!(consts, ["start", "complete", "cancel", "block", "add"]);
     }
 }
