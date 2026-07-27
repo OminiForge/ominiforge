@@ -279,12 +279,13 @@ ominiforge Web 控制台是**开发者每天盯 8 小时的 agent 生产工具**
 
 - **user**：右对齐 `.user-bubble`，`--user-bg/border`，中文字体。
 - **text**：markdown 渲染，行高 1.75。行内 code 用 `--syntax-str` 绿。链接 `--accent-ink`。流式时尾部 `.streaming` 加 acid-lime 闪烁竖条。
-- **reasoning**：默认折叠。折叠=`.reasoning-toggle`（靛蓝边+预览首行+箭头）；展开=`.reasoning-body`（靛蓝左竖条）。安静，不抢主回复。
-- **tool（120% 招牌）**：折叠头 = pip + name + status-badge + preview + chevron。三态：
+- **reasoning**：降级为非卡片。流式中=一行内联状态（`思考中` + 脉冲点）+ 安静的流式正文（muted，用户能看到它在想什么）；完成后=单行灰字首行预览（点击就地展开原文）。视觉权重 ≤ inherited 历史，不与 user/text/tool 抢块级节奏。
+- **tool（120% 招牌）**：折叠头 = pip + name + status-badge + summary + chevron。三态：
   - `done` 绿 pip + 绿徽章 + 绿边框
   - `running` 琥珀 pip(涟漪) + spinner + 琥珀徽章 + **2s 脉冲边框**
   - `error` 红 pip + 红徽章 + 红边框
-  - 展开 = 主呈现（后端 `ToolView`，如 edit/write 的 diff——见 `doc/tool-view.md`，前端只渲染不构建）+ debug 折层（原始 args + model-facing result，全过程透明）。
+  - 展开 = 主呈现（后端 `ToolView` 结构化 view，按 `kind` 分发到 Diff/Code/Terminal/Listing/Markdown/Plain 组件——见 `doc/tool-view.md`，前端只渲染不构建）+ debug 折层（原始 args + model-facing result，全过程透明）。
+  - **view 契约**：view 是 UI 的事实通道，可含 result 没有的信息（行号/上下文），但**永不进模型上下文**（`render_output` 只取 `Text`）。view 只存 diff + 上下文（与改动量成正比，不随文件大小膨胀），`write` 新建存完整内容。
 - **流式光标**：2px `--accent` 竖条，`cursor-blink` 1.1s。
 
 ### 4.2 输入区

@@ -1,7 +1,7 @@
 <script lang="ts">
 	import type { Item } from '$lib/conversation';
-	import { resultComponent } from '$lib/tools/registry';
-	import { extractArgsPath } from '$lib/tools/utils';
+	import { resultComponent, viewComponent } from '$lib/tools/registry';
+	import { parseView } from '$lib/tools/view';
 	import ApprovalControls from '$lib/components/ApprovalControls.svelte';
 	import type { ApprovalScope } from '$lib/types/ApprovalScope';
 
@@ -36,8 +36,6 @@
 		override ??
 			(item.approvalPending === true || !(item.name === 'read' && item.status !== 'running'))
 	);
-	const Body = $derived(resultComponent(item.name));
-
 	const awaiting = $derived(item.approvalPending === true);
 
 	function clip(s: string, n: number): string {
@@ -45,44 +43,18 @@
 		return line.length > n ? line.slice(0, n) + '…' : line;
 	}
 
-	/** One-line preview of the call's args for the collapsed header — the most
-	 *  meaningful field (command/path/query/…) from the parsed JSON, else raw. */
-	function toolPreview(args: string): string {
-		if (!args || args === '{}') return '';
-		let parsed: unknown;
-		try {
-			parsed = JSON.parse(args);
-		} catch {
-			return clip(args, 80);
-		}
-		if (parsed && typeof parsed === 'object') {
-			const obj = parsed as Record<string, unknown>;
-			const keys = [
-				'command',
-				'cmd',
-				'script',
-				'path',
-				'file',
-				'file_path',
-				'query',
-				'url',
-				'pattern'
-			];
-			for (const k of keys) {
-				if (typeof obj[k] === 'string' && obj[k]) return clip(obj[k] as string, 80);
-			}
-			// `edit`'s batch args carry no top-level path key — the path is nested
-			// under `edits[0]`. Reuse the shared extractor (which knows that shape)
-			// so the collapsed header shows the target file, not truncated raw JSON.
-			const path = extractArgsPath(args);
-			if (path) return clip(path, 80);
-			const firstStr = Object.values(obj).find((v) => typeof v === 'string' && v);
-			if (typeof firstStr === 'string') return clip(firstStr, 80);
-		}
-		return clip(args, 80);
-	}
+	/** One-line summary of the call's args for the collapsed header — produced
+	 *  by the tool itself (`Tool::summarize`), rendered verbatim. Falls back to
+	 *  truncated raw args when absent (legacy logs, MCP tools). */
+	const summary = $derived(item.summary || clip(item.args, 80));
 
-	const preview = $derived(toolPreview(item.args));
+	/** The structured UI view, parsed from the JSON envelope. `null` when the
+	 *  text isn't a recognized envelope (legacy logs, MCP tools) — the caller
+	 *  falls back to the tool-name registry. */
+	const view = $derived(item.view ? parseView(item.view) : null);
+	const Body = $derived(
+		(view ? viewComponent(view) : null) ?? resultComponent(item.name)
+	);
 </script>
 
 <div
@@ -101,8 +73,8 @@
 			{/if}
 			<span class="tool-name">{item.name}</span>
 			<span class="tool-status-badge">{awaiting ? '等待批准' : item.status}</span>
-			{#if preview}
-				<span class="tool-preview">{preview}</span>
+			{#if summary}
+				<span class="tool-preview">{summary}</span>
 			{/if}
 			<svg
 				class="tool-chevron"

@@ -21,6 +21,7 @@
 		type Item,
 		type PlanStep
 	} from '$lib/conversation';
+	import type { GatewayEvent } from '$lib/types/GatewayEvent';
 	import ToolBlock from '$lib/components/tools/ToolBlock.svelte';
 	import type { ApprovalScope } from '$lib/types/ApprovalScope';
 	import { num, statLabel, formatCost, cacheLabel, topTools } from '$lib/stats';
@@ -53,6 +54,56 @@
 	const SCROLL_BOTTOM_THRESHOLD = 80;
 
 	let convo = $state<ConversationState>(emptyState());
+	/** Raw committed events, kept alongside the folded `items` so inspect mode
+	 *  can render the full timeline (including history that predates the current
+	 *  subscription). Only `type: 'event'` entries are stored — deltas are
+	 *  transient and not replayed.
+	 *
+	 *  NOT reactive: during the replay burst thousands of events arrive in a
+	 *  tight loop, and a `$state` array would invalidate + re-render on every
+	 *  one (and a `[...rawLog, ev]` spread is an O(n²) copy). Inspect mode reads
+	 *  this imperatively; `inspectTick` is bumped once per batch to tell the
+	 *  timeline to re-read. */
+	// `$state.raw`: the array reference is reactive (session switch replaces
+	// it), but push() does NOT trigger invalidation — exactly what the replay
+	// burst needs. The inspect timeline re-reads via `inspectTick`.
+	let rawLog = $state.raw<(GatewayEvent & { type: 'event' })[]>([]);
+	/** Bumped (cheap, batched) when rawLog grows, so the inspect timeline
+	 *  re-reads it without rawLog itself being reactive. */
+	let inspectTick = $state(0);
+	let inspectRaf = 0;
+	function scheduleInspectTick() {
+		if (!browser || !inspectMode) return;
+		cancelAnimationFrame(inspectRaf);
+		inspectRaf = requestAnimationFrame(() => inspectTick++);
+	}
+	/** Inspect mode is the "timeline" tab of the right detail rail: instead of a
+	 *  floating overlay, the rail hosts Info and Inspect as switchable tabs. */
+	let inspectMode = $state(false);
+	/** Tab switching only flips which pane shows; it never opens/closes the
+	 *  rail itself (that's the topbar rail toggle's job). */
+	function setInspect(on: boolean) {
+		inspectMode = on;
+	}
+	/** Inspect timeline order: false = chronological (oldest first), true =
+	 *  newest first (like a log tail). Display-only — rawLog itself stays in
+	 *  commit order. */
+	let inspectReversed = $state(false);
+	/** The events in display order. rawLog is `$state.raw` (push doesn't
+	 *  invalidate), so this derives from inspectTick instead — it's bumped once
+	 *  per batch, which is exactly when the timeline re-reads. The spread +
+	 *  reverse is one O(n) copy per batch, not per event. */
+	const inspectEvents = $derived.by(() => {
+		void inspectTick;
+		const list = [...rawLog];
+		if (inspectReversed) list.reverse();
+		return list;
+	});
+	/** The timeline rows: multi-phase actions (model requests, tool calls)
+	 *  folded into one expandable group row, everything else a single row.
+	 *  Grouping runs over the display-ordered list, so a reversed timeline
+	 *  shows the group's LAST phase as its row position. */
+	const inspectRows = $derived(groupInspectEvents(inspectEvents));
 	let input = $state('');
 	let sending = $state(false);
 	// Messages the user sent while a turn was running: held here (and mirrored to
@@ -170,6 +221,38 @@
 		el.scrollTo({ top, behavior: 'smooth' });
 	}
 
+	/** Inspect → conversation jump: user items key on their Turn::Started seq,
+	 *  tool items on the model's ToolCall block seq, so most events land on the
+	 *  item at-or-just-before their seq. Internal events that precede ANY visible
+	 *  message (Session.Created, early injections/hooks) have no such anchor —
+	 *  they fall forward to the FIRST item after them, i.e. the message whose
+	 *  turn they belong to. Either way every row jumps somewhere; the rail stays
+	 *  on the inspect tab so the user can click several events in a row. */
+	function scrollToSeq(seq: number) {
+		const el = streamEl;
+		if (!el) return;
+		let anchor: number | null = null;
+		for (let i = 0; i < convo.items.length; i++) {
+			const it = convo.items[i];
+			if ((it.kind === 'user' || it.kind === 'tool') && it.seq != null && it.seq <= seq) anchor = i;
+		}
+		if (anchor == null) {
+			// No visible message at/before this event: take the first one after it.
+			for (let i = 0; i < convo.items.length; i++) {
+				const it = convo.items[i];
+				if ((it.kind === 'user' || it.kind === 'tool') && it.seq != null && it.seq > seq) {
+					anchor = i;
+					break;
+				}
+			}
+		}
+		if (anchor == null) return;
+		const node = el.querySelector<HTMLElement>(`[data-item-anchor="${anchor}"]`);
+		if (!node) return;
+		const top = node.getBoundingClientRect().top - el.getBoundingClientRect().top + el.scrollTop;
+		el.scrollTo({ top, behavior: 'smooth' });
+	}
+
 	/** Jump to the previous/next user message relative to the current scroll
 	 *  position. Target geometry is the pure `jumpTarget` (unit-tested); this just
 	 *  applies it to the live element. Downward past the last message continues to
@@ -229,6 +312,8 @@
 	function toggleDetail() {
 		detailOpen = !detailOpen;
 		localStorage.setItem('detailOpen', detailOpen ? '1' : '0');
+		// Closing the rail also leaves inspect mode — its tab lives in the rail.
+		if (!detailOpen) inspectMode = false;
 	}
 
 	onMount(() => {
@@ -451,6 +536,8 @@
 		} else {
 			convo = emptyState();
 			collapsed = {};
+			rawLog = [];
+			inspectTick = 0;
 		}
 		context = null;
 		// Restore this session's persisted pending queue (survives a mid-turn
@@ -477,6 +564,14 @@
 			{
 				onEvent: (ev) => {
 					convo = apply(convo, ev);
+					// Inspect mode: keep the raw committed events for the timeline.
+					// Deltas are transient and not replayed, so only `type: 'event'`
+					// entries are stored. Mutate (no spread) + batched tick: during
+					// replay this is called thousands of times and must stay O(1).
+					if (ev.type === 'event') {
+						rawLog.push(ev);
+						scheduleInspectTick();
+					}
 					if (ev.type === 'compacted') {
 						// Compaction swaps the live session for a fresh one. Navigate to
 						// its route; page.params.id updates → the sync $effect re-subscribes
@@ -883,6 +978,259 @@
 		}
 	}
 
+	/** Inspect timeline: the raw log is the full event history, including the
+	 *  internal events the folded conversation stream never shows (context
+	 *  injections, permission decisions, hooks, request timing/usage). A bare
+	 *  category word like "Model" is useless at that density, so each row shows
+	 *  the variant plus its most identifying field. */
+	function inspectDetail(ev: (typeof rawLog)[number]): { variant: string; detail: string } {
+		const p = ev.payload;
+		if (!p) return { variant: 'unknown', detail: '' };
+		const [kind, body] = Object.entries(p)[0] as [string, unknown];
+		const v = body != null && typeof body === 'object' ? Object.entries(body)[0] : null;
+		if (!v) return { variant: kind, detail: '' };
+		const [variant, d] = v as [string, Record<string, unknown>];
+		const num = (x: unknown) => (typeof x === 'bigint' ? Number(x) : (x as number));
+		switch (`${kind}.${variant}`) {
+			case 'Turn.Started': {
+				const input = (d.input as string) ?? '';
+				return {
+					variant,
+					detail: input ? input.replace(/\s+/g, ' ').slice(0, 60) : '(no user input)'
+				};
+			}
+			case 'Turn.Failed':
+				return { variant, detail: (d.reason as string) ?? '' };
+			case 'Model.RequestStarted':
+				return { variant, detail: `${d.provider}/${d.model}` };
+			case 'Model.ContentBlock': {
+				const c = (d.content ?? {}) as Record<string, Record<string, string>>;
+				const b = Object.entries(c)[0];
+				if (!b) return { variant, detail: '' };
+				const [bkind, bd] = b;
+				if (bkind === 'ToolCall')
+					return {
+						variant: `Block·${bkind}`,
+						detail: `${bd.name}${bd.summary ? ' ' + bd.summary : ''}`.slice(0, 80)
+					};
+				return {
+					variant: `Block·${bkind}`,
+					detail: `${(bd.text ?? '').replace(/\s+/g, ' ').length} chars`
+				};
+			}
+			case 'Model.RequestCompleted': {
+				const u = d.usage as { input_tokens: number; output_tokens: number };
+				return {
+					variant,
+					detail: `${d.stop_reason} · ${num(d.duration_ms)}ms · in ${u.input_tokens} / out ${u.output_tokens}`
+				};
+			}
+			case 'Model.RequestFailed':
+				return { variant, detail: ((d.error as { message?: string })?.message ?? '').slice(0, 80) };
+			case 'Tool.Started':
+				return { variant, detail: d.tool_name as string };
+			case 'Tool.Completed':
+				return { variant, detail: `${num(d.duration_ms)}ms · ${num(d.output_bytes)}B` };
+			case 'Tool.Failed':
+				return { variant, detail: ((d.error as { code?: string })?.code ?? '').slice(0, 80) };
+			case 'Session.Created':
+				return { variant, detail: `${(d.tools as string[]).length} tools` };
+			case 'Session.Forked':
+				return { variant, detail: `at #${d.fork_at_seq}` };
+			case 'Session.Ended':
+				return { variant, detail: d.reason as string };
+			case 'Artifact.Created':
+				return { variant, detail: `${d.kind} · ${d.media_type} · ${num(d.size)}B` };
+			case 'Injection.ContextInjected':
+				return { variant, detail: `${d.token_count} tokens` };
+			case 'Hook.Executed':
+				return {
+					variant,
+					detail: `${d.hook_name} @ ${d.hook_point} → ${d.outcome} · ${num(d.duration_ms)}ms`
+				};
+			case 'Permission.Requested':
+				return { variant, detail: d.tool_name as string };
+			case 'Permission.Decided':
+				return { variant, detail: `${d.outcome} by ${d.decided_by}` };
+			case 'Error.Raised':
+				return {
+					variant,
+					detail: `${(d as unknown as { code: string }).code}: ${((d as unknown as { message: string }).message ?? '').slice(0, 60)}`
+				};
+			default:
+				return { variant: `${kind}.${variant}`, detail: '' };
+		}
+	}
+
+	/** One logical action's timeline rows folded together: a model request
+	 *  (RequestStarted → ContentBlock* → RequestCompleted) or a tool call
+	 *  (ToolCall block → Permission ask/decide → Started → Completed). */
+	type InspectGroup = {
+		key: string;
+		/** Display position + jump target = the group's first event. */
+		seq: number;
+		kind: 'model' | 'tool';
+		label: string;
+		detail: string;
+		events: (typeof rawLog)[number][];
+	};
+	type InspectRow =
+		| { type: 'single'; ev: (typeof rawLog)[number] }
+		| { type: 'group'; group: InspectGroup };
+
+	/** Group the flat event log into rows. Grouping keys come from the events
+	 *  themselves: request_id links a model request's phases; the tool-call
+	 *  event id links a tool's phases and its permission gate (Permission
+	 *  events key on call_id, the ToolCall block carries the same id). Turn
+	 *  events span the whole conversation, so they stay single rows — grouping
+	 *  them would swallow everything between Started and Completed. */
+	function groupInspectEvents(events: (typeof rawLog)[number][]): InspectRow[] {
+		// Pass 1: tool-call event seq → call id (the ToolCall content block is the
+		// only place the model-assigned call id appears; Tool/Permission events
+		// reference the block by its event seq).
+		const callIdByEventSeq = new Map<number, string>();
+		for (const ev of events) {
+			const p = ev.payload as Record<string, unknown> | undefined;
+			const m = p?.Model as Record<string, unknown> | undefined;
+			const cb = m?.ContentBlock as { content?: Record<string, unknown> } | undefined;
+			const tc = cb?.content?.ToolCall as { id?: string } | undefined;
+			if (tc?.id) callIdByEventSeq.set(Number(ev.seq), tc.id);
+		}
+
+		const num = (x: unknown) => (typeof x === 'bigint' ? Number(x) : (x as number));
+		const groups = new Map<string, InspectGroup & { requestId?: string; callId?: string }>();
+		const groupKeyOf = (ev: (typeof rawLog)[number]): string | null => {
+			const p = ev.payload as Record<string, unknown> | undefined;
+			if (!p) return null;
+			if (p.Model) {
+				const [variant, d] = Object.entries(p.Model as object)[0] as [
+					string,
+					Record<string, unknown>
+				];
+				if (variant === 'ContentBlock' && (d.content as Record<string, unknown>)?.ToolCall)
+					return null; // tool groups own ToolCall blocks
+				return `model:${d.request_id}`;
+			}
+			if (p.Tool) {
+				const d = Object.values(p.Tool as object)[0] as Record<string, unknown>;
+				return `tool:${(d.tool_call_event_id as { seq: bigint }).seq}`;
+			}
+			if (p.Permission) {
+				const d = Object.values(p.Permission as object)[0] as Record<string, unknown>;
+				return `perm:${d.call_id}`;
+			}
+			return null;
+		};
+
+		// Pass 2: accumulate events into groups, preserving first-seen order.
+		for (const ev of events) {
+			let key = groupKeyOf(ev);
+			if (key?.startsWith('perm:')) {
+				// Attach to the tool group whose ToolCall block carries this call id.
+				const callId = key.slice(5);
+				key = null;
+				for (const [eventSeq, id] of callIdByEventSeq) {
+					if (id === callId) {
+						key = `tool:${eventSeq}`;
+						break;
+					}
+				}
+				if (!key) key = `perm:${callId}`; // orphan permission (no block seen): own group
+			}
+			if (!key) continue;
+			let g = groups.get(key);
+			if (!g) {
+				g = {
+					key,
+					seq: Number(ev.seq),
+					kind: key.startsWith('model:') ? 'model' : 'tool',
+					label: '',
+					detail: '',
+					events: []
+				};
+				groups.set(key, g);
+			}
+			g.events.push(ev);
+		}
+
+		// Pass 3: summarize each group from its members.
+		for (const g of groups.values()) {
+			if (g.kind === 'model') {
+				let started: Record<string, unknown> | undefined;
+				let completed: Record<string, unknown> | undefined;
+				let failed: Record<string, unknown> | undefined;
+				for (const ev of g.events) {
+					const m = (ev.payload as Record<string, Record<string, unknown>>).Model;
+					if (m.RequestStarted) started = m.RequestStarted as Record<string, unknown>;
+					if (m.RequestCompleted) completed = m.RequestCompleted as Record<string, unknown>;
+					if (m.RequestFailed) failed = m.RequestFailed as Record<string, unknown>;
+				}
+				g.label = 'Request';
+				if (started) g.label = `${started.provider}/${started.model}`;
+				if (completed) {
+					const u = completed.usage as { input_tokens: number; output_tokens: number };
+					g.detail = `${completed.stop_reason} · ${num(completed.duration_ms)}ms · in ${u.input_tokens} / out ${u.output_tokens}`;
+				} else if (failed) {
+					g.detail = `✗ ${num(failed.duration_ms)}ms`;
+				} else {
+					g.detail = 'running…';
+				}
+			} else {
+				let name = '';
+				let completed: Record<string, unknown> | undefined;
+				let failedEv: Record<string, unknown> | undefined;
+				let permOutcome = '';
+				for (const ev of g.events) {
+					const p = ev.payload as Record<string, Record<string, unknown>>;
+					if (p.Tool?.Started)
+						name = (p.Tool.Started as Record<string, unknown>).tool_name as string;
+					if (p.Tool?.Completed) completed = p.Tool.Completed as Record<string, unknown>;
+					if (p.Tool?.Failed) failedEv = p.Tool.Failed as Record<string, unknown>;
+					if (p.Permission?.Decided)
+						permOutcome = (p.Permission.Decided as Record<string, unknown>).outcome as string;
+				}
+				g.label = `Tool ${name || '(unknown)'}`;
+				const parts: string[] = [];
+				if (permOutcome) parts.push(permOutcome);
+				if (completed)
+					parts.push(`${num(completed.duration_ms)}ms · ${num(completed.output_bytes)}B`);
+				else if (failedEv) parts.push(`✗ ${num(failedEv.duration_ms)}ms`);
+				else parts.push('running…');
+				g.detail = parts.join(' · ');
+			}
+		}
+
+		// Pass 4: emit rows in event order; a group appears at its first event.
+		const rows: InspectRow[] = [];
+		const emitted = new Set<string>();
+		for (const ev of events) {
+			let key = groupKeyOf(ev);
+			if (key?.startsWith('perm:')) {
+				const callId = key.slice(5);
+				key = null;
+				for (const [eventSeq, id] of callIdByEventSeq) {
+					if (id === callId) {
+						key = `tool:${eventSeq}`;
+						break;
+					}
+				}
+				if (!key) key = `perm:${callId}`;
+			}
+			if (key && groups.has(key)) {
+				if (!emitted.has(key)) {
+					emitted.add(key);
+					rows.push({ type: 'group', group: groups.get(key)! });
+				}
+			} else {
+				rows.push({ type: 'single', ev });
+			}
+		}
+		return rows;
+	}
+
+	/** Expanded inspect groups, keyed by group key. */
+	let inspectExpanded = $state<Record<string, boolean>>({});
+
 	/** Short workspace label for the INFO panel: last two path segments, full
 	 *  path on hover. */
 	function wsLabel(ws: string): string {
@@ -1099,7 +1447,12 @@
 					{/if}
 					{#each convo.items as item, i (i)}
 						{#if item.kind === 'user'}
-							<div class="item item-user" data-user-anchor={i} in:fly|local={itemEnter}>
+							<div
+								class="item item-user"
+								data-user-anchor={i}
+								data-item-anchor={i}
+								in:fly|local={itemEnter}
+							>
 								{#if item.seq != null && !isDraft && item.seq !== firstUserSeq}
 									<!-- Turn actions: low-frequency per-turn operations, anchored to
 								     the user message that starts the turn. Faint by default
@@ -1144,6 +1497,7 @@
 								<div
 									class="item item-text"
 									class:streaming={item.streaming}
+									data-item-anchor={i}
 									in:fly|local={itemEnter}
 								>
 									{#if browser}
@@ -1159,34 +1513,18 @@
 								<div
 									class="item item-reasoning"
 									class:expanded={!isCollapsed(item, i)}
+									data-item-anchor={i}
 									in:fly|local={itemEnter}
 								>
-									<button
-										class="reasoning-toggle"
-										onclick={() => toggleCollapse(item, i)}
-										aria-expanded={!isCollapsed(item, i)}
-									>
-										<svg
-											class="reasoning-toggle-icon"
-											viewBox="0 0 14 14"
-											fill="none"
-											stroke="currentColor"
-											stroke-width="1.6"
-											stroke-linecap="round"
-											stroke-linejoin="round"
-										>
-											<polyline points="5,3 9,7 5,11" />
-										</svg>
-										<span class="reasoning-label">Thinking</span>
-										{#if isCollapsed(item, i)}
-											<span class="reasoning-preview">{shortPreview(item.text)}</span>
-										{/if}
-										{#if item.streaming}
+									{#if item.streaming}
+										<!-- Streaming: quiet inline label + the live text, so the
+										     user sees what it's thinking as it thinks — no card
+										     chrome, but content visible. -->
+										<div class="reasoning-inline">
+											<span class="reasoning-inline-label">思考中</span>
 											<span class="streaming-dot"></span>
-										{/if}
-									</button>
-									{#if !isCollapsed(item, i)}
-										<div class="reasoning-body">
+										</div>
+										<div class="reasoning-stream">
 											{#if browser}
 												<!-- eslint-disable-next-line svelte/no-at-html-tags -->
 												{@html renderMarkdown(item.text)}
@@ -1194,11 +1532,34 @@
 												{item.text}
 											{/if}
 										</div>
+									{:else}
+										<!-- Done: single-line muted preview, click to expand. -->
+										<button
+											class="reasoning-preview"
+											onclick={() => toggleCollapse(item, i)}
+											aria-expanded={!isCollapsed(item, i)}
+										>
+											{#if isCollapsed(item, i)}
+												{shortPreview(item.text)}
+											{:else}
+												收起思考
+											{/if}
+										</button>
+										{#if !isCollapsed(item, i)}
+											<div class="reasoning-body">
+												{#if browser}
+													<!-- eslint-disable-next-line svelte/no-at-html-tags -->
+													{@html renderMarkdown(item.text)}
+												{:else}
+													{item.text}
+												{/if}
+											</div>
+										{/if}
 									{/if}
 								</div>
 							{/if}
 						{:else if item.kind === 'tool'}
-							<div class="item" in:fly|local={itemEnter}>
+							<div class="item" data-item-anchor={i} in:fly|local={itemEnter}>
 								<ToolBlock {item} onDecide={decideApproval} />
 							</div>
 						{:else if item.kind === 'plan'}
@@ -1208,7 +1569,7 @@
 					     the dock, so skip it here too — only committed history cards render. -->
 							{#if !item.streaming && i !== dockPlan?.index}
 								{@const prog = planProgress(item.steps)}
-								<div class="item" in:fly|local={itemEnter}>
+								<div class="item" data-item-anchor={i} in:fly|local={itemEnter}>
 									<div
 										class="plan-card"
 										class:expanded={!isCollapsed(item, i)}
@@ -1324,6 +1685,7 @@
 					{/if}
 				</div>
 			</div>
+
 			{#if ticks.length > 1}
 				<!-- User-message minimap: a tick per user turn on the scroll rail.
 				     Hover previews the message; click (or Ctrl+↑/↓) jumps to it.
@@ -1528,7 +1890,16 @@
 					></textarea>
 					<div class="input-actions">
 						<span class="input-status">
-							{#if incomplete}<span class="status-warn">Turn incomplete</span>{/if}
+							{#if turnRunning}
+								<!-- Live turn indicator: the only place the running state is
+								     surfaced in the conversation itself (the session-list
+								     icon is per-row; this is the in-context signal). -->
+								<span class="status-running">
+									<span class="status-running-dot"></span>运行中
+								</span>
+							{:else if incomplete}
+								<span class="status-warn">Turn incomplete</span>
+							{/if}
 						</span>
 						<div class="cfg">
 							<button
@@ -1659,142 +2030,246 @@
 
 	{#if !isDraft}
 		<aside class="detail">
-			<!-- INFO: config-layer session context (moved off the global sidebar) -->
-			<section class="detail-section">
-				<div class="detail-label">Info</div>
-				{#if meta?.workspace}
-					<div class="kv">
-						<div class="kv-key">Workspace</div>
-						<div class="kv-val" title={meta.workspace}>{wsLabel(meta.workspace)}</div>
-					</div>
+			<!-- Rail tabs: Info (config + stats) and Inspect (raw event timeline)
+			     share the rail; the topbar clock toggle selects the inspect tab. -->
+			<div class="detail-tabs" role="tablist">
+				<button
+					class="detail-tab"
+					class:on={!inspectMode}
+					role="tab"
+					aria-selected={!inspectMode}
+					onclick={() => setInspect(false)}
+				>
+					Info
+				</button>
+				<button
+					class="detail-tab"
+					class:on={inspectMode}
+					role="tab"
+					aria-selected={inspectMode}
+					onclick={() => setInspect(true)}
+				>
+					Inspect
+				</button>
+				{#if inspectMode}
+					<!-- Timeline order toggle: newest-first reads like a log tail. -->
+					<button
+						class="inspect-order"
+						onclick={() => (inspectReversed = !inspectReversed)}
+						title={inspectReversed ? '最新在前，点击切换为正序' : '正序，点击切换为最新在前'}
+						aria-label="Toggle timeline order"
+						aria-pressed={inspectReversed}
+					>
+						{#if inspectReversed}↓ 最新{:else}↑ 最早{/if}
+					</button>
 				{/if}
-				{#if runtime && runtime.env.length > 0}
-					<div class="kv">
-						<div class="kv-key">Env</div>
-						<div class="kv-val" title={runtime.env.join(' · ')}>{runtime.env.join(' · ')}</div>
-					</div>
-				{/if}
-				{#if runtime}
-					<div class="kv">
-						<div class="kv-key">Model</div>
-						<div class="kv-val" title={`${runtime.provider} · ${runtime.model}`}>
-							{runtime.model}
-						</div>
-					</div>
-				{/if}
-				{#if divergent.length > 0}
-					<div class="kv warn">
-						<div class="kv-key warn-key">⚠ Runtime</div>
-						<div
-							class="kv-val warn-val"
-							title={`runtime used ${divergent.join(', ')}, configured ${runtime?.model}`}
-						>
-							{divergent.join(' · ')} ≠ {runtime?.model}
-						</div>
-					</div>
-				{/if}
-				{#if meta?.profile_id}
-					<div class="kv">
-						<div class="kv-key">Profile</div>
-						<div class="kv-val">{meta.profile_id}</div>
-					</div>
-				{/if}
-			</section>
+			</div>
 
-			<!-- CONTEXT: live per-round window occupancy (context_updated event). Its
+			{#if !inspectMode}
+				<div class="detail-info">
+					<!-- INFO: config-layer session context (moved off the global sidebar) -->
+					<section class="detail-section">
+						<div class="detail-label">Info</div>
+						{#if meta?.workspace}
+							<div class="kv">
+								<div class="kv-key">Workspace</div>
+								<div class="kv-val" title={meta.workspace}>{wsLabel(meta.workspace)}</div>
+							</div>
+						{/if}
+						{#if runtime && runtime.env.length > 0}
+							<div class="kv">
+								<div class="kv-key">Env</div>
+								<div class="kv-val" title={runtime.env.join(' · ')}>{runtime.env.join(' · ')}</div>
+							</div>
+						{/if}
+						{#if runtime}
+							<div class="kv">
+								<div class="kv-key">Model</div>
+								<div class="kv-val" title={`${runtime.provider} · ${runtime.model}`}>
+									{runtime.model}
+								</div>
+							</div>
+						{/if}
+						{#if divergent.length > 0}
+							<div class="kv warn">
+								<div class="kv-key warn-key">⚠ Runtime</div>
+								<div
+									class="kv-val warn-val"
+									title={`runtime used ${divergent.join(', ')}, configured ${runtime?.model}`}
+								>
+									{divergent.join(' · ')} ≠ {runtime?.model}
+								</div>
+							</div>
+						{/if}
+						{#if meta?.profile_id}
+							<div class="kv">
+								<div class="kv-key">Profile</div>
+								<div class="kv-val">{meta.profile_id}</div>
+							</div>
+						{/if}
+					</section>
+
+					<!-- CONTEXT: live per-round window occupancy (context_updated event). Its
 		     own section (driven by live events, not the summary endpoint) so it
 		     shows mid-turn even before the first summary snapshot loads. -->
-			{#if context}
-				{@const pct = context.window
-					? Math.min(100, (context.tokens / context.window) * 100)
-					: null}
-				{@const overThreshold = pct !== null && pct / 100 >= context.threshold}
-				<section class="detail-section">
-					<div class="detail-label">Context</div>
-					<div class="ctx">
-						<div class="ctx-nums">
-							<span class="ctx-val">{context.tokens.toLocaleString()}</span>
-							{#if context.window}
-								<span class="ctx-limit">/ {context.window.toLocaleString()}</span>
-							{/if}
-						</div>
-						{#if pct !== null}
-							<div
-								class="ctx-track"
-								title={`${context.tokens.toLocaleString()} / ${context.window.toLocaleString()} tokens · compaction at ${(context.threshold * 100).toFixed(0)}%`}
-							>
-								<span class="ctx-fill" class:warn={overThreshold} style="width: {pct}%"></span>
-								<!-- compaction-threshold tick, mirroring the TUI gauge marker -->
-								<span class="ctx-tick" style="left: {context.threshold * 100}%"></span>
-							</div>
-							<span class="ctx-pct" class:warn={overThreshold}>{pct.toFixed(0)}%</span>
-						{:else}
-							<span class="ctx-pct unpriced">window unknown</span>
-						{/if}
-					</div>
-				</section>
-			{/if}
-
-			<!-- STATS: folded summary snapshot, refreshed on each settled turn -->
-			{#if summary}
-				{@const s = summary}
-				{@const tools = topTools(s, 6)}
-				<section class="detail-section">
-					<div class="detail-label">Stats</div>
-					<div class="stat-grid">
-						<div class="stat">
-							<span class="stat-value">{s.total_turns}</span>
-							<span class="stat-key">{statLabel.turns(s.total_turns)}</span>
-						</div>
-						<div class="stat">
-							<span class="stat-value">{s.total_model_requests}</span>
-							<span class="stat-key">{statLabel.reqs(s.total_model_requests)}</span>
-						</div>
-						<div class="stat">
-							<span class="stat-value">
-								{s.total_tool_calls}{#if s.total_tool_failures > 0}<span class="stat-fail"
-										>/{s.total_tool_failures}✗</span
-									>{/if}
-							</span>
-							<span class="stat-key">{statLabel.toolCalls(s.total_tool_calls)}</span>
-						</div>
-						<div class="stat">
-							<span class="stat-value cost" class:unpriced={s.cost_usd == null}
-								>{formatCost(s)}</span
-							>
-							<span class="stat-key">{statLabel.cost}</span>
-						</div>
-						<div class="stat">
-							<span class="stat-value">{num(s.total_input_tokens).toLocaleString()}</span>
-							<span class="stat-key">{statLabel.inTok}</span>
-						</div>
-						<div class="stat">
-							<span class="stat-value">{num(s.total_output_tokens).toLocaleString()}</span>
-							<span class="stat-key">{statLabel.outTok}</span>
-						</div>
-						<div class="stat">
-							<span class="stat-value">{cacheLabel(s)}</span>
-							<span class="stat-key">{statLabel.cache}</span>
-						</div>
-					</div>
-				</section>
-
-				{#if tools.length > 0}
-					<section class="detail-section">
-						<div class="detail-label">Tool usage</div>
-						<ul class="bars">
-							{#each tools as t (t.tool)}
-								<li class="bar-row">
-									<span class="bar-label" title={t.tool}>{t.tool}</span>
-									<span class="bar-track"
-										><span class="bar-fill" style="width: {t.pct}%"></span></span
+					{#if context}
+						{@const pct = context.window
+							? Math.min(100, (context.tokens / context.window) * 100)
+							: null}
+						{@const overThreshold = pct !== null && pct / 100 >= context.threshold}
+						<section class="detail-section">
+							<div class="detail-label">Context</div>
+							<div class="ctx">
+								<div class="ctx-nums">
+									<span class="ctx-val">{context.tokens.toLocaleString()}</span>
+									{#if context.window}
+										<span class="ctx-limit">/ {context.window.toLocaleString()}</span>
+									{/if}
+								</div>
+								{#if pct !== null}
+									<div
+										class="ctx-track"
+										title={`${context.tokens.toLocaleString()} / ${context.window.toLocaleString()} tokens · compaction at ${(context.threshold * 100).toFixed(0)}%`}
 									>
-									<span class="bar-count">{t.count}</span>
-								</li>
-							{/each}
-						</ul>
-					</section>
-				{/if}
+										<span class="ctx-fill" class:warn={overThreshold} style="width: {pct}%"></span>
+										<!-- compaction-threshold tick, mirroring the TUI gauge marker -->
+										<span class="ctx-tick" style="left: {context.threshold * 100}%"></span>
+									</div>
+									<span class="ctx-pct" class:warn={overThreshold}>{pct.toFixed(0)}%</span>
+								{:else}
+									<span class="ctx-pct unpriced">window unknown</span>
+								{/if}
+							</div>
+						</section>
+					{/if}
+
+					<!-- STATS: folded summary snapshot, refreshed on each settled turn -->
+					{#if summary}
+						{@const s = summary}
+						{@const tools = topTools(s, 6)}
+						<section class="detail-section">
+							<div class="detail-label">Stats</div>
+							<div class="stat-grid">
+								<div class="stat">
+									<span class="stat-value">{s.total_turns}</span>
+									<span class="stat-key">{statLabel.turns(s.total_turns)}</span>
+								</div>
+								<div class="stat">
+									<span class="stat-value">{s.total_model_requests}</span>
+									<span class="stat-key">{statLabel.reqs(s.total_model_requests)}</span>
+								</div>
+								<div class="stat">
+									<span class="stat-value">
+										{s.total_tool_calls}{#if s.total_tool_failures > 0}<span class="stat-fail"
+												>/{s.total_tool_failures}✗</span
+											>{/if}
+									</span>
+									<span class="stat-key">{statLabel.toolCalls(s.total_tool_calls)}</span>
+								</div>
+								<div class="stat">
+									<span class="stat-value cost" class:unpriced={s.cost_usd == null}
+										>{formatCost(s)}</span
+									>
+									<span class="stat-key">{statLabel.cost}</span>
+								</div>
+								<div class="stat">
+									<span class="stat-value">{num(s.total_input_tokens).toLocaleString()}</span>
+									<span class="stat-key">{statLabel.inTok}</span>
+								</div>
+								<div class="stat">
+									<span class="stat-value">{num(s.total_output_tokens).toLocaleString()}</span>
+									<span class="stat-key">{statLabel.outTok}</span>
+								</div>
+								<div class="stat">
+									<span class="stat-value">{cacheLabel(s)}</span>
+									<span class="stat-key">{statLabel.cache}</span>
+								</div>
+							</div>
+						</section>
+
+						{#if tools.length > 0}
+							<section class="detail-section">
+								<div class="detail-label">Tool usage</div>
+								<ul class="bars">
+									{#each tools as t (t.tool)}
+										<li class="bar-row">
+											<span class="bar-label" title={t.tool}>{t.tool}</span>
+											<span class="bar-track"
+												><span class="bar-fill" style="width: {t.pct}%"></span></span
+											>
+											<span class="bar-count">{t.count}</span>
+										</li>
+									{/each}
+								</ul>
+							</section>
+						{/if}
+					{/if}
+				</div>
+			{:else}
+				<!-- INSPECT: raw event timeline. Read rawLog imperatively; inspectTick
+			     re-triggers the read after each batched burst (rawLog itself is
+			     intentionally NOT reactive — see its declaration). -->
+				{@const _ = inspectTick}
+				<div class="inspect-timeline">
+					{#each inspectRows as row (row.type === 'group' ? row.group.key : row.ev.seq)}
+						{#if row.type === 'single'}
+							{@const info = inspectDetail(row.ev)}
+							<button
+								class="inspect-event"
+								onclick={() => scrollToSeq(Number(row.ev.seq))}
+								title="跳转到对话中的对应位置"
+							>
+								<span class="inspect-seq">#{row.ev.seq}</span>
+								<span class="inspect-type">{info.variant}</span>
+								{#if info.detail}<span class="inspect-detail">{info.detail}</span>{/if}
+								<span class="inspect-time">{new Date(row.ev.timestamp).toLocaleTimeString()}</span>
+							</button>
+						{:else}
+							{@const g = row.group}
+							<!-- Group row: click expands/collapses the phase list; the ⧉
+							     button jumps to the group's conversation position. -->
+							<div class="inspect-group">
+								<button
+									class="inspect-event inspect-group-head"
+									onclick={() =>
+										(inspectExpanded = { ...inspectExpanded, [g.key]: !inspectExpanded[g.key] })}
+									aria-expanded={!!inspectExpanded[g.key]}
+									title="展开/收起各阶段"
+								>
+									<span class="inspect-seq">#{g.seq}</span>
+									<span class="inspect-caret" class:open={!!inspectExpanded[g.key]}>▸</span>
+									<span class="inspect-type">{g.label}</span>
+									{#if g.detail}<span class="inspect-detail">{g.detail}</span>{/if}
+									<span class="inspect-count">{g.events.length}</span>
+								</button>
+								<button
+									class="inspect-jump"
+									onclick={() => scrollToSeq(g.seq)}
+									title="跳转到对话中的对应位置"
+									aria-label="跳转到对话中的对应位置"
+								>
+									⧉
+								</button>
+								{#if inspectExpanded[g.key]}
+									{#each g.events as ev (ev.seq)}
+										{@const info = inspectDetail(ev)}
+										<button
+											class="inspect-event inspect-phase"
+											onclick={() => scrollToSeq(Number(ev.seq))}
+											title="跳转到对话中的对应位置"
+										>
+											<span class="inspect-seq">#{ev.seq}</span>
+											<span class="inspect-type">{info.variant}</span>
+											{#if info.detail}<span class="inspect-detail">{info.detail}</span>{/if}
+											<span class="inspect-time">{new Date(ev.timestamp).toLocaleTimeString()}</span
+											>
+										</button>
+									{/each}
+								{/if}
+							</div>
+						{/if}
+					{/each}
+				</div>
 			{/if}
 		</aside>
 	{/if}
@@ -2701,68 +3176,88 @@
 		}
 	}
 
-	/* ---- REASONING ---- */
-	.reasoning-toggle {
+	/* ---- REASONING (inline, non-card) ---- */
+	/* Streaming: one quiet inline line, no card chrome. */
+	.reasoning-inline {
 		display: flex;
 		align-items: center;
 		gap: var(--space-2);
-		padding: var(--space-2) var(--space-3);
-		border-radius: var(--radius-md);
-		border: 1px solid var(--reasoning-border);
-		background: var(--reasoning-bg);
-		cursor: pointer;
-		transition:
-			border-color var(--dur-fast) var(--ease-out),
-			background var(--dur-fast) var(--ease-out);
-		width: 100%;
-		text-align: left;
-	}
-
-	.reasoning-toggle:hover {
-		border-color: color-mix(in srgb, var(--reasoning-text) 40%, transparent);
-	}
-
-	.reasoning-toggle-icon {
-		width: 14px;
-		height: 14px;
-		flex-shrink: 0;
-		color: var(--reasoning-text);
-		transition: transform var(--dur-std) var(--ease-out);
-	}
-
-	.item-reasoning.expanded .reasoning-toggle-icon {
-		transform: rotate(90deg);
-	}
-
-	.reasoning-label {
-		font-size: 10.5px;
-		font-weight: 510;
-		color: var(--reasoning-text);
-		text-transform: uppercase;
-		letter-spacing: 0.08em;
-		flex-shrink: 0;
-	}
-
-	.reasoning-preview {
-		font-size: 12px;
-		color: var(--text-tertiary);
-		white-space: nowrap;
-		overflow: hidden;
-		text-overflow: ellipsis;
-		flex: 1;
+		padding: var(--space-1) 0;
 		font-family: var(--font-chinese);
 	}
 
-	.reasoning-body {
-		padding: var(--space-3) var(--space-3) var(--space-2);
-		margin-top: 2px;
-		margin-left: var(--space-3);
-		border-left: 2px solid var(--reasoning-border);
+	.reasoning-inline-label {
+		font-size: 12px;
+		color: var(--text-tertiary);
+		font-style: italic;
+	}
+
+	/* Streaming body: the live reasoning text, quiet (muted + smaller) but
+	 *  visible — the user watches it think. Same muted weight as the done
+	 *  state, just not collapsed. */
+	.reasoning-stream {
 		font-size: 12.5px;
 		color: var(--text-tertiary);
 		line-height: 1.7;
 		font-family: var(--font-chinese);
 		text-wrap: pretty;
+		opacity: 0.75;
+		margin-top: 2px;
+	}
+	.reasoning-stream :global(p) {
+		margin-bottom: var(--space-2);
+	}
+	.reasoning-stream :global(p:last-child) {
+		margin-bottom: 0;
+	}
+	.reasoning-stream :global(ol),
+	.reasoning-stream :global(ul) {
+		padding-left: var(--space-5);
+		margin-bottom: var(--space-2);
+	}
+	.reasoning-stream :global(code) {
+		font-family: var(--font-mono);
+		font-size: 11.5px;
+		background: var(--canvas-float);
+		padding: 1px 4px;
+		border-radius: 3px;
+	}
+
+	/* Done: single-line muted preview, click to expand. */
+	.reasoning-preview {
+		display: block;
+		width: 100%;
+		padding: var(--space-1) 0;
+		background: none;
+		border: none;
+		cursor: pointer;
+		text-align: left;
+		font-size: 12px;
+		color: var(--text-tertiary);
+		font-family: var(--font-chinese);
+		font-style: italic;
+		opacity: 0.62;
+		transition: opacity var(--dur-fast) var(--ease-out);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+
+	.reasoning-preview:hover {
+		opacity: 1;
+	}
+
+	.reasoning-body {
+		padding: var(--space-2) 0 var(--space-2) var(--space-3);
+		margin-top: 2px;
+		margin-left: var(--space-3);
+		border-left: 1px solid var(--border-subtle);
+		font-size: 12.5px;
+		color: var(--text-tertiary);
+		line-height: 1.7;
+		font-family: var(--font-chinese);
+		text-wrap: pretty;
+		opacity: 0.62;
 	}
 	.reasoning-body :global(p) {
 		margin-bottom: var(--space-2);
@@ -3190,6 +3685,27 @@
 		color: var(--state-running-text);
 	}
 
+	/* Live turn indicator in the composer status row: amber pulsing dot +
+	 *  label, matching the session-list running state (color+shape+motion). */
+	.status-running {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		color: var(--state-running-text);
+	}
+	.status-running-dot {
+		width: 6px;
+		height: 6px;
+		border-radius: 50%;
+		background: var(--state-running);
+		animation: pulse 1.4s ease-in-out infinite;
+	}
+	@media (prefers-reduced-motion: reduce) {
+		.status-running-dot {
+			animation: none;
+		}
+	}
+
 	.input-btn {
 		display: flex;
 		align-items: center;
@@ -3399,6 +3915,179 @@
 		font-family: var(--font-mono);
 		margin-top: 5px;
 		padding-left: 2px;
+	}
+
+	/* ---- RAIL TABS + INSPECT (raw event timeline) ---- */
+	/* Info and Inspect share the right rail as switchable tabs; the inspect
+	 *  timeline lives inside the rail instead of floating over the viewport. */
+	/* The rail scrolls as a whole (info sections and the inspect timeline
+	 *  alike); the tab bar sticks to the top so the switch is always reachable. */
+	.detail-tabs {
+		display: flex;
+		gap: var(--space-1);
+		border-bottom: 1px solid var(--border-subtle);
+		padding-bottom: var(--space-2);
+		position: sticky;
+		top: calc(-1 * var(--space-5));
+		background: var(--canvas-raised);
+		padding-top: var(--space-1);
+		z-index: 1;
+	}
+
+	.detail-tab {
+		border: none;
+		border-radius: var(--radius-sm);
+		background: transparent;
+		padding: var(--space-1) var(--space-2);
+		font-family: var(--font-mono);
+		font-size: 11px;
+		font-weight: 510;
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--text-tertiary);
+		cursor: pointer;
+	}
+
+	.detail-tab:hover {
+		color: var(--text-primary);
+		background: var(--surface-hover);
+	}
+
+	.detail-tab.on {
+		color: var(--text-secondary);
+		background: var(--canvas-overlay);
+	}
+
+	/* Inspect order toggle: pinned to the tab bar's right edge, shown only
+	 *  while the inspect tab is active. */
+	.inspect-order {
+		margin-left: auto;
+		border: none;
+		border-radius: var(--radius-sm);
+		background: transparent;
+		padding: var(--space-1) var(--space-2);
+		font-family: var(--font-mono);
+		font-size: 10.5px;
+		color: var(--text-tertiary);
+		cursor: pointer;
+		white-space: nowrap;
+	}
+
+	.inspect-order:hover {
+		color: var(--text-primary);
+		background: var(--surface-hover);
+	}
+
+	/* The info tab scrolls its sections together with the rail. */
+	.detail-info {
+		display: contents;
+	}
+
+	.inspect-timeline {
+		padding: 0;
+	}
+
+	.inspect-event {
+		display: flex;
+		align-items: center;
+		gap: var(--space-3);
+		padding: var(--space-2) var(--space-3);
+		border: none;
+		border-radius: var(--radius-sm);
+		font-family: var(--font-mono);
+		font-size: 11px;
+		border-bottom: 1px solid var(--border-subtle);
+		/* Now a <button> (click jumps to the conversation position): reset the
+		   UA button chrome so it still reads as a log row. */
+		width: 100%;
+		background: transparent;
+		color: inherit;
+		text-align: left;
+		cursor: pointer;
+	}
+
+	.inspect-event:hover {
+		background: var(--canvas-raised);
+	}
+
+	.inspect-seq {
+		color: var(--text-tertiary);
+		min-width: 3ch;
+		text-align: right;
+	}
+
+	.inspect-type {
+		color: var(--accent-ink);
+		font-weight: 500;
+		white-space: nowrap;
+	}
+
+	.inspect-detail {
+		color: var(--text-secondary);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		min-width: 0;
+	}
+
+	.inspect-time {
+		color: var(--text-tertiary);
+		margin-left: auto;
+		font-variant-numeric: tabular-nums;
+	}
+
+	/* Group rows: the head expands/collapses phases; the ⧉ jump button sits at
+	 *  the row's right edge (the head's count badge replaces the time there). */
+	.inspect-group {
+		position: relative;
+	}
+
+	.inspect-caret {
+		color: var(--text-tertiary);
+		transition: transform var(--dur-fast) var(--ease-out);
+	}
+
+	.inspect-caret.open {
+		transform: rotate(90deg);
+	}
+
+	.inspect-count {
+		margin-left: auto;
+		color: var(--text-tertiary);
+		font-variant-numeric: tabular-nums;
+		padding-right: 20px; /* room for the absolutely-positioned jump button */
+	}
+
+	.inspect-jump {
+		position: absolute;
+		top: 50%;
+		right: var(--space-2);
+		transform: translateY(-50%);
+		border: none;
+		border-radius: var(--radius-sm);
+		background: transparent;
+		color: var(--text-tertiary);
+		font-size: 11px;
+		cursor: pointer;
+		padding: 2px 4px;
+	}
+
+	.inspect-jump:hover {
+		color: var(--text-primary);
+		background: var(--surface-hover);
+	}
+
+	/* Phase rows sit inside an expanded group: indented, quieter, and without
+	 *  the row separator (the group's own bottom border closes the block). */
+	.inspect-phase {
+		padding-left: var(--space-6);
+		border-bottom: none;
+		color: var(--text-tertiary);
+	}
+
+	.inspect-phase .inspect-type {
+		color: var(--text-secondary);
+		font-weight: 400;
 	}
 
 	@media (prefers-reduced-motion: reduce) {

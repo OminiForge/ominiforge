@@ -600,9 +600,10 @@ function pairResult(
 	if (call?.kind !== 'tool') return state;
 	// Content blocks partition by role (`doc/tool-view.md` §3): `Text` is the
 	// model-facing result; `TextView` (audience "ui") is the backend's UI-only
-	// rendering of that same result — the diff/code view this card shows
-	// verbatim; trailing `Text` on the built-in file tools is the debug-only
-	// LSP diagnostics block (`doc/lsp.md` §5).
+	// structured view (a JSON envelope `{ kind, ... }` — the diff/code/terminal
+	// view this card dispatches on `kind` and renders verbatim); trailing `Text`
+	// on the built-in file tools is the debug-only LSP diagnostics block
+	// (`doc/lsp.md` §5).
 	//
 	// `content[0]` (Text) is the tool's primary result — what `result` means
 	// everywhere else in the UI (ReadResult parses it as the file body). Only

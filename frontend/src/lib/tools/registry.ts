@@ -7,6 +7,7 @@ import EditResult from '$lib/components/tools/EditResult.svelte';
 import WriteResult from '$lib/components/tools/WriteResult.svelte';
 import ShellResult from '$lib/components/tools/ShellResult.svelte';
 import GenericResult from '$lib/components/tools/GenericResult.svelte';
+import type { ToolView } from './view';
 
 /** The union of props any result component may receive. Each component reads the
  *  subset it needs (Svelte ignores extra props), so ToolBlock can pass one shape.
@@ -45,4 +46,22 @@ const REGISTRY: Record<string, Component<ResultProps>> = {
 /** Result component for a tool name, or GenericResult when unmapped. */
 export function resultComponent(name: string): Component<ResultProps> {
 	return REGISTRY[name] ?? (GenericResult as Component<ResultProps>);
+}
+
+/** Component for a structured `ToolView`'s `kind`, or `null` when the kind has
+ *  no dedicated renderer (the caller falls back to the tool-name registry).
+ *  `markdown`/`plain` are in the union for future built-ins; no current
+ *  backend emits them, so they return `null` here. */
+export function viewComponent(view: ToolView): Component<ResultProps> | null {
+	switch (view.kind) {
+		case 'diff':
+			return EditResult as Component<ResultProps>;
+		case 'code':
+		case 'listing':
+			return ReadResult as Component<ResultProps>;
+		case 'terminal':
+			return ShellResult as Component<ResultProps>;
+		default:
+			return null;
+	}
 }

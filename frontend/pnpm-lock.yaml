@@ -23,6 +23,9 @@ importers:
       marked:
         specifier: ^18.0.5
         version: 18.0.5
+      web-tree-sitter:
+        specifier: ^0.26.11
+        version: 0.26.11
     devDependencies:
       '@sveltejs/adapter-static':
         specifier: ^3.0.8
@@ -1264,6 +1267,9 @@ packages:
       jsdom:
         optional: true
 
+  web-tree-sitter@0.26.11:
+    resolution: {integrity: sha512-Q5Dm3YTIXSXuH6FxX6RuzX2Qwpc4DPGiYMU87Wg5Z8OIStiQFiUex4zMDc0vBTw78EphaYJacncJghCHzbZptg==}
+
   why-is-node-running@2.3.0:
     resolution: {integrity: sha512-hUrmaWBdVDcxvYqnyh09zunKzROWjbZTiNy8dBEjkS7ehEDQibXJ7XvlmtbwuTclUiIyN+CyXQD4Vmko8fNm8w==}
     engines: {node: '>=8'}
@@ -2374,6 +2380,8 @@ snapshots:
       - terser
       - tsx
       - yaml
+
+  web-tree-sitter@0.26.11: {}
 
   why-is-node-running@2.3.0:
     dependencies:
