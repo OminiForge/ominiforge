@@ -127,6 +127,7 @@ fn router(state: AppState) -> Router {
         .route("/sessions/{id}/archive", post(archive_session))
         .route("/sessions/{id}/compact", post(compact_session))
         .route("/sessions/{id}/summary", get(session_summary))
+        .route("/sessions/{id}/view", get(session_view))
         .route("/sessions/{id}/snapshot", get(session_snapshot))
         .route("/sessions/{id}/fork-preview", get(fork_preview))
         .route("/sessions/{id}/runtime", get(session_runtime))
@@ -156,6 +157,12 @@ fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .nest("/api", protected)
+        // Compress responses (gzip/br) when the client accepts it: the folded
+        // conversation view is multi-MB JSON, and over a relayed link (SSH
+        // forward / reverse proxy) the transfer — not the fold — dominates
+        // session-open latency. SSE streams pass through unaffected (they are
+        // flushed per frame, not buffered).
+        .layer(tower_http::compression::CompressionLayer::new())
 }
 
 /// Bearer-token auth. A no-op when no key is configured; otherwise rejects any
@@ -866,6 +873,28 @@ async fn session_summary(State(state): State<AppState>, Path(id): Path<String>) 
     }
 }
 
+/// `GET /sessions/{id}/view` — the folded conversation view: the session's
+/// committed log run through the server-side conversation fold
+/// (`super::view`), returned as render-ready items plus the high-water seq.
+/// This is how a client OPENS a session: one request, no replay stream, no
+/// actor spawn — the client renders these items, then subscribes to the live
+/// stream with `Last-Event-ID: last_seq` so anything committed since the fold
+/// is replayed over SSE, not lost. The fold runs on every request (no cache):
+/// it is one O(events) pass over a file the summary endpoint already rereads
+/// per request.
+async fn session_view(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let sid = SessionId(id);
+    let events = state
+        .registry
+        .store()
+        .read_events(&sid)
+        .with_context(|| format!("failed to read session `{}`", sid.0));
+    match events {
+        Ok(events) => Json(super::view::fold_view(&events)).into_response(),
+        Err(e) => not_found(&e),
+    }
+}
+
 /// `GET /sessions/{id}/snapshot` — the inherited context a non-`new` session was
 /// seeded with: the `context_snapshot.json` (`Vec<Message>`) materialized at
 /// fork / compaction / reconfiguration (`doc/architecture.md` §6.1, §7). The
@@ -967,6 +996,7 @@ async fn sse_events(
     // ever arrive (a retired session produces no events).
     if state.registry.store().is_archived(&sid) {
         let stream = tokio_stream::iter(replay_events(&state.registry, &sid, last_seen))
+            .chain(tokio_stream::iter([Ok(sse_from_gateway(&GatewayEvent::ReplayEnd))]))
             .chain(tokio_stream::pending());
         return Sse::new(stream)
             .keep_alive(KeepAlive::default())
@@ -987,7 +1017,14 @@ async fn sse_events(
     let live = live_event_stream(handle.subscribe());
     let replay = replay_events(&state.registry, &sid, last_seen);
 
-    let stream = tokio_stream::iter(replay).chain(live);
+    // Replay, then the ReplayEnd boundary marker, then the live stream: the
+    // marker tells the client "everything folded so far is history; what
+    // follows is live", which is when it presents the conversation.
+    let stream = tokio_stream::iter(replay)
+        .chain(tokio_stream::iter([Ok(sse_from_gateway(
+            &GatewayEvent::ReplayEnd,
+        ))]))
+        .chain(live);
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response()
@@ -2619,6 +2656,115 @@ default = "openai-main/gpt-4o"
             .await
             .unwrap();
         assert_eq!(resp.status(), 404);
+    }
+
+    /// The SSE stream carries a `replay_end` frame between the replayed
+    /// history and the live tail: the web client folds the burst off-screen
+    /// and only presents the conversation when this boundary lands, so history
+    /// never visibly scrolls past. Pinned via the archived (replay-only) path,
+    /// which is the one this test registry can serve without provider config.
+    #[tokio::test]
+    async fn events_stream_marks_replay_boundary() {
+        let (registry, _dir) = test_registry();
+        let sid = {
+            let writer = registry.store().create_new(None, None, vec![]).unwrap();
+            let id = writer.session_id().clone();
+            drop(writer);
+            id
+        };
+        registry.store().archive(&sid).unwrap();
+        let state = AppState {
+            registry,
+            api_key: None,
+            pricing: Arc::new(PricingTable::default()),
+        };
+        let base = serve_test(state).await;
+
+        let mut resp = reqwest::get(format!("{base}/api/sessions/{}/events", sid.0))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        // Collect frames until the boundary marker shows up (the live tail is
+        // open-ended, so stop as soon as the marker arrives).
+        let mut saw_replay_end = false;
+        let mut saw_committed = false;
+        for _ in 0..8 {
+            let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), resp.chunk())
+                .await
+                .expect("frames should arrive promptly")
+                .expect("stream readable")
+                .expect("a frame is present");
+            let text = String::from_utf8_lossy(&chunk);
+            if text.contains("\"type\":\"event\"") {
+                saw_committed = true;
+            }
+            if text.contains("\"type\":\"replay_end\"") {
+                saw_replay_end = true;
+                break;
+            }
+        }
+        assert!(saw_committed, "the replay (Created event) must stream first");
+        assert!(
+            saw_replay_end,
+            "a replay_end boundary frame must follow the replay"
+        );
+    }
+
+    /// The folded view is multi-MB of compressible JSON; over a relayed link
+    /// (SSH forward / reverse proxy) the transfer dominates session-open
+    /// latency, so the gateway must honor `Accept-Encoding: gzip`. The
+    /// compression layer only kicks in above a size threshold, so this seeds
+    /// a session with a large turn input to push the view over it.
+    #[tokio::test]
+    async fn view_endpoint_compresses_when_accepted() {
+        let (registry, _dir) = test_registry();
+        let sid = {
+            let mut writer = registry.store().create_new(None, None, vec![]).unwrap();
+            let id = writer.session_id().clone();
+            // A large committed turn input so the folded view clears the
+            // compression layer's size threshold.
+            let big = "x".repeat(64 * 1024);
+            writer
+                .append(
+                    crate::core::EventSource {
+                        kind: crate::core::SourceKind::Runtime,
+                        id: "test".to_owned(),
+                    },
+                    crate::core::EventPayload::Turn(crate::core::payload::TurnEvent::Started {
+                        turn_id: crate::core::TurnId("t".to_owned()),
+                        input: Some(big),
+                    }),
+                    None,
+                    None,
+                )
+                .unwrap();
+            drop(writer);
+            id
+        };
+        let state = AppState {
+            registry,
+            api_key: None,
+            pricing: Arc::new(PricingTable::default()),
+        };
+        let base = serve_test(state).await;
+
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/api/sessions/{}/view", sid.0))
+            .header("accept-encoding", "gzip")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        // reqwest transparently decompresses, so the marker is the response
+        // header the layer stamps, not the decoded body.
+        assert_eq!(
+            resp.headers()
+                .get("content-encoding")
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+            "the view must be gzip-compressed when the client accepts it"
+        );
     }
 
     /// `GET /status/events` streams the gateway-wide status snapshot: a status

@@ -94,6 +94,13 @@ pub enum GatewayEvent {
         tool_name: String,
         input: serde_json::Value,
     },
+    /// Marks the end of the committed-log replay on a fresh (or resumed)
+    /// subscription: every event after this frame is live. The web client
+    /// folds the replay burst off-screen and only presents the conversation
+    /// once this lands — mirroring how the Zed client `await`s a thread's
+    /// replay before handing it to the UI, so history never visibly scrolls
+    /// past. Carries no payload; a client that doesn't care can ignore it.
+    ReplayEnd,
 }
 
 /// A live streaming delta, mirroring [`StreamSink`] callbacks.

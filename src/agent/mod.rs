@@ -32,7 +32,7 @@ pub use approval::{
     ApprovalScope, NullGate,
 };
 pub use error::AgentError;
-pub use plan::{PlanStep, StepStatus};
+pub use plan::{LeafOp, PlanOp, PlanStep, StepStatus};
 pub use resume::rebuild_runtime;
 pub use sink::{BlockKind, NullSink, StreamSink};
 
@@ -58,7 +58,7 @@ use crate::tool::{ToolError, ToolInput, ToolRegistry};
 
 use futures_util::{FutureExt, StreamExt};
 
-use plan::{PLAN_TOOL_NAME, PlanError, PlanOp, apply_plan_op};
+use plan::{PLAN_TOOL_NAME, PlanError, apply_plan_op};
 
 /// How many completion-gate nudges a turn tolerates before giving up: the model
 /// stopped without finishing the plan this many times running (`doc/plan.md` §6).

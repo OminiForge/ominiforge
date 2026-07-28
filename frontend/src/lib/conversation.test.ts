@@ -1,6 +1,13 @@
 import { describe, it, expect } from 'vitest';
-import { apply, emptyState, type ConversationState } from './conversation';
+import {
+	apply,
+	applyBatch,
+	emptyState,
+	stateFromView,
+	type ConversationState
+} from './conversation';
 import type { GatewayEvent } from '$lib/types/GatewayEvent';
+import type { SessionView } from '$lib/types/SessionView';
 
 function fold(events: GatewayEvent[]): ConversationState {
 	return events.reduce(apply, emptyState());
@@ -1186,5 +1193,192 @@ describe('tool diagnostics split (LSP assist)', () => {
 		const t = state.items.find((i) => i.kind === 'tool');
 		expect(t?.kind === 'tool' && t.result).toBe('hit onehit two');
 		expect(t?.kind === 'tool' && t.diagnostics).toBeUndefined();
+	});
+});
+
+// ── Stable item ids + batch folding ─────────────────────────────────
+//
+// The conversation renders through a keyed each on `Item.id`, and the session
+// page folds the replay burst via `applyBatch`. These pin the two properties
+// the rendering layer relies on: ids are unique/stable across folds, and a
+// batched fold is indistinguishable from an event-at-a-time fold.
+
+describe('item identity + batch fold', () => {
+	it('every folded item carries a unique id; committed items key on their event seq', () => {
+		const events: GatewayEvent[] = [
+			turnStarted(1, 'hello'),
+			reqStarted(2),
+			contentBlock(3, { Reasoning: { text: 'think' } }),
+			contentBlock(4, { Text: { text: 'answer' } }),
+			contentBlock(5, { ToolCall: { id: 'c1', name: 'read', arguments: '{}' } }),
+			toolCompleted(6, 5, 'done'),
+			turnCompleted(7),
+			{ type: 'notice', message: 'note' }
+		];
+		const state = fold(events);
+		const ids = state.items.map((i) => i.id);
+		expect(new Set(ids).size).toBe(ids.length);
+		// Committed items key on the producing event's seq.
+		const user = state.items.find((i) => i.kind === 'user');
+		expect(user?.id).toBe(1);
+		const text = state.items.find((i) => i.kind === 'text');
+		expect(text?.id).toBe(4);
+		// Transient items (notices) draw from the negative namespace, never
+		// colliding with a seq.
+		const notice = state.items.find((i) => i.kind === 'notice');
+		expect(notice !== undefined && notice.id < 0).toBe(true);
+	});
+
+	it('an orphan permission card is re-keyed from the Requested seq to the ToolCall seq', () => {
+		// The synthesized orphan is keyed on the Requested event's seq; the late
+		// ContentBlock completing it must re-key to the real ToolCall seq, or the
+		// card's DOM identity carries a seq that pairs with nothing.
+		const state = fold([
+			permRequested(1, 'c1', 'write'),
+			contentBlock(2, { ToolCall: { id: 'c1', name: 'write', arguments: '{}' } })
+		]);
+		const t = state.items.find((i) => i.kind === 'tool');
+		expect(t?.id).toBe(2);
+		expect(t?.kind === 'tool' && t.seq).toBe(2);
+	});
+
+	it('applyBatch folds identically to event-at-a-time apply', () => {
+		// The replay burst folds through applyBatch; any divergence from the
+		// per-event path would render history differently from live output.
+		const events: GatewayEvent[] = [
+			turnStarted(1, 'hello'),
+			reqStarted(2),
+			{ type: 'delta', delta: 'block_start', index: 0, kind: 'text', tool: null },
+			{ type: 'delta', delta: 'text', index: 0, text: 'ans' },
+			contentBlock(3, { Text: { text: 'ans' } }),
+			contentBlock(4, { ToolCall: { id: 'c1', name: 'read', arguments: '{}' } }),
+			toolCompleted(5, 4, 'done'),
+			turnCompleted(6),
+			turnStarted(7, 'next'),
+			reqStarted(8),
+			planCall(9, { op: 'init', steps: [{ content: 'a' }] }),
+			{ type: 'turn_settled', incomplete: null },
+			{ type: 'notice', message: 'note' }
+		];
+		const batched = applyBatch(emptyState(), events);
+		const incremental = fold(events);
+		expect(batched).toEqual(incremental);
+	});
+});
+
+describe('stateFromView (server-folded history)', () => {
+	it('a running tool card in the view must pair with a Tool::Completed that lands after subscribe', () => {
+		// Mid-turn session open: the ToolCall block committed BEFORE the view
+		// fetch (so the card renders from the view, keyed by its seq ≤ last_seq),
+		// but its result commits after. `pairResult` looks the call up in
+		// `toolSeqs` — if stateFromView doesn't rebuild that entry, the result
+		// is silently dropped and the card stays `running` until the session is
+		// reopened. This is the bug a user actually sees: open a busy session,
+		// one card never finishes.
+		const view: SessionView = {
+			items: [
+				{ kind: 'user', id: 1, seq: 1, text: 'go' },
+				{
+					kind: 'tool',
+					id: 2,
+					seq: 2,
+					callId: 'c1',
+					name: 'read',
+					args: '{}',
+					status: 'running'
+				}
+			],
+			last_seq: 2,
+			turn_running: true,
+			runtime_models: ['m']
+		};
+		const state = apply(stateFromView(view), toolCompleted(3, 2, 'done'));
+		const card = state.items.find((i) => i.kind === 'tool');
+		expect(card?.kind === 'tool' && card.status).toBe('done');
+		expect(card?.kind === 'tool' && card.result).toBe('done');
+	});
+
+	it('a live ContentBlock after the view must append, not truncate the view items', () => {
+		// Mid-turn open: the view already holds committed blocks from the
+		// in-flight request. `requestCommitted` must be true so the first live
+		// ContentBlock appends instead of mis-firing the first-commit truncation
+		// that replaces streaming previews (there are none in a view — the slice
+		// would eat real history).
+		const view: SessionView = {
+			items: [
+				{ kind: 'user', id: 1, seq: 1, text: 'go' },
+				{ kind: 'text', id: 2, text: 'partial answer', streaming: false }
+			],
+			last_seq: 2,
+			turn_running: true,
+			runtime_models: ['m']
+		};
+		const state = apply(
+			stateFromView(view),
+			contentBlock(3, { Text: { text: ' rest of answer' } })
+		);
+		expect(state.items).toHaveLength(3);
+		expect(state.items[0]).toMatchObject({ kind: 'user', text: 'go' });
+		expect(state.items[1]).toMatchObject({ kind: 'text', text: 'partial answer' });
+		expect(state.items[2]).toMatchObject({ kind: 'text', text: ' rest of answer' });
+	});
+
+	it('a new RequestStarted after the view starts fresh bookkeeping past the view', () => {
+		// The next request (after the in-flight one settles) must truncate any
+		// streaming previews created after the view, not the view itself. Its
+		// truncation point is `committedEnd`, which the view seeds to its own
+		// length.
+		const view: SessionView = {
+			items: [{ kind: 'user', id: 1, seq: 1, text: 'go' }],
+			last_seq: 1,
+			turn_running: true,
+			runtime_models: []
+		};
+		let state = stateFromView(view);
+		// A live delta creates a streaming preview after the view.
+		state = apply(state, { type: 'delta', delta: 'text', index: 0, text: 'preview' });
+		expect(state.items).toHaveLength(2);
+		// The next RequestStarted truncates the preview, keeping the view intact.
+		state = apply(state, reqStarted(2));
+		expect(state.requestStart).toBe(1);
+		state = apply(state, contentBlock(3, { Text: { text: 'real answer' } }));
+		expect(state.items).toHaveLength(2);
+		expect(state.items[0]).toMatchObject({ kind: 'user', text: 'go' });
+		expect(state.items[1]).toMatchObject({ kind: 'text', text: 'real answer' });
+	});
+});
+
+// ── Replay boundary (ready gate) ────────────────────────────────────
+//
+// The view renders nothing until the gateway's replay_end frame folds in —
+// the "await replay, then present" sequencing that keeps history from
+// visibly scrolling past. These pin the flag's lifecycle: false from a fresh
+// state, true exactly at the marker, and unaffected by the events before it.
+
+describe('replay boundary (ready)', () => {
+	it('ready is false until the replay_end marker folds in', () => {
+		const state = fold([turnStarted(1, 'hi'), reqStarted(2)]);
+		expect(state.ready).toBe(false);
+	});
+
+	it('replay_end flips ready without disturbing folded content', () => {
+		const state = fold([
+			turnStarted(1, 'hi'),
+			reqStarted(2),
+			contentBlock(3, { Text: { text: 'answer' } }),
+			{ type: 'replay_end' } as GatewayEvent
+		]);
+		expect(state.ready).toBe(true);
+		expect(state.items.filter((i) => i.kind === 'user')).toHaveLength(1);
+		expect(state.items.filter((i) => i.kind === 'text')).toHaveLength(1);
+	});
+
+	it('live events after the marker keep ready set', () => {
+		const state = fold([
+			{ type: 'replay_end' } as GatewayEvent,
+			turnStarted(1, 'hi'),
+			{ type: 'turn_settled', incomplete: null }
+		]);
+		expect(state.ready).toBe(true);
 	});
 });

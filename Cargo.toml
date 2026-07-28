@@ -73,6 +73,11 @@ boxlite = { version = "0.9.7", optional = true }
 # drops the axum stack entirely. See doc/architecture.md §5.1, §18.
 axum = { version = "0.8", optional = true, features = ["ws"] }
 tokio-stream = { version = "0.1", optional = true, features = ["sync"] }
+# Response compression (gzip/br) for the gateway. The folded conversation
+# view (`GET /sessions/{id}/view`) is multi-MB of highly compressible JSON;
+# over a relayed link (SSH forward / reverse proxy) compression is the
+# difference between a 10s and a 1s session open.
+tower-http = { version = "0.6", optional = true, features = ["compression-gzip", "compression-br"] }
 
 # ts-rs (feature `ts-export`): generate the TS type bindings the frontend
 # consumes from the Rust wire types (events, gateway frames, session meta). Dev
@@ -90,7 +95,7 @@ globset = "0.4.19"
 # Gateway on by default (doc/architecture.md §5.1); build without it via
 # `--no-default-features`.
 default = ["gateway"]
-gateway = ["dep:axum", "dep:tokio-stream"]
+gateway = ["dep:axum", "dep:tokio-stream", "dep:tower-http"]
 # BoxLite microVM sandbox backend (doc/sandbox.md §4). OFF by default: libkrun is
 # Linux + Apple-Silicon only and heavy. Enable on a supported host with
 # `--features sandbox-boxlite`.

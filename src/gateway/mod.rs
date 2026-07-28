@@ -27,6 +27,7 @@ mod config;
 mod registry;
 mod server;
 mod status;
+pub mod view;
 mod workspace;
 pub(crate) mod workspace_config;
 

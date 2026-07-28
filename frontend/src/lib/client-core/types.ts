@@ -4,6 +4,7 @@
 
 import type { SessionMeta } from '$lib/types/SessionMeta';
 import type { GatewayEvent } from '$lib/types/GatewayEvent';
+import type { SessionView } from '$lib/types/SessionView';
 import type { SessionSummary } from '$lib/types/SessionSummary';
 import type { Message } from '$lib/types/Message';
 import type { RuntimeInfo } from '$lib/types/RuntimeInfo';
@@ -142,6 +143,12 @@ export interface SessionClient {
 	 *  session, which has no snapshot — callers treat that as "no inherited
 	 *  context", not an error. */
 	getSnapshot(id: string): Promise<Message[]>;
+	/** The folded conversation view (render-ready items + the high-water seq),
+	 *  computed server-side. This is how a session OPENS: one request, no replay
+	 *  stream, no actor spawn — the client renders these items, then subscribes
+	 *  to the live stream with `Last-Event-ID: last_seq` so anything committed
+	 *  since the fold replays over SSE rather than being lost. */
+	getView(id: string): Promise<SessionView>;
 	/** The context a fork at `atSeq` WOULD inherit, computed without creating a
 	 *  session. Backs the draft branch view so a fork shows its inherited history
 	 *  before the first send (no real session, hence no snapshot, exists yet).

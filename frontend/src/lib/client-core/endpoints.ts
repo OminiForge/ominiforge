@@ -21,6 +21,7 @@ export const endpoints = {
 	approve: (id: string) => `${API}/sessions/${encodeURIComponent(id)}/approve`,
 	compact: (id: string) => `${API}/sessions/${encodeURIComponent(id)}/compact`,
 	summary: (id: string) => `${API}/sessions/${encodeURIComponent(id)}/summary`,
+	view: (id: string) => `${API}/sessions/${encodeURIComponent(id)}/view`,
 	snapshot: (id: string) => `${API}/sessions/${encodeURIComponent(id)}/snapshot`,
 	forkPreview: (id: string, atSeq: number) =>
 		`${API}/sessions/${encodeURIComponent(id)}/fork-preview?at_seq=${atSeq}`,

@@ -1,6 +1,7 @@
 import type { GatewayEvent } from '$lib/types/GatewayEvent';
 import type { CoreEvent } from '$lib/types/CoreEvent';
 import type { BlockContent } from '$lib/types/BlockContent';
+import type { SessionView } from '$lib/types/SessionView';
 
 /** The control tool whose calls drive the plan card. Must match
  *  `PLAN_TOOL_NAME` in `src/agent/plan.rs` — plan calls are folded into a
@@ -21,15 +22,28 @@ export interface PlanStep {
 }
 
 export type Item =
-	/** `seq` is the committed `Turn::Started` event seq — the fork point for
-	 *  branching a new session at this turn (`POST /sessions/{id}/fork`). Absent on
-	 *  a draft's optimistic user item (no committed event yet), so fork affordances
-	 *  gate on `seq != null`. */
-	| { kind: 'user'; text: string; seq?: number }
-	| { kind: 'text'; text: string; streaming: boolean }
-	| { kind: 'reasoning'; text: string; streaming: boolean }
+	/** Every item carries a stable `id` used as the keyed-each identity, so a
+	 *  rendering window that prepends history above the viewport doesn't force
+	 *  the whole list to re-render (index keys would shift on every prepend).
+	 *  Committed items key on the producing event's seq (unique per event,
+	 *  stable across replays); transient items (streaming previews, notices,
+	 *  errors — none of which come from a committed event) draw from a negative
+	 *  counter, a namespace that never collides with a seq. */
+	| {
+			kind: 'user';
+			id: number;
+			text: string;
+			/** The committed `Turn::Started` event seq — the fork point for
+			 *  branching a new session at this turn (`POST /sessions/{id}/fork`).
+			 *  Absent on a draft's optimistic user item (no committed event yet),
+			 *  so fork affordances gate on `seq != null`. */
+			seq?: number;
+	  }
+	| { kind: 'text'; id: number; text: string; streaming: boolean }
+	| { kind: 'reasoning'; id: number; text: string; streaming: boolean }
 	| {
 			kind: 'tool';
+			id: number;
 			seq: number;
 			name: string;
 			args: string;
@@ -72,12 +86,23 @@ export type Item =
 	 *  `init`). `streaming` marks a placeholder shown while the call's args are
 	 *  still streaming (partial JSON, not yet foldable); it is replaced by the
 	 *  real card on commit. See foldPlanOp. */
-	| { kind: 'plan'; steps: PlanStep[]; streaming: boolean }
-	| { kind: 'error'; message: string }
-	| { kind: 'notice'; message: string };
+	| { kind: 'plan'; id: number; steps: PlanStep[]; streaming: boolean }
+	| { kind: 'error'; id: number; message: string }
+	| { kind: 'notice'; id: number; message: string };
 
 export interface ConversationState {
 	items: Item[];
+	/** Source of transient (negative) item ids — see `Item.id`. Decremented on
+	 *  each allocation. */
+	nextId: number;
+	/** False while the committed-log replay is still streaming in; the
+	 *  gateway's `replay_end` frame flips it true. The view renders NOTHING
+	 *  until then (mirroring how the Zed client `await`s a thread's replay
+	 *  before handing it to the UI), so history never visibly scrolls past —
+	 *  the first paint already shows the full conversation, positioned at the
+	 *  tail. A live session with no replay history gets the marker immediately
+	 *  after the (empty) replay, so this never latches false. */
+	ready: boolean;
 	lastSeq?: number;
 	lastSettle?: string | null;
 	/** block index → items position, current request streaming. Only used for tool_call tracking;
@@ -133,11 +158,61 @@ export interface ConversationState {
 export function emptyState(): ConversationState {
 	return {
 		items: [],
+		nextId: -1,
+		ready: false,
 		open: {},
 		toolSeqs: new Map(),
 		orphanTools: new Map(),
 		runtimeModels: new Set()
 	};
+}
+
+/** Seed the state from the server-folded view (`GET /sessions/{id}/view`):
+ *  the items render as-is, and the live stream resumes after `last_seq`.
+ *  `ready` starts true — the history is already complete, so there is no
+ *  replay boundary to wait for. The fold's live-only bookkeeping (open
+ *  blocks, tool pairing maps) starts empty: the server view carries no
+ *  in-flight request, and live events rebuild it as they land. */
+export function stateFromView(view: SessionView): ConversationState {
+	// Rebuild the live pairing bookkeeping for blocks that are still open when
+	// the view is taken: a `running` tool card's `Tool::Completed` may commit
+	// after the subscribe, and its seq is ≤ last_seq — it will never re-enter
+	// through the ContentBlock path, so `pairResult` needs the entry up front
+	// or the result is dropped and the card stays running forever.
+	const toolSeqs = new Map<number, number>();
+	view.items.forEach((item, pos) => {
+		if (item.kind === 'tool' && item.status === 'running') toolSeqs.set(item.seq, pos);
+	});
+	// Every item in the view is committed history, so the live fold resumes
+	// with the same bookkeeping a full replay would have at this point:
+	// `requestStart`/`commitBase`/`committedEnd` all point past the view, and
+	// `requestCommitted` is already true (the view contains committed blocks).
+	// Without this, the first live `ContentBlock` would mis-fire the
+	// first-commit truncation and slice away the view's items.
+	const end = view.items.length;
+	return {
+		...emptyState(),
+		items: view.items,
+		lastSeq: view.last_seq ?? undefined,
+		ready: true,
+		turnRunning: view.turn_running,
+		runtimeModels: new Set(view.runtime_models),
+		toolSeqs,
+		requestStart: end,
+		requestCommitted: true,
+		commitBase: end,
+		committedEnd: end
+	};
+}
+
+/** Fold many events in one call. Semantically identical to folding them one
+ *  `apply` at a time (dedup by seq, ordering, streaming/commit pairing all
+ *  unchanged) — this exists so the replay burst is a single state assignment
+ *  downstream rather than one invalidation per event. */
+export function applyBatch(state: ConversationState, events: GatewayEvent[]): ConversationState {
+	let next = state;
+	for (const ev of events) next = apply(next, ev);
+	return next;
 }
 
 export function apply(state: ConversationState, ev: GatewayEvent): ConversationState {
@@ -164,12 +239,19 @@ export function apply(state: ConversationState, ev: GatewayEvent): ConversationS
 				commitBase: undefined
 			};
 		case 'compacted':
-			return push(
+			return pushTransient(
 				{ ...state, turnRunning: false },
 				{ kind: 'notice', message: `compacted → ${ev.new_session_id}` }
 			);
 		case 'notice':
-			return push({ ...state, turnRunning: false }, { kind: 'notice', message: ev.message });
+			return pushTransient(
+				{ ...state, turnRunning: false },
+				{ kind: 'notice', message: ev.message }
+			);
+		case 'replay_end':
+			// The replay burst is done; everything after is live. The view gates
+			// its first render on this.
+			return { ...state, ready: true };
 		// Live-only context occupancy snapshot: handled by the page (STATS panel),
 		// not folded into conversation items.
 		case 'context_updated':
@@ -199,7 +281,12 @@ function applyCommitted(
 		if ('Started' in t) {
 			const started = { ...next, turnRunning: true };
 			return t.Started.input
-				? push(started, { kind: 'user', text: t.Started.input, seq: Number(core.seq) })
+				? push(started, {
+						kind: 'user',
+						id: Number(core.seq),
+						text: t.Started.input,
+						seq: Number(core.seq)
+					})
 				: started;
 		}
 		if ('Resumed' in t) return { ...next, turnRunning: true };
@@ -287,6 +374,7 @@ function applyCommitted(
 			orphanTools.set(r.call_id, next.items.length);
 			const pushed = push(next, {
 				kind: 'tool',
+				id: Number(core.seq),
 				seq: Number(core.seq),
 				callId: r.call_id,
 				name: r.tool_name,
@@ -311,7 +399,7 @@ function applyCommitted(
 		return next;
 	}
 	if ('Error' in payload)
-		return push(next, { kind: 'error', message: payload.Error.Raised.message });
+		return pushTransient(next, { kind: 'error', message: payload.Error.Raised.message });
 	return next;
 }
 
@@ -360,12 +448,12 @@ function commitBlock(
 	if ('Text' in content) {
 		if (!content.Text.text.trim())
 			return { ...state, requestCommitted: true, commitBase, committedEnd: items.length };
-		item = { kind: 'text', text: content.Text.text, streaming: false };
+		item = { kind: 'text', id: seq, text: content.Text.text, streaming: false };
 		items.push(item);
 	} else if ('Reasoning' in content) {
 		if (!content.Reasoning.text.trim())
 			return { ...state, requestCommitted: true, commitBase, committedEnd: items.length };
-		item = { kind: 'reasoning', text: content.Reasoning.text, streaming: false };
+		item = { kind: 'reasoning', id: seq, text: content.Reasoning.text, streaming: false };
 		// Insert reasoning at commitBase so it appears before any text items
 		// that the collector emitted earlier (providers may open text@0 before reasoning@1).
 		const insertAt = commitBase ?? items.length;
@@ -377,7 +465,7 @@ function commitBlock(
 		// later ops mutate it in place (mirrors the backend's single authoritative
 		// plan, but each `init` starts a fresh card so turn history is preserved).
 		if (content.ToolCall.name === PLAN_TOOL_NAME) {
-			items = foldPlanOp(items, content.ToolCall.arguments);
+			items = foldPlanOp(items, seq, content.ToolCall.arguments);
 			return { ...state, items, requestCommitted: true, commitBase, committedEnd: items.length };
 		}
 		const toolSeqs = new Map(state.toolSeqs);
@@ -407,8 +495,11 @@ function commitBlock(
 					toolSeqs.set(seq, pos);
 					// Spread keeps approvalPending: the ask is still outstanding
 					// (or was already cleared by a Decided that landed on the orphan).
+					// Re-key on the real ToolCall seq: the orphan was keyed on the
+					// Requested event's seq, which must not linger as a DOM identity.
 					items[pos] = {
 						...cur,
+						id: seq,
 						seq,
 						name: content.ToolCall.name,
 						args: content.ToolCall.arguments,
@@ -433,6 +524,7 @@ function commitBlock(
 			toolSeqs.set(seq, items.length);
 			items.push({
 				kind: 'tool',
+				id: seq,
 				seq,
 				callId: content.ToolCall.id,
 				name: content.ToolCall.name,
@@ -454,6 +546,7 @@ function commitBlock(
 		toolSeqs.set(seq, items.length);
 		item = {
 			kind: 'tool',
+			id: seq,
 			seq,
 			callId: content.ToolCall.id,
 			name: content.ToolCall.name,
@@ -488,6 +581,17 @@ type LeafOp =
 	| { op: 'block'; id: string; reason?: string }
 	| { op: 'add'; content: string; after_id?: string };
 
+/** Push a transient item, allocating its negative id from the state counter
+ *  (see `Item.id`). Every push site that does not carry a committed event seq
+ *  (notices, errors) goes through here. */
+function pushTransient(
+	state: ConversationState,
+	item: { kind: 'error' | 'notice'; message: string }
+): ConversationState {
+	const pushed = push(state, { ...item, id: state.nextId });
+	return { ...pushed, nextId: state.nextId - 1 };
+}
+
 /// Fold one committed `plan` tool call into the items list.
 ///
 /// Strategy mirrors the backend (`src/agent/plan.rs`): `init` replaces the plan
@@ -500,7 +604,7 @@ type LeafOp =
 /// a mutation with no card to target is ignored (the items list is returned
 /// unchanged), mirroring the backend's benign `is_error` handling — the model
 /// corrects itself next round and we never throw mid-fold.
-function foldPlanOp(items: Item[], args: string): Item[] {
+function foldPlanOp(items: Item[], id: number, args: string): Item[] {
 	let call: PlanCall;
 	try {
 		call = JSON.parse(args) as PlanCall;
@@ -515,7 +619,7 @@ function foldPlanOp(items: Item[], args: string): Item[] {
 			content: s.content,
 			status: 'pending'
 		}));
-		return [...items, { kind: 'plan', steps, streaming: false }];
+		return [...items, { kind: 'plan', id, steps, streaming: false }];
 	}
 
 	if (!('ops' in call) || !Array.isArray(call.ops)) return items;
@@ -531,7 +635,7 @@ function foldPlanOp(items: Item[], args: string): Item[] {
 	}
 	if (steps === card.steps) return items; // unchanged (unknown id / anchor)
 	const next = [...items];
-	next[pos] = { kind: 'plan', steps, streaming: false };
+	next[pos] = { ...card, steps };
 	return next;
 }
 
@@ -750,12 +854,20 @@ function applyDelta(
 				// committed ContentBlock replace the placeholder with the real card.
 				if (ev.tool === PLAN_TOOL_NAME) {
 					open[ev.index] = items.length;
-					items.push({ kind: 'plan', steps: [], streaming: true });
+					items.push({ kind: 'plan', id: state.nextId, steps: [], streaming: true });
 				} else {
 					// Tool calls: immediate creation, index-based tracking
 					open[ev.index] = items.length;
-					items.push({ kind: 'tool', seq: -1, name: ev.tool ?? '', args: '', status: 'running' });
+					items.push({
+						kind: 'tool',
+						id: state.nextId,
+						seq: -1,
+						name: ev.tool ?? '',
+						args: '',
+						status: 'running'
+					});
 				}
+				return { ...state, items, open, nextId: state.nextId - 1 };
 			} else {
 				// Text/reasoning: close the previous streaming item of the same kind
 				// (so new content for the same kind starts a fresh item at the end),
@@ -786,7 +898,8 @@ function applyDelta(
 			//  deferring lets a later reasoning block take an earlier visual position).
 			if (ev.text) {
 				open[ev.index] = items.length;
-				items.push({ kind: 'text', text: ev.text, streaming: true });
+				items.push({ kind: 'text', id: state.nextId, text: ev.text, streaming: true });
+				return { ...state, items, open, nextId: state.nextId - 1 };
 			}
 			return { ...state, items, open };
 		}
@@ -799,7 +912,8 @@ function applyDelta(
 			}
 			if (ev.text) {
 				open[ev.index] = items.length;
-				items.push({ kind: 'reasoning', text: ev.text, streaming: true });
+				items.push({ kind: 'reasoning', id: state.nextId, text: ev.text, streaming: true });
+				return { ...state, items, open, nextId: state.nextId - 1 };
 			}
 			return { ...state, items, open };
 		}
@@ -818,8 +932,15 @@ function applyDelta(
 				return { ...state, items, open };
 			}
 			open[ev.index] = items.length;
-			items.push({ kind: 'tool', seq: -1, name: '', args: ev.json, status: 'running' });
-			return { ...state, items, open };
+			items.push({
+				kind: 'tool',
+				id: state.nextId,
+				seq: -1,
+				name: '',
+				args: ev.json,
+				status: 'running'
+			});
+			return { ...state, items, open, nextId: state.nextId - 1 };
 		}
 		default:
 			return assertNever(ev);

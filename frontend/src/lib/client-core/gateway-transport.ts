@@ -9,6 +9,7 @@
 import type { SessionMeta } from '$lib/types/SessionMeta';
 import type { GatewayEvent } from '$lib/types/GatewayEvent';
 import type { SessionSummary } from '$lib/types/SessionSummary';
+import type { SessionView } from '$lib/types/SessionView';
 import type { Message } from '$lib/types/Message';
 import type { RuntimeInfo } from '$lib/types/RuntimeInfo';
 import type { ProfileSummary } from '$lib/types/ProfileSummary';
@@ -222,6 +223,10 @@ export class GatewayTransport implements SessionClient {
 
 	getSummary(id: string): Promise<SessionSummary> {
 		return this.#json<SessionSummary>(endpoints.summary(id));
+	}
+
+	getView(id: string): Promise<SessionView> {
+		return this.#json<SessionView>(endpoints.view(id));
 	}
 
 	getSnapshot(id: string): Promise<Message[]> {

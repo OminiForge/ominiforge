@@ -15,14 +15,16 @@
 	import type { ProfileSummary } from '$lib/types/ProfileSummary';
 	import type { ModelSummary } from '$lib/types/ModelSummary';
 	import {
-		apply,
+		applyBatch,
 		emptyState,
+		stateFromView,
 		type ConversationState,
 		type Item,
 		type PlanStep
 	} from '$lib/conversation';
 	import type { GatewayEvent } from '$lib/types/GatewayEvent';
 	import ToolBlock from '$lib/components/tools/ToolBlock.svelte';
+	import Skeleton from '$lib/components/Skeleton.svelte';
 	import type { ApprovalScope } from '$lib/types/ApprovalScope';
 	import { num, statLabel, formatCost, cacheLabel, topTools } from '$lib/stats';
 	import { markSeen } from '$lib/status.svelte';
@@ -73,7 +75,7 @@
 	let inspectTick = $state(0);
 	let inspectRaf = 0;
 	function scheduleInspectTick() {
-		if (!browser || !inspectMode) return;
+		if (!browser) return;
 		cancelAnimationFrame(inspectRaf);
 		inspectRaf = requestAnimationFrame(() => inspectTick++);
 	}
@@ -160,6 +162,65 @@
 	let summaryDebounce: ReturnType<typeof setTimeout> | undefined;
 	let sub: EventSubscription | undefined;
 	let streamEl = $state<HTMLElement | null>(null);
+	/** True while the server-folded view is being fetched (session opening). */
+	let loading = $state(false);
+	/** Guards async view-fetch callbacks against firing after a session switch. */
+	let subscribeGen = 0;
+
+	// ── Event intake: coalesce the replay burst into one fold per frame ──
+	//
+	// The gateway replays the full committed log over SSE on subscribe, one
+	// frame per event. Folding each event straight into `convo` meant one state
+	// assignment (and one Svelte invalidation) per event — the "click a session,
+	// wait seconds" path this redesign removes. Instead every event (replay or
+	// live) is pushed into this plain buffer and folded once per animation
+	// frame; live events ride the same path, so no ordering can invert.
+	//
+	// The view renders NOTHING until the gateway's `replay_end` frame folds in
+	// (state.ready) — the same "await replay, then hand to the UI" sequencing
+	// the Zed client uses — so the first paint already shows the full
+	// conversation, positioned at the tail. No incremental mounting, no scroll
+	// anchoring: after `ready`, content only ever grows at the tail.
+	let eventBuffer: GatewayEvent[] = [];
+	let flushRaf = 0;
+	function scheduleFlush() {
+		if (!browser || flushRaf) return;
+		flushRaf = requestAnimationFrame(flushEvents);
+	}
+	function flushEvents() {
+		if (flushRaf) {
+			cancelAnimationFrame(flushRaf);
+			flushRaf = 0;
+		}
+		if (eventBuffer.length === 0) return;
+		const batch = eventBuffer;
+		eventBuffer = [];
+		convo = applyBatch(convo, batch);
+		if (shouldAutoScroll) scrollTailSoon();
+	}
+	function scrollTailSoon() {
+		requestAnimationFrame(() => {
+			streamEl?.scrollTo({ top: streamEl.scrollHeight, behavior: 'smooth' });
+		});
+	}
+
+	/** Items that folded from the replay burst render without the rise
+	 *  animation (they are history, appearing with the first paint); only
+	 *  genuinely live items animate in. Set when the replay boundary folds in. */
+	let replayedCount = $state(0);
+
+	/** The replay boundary (`replay_end`) has folded in: reveal the
+	 *  conversation and land at the tail instantly (no smooth animation —
+	 *  opening a session should BE at the bottom, never scroll there). */
+	function presentReplayedHistory() {
+		replayedCount = convo.items.length;
+		tick().then(() => {
+			if (!streamEl) return;
+			streamEl.scrollTop = streamEl.scrollHeight;
+			lastScrollTop = streamEl.scrollTop;
+			shouldAutoScroll = true;
+		});
+	}
 	// Whether the user is scrolled to (or near) the bottom – controls auto-scroll.
 	let shouldAutoScroll = $state(true);
 	// User-message minimap: one tick per user turn on the scroll rail, for
@@ -288,11 +349,14 @@
 	// user can collapse it to give the conversation the full width.
 	let detailOpen = $state(true);
 	let copied = $state(false);
-	/** Enter animation for stream items (DESIGN.md §3.2). History is now folded
-	 *  in one batch before the first paint (see subscribe), so every item that
-	 *  animates in is a genuinely new one — a live turn's output or a freshly
-	 *  sent bubble. */
+	/** Enter animation for stream items (DESIGN.md §3.2). Only LIVE items
+	 *  animate: history arrives via the initial batch + upward mounting, both
+	 *  of which render with the `history` transition (no motion) — see the
+	 *  template's transition choice per item. */
 	const itemEnter = rise(8, 200);
+	/** No-op transition for history items (replay + upward-mounted batches):
+	 *  they must appear in place, never fly in one batch after another. */
+	const itemEnterHistory = rise(0, 0);
 
 	function toggleDetail() {
 		detailOpen = !detailOpen;
@@ -327,13 +391,24 @@
 		// messages, streaming growth, window resize, font load). One observer for
 		// the lifetime of the component.
 		const ro = new ResizeObserver(() => scheduleMeasure());
-		if (streamEl) ro.observe(streamEl);
+		if (streamEl) {
+			ro.observe(streamEl);
+			// The observer only fires on RESIZE — the very first content mount
+			// precedes any resize, so kick one measurement explicitly.
+			scheduleMeasure();
+		}
 		window.addEventListener('keydown', onWindowKeydown);
 		return () => {
 			ro.disconnect();
 			cancelAnimationFrame(measureRaf);
 			window.removeEventListener('keydown', onWindowKeydown);
 		};
+	});
+
+	// The replay boundary folded in: reveal the (fully rendered) conversation
+	// and land at the tail. Runs once per subscription.
+	$effect(() => {
+		if (convo.ready && replayedCount === 0 && !isDraft) presentReplayedHistory();
 	});
 
 	// Re-measure when the item list changes (covers content that grows without a
@@ -509,80 +584,106 @@
 		summaryDebounce = setTimeout(() => void refreshSummary(id), 500);
 	}
 
+	/** Open a session: fetch the server-folded view (one request, no replay
+	 *  stream, no actor spawn), render it, then attach the live stream
+	 *  resuming after the view's high-water seq. Falls back to the bare
+	 *  subscription (full replay) if the view endpoint fails, so a session
+	 *  always opens. */
 	function subscribe(id: string) {
 		sub?.close();
-		// There is no session cache — switching away drops the in-memory
-		// conversation, so every mount/switch rebuilds from the durable log.
+		if (flushRaf) {
+			cancelAnimationFrame(flushRaf);
+			flushRaf = 0;
+		}
+		eventBuffer = [];
+		replayedCount = 0;
 		convo = emptyState();
 		collapsed = {};
 		rawLog = [];
 		inspectTick = 0;
 		context = null;
-		// Restore this session's persisted pending queue (survives a mid-turn
-		// refresh). Keyed by id, so switching sessions swaps the right queue in.
 		queued = loadQueue(id);
-		// A new subscription means fresh content – start auto-scrolling.
 		shouldAutoScroll = true;
+		loading = true;
 
-		// Open the SSE stream with no Last-Event-ID: the gateway replays the full
-		// committed log over it, then attaches the live stream. This single stream
-		// is the only event source — subscribing immediately (rather than fetching
-		// history first) is what keeps a just-sent turn's live deltas from falling
-		// in the gap, since deltas are never persisted or replayed. An archived
-		// session is served replay-only by the gateway (it has no actor to attach),
-		// which is exactly the read-only history it needs.
-		sub = client.subscribeEvents(id, {
-			onEvent: (ev) => {
-				convo = apply(convo, ev);
-				// Inspect mode: keep the raw committed events for the timeline.
-				// Deltas are transient and not replayed, so only `type: 'event'`
-				// entries are stored. Mutate (no spread) + batched tick: this is
-				// called once per committed event and must stay O(1).
-				if (ev.type === 'event') {
-					rawLog.push(ev);
-					scheduleInspectTick();
-				}
-				if (ev.type === 'compacted') {
-					// Compaction swaps the live session for a fresh one. Navigate to
-					// its route; page.params.id updates → the sync $effect re-subscribes
-					// and reloads meta for the new id (and the sidebar highlights it).
-					void goto(`/workspaces/${workspaceId}/sessions/${ev.new_session_id}`);
-				}
-				// A settled turn means the fold's aggregates changed — refresh the
-				// STATS snapshot so turns/cost/tokens track the live conversation.
-				if (ev.type === 'turn_settled') {
-					void refreshSummary(id);
-					// The turn is done: release the next queued message (if any). One
-					// per settle keeps the gateway's own defer-queue empty, so every
-					// still-pending message stays here — visible and cancellable.
-					void flushQueue(id);
-				}
-				// Live context occupancy (per round): drive the STATS context bar.
-				if (ev.type === 'context_updated') {
-					context = { tokens: ev.tokens, window: ev.window, threshold: ev.threshold };
-				}
-				// Per-request STATS refresh (Q2): a committed RequestCompleted means a
-				// model round's usage landed, so the aggregates moved mid-turn.
-				// Debounced; history already folded above is excluded by the seq dedup.
-				if (ev.type === 'event') {
-					const p = ev.payload;
-					if ('Model' in p && 'RequestCompleted' in p.Model) {
-						scheduleSummaryRefresh(id);
+		const myGen = ++subscribeGen;
+		void (async () => {
+			try {
+				const view = await client.getView(id);
+				if (myGen !== subscribeGen) return; // switched away mid-fetch
+				convo = stateFromView(view);
+				replayedCount = convo.items.length;
+				loading = false;
+				// Land at the tail once the view is painted.
+				await tick();
+				if (myGen !== subscribeGen || !streamEl) return;
+				streamEl.scrollTop = streamEl.scrollHeight;
+				lastScrollTop = streamEl.scrollTop;
+				// Attach the live stream after the view's high-water seq: events
+				// committed between the view read and this subscribe replay over
+				// SSE (Last-Event-ID), so nothing is lost in the gap.
+				attachLive(id, view.last_seq ?? undefined);
+			} catch {
+				if (myGen !== subscribeGen) return;
+				// The view endpoint failed: fall back to the full replay stream so
+				// the session still opens (the old path, slower but always works).
+				loading = false;
+				attachLive(id, undefined);
+			}
+		})();
+	}
+
+	/** Attach the live SSE stream, resuming after `lastSeq` (undefined = a
+	 *  fresh subscribe: the gateway replays the full committed log first). */
+	function attachLive(id: string, lastSeq: number | undefined) {
+		sub = client.subscribeEvents(
+			id,
+			{
+				onEvent: (ev) => {
+					eventBuffer.push(ev);
+					scheduleFlush();
+					if (ev.type === 'event') {
+						rawLog.push(ev);
+						scheduleInspectTick();
 					}
-				}
-				if (shouldAutoScroll) {
-					// Live event: smooth scroll only when the user is already at
-					// (or near) the bottom. This prevents yanking them back to
-					// the latest message while they're reading history.
-					requestAnimationFrame(() => {
-						streamEl?.scrollTo({ top: streamEl.scrollHeight, behavior: 'smooth' });
-					});
+					if (ev.type === 'compacted') {
+						// Compaction swaps the live session for a fresh one. Navigate to
+						// its route; page.params.id updates → the sync $effect re-subscribes
+						// and reloads meta for the new id (and the sidebar highlights it).
+						void goto(`/workspaces/${workspaceId}/sessions/${ev.new_session_id}`);
+					}
+					// A settled turn means the fold's aggregates changed — refresh the
+					// STATS snapshot so turns/cost/tokens track the live conversation.
+					if (ev.type === 'turn_settled') {
+						void refreshSummary(id);
+						// The turn is done: release the next queued message (if any). One
+						// per settle keeps the gateway's own defer-queue empty, so every
+						// still-pending message stays here — visible and cancellable.
+						void flushQueue(id);
+					}
+					// Live context occupancy (per round): drive the STATS context bar.
+					if (ev.type === 'context_updated') {
+						context = { tokens: ev.tokens, window: ev.window, threshold: ev.threshold };
+					}
+					// Per-request STATS refresh (Q2): a committed RequestCompleted means a
+					// model round's usage landed, so the aggregates moved mid-turn.
+					// Debounced; history already folded above is excluded by the seq dedup.
+					if (ev.type === 'event') {
+						const p = ev.payload;
+						if ('Model' in p && 'RequestCompleted' in p.Model) {
+							scheduleSummaryRefresh(id);
+						}
+					}
+					// Follow-scroll lives in flushEvents: the DOM only changes after the
+					// batched fold commits, so scrolling per raw event would chase frames
+					// that do not exist yet.
+				},
+				onError: (e) => {
+					error = e instanceof Error ? e.message : String(e);
 				}
 			},
-			onError: (e) => {
-				error = e instanceof Error ? e.message : String(e);
-			}
-		});
+			lastSeq
+		);
 	}
 
 	$effect(() => {
@@ -591,6 +692,7 @@
 		// real session doesn't exist yet — it's created on the first send().
 		if (id === DRAFT_ID) {
 			sub?.close();
+			replayedCount = 0;
 			convo = emptyState();
 			collapsed = {};
 			meta = null;
@@ -656,6 +758,7 @@
 
 	onDestroy(() => {
 		sub?.close();
+		if (flushRaf) cancelAnimationFrame(flushRaf);
 		clearTimeout(summaryDebounce);
 	});
 
@@ -1367,7 +1470,23 @@
 		<!-- CONVERSATION SCROLL -->
 		<div class="conv-viewport">
 			<div class="conv-scroll" bind:this={streamEl} onscroll={onStreamScroll}>
-				<div class="conv-inner">
+				<!-- Loading skeleton, OUTSIDE the pre-ready container (which is
+				     visibility:hidden while loading, so anything inside it is
+				     invisible too). Shows while the view loads; the conversation
+				     below it appears already positioned at the tail. -->
+				{#if (loading || !convo.ready) && !isDraft}
+					<div class="loading-skeleton" role="status" aria-label="加载历史">
+						<div class="sk-row sk-user"><Skeleton width="42%" height="38px" radius="var(--radius-lg)" /></div>
+						<div class="sk-row"><Skeleton width="88%" height="14px" /></div>
+						<div class="sk-row"><Skeleton width="76%" height="14px" /></div>
+						<div class="sk-row"><Skeleton width="94%" height="52px" radius="var(--radius-md)" /></div>
+						<div class="sk-row"><Skeleton width="64%" height="14px" /></div>
+						<div class="sk-row sk-user"><Skeleton width="36%" height="38px" radius="var(--radius-lg)" /></div>
+						<div class="sk-row"><Skeleton width="82%" height="14px" /></div>
+						<div class="sk-row"><Skeleton width="70%" height="14px" /></div>
+					</div>
+				{/if}
+				<div class="conv-inner" class:pre-ready={(loading || !convo.ready) && !isDraft}>
 					<!-- Inherited context: the parent conversation this branched session was
 				     seeded with (fork/compaction/reconfiguration), rendered dimmed above the
 				     live turns so the branch shows what came before. See DESIGN.md §4.8. -->
@@ -1406,13 +1525,14 @@
 							<div class="inherited-sep"><span>分支自此处 · inherited context above</span></div>
 						</div>
 					{/if}
-					{#each convo.items as item, i (i)}
+					{#each convo.items as item, i (item.id)}
+						{@const enterAnim = i < replayedCount ? itemEnterHistory : itemEnter}
 						{#if item.kind === 'user'}
 							<div
 								class="item item-user"
 								data-user-anchor={i}
 								data-item-anchor={i}
-								in:fly|local={itemEnter}
+								in:fly|local={enterAnim}
 							>
 								{#if item.seq != null && !isDraft && item.seq !== firstUserSeq}
 									<!-- Turn actions: low-frequency per-turn operations, anchored to
@@ -1466,7 +1586,7 @@
 									class="item item-text"
 									class:streaming={item.streaming}
 									data-item-anchor={i}
-									in:fly|local={itemEnter}
+									in:fly|local={enterAnim}
 								>
 									{#if browser}
 										<!-- eslint-disable-next-line svelte/no-at-html-tags -->
@@ -1482,7 +1602,7 @@
 									class="item item-reasoning"
 									class:expanded={!isCollapsed(item, i)}
 									data-item-anchor={i}
-									in:fly|local={itemEnter}
+									in:fly|local={enterAnim}
 								>
 									{#if item.streaming}
 										<!-- Streaming: quiet inline label + the live text, so the
@@ -1527,7 +1647,7 @@
 								</div>
 							{/if}
 						{:else if item.kind === 'tool'}
-							<div class="item" data-item-anchor={i} in:fly|local={itemEnter}>
+							<div class="item" data-item-anchor={i} in:fly|local={enterAnim}>
 								<ToolBlock {item} onDecide={decideApproval} />
 							</div>
 						{:else if item.kind === 'plan'}
@@ -1537,7 +1657,7 @@
 					     the dock, so skip it here too — only committed history cards render. -->
 							{#if !item.streaming && i !== dockPlan?.index}
 								{@const prog = planProgress(item.steps)}
-								<div class="item" data-item-anchor={i} in:fly|local={itemEnter}>
+								<div class="item" data-item-anchor={i} in:fly|local={enterAnim}>
 									<div
 										class="plan-card"
 										class:expanded={!isCollapsed(item, i)}
@@ -1642,13 +1762,13 @@
 								</div>
 							{/if}
 						{:else if item.kind === 'error'}
-							<div class="item item-error" in:fly|local={itemEnter}>{item.message}</div>
+							<div class="item item-error" in:fly|local={enterAnim}>{item.message}</div>
 						{:else if item.kind === 'notice'}
-							<div class="item item-notice" in:fly|local={itemEnter}>{item.message}</div>
+							<div class="item item-notice" in:fly|local={enterAnim}>{item.message}</div>
 						{/if}
 					{/each}
 
-					{#if convo.items.length === 0}
+					{#if convo.items.length === 0 && !loading && convo.ready}
 						<p class="empty">{isDraft ? '输入消息，开始一段新对话' : '发送消息开始对话'}</p>
 					{/if}
 				</div>
@@ -2672,6 +2792,13 @@
 		margin: 0 auto;
 	}
 
+	/* Pre-ready (replay still folding): keep the conversation rendered but
+	 *  invisible — it must exist in the layout so the reveal lands at the
+	 *  correct tail position in a single frame. */
+	.conv-inner.pre-ready {
+		visibility: hidden;
+	}
+
 	/* ---- USER-MESSAGE MINIMAP (jump-to-message rail) ---- */
 	.minimap {
 		position: absolute;
@@ -2856,6 +2983,26 @@
 		margin-top: 25vh;
 		font-size: 13px;
 		font-family: var(--font-chinese);
+	}
+
+	/* Loading skeleton: conversation-shaped shimmer while the view loads.
+	 *  Rows mirror the real layout (right-aligned user bubbles, full-width
+	 *  text, tool cards) so the reveal feels like the content arriving, not a
+	 *  spinner being replaced. Same centered measure as .conv-inner. */
+	.loading-skeleton {
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-4);
+		margin-top: var(--space-6);
+		max-width: 740px;
+		margin-left: auto;
+		margin-right: auto;
+	}
+	.sk-row {
+		display: flex;
+	}
+	.sk-user {
+		justify-content: flex-end;
 	}
 
 	/* ---- USER ---- */
