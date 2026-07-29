@@ -93,6 +93,27 @@ export type Item =
 	 *  still streaming (partial JSON, not yet foldable); it is replaced by the
 	 *  real card on commit. See foldTodoOp. */
 	| { kind: 'todo'; id: number; steps: TodoStep[]; streaming: boolean }
+	/** A one-line activity row in the conversation flow: lighter than a tool
+	 *  card, visible unlike the inspect panel. Carries the operations that
+	 *  otherwise leave no trace on the timeline — todo ops (the card/dock
+	 *  already shows list state; this records what changed, and scrolls away
+	 *  with history), hook executions, and runtime reminders (completion gate
+	 *  / stuck-step nudges the loop injects mid-turn — not user input, so the
+	 *  user must see why the agent "kept going"). `icon` is a render hint;
+	 *  `label` is the one-line human-readable summary. */
+	| {
+			kind: 'activity';
+			id: number;
+			icon: 'hook' | 'todo' | 'runtime';
+			label: string;
+			detail?: string;
+			/** True while the op this row traces is still streaming/executing.
+			 *  A transient row in a live request (negative id) can never be
+			 *  replaced by its committed self — commitBlock truncates the whole
+			 *  request window — so the row is PUSHED at delta time and flipped
+			 *  in place when the committed event lands. */
+			streaming?: boolean;
+	  }
 	| { kind: 'error'; id: number; message: string }
 	| { kind: 'notice'; id: number; message: string };
 
@@ -360,6 +381,33 @@ function applyCommitted(
 	}
 	if ('Tool' in payload) {
 		const tool = payload.Tool;
+		// Todo is a control tool: its Started/Completed pair has no card to
+		// pair (calls fold into todo cards instead). An `ops` call surfaces as
+		// a one-line activity row so the op itself is visible on the timeline
+		// — the card/dock shows list state but not what the agent just did.
+		// If the transient row was pushed at delta time, flip THAT row in
+		// place: it lives inside the request window commitBlock truncates, so
+		// an append here would leave the transient row behind forever. The
+		// row's own trace is transient-only (the definitive trace is the
+		// committed todo card), so flipping it to settled-not-reidentifiable
+		// — not giving it this Started's seq — keeps the next todo call's
+		// transient row from being mistaken for it.
+		if ('Started' in tool && tool.Started.tool_name === TODO_TOOL_NAME) {
+			const label = todoOpLabel(tool.Started.input);
+			if (!label) return next;
+			const at = transientActivityIndex(next.items, 'todo');
+			if (at >= 0) {
+				const items = [...next.items];
+				items[at] = { ...items[at], streaming: false } as Item;
+				return { ...next, items, committedEnd: items.length };
+			}
+			return push(next, {
+				kind: 'activity',
+				id: Number(core.seq),
+				icon: 'todo',
+				label
+			});
+		}
 		if ('Completed' in tool)
 			return pairResult(
 				next,
@@ -374,6 +422,62 @@ function applyCommitted(
 				{ content: [{ Text: tool.Failed.error.message }], is_error: true, error_code: null },
 				true
 			);
+		return next;
+	}
+	if ('Hook' in payload) {
+		// Every hook execution lands as a one-line activity row: hooks act on
+		// the pipeline invisibly otherwise (the inspect panel is opt-in), and
+		// a block or modify the user can't see reads as the agent misbehaving.
+		const h = payload.Hook;
+		if ('Executed' in h) {
+			const e = h.Executed;
+			const detail =
+				typeof e.outcome === 'object' && 'Blocked' in e.outcome
+					? e.outcome.Blocked.reason
+					: typeof e.outcome === 'object' && 'Failed' in e.outcome
+						? e.outcome.Failed.error
+						: undefined;
+			const outcome = typeof e.outcome === 'string' ? e.outcome : Object.keys(e.outcome)[0];
+			// Flip the transient row in place when it exists (same reasoning as
+			// the todo-op row above: appended rows survive commit truncation).
+			const at = transientActivityIndex(next.items, 'hook');
+			if (at >= 0) {
+				const items = [...next.items];
+				items[at] = { ...items[at], id: Number(core.seq), streaming: false } as Item;
+				return { ...next, items, committedEnd: items.length };
+			}
+			return push(next, {
+				kind: 'activity',
+				id: Number(core.seq),
+				icon: 'hook',
+				label: `${e.hook_name} @ ${e.hook_point} → ${outcome}`,
+				detail
+			});
+		}
+		return next;
+	}
+	if ('Injection' in payload) {
+		const inj = payload.Injection;
+		// Only Runtime injections surface in the flow: they are the loop nudging
+		// itself mid-turn (completion gate / stuck-step reminders), invisible
+		// otherwise. Memory/RAG/Hook/ProjectGuidance injections happen at
+		// assembly time and are inspect content, not conversation activity.
+		if ('ContextInjected' in inj && inj.ContextInjected.source === 'Runtime') {
+			const content = inj.ContextInjected.content;
+			const at = transientActivityIndex(next.items, 'runtime');
+			if (at >= 0) {
+				const items = [...next.items];
+				items[at] = { ...items[at], id: Number(core.seq), streaming: false } as Item;
+				return { ...next, items, committedEnd: items.length };
+			}
+			return push(next, {
+				kind: 'activity',
+				id: Number(core.seq),
+				icon: 'runtime',
+				label: runtimeInjectionLabel(content),
+				detail: content
+			});
+		}
 		return next;
 	}
 	if ('Permission' in payload) {
@@ -548,14 +652,30 @@ function commitBlock(
 		// later ops mutate it in place (mirrors the backend's single authoritative
 		// todo, but each `init` starts a fresh card so turn history is preserved).
 		if (content.ToolCall.name === TODO_TOOL_NAME) {
+			// A truncation above sliced away this call's transient activity row
+			// (it sat at/after requestStart with no committed seq). Re-push it
+			// as the settled trace row — the definitive trace is the committed
+			// todo card, so the row carries no id link and the paired
+			// Tool::Started leaves it alone (it only flips streaming rows).
+			const lostRow = truncated && state.items.some((i) => i.kind === 'activity' && i.streaming);
 			items = foldTodoOp(items, seq, content.ToolCall.arguments);
+			if (lostRow) {
+				items.push({
+					kind: 'activity',
+					id: state.nextId,
+					icon: 'todo',
+					label: 'Updated todo list',
+					streaming: false
+				});
+			}
 			return {
 				...state,
 				items,
 				open,
 				requestCommitted: true,
 				commitBase,
-				committedEnd: items.length
+				committedEnd: items.length,
+				nextId: lostRow ? state.nextId - 1 : state.nextId
 			};
 		}
 		const toolSeqs = new Map(state.toolSeqs);
@@ -729,6 +849,63 @@ function pushTransient(
 	return { ...pushed, nextId: state.nextId - 1 };
 }
 
+/// Find the newest transient activity row of the given icon (a row pushed at
+/// delta time for a live op). Returns its items index, or -1.
+function transientActivityIndex(items: Item[], icon: 'hook' | 'todo' | 'runtime'): number {
+	for (let i = items.length - 1; i >= 0; i--) {
+		const it = items[i];
+		if (it.kind === 'activity' && it.icon === icon && it.streaming) return i;
+	}
+	return -1;
+}
+
+/// One-line label for a runtime-injected reminder (completion gate /
+/// stuck-step). The content is a `<reminder>…</reminder>` block (`doc/todo.md`
+/// §8); the label is its first line with the tags stripped. The prefix names
+/// the audience — the reminder addresses the MODEL, not the user — so the
+/// user reads the row as the loop nudging its model, not as a message to them.
+function runtimeInjectionLabel(content: string): string {
+	const stripped = content.replace(/<\/?reminder>/g, '').trim();
+	const firstLine = stripped.split('\n', 1)[0] ?? '';
+	return `Model reminder: ${firstLine}`;
+}
+
+/// One-line label for a committed todo `ops` call (from its `Tool::Started`
+/// input), e.g. `Completed step 2 · Blocked step 3: waiting for API key`. Returns
+/// `null` for `init` (the todo card itself marks it) and for malformed input
+/// — the fold never throws on model-authored JSON.
+function todoOpLabel(input: unknown): string | null {
+	if (!input || typeof input !== 'object') return null;
+	const ops = (input as { ops?: unknown }).ops;
+	if (!Array.isArray(ops)) return null;
+	if (ops.length === 0) return 'Updated todo list (no changes)';
+	const parts: string[] = [];
+	for (const raw of ops) {
+		if (!raw || typeof raw !== 'object') return null;
+		const op = raw as LeafOp;
+		switch (op.op) {
+			case 'start':
+				parts.push(`Started step ${op.id}`);
+				break;
+			case 'complete':
+				parts.push(`Completed step ${op.id}`);
+				break;
+			case 'cancel':
+				parts.push(`Cancelled step ${op.id}${op.reason ? `: ${op.reason}` : ''}`);
+				break;
+			case 'block':
+				parts.push(`Blocked step ${op.id}${op.reason ? `: ${op.reason}` : ''}`);
+				break;
+			case 'add':
+				parts.push(`Added step: ${op.content}`);
+				break;
+			default:
+				return null;
+		}
+	}
+	return parts.join(' · ');
+}
+
 /// Fold one committed `todo` tool call into the items list.
 ///
 /// Strategy mirrors the backend (`src/agent/todo.rs`): `init` replaces the list
@@ -756,7 +933,8 @@ function foldTodoOp(items: Item[], id: number, args: string): Item[] {
 			content: s.content,
 			status: 'pending'
 		}));
-		return [...items, { kind: 'todo', id, steps, streaming: false }];
+		const card = { kind: 'todo', id, steps, streaming: false } as Item;
+		return [...items, card];
 	}
 
 	if (!('ops' in call) || !Array.isArray(call.ops)) return items;
@@ -985,13 +1163,20 @@ function applyDelta(
 			const kind =
 				ev.kind === 'reasoning' ? 'reasoning' : ev.kind === 'tool_call' ? 'tool_call' : 'text';
 			if (kind === 'tool_call') {
-				// Todo is a control tool: show a single streaming placeholder card,
-				// not a generic tool block. Its args stream as partial JSON (not
-				// foldable mid-stream), so we ignore tool_args for it and let the
-				// committed ContentBlock replace the placeholder with the real card.
+				// Todo is a control tool: push a transient activity row ("updating
+				// the todo list…") instead of a placeholder card — the committed
+				// Tool::Started flips this row in place with the real op label.
+				// tool_args deltas stream partial JSON (not foldable mid-stream),
+				// so they are ignored for todo.
 				if (ev.tool === TODO_TOOL_NAME) {
 					open[ev.index] = items.length;
-					items.push({ kind: 'todo', id: state.nextId, steps: [], streaming: true });
+					items.push({
+						kind: 'activity',
+						id: state.nextId,
+						icon: 'todo',
+						label: 'Updating todo list…',
+						streaming: true
+					});
 				} else {
 					// Tool calls: immediate creation, index-based tracking
 					open[ev.index] = items.length;
@@ -1063,7 +1248,9 @@ function applyDelta(
 			const cur = pos !== undefined ? items[pos] : undefined;
 			// Todo placeholder: args stream as partial JSON, not foldable until the
 			// committed ContentBlock arrives — ignore the stream for it.
-			if (cur?.kind === 'todo') return { ...state, items, open };
+			// Todo streams as a transient activity row, not a foldable card —
+			// ignore its partial-JSON args.
+			if (cur?.kind === 'activity') return { ...state, items, open };
 			if (cur?.kind === 'tool') {
 				items[pos] = { ...cur, args: cur.args + ev.json };
 				return { ...state, items, open };

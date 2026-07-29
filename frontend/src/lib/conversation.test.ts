@@ -769,18 +769,36 @@ describe('todo fold', () => {
 		expect(todos[1].kind === 'todo' && todos[1].steps.map((s) => s.content)).toEqual(['x', 'y']);
 	});
 
-	it('streaming todo placeholder is replaced by the committed card (no duplication)', () => {
+	it('a streaming todo call leaves exactly one settled activity row beside its card', () => {
 		const state = fold([
 			reqStarted(1),
 			{ type: 'delta', delta: 'block_start', index: 0, kind: 'tool_call', tool: 'todo' },
 			{ type: 'delta', delta: 'tool_args', index: 0, json: '{"op":"in' },
 			{ type: 'delta', delta: 'tool_args', index: 0, json: 'it","steps":[{"content":"a"}]}' },
-			todoCall(2, { op: 'init', steps: [{ content: 'a' }] })
+			todoCall(2, { op: 'init', steps: [{ content: 'a' }] }),
+			todoStarted(3, { op: 'init', steps: [{ content: 'a' }] })
 		]);
 		const todos = state.items.filter((i) => i.kind === 'todo');
 		expect(todos).toHaveLength(1);
 		expect(todos[0].kind === 'todo' && todos[0].streaming).toBe(false);
 		expect(todos[0].kind === 'todo' && todos[0].steps[0].content).toBe('a');
+		// commitBlock's truncation sliced the transient row (it sat inside the
+		// request window); the fold re-pushed it as a settled trace row. No
+		// duplicate card, no leftover streaming row.
+		const activities = state.items.filter((i) => i.kind === 'activity');
+		expect(activities).toHaveLength(1);
+		expect(activities[0].kind === 'activity' && activities[0].streaming).toBe(false);
+	});
+
+	it('a committed todo op without a transient row appends (replay/no-delta path)', () => {
+		const state = fold([
+			reqStarted(1),
+			todoCall(2, { op: 'init', steps: [{ content: 'a' }] }),
+			todoStarted(3, { ops: [{ op: 'complete', id: '1' }] })
+		]);
+		const activities = state.items.filter((i) => i.kind === 'activity');
+		expect(activities).toHaveLength(1);
+		expect(activities[0].kind === 'activity' && activities[0].label).toBe('Completed step 1');
 	});
 
 	it('a later turn op mutates a todo card from an earlier request', () => {
@@ -797,6 +815,147 @@ describe('todo fold', () => {
 		]);
 		const steps = todoSteps(state);
 		expect(steps[0].status).toBe('completed');
+	});
+});
+
+// ── Activity rows: todo ops + hook executions ────────────────────────────
+//
+// Todo ops and hook executions act on the agent/pipeline without any trace on
+// the conversation timeline (the todo card shows list state, not what changed;
+// hooks were only visible in the opt-in inspect panel). Each folds into a
+// one-line `activity` item — lighter than a tool card, visible inline.
+
+/** A committed `Tool::Started` event for the todo control tool. */
+function todoStarted(seq: number, input: object): GatewayEvent {
+	return {
+		type: 'event',
+		schema_version: 'ominiforge.event.v1',
+		seq,
+		session_id: 's',
+		timestamp: '2026-06-24T00:00:00Z',
+		source: { kind: 'Tool', id: 'todo' },
+		parent_event_id: null,
+		turn_id: null,
+		payload: {
+			Tool: {
+				Started: {
+					tool_call_event_id: { session_id: 's', seq },
+					tool_name: 'todo',
+					source: 'Builtin',
+					input,
+					working_dir: null
+				}
+			}
+		}
+	} as unknown as GatewayEvent;
+}
+
+/** A committed `Hook::Executed` event. */
+function hookExecuted(seq: number, outcome: unknown): GatewayEvent {
+	return {
+		type: 'event',
+		schema_version: 'ominiforge.event.v1',
+		seq,
+		session_id: 's',
+		timestamp: '2026-06-24T00:00:00Z',
+		source: { kind: 'Runtime', id: 'hook:security-guard' },
+		parent_event_id: null,
+		turn_id: null,
+		payload: {
+			Hook: {
+				Executed: {
+					hook_name: 'security-guard',
+					hook_point: 'tool:invoke:before',
+					outcome,
+					duration_ms: 3
+				}
+			}
+		}
+	} as unknown as GatewayEvent;
+}
+
+describe('activity fold', () => {
+	it('a todo ops call folds into a one-line activity row; init does not', () => {
+		const state = fold([
+			reqStarted(1),
+			todoCall(2, { op: 'init', steps: [{ content: 'a' }, { content: 'b' }] }),
+			todoStarted(3, { op: 'init', steps: [{ content: 'a' }, { content: 'b' }] }),
+			todoStarted(4, {
+				ops: [
+					{ op: 'start', id: '1' },
+					{ op: 'complete', id: '1' }
+				]
+			}),
+			todoStarted(5, { ops: [{ op: 'block', id: '2', reason: 'needs API key' }] })
+		]);
+		const activities = state.items.filter((i) => i.kind === 'activity');
+		expect(activities).toHaveLength(2);
+		expect(activities[0].kind === 'activity' && activities[0].icon).toBe('todo');
+		expect(activities[0].kind === 'activity' && activities[0].label).toBe(
+			'Started step 1 · Completed step 1'
+		);
+		expect(activities[1].kind === 'activity' && activities[1].label).toBe(
+			'Blocked step 2: needs API key'
+		);
+	});
+
+	it('a malformed todo op produces no row (never throws mid-fold)', () => {
+		const state = fold([
+			todoStarted(1, { ops: [{ nope: true }] }),
+			todoStarted(2, 'junk' as unknown as object)
+		]);
+		expect(state.items.filter((i) => i.kind === 'activity')).toHaveLength(0);
+	});
+
+	it('a runtime reminder (completion gate) folds into an activity row with the full text', () => {
+		const inject = (seq: number, source: string, content: string): GatewayEvent =>
+			({
+				type: 'event',
+				schema_version: 'ominiforge.event.v1',
+				seq,
+				session_id: 's',
+				timestamp: '2026-06-24T00:00:00Z',
+				source: { kind: 'Runtime', id: 'runtime' },
+				parent_event_id: null,
+				turn_id: null,
+				payload: { Injection: { ContextInjected: { source, content, token_count: 10 } } }
+			}) as unknown as GatewayEvent;
+		const reminder =
+			'<reminder>The following todo items are not in a terminal state. ' +
+			'Continue working on them:\n- [ ] 2. write tests</reminder>';
+		const state = fold([
+			inject(1, 'Runtime', reminder),
+			inject(2, 'Memory', 'user prefers dark mode')
+		]);
+		const activities = state.items.filter((i) => i.kind === 'activity');
+		// Only the Runtime injection surfaces; assembly-time sources (Memory et
+		// al.) stay inspect-only.
+		expect(activities).toHaveLength(1);
+		const row = activities[0];
+		expect(row.kind === 'activity' && row.icon).toBe('runtime');
+		expect(row.kind === 'activity' && row.label).toBe(
+			'Model reminder: The following todo items are not in a terminal state. Continue working on them:'
+		);
+		expect(row.kind === 'activity' && row.detail).toBe(reminder);
+	});
+
+	it('every hook execution folds into an activity row; block/fail carry the reason', () => {
+		const state = fold([
+			hookExecuted(1, 'Pass'),
+			hookExecuted(2, { Blocked: { reason: 'rm -rf' } }),
+			hookExecuted(3, { Failed: { error: 'timeout' } })
+		]);
+		const activities = state.items.filter((i) => i.kind === 'activity');
+		expect(activities).toHaveLength(3);
+		expect(activities[0].kind === 'activity' && activities[0].icon).toBe('hook');
+		expect(activities[0].kind === 'activity' && activities[0].label).toBe(
+			'security-guard @ tool:invoke:before → Pass'
+		);
+		expect(activities[1].kind === 'activity' && activities[1].label).toBe(
+			'security-guard @ tool:invoke:before → Blocked'
+		);
+		expect(activities[1].kind === 'activity' && activities[1].detail).toBe('rm -rf');
+		expect(activities[2].kind === 'activity' && activities[2].detail).toBe('timeout');
 	});
 });
 

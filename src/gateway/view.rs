@@ -24,9 +24,12 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 
-use crate::agent::{LeafOp, TodoOp};
+use crate::agent::{LeafOp, TODO_TOOL_NAME, TodoOp};
 use crate::core::CoreEvent;
-use crate::core::payload::{BlockContent, Content, EventPayload, PermissionEvent, ToolEvent};
+use crate::core::payload::{
+    BlockContent, Content, EventPayload, HookEvent, HookOutcome, InjectionEvent, InjectionSource,
+    ModelEvent, PermissionEvent, ToolEvent, TurnEvent,
+};
 
 /// One row of the rendered conversation.
 ///
@@ -73,8 +76,28 @@ pub enum ViewItem {
     },
     /// A todo checklist (one card per `init`; later ops mutate it in place).
     Todo { id: u64, steps: Vec<ViewTodoStep> },
+    /// A one-line activity row in the conversation flow (lighter than a tool
+    /// card): todo ops and hook executions, which otherwise leave no visible
+    /// trace on the timeline. Mirrors the web fold's `activity` item.
+    Activity {
+        id: u64,
+        icon: ViewActivityIcon,
+        label: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
     /// A committed `Error::Raised`.
     Error { id: u64, message: String },
+}
+
+/// Render hint for an [`ViewItem::Activity`] row, mirroring the web fold's
+/// `icon` union.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewActivityIcon {
+    Hook,
+    Todo,
+    Runtime,
 }
 
 // serde's `skip_serializing_if` passes a reference; the by-value signature
@@ -173,53 +196,13 @@ pub fn fold_view(events: &[CoreEvent]) -> SessionView {
         let seq = ev.seq;
         last_seq = Some(seq);
         match &ev.payload {
-            EventPayload::Turn(t) => {
-                if let crate::core::payload::TurnEvent::Started {
-                    input: Some(text), ..
-                } = t
-                {
-                    items.push(ViewItem::User {
-                        id: seq,
-                        text: text.clone(),
-                        seq,
-                    });
-                }
-                match t {
-                    crate::core::payload::TurnEvent::Started { .. }
-                    | crate::core::payload::TurnEvent::Resumed { .. } => turn_running = true,
-                    crate::core::payload::TurnEvent::Completed { .. }
-                    | crate::core::payload::TurnEvent::Failed { .. }
-                    | crate::core::payload::TurnEvent::Interrupted { .. } => turn_running = false,
-                }
-                // A turn ending while an ask is pending leaves a zombie prompt
-                // (its Decided can never commit): disarm it, mirroring the web
-                // fold's Completed/Failed/Interrupted handling.
-                if matches!(
-                    t,
-                    crate::core::payload::TurnEvent::Completed { .. }
-                        | crate::core::payload::TurnEvent::Failed { .. }
-                        | crate::core::payload::TurnEvent::Interrupted { .. }
-                ) {
-                    for item in &mut items {
-                        if let ViewItem::Tool {
-                            approval_pending, ..
-                        } = item
-                        {
-                            *approval_pending = false;
-                        }
-                    }
-                }
-            }
-            EventPayload::Model(crate::core::payload::ModelEvent::RequestStarted {
-                model, ..
-            }) => {
+            EventPayload::Turn(t) => fold_turn(seq, t, &mut items, &mut turn_running),
+            EventPayload::Model(ModelEvent::RequestStarted { model, .. }) => {
                 if !runtime_models.contains(model) {
                     runtime_models.push(model.clone());
                 }
             }
-            EventPayload::Model(crate::core::payload::ModelEvent::ContentBlock {
-                content, ..
-            }) => {
+            EventPayload::Model(ModelEvent::ContentBlock { content, .. }) => {
                 fold_block(
                     seq,
                     content,
@@ -229,82 +212,10 @@ pub fn fold_view(events: &[CoreEvent]) -> SessionView {
                     &mut pending_asks,
                 );
             }
-            EventPayload::Tool(t) => match t {
-                ToolEvent::Completed {
-                    tool_call_event_id,
-                    result,
-                    ..
-                } => {
-                    if let Some(card) = tools_by_seq.get(&tool_call_event_id.seq) {
-                        let status = if result.is_error {
-                            ViewToolStatus::Error
-                        } else {
-                            ViewToolStatus::Done
-                        };
-                        apply_tool_outcome(
-                            &mut items,
-                            card.item_index,
-                            status,
-                            &result.content,
-                            result.error_code.clone(),
-                        );
-                    }
-                }
-                ToolEvent::Failed {
-                    tool_call_event_id,
-                    error,
-                    ..
-                } => {
-                    if let Some(card) = tools_by_seq.get(&tool_call_event_id.seq) {
-                        let content = vec![Content::Text(error.message.clone())];
-                        apply_tool_outcome(
-                            &mut items,
-                            card.item_index,
-                            ViewToolStatus::Error,
-                            &content,
-                            None,
-                        );
-                    }
-                }
-                ToolEvent::Started { .. } => {}
-            },
-            EventPayload::Permission(p) => match p {
-                PermissionEvent::Requested {
-                    call_id,
-                    tool_name,
-                    input,
-                    preview,
-                } => {
-                    if let Some(&idx) = tools_by_call_id.get(call_id) {
-                        if let ViewItem::Tool {
-                            approval_pending,
-                            preview: slot,
-                            ..
-                        } = &mut items[idx]
-                        {
-                            *approval_pending = true;
-                            slot.clone_from(preview);
-                        }
-                    } else {
-                        // The ToolCall block hasn't folded (out-of-order
-                        // delivery): remember the ask; the late block
-                        // backfills the card with it.
-                        pending_asks.insert(
-                            call_id.clone(),
-                            (seq, tool_name.clone(), input.clone(), preview.clone()),
-                        );
-                    }
-                }
-                PermissionEvent::Decided { call_id, .. } => {
-                    if let Some(&idx) = tools_by_call_id.get(call_id)
-                        && let ViewItem::Tool {
-                            approval_pending, ..
-                        } = &mut items[idx]
-                    {
-                        *approval_pending = false;
-                    }
-                }
-            },
+            EventPayload::Tool(t) => fold_tool(seq, t, &mut items, &tools_by_seq),
+            EventPayload::Permission(p) => {
+                fold_permission(seq, p, &mut items, &tools_by_call_id, &mut pending_asks);
+            }
             EventPayload::Error(e) => {
                 let crate::core::payload::ErrorEvent::Raised(detail) = e;
                 items.push(ViewItem::Error {
@@ -312,8 +223,10 @@ pub fn fold_view(events: &[CoreEvent]) -> SessionView {
                     message: detail.message.clone(),
                 });
             }
-            // Session/Artifact/Injection/Hook payloads are not conversation
-            // content (they drive inspect/monitoring, not the chat view).
+            EventPayload::Hook(h) => fold_hook(seq, h, &mut items),
+            EventPayload::Injection(i) => fold_injection(seq, i, &mut items),
+            // Session/Artifact payloads are not conversation content (they
+            // drive inspect/monitoring, not the chat view).
             _ => {}
         }
     }
@@ -323,6 +236,193 @@ pub fn fold_view(events: &[CoreEvent]) -> SessionView {
         last_seq,
         turn_running,
         runtime_models,
+    }
+}
+
+/// Fold a turn lifecycle event: a `Started` with user input opens the user
+/// bubble; the lifecycle flips `turn_running` last-write-wins. A turn ending
+/// while an ask is pending leaves a zombie prompt (its Decided can never
+/// commit): disarm it, mirroring the web fold's Completed/Failed/Interrupted
+/// handling.
+fn fold_turn(seq: u64, t: &TurnEvent, items: &mut Vec<ViewItem>, turn_running: &mut bool) {
+    if let TurnEvent::Started {
+        input: Some(text), ..
+    } = t
+    {
+        items.push(ViewItem::User {
+            id: seq,
+            text: text.clone(),
+            seq,
+        });
+    }
+    match t {
+        TurnEvent::Started { .. } | TurnEvent::Resumed { .. } => *turn_running = true,
+        TurnEvent::Completed { .. } | TurnEvent::Failed { .. } | TurnEvent::Interrupted { .. } => {
+            *turn_running = false;
+            for item in items.iter_mut() {
+                if let ViewItem::Tool {
+                    approval_pending, ..
+                } = item
+                {
+                    *approval_pending = false;
+                }
+            }
+        }
+    }
+}
+
+/// Fold a tool event: `Completed`/`Failed` pair back to the call's card via
+/// `tools_by_seq`; a todo `Started` (control tool — its call folded into a
+/// todo card, so there is no card to pair) surfaces an `ops` call as a
+/// one-line activity row so the op itself is visible on the timeline (`init`
+/// is already marked by the todo card it creates).
+fn fold_tool(
+    seq: u64,
+    t: &ToolEvent,
+    items: &mut Vec<ViewItem>,
+    tools_by_seq: &HashMap<u64, ToolCard>,
+) {
+    match t {
+        ToolEvent::Completed {
+            tool_call_event_id,
+            result,
+            ..
+        } => {
+            if let Some(card) = tools_by_seq.get(&tool_call_event_id.seq) {
+                let status = if result.is_error {
+                    ViewToolStatus::Error
+                } else {
+                    ViewToolStatus::Done
+                };
+                apply_tool_outcome(
+                    items,
+                    card.item_index,
+                    status,
+                    &result.content,
+                    result.error_code.clone(),
+                );
+            }
+        }
+        ToolEvent::Failed {
+            tool_call_event_id,
+            error,
+            ..
+        } => {
+            if let Some(card) = tools_by_seq.get(&tool_call_event_id.seq) {
+                let content = vec![Content::Text(error.message.clone())];
+                apply_tool_outcome(
+                    items,
+                    card.item_index,
+                    ViewToolStatus::Error,
+                    &content,
+                    None,
+                );
+            }
+        }
+        ToolEvent::Started {
+            tool_name, input, ..
+        } if tool_name == TODO_TOOL_NAME => {
+            if let Some(label) = todo_op_label(input) {
+                items.push(ViewItem::Activity {
+                    id: seq,
+                    icon: ViewActivityIcon::Todo,
+                    label,
+                    detail: None,
+                });
+            }
+        }
+        ToolEvent::Started { .. } => {}
+    }
+}
+
+/// Fold a permission gate event: a `Requested` attaches its prompt (and the
+/// would-be diff preview) to the gated call's card — or, if the `ToolCall`
+/// block hasn't folded yet (out-of-order delivery), is remembered for the
+/// late block to backfill. `Decided` disarms the prompt.
+fn fold_permission(
+    seq: u64,
+    p: &PermissionEvent,
+    items: &mut [ViewItem],
+    tools_by_call_id: &HashMap<String, usize>,
+    pending_asks: &mut HashMap<String, (u64, String, serde_json::Value, Option<String>)>,
+) {
+    match p {
+        PermissionEvent::Requested {
+            call_id,
+            tool_name,
+            input,
+            preview,
+        } => {
+            if let Some(&idx) = tools_by_call_id.get(call_id) {
+                if let ViewItem::Tool {
+                    approval_pending,
+                    preview: slot,
+                    ..
+                } = &mut items[idx]
+                {
+                    *approval_pending = true;
+                    slot.clone_from(preview);
+                }
+            } else {
+                pending_asks.insert(
+                    call_id.clone(),
+                    (seq, tool_name.clone(), input.clone(), preview.clone()),
+                );
+            }
+        }
+        PermissionEvent::Decided { call_id, .. } => {
+            if let Some(&idx) = tools_by_call_id.get(call_id)
+                && let ViewItem::Tool {
+                    approval_pending, ..
+                } = &mut items[idx]
+            {
+                *approval_pending = false;
+            }
+        }
+    }
+}
+
+/// Fold a hook execution into a one-line activity row: hooks act on the
+/// pipeline invisibly otherwise, and a block/modify the user can't see reads
+/// as the agent misbehaving.
+fn fold_hook(seq: u64, h: &HookEvent, items: &mut Vec<ViewItem>) {
+    let HookEvent::Executed {
+        hook_name,
+        hook_point,
+        outcome,
+        ..
+    } = h;
+    let (outcome_label, detail) = match outcome {
+        HookOutcome::Pass => ("Pass", None),
+        HookOutcome::Modified => ("Modified", None),
+        HookOutcome::Observed => ("Observed", None),
+        HookOutcome::Blocked { reason } => ("Blocked", Some(reason.clone())),
+        HookOutcome::Failed { error } => ("Failed", Some(error.clone())),
+    };
+    items.push(ViewItem::Activity {
+        id: seq,
+        icon: ViewActivityIcon::Hook,
+        label: format!("{hook_name} @ {hook_point} → {outcome_label}"),
+        detail,
+    });
+}
+
+/// Fold a context injection: only Runtime injections surface in the flow —
+/// they are the loop nudging itself mid-turn (completion gate / stuck-step
+/// reminders, not user input, so the user must see why the agent kept
+/// going). Assembly-time sources (Memory/RAG/Hook/ProjectGuidance) stay
+/// inspect-only.
+fn fold_injection(seq: u64, i: &InjectionEvent, items: &mut Vec<ViewItem>) {
+    let InjectionEvent::ContextInjected {
+        source, content, ..
+    } = i;
+    if *source == InjectionSource::Runtime {
+        items.push(ViewItem::Activity {
+            id: seq,
+            icon: ViewActivityIcon::Runtime,
+            label: runtime_injection_label(content),
+            detail: Some(content.clone()),
+        });
     }
 }
 
@@ -440,6 +540,58 @@ fn apply_tool_outcome(
     *ec = error_code;
 }
 
+/// One-line label for a runtime-injected reminder (completion gate /
+/// stuck-step), mirroring the web fold's `runtimeInjectionLabel`: the first
+/// line of the `<reminder>` block with the tags stripped. The prefix names
+/// the audience — the reminder addresses the MODEL, not the user.
+fn runtime_injection_label(content: &str) -> String {
+    let stripped = content.replace("<reminder>", "").replace("</reminder>", "");
+    let first_line = stripped.trim().lines().next().unwrap_or("");
+    format!("Model reminder: {first_line}")
+}
+
+/// One-line label for a committed todo `ops` call (from its `Tool::Started`
+/// input), mirroring the web fold's `todoOpLabel`: `None` for `init` (the
+/// todo card itself marks it) and for malformed input. Fields are read
+/// tolerantly (reasons are optional) so a schema-invalid op the runtime will
+/// reject as `is_error` still gets a row — hiding it would leave the failed
+/// op invisible.
+fn todo_op_label(input: &serde_json::Value) -> Option<String> {
+    let ops = input.get("ops")?.as_array()?;
+    if ops.is_empty() {
+        return Some("Updated todo list (no changes)".to_owned());
+    }
+    let mut parts: Vec<String> = Vec::with_capacity(ops.len());
+    for op in ops {
+        let kind = op.get("op")?.as_str()?;
+        let id = || {
+            op.get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?")
+        };
+        let reason = op.get("reason").and_then(serde_json::Value::as_str);
+        let part = match kind {
+            "start" => format!("Started step {}", id()),
+            "complete" => format!("Completed step {}", id()),
+            "cancel" => reason.map_or_else(
+                || format!("Cancelled step {}", id()),
+                |r| format!("Cancelled step {}: {r}", id()),
+            ),
+            "block" => reason.map_or_else(
+                || format!("Blocked step {}", id()),
+                |r| format!("Blocked step {}: {r}", id()),
+            ),
+            "add" => {
+                let content = op.get("content").and_then(serde_json::Value::as_str)?;
+                format!("Added step: {content}")
+            }
+            _ => return None,
+        };
+        parts.push(part);
+    }
+    Some(parts.join(" · "))
+}
+
 /// Fold one committed `todo` call: `init` pushes a fresh card (ids "1".."N");
 /// `ops` mutate the LATEST card in place. Malformed ops are a benign no-op,
 /// mirroring both the runtime and the web fold.
@@ -483,10 +635,10 @@ fn apply_leaf(steps: &mut Vec<ViewTodoStep>, op: LeafOp) {
         LeafOp::Start { id } => set_status(steps, &id, ViewTodoStatus::InProgress, None),
         LeafOp::Complete { id } => set_status(steps, &id, ViewTodoStatus::Completed, None),
         LeafOp::Cancel { id, reason } => {
-            set_status(steps, &id, ViewTodoStatus::Cancelled, Some(reason))
+            set_status(steps, &id, ViewTodoStatus::Cancelled, Some(reason));
         }
         LeafOp::Block { id, reason } => {
-            set_status(steps, &id, ViewTodoStatus::Blocked, Some(reason))
+            set_status(steps, &id, ViewTodoStatus::Blocked, Some(reason));
         }
         LeafOp::Add { content, after_id } => {
             let max = steps
@@ -526,8 +678,8 @@ mod tests {
     use super::*;
     use crate::core::EventId;
     use crate::core::payload::{
-        ErrorDetail, ErrorSeverity, ModelEvent, PermissionOutcome, SessionEvent, StopReason,
-        ToolOutput, TurnEvent, Usage,
+        ErrorDetail, ErrorSeverity, HookEvent, HookOutcome, ModelEvent, PermissionOutcome,
+        SessionEvent, StopReason, ToolOutput, ToolSource, TurnEvent, Usage,
     };
     use crate::core::{EventSource, SCHEMA_VERSION, SessionId, SourceKind};
     use chrono::{TimeZone, Utc};
@@ -641,6 +793,7 @@ mod tests {
                 ViewItem::Text { .. } => "text",
                 ViewItem::Tool { .. } => "tool",
                 ViewItem::Todo { .. } => "todo",
+                ViewItem::Activity { .. } => "activity",
                 ViewItem::Error { .. } => "error",
             })
             .collect();
@@ -770,6 +923,160 @@ mod tests {
         assert_eq!(steps.len(), 2);
         assert_eq!(steps[0].status, ViewTodoStatus::Completed);
         assert_eq!(steps[1].status, ViewTodoStatus::Pending);
+    }
+
+    /// A todo `ops` call surfaces as a one-line activity row (the op itself is
+    /// otherwise invisible once its card scrolls away); `init` does not — the
+    /// fresh card already marks it. Non-todo `Tool::Started` events fold to
+    /// nothing, as before.
+    #[test]
+    fn todo_ops_fold_into_activity_rows() {
+        let started = |seq: u64, input: serde_json::Value| {
+            ev(
+                seq,
+                EventPayload::Tool(ToolEvent::Started {
+                    tool_call_event_id: EventId {
+                        session_id: SessionId("s".into()),
+                        seq,
+                    },
+                    tool_name: "todo".into(),
+                    source: ToolSource::Builtin,
+                    input,
+                    working_dir: None,
+                }),
+            )
+        };
+        let events = vec![
+            block(
+                1,
+                tool_call(
+                    "p1",
+                    "todo",
+                    r#"{"op":"init","steps":[{"content":"a"},{"content":"b"}]}"#,
+                ),
+            ),
+            started(
+                2,
+                serde_json::json!({"op":"init","steps":[{"content":"a"},{"content":"b"}]}),
+            ),
+            started(
+                3,
+                serde_json::json!({"ops":[{"op":"start","id":"1"},{"op":"complete","id":"1"}]}),
+            ),
+            started(
+                4,
+                serde_json::json!({"ops":[{"op":"block","id":"2","reason":"needs API key"}]}),
+            ),
+        ];
+        let view = fold_view(&events);
+        let kinds: Vec<&str> = view
+            .items
+            .iter()
+            .map(|i| match i {
+                ViewItem::Todo { .. } => "todo",
+                ViewItem::Activity { .. } => "activity",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, ["todo", "activity", "activity"]);
+        let ViewItem::Activity { icon, label, .. } = &view.items[1] else {
+            panic!("activity row")
+        };
+        assert_eq!(*icon, ViewActivityIcon::Todo);
+        assert_eq!(label, "Started step 1 · Completed step 1");
+        let ViewItem::Activity { label, .. } = &view.items[2] else {
+            panic!("activity row")
+        };
+        assert_eq!(label, "Blocked step 2: needs API key");
+    }
+
+    /// Every hook execution folds into a one-line activity row: hooks act on
+    /// the pipeline invisibly otherwise, and a block the user can't see reads
+    /// as the agent misbehaving.
+    #[test]
+    fn hook_executions_fold_into_activity_rows() {
+        let hook = |seq: u64, outcome: HookOutcome| {
+            ev(
+                seq,
+                EventPayload::Hook(HookEvent::Executed {
+                    hook_name: "security-guard".into(),
+                    hook_point: "tool:invoke:before".into(),
+                    outcome,
+                    duration_ms: 3,
+                }),
+            )
+        };
+        let view = fold_view(&[
+            hook(1, HookOutcome::Pass),
+            hook(
+                2,
+                HookOutcome::Blocked {
+                    reason: "rm -rf".into(),
+                },
+            ),
+        ]);
+        assert_eq!(view.items.len(), 2);
+        let ViewItem::Activity {
+            icon,
+            label,
+            detail,
+            ..
+        } = &view.items[0]
+        else {
+            panic!("activity row")
+        };
+        assert_eq!(*icon, ViewActivityIcon::Hook);
+        assert_eq!(label, "security-guard @ tool:invoke:before → Pass");
+        assert_eq!(*detail, None);
+        let ViewItem::Activity { label, detail, .. } = &view.items[1] else {
+            panic!("activity row")
+        };
+        assert_eq!(label, "security-guard @ tool:invoke:before → Blocked");
+        assert_eq!(detail.as_deref(), Some("rm -rf"));
+    }
+
+    /// A runtime reminder (completion gate / stuck-step nudge) folds into an
+    /// activity row — it is the loop nudging itself mid-turn, not user input,
+    /// so the user must see why the agent kept going. Assembly-time sources
+    /// (Memory et al.) stay inspect-only.
+    #[test]
+    fn runtime_injections_fold_into_activity_rows() {
+        let inject = |seq: u64, source: crate::core::payload::InjectionSource, content: &str| {
+            ev(
+                seq,
+                EventPayload::Injection(crate::core::payload::InjectionEvent::ContextInjected {
+                    source,
+                    content: content.into(),
+                    token_count: 10,
+                }),
+            )
+        };
+        let reminder = "<reminder>The following todo items are not in a terminal state. \
+                        Continue working on them:\n- [ ] 2. write tests</reminder>";
+        let view = fold_view(&[
+            inject(1, crate::core::payload::InjectionSource::Runtime, reminder),
+            inject(
+                2,
+                crate::core::payload::InjectionSource::Memory,
+                "user prefers dark mode",
+            ),
+        ]);
+        assert_eq!(view.items.len(), 1);
+        let ViewItem::Activity {
+            icon,
+            label,
+            detail,
+            ..
+        } = &view.items[0]
+        else {
+            panic!("activity row")
+        };
+        assert_eq!(*icon, ViewActivityIcon::Runtime);
+        assert_eq!(
+            label,
+            "Model reminder: The following todo items are not in a terminal state. Continue working on them:"
+        );
+        assert_eq!(detail.as_deref(), Some(reminder));
     }
 
     /// The file tools split a trailing Text block off as diagnostics; other

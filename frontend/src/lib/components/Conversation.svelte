@@ -1565,12 +1565,18 @@
 				     below it appears already positioned at the tail. -->
 				{#if (loading || !convo.ready) && !isDraft}
 					<div class="loading-skeleton" role="status" aria-label="加载历史">
-						<div class="sk-row sk-user"><Skeleton width="42%" height="38px" radius="var(--radius-lg)" /></div>
+						<div class="sk-row sk-user">
+							<Skeleton width="42%" height="38px" radius="var(--radius-lg)" />
+						</div>
 						<div class="sk-row"><Skeleton width="88%" height="14px" /></div>
 						<div class="sk-row"><Skeleton width="76%" height="14px" /></div>
-						<div class="sk-row"><Skeleton width="94%" height="52px" radius="var(--radius-md)" /></div>
+						<div class="sk-row">
+							<Skeleton width="94%" height="52px" radius="var(--radius-md)" />
+						</div>
 						<div class="sk-row"><Skeleton width="64%" height="14px" /></div>
-						<div class="sk-row sk-user"><Skeleton width="36%" height="38px" radius="var(--radius-lg)" /></div>
+						<div class="sk-row sk-user">
+							<Skeleton width="36%" height="38px" radius="var(--radius-lg)" />
+						</div>
 						<div class="sk-row"><Skeleton width="82%" height="14px" /></div>
 						<div class="sk-row"><Skeleton width="70%" height="14px" /></div>
 					</div>
@@ -1856,6 +1862,95 @@
 										{/if}
 									</div>
 								</div>
+							{/if}
+						{:else if item.kind === 'activity'}
+							<!-- One-line operation trace (todo op / hook execution / runtime
+							     reminder): a quiet left-aligned rail row, lighter than a tool
+							     card but visible on the timeline unlike the inspect panel.
+							     detail carries the why (hook block reason, reminder text) as
+							     a chip — hook labels are fixed-shape (name @ point → outcome),
+							     so the variable-length reason must not trail raw text. A
+							     multi-line detail (a runtime reminder) is truncated on the
+							     row and expandable in full below it. -->
+							{@const detailInline =
+								item.detail && !item.detail.includes('\n')
+									? item.detail.replace(/<\/?reminder>/g, '').trim()
+									: undefined}
+							{@const detailBlock =
+								item.detail && item.detail.includes('\n')
+									? item.detail.replace(/<\/?reminder>/g, '').trim()
+									: undefined}
+							<div
+								class="item item-activity"
+								class:activity-blocked={item.icon === 'hook' && !!item.detail}
+								in:fly|local={enterAnim}
+							>
+								<span class="activity-mark" aria-hidden="true">
+									{#if item.icon === 'hook'}
+										<svg
+											viewBox="0 0 12 12"
+											fill="none"
+											stroke="currentColor"
+											stroke-width="1.4"
+											stroke-linecap="round"
+											stroke-linejoin="round"
+											><path d="M6.5 1 2.5 6.5h2.7L5 11l4-5.5H6.3L6.5 1Z" /></svg
+										>
+									{:else if item.icon === 'runtime'}
+										<svg
+											viewBox="0 0 12 12"
+											fill="none"
+											stroke="currentColor"
+											stroke-width="1.4"
+											stroke-linecap="round"
+											stroke-linejoin="round"
+											><circle cx="6" cy="6" r="4.5" /><line
+												x1="6"
+												y1="3.6"
+												x2="6"
+												y2="6.4"
+											/><circle cx="6" cy="8.4" r="0.4" fill="currentColor" stroke="none" /></svg
+										>
+									{:else}
+										<svg
+											viewBox="0 0 12 12"
+											fill="none"
+											stroke="currentColor"
+											stroke-width="1.4"
+											stroke-linecap="round"
+											stroke-linejoin="round"><polyline points="2.5,6.5 5,9 9.5,3.5" /></svg
+										>
+									{/if}
+								</span>
+								{#if detailBlock}
+									<button
+										class="activity-expand"
+										onclick={() => toggleCollapse(item, i)}
+										aria-expanded={!isCollapsed(item, i)}
+									>
+										<span class="activity-label">{item.label}</span>
+										<svg
+											class="activity-chevron"
+											class:open={!isCollapsed(item, i)}
+											viewBox="0 0 12 12"
+											fill="none"
+											stroke="currentColor"
+											stroke-width="1.6"
+											stroke-linecap="round"
+											stroke-linejoin="round"><polyline points="4,2 8,6 4,10" /></svg
+										>
+									</button>
+								{:else}
+									<span class="activity-label">{item.label}</span>
+								{/if}
+								{#if detailInline}<span class="activity-detail" title={detailInline}
+										>{detailInline}</span
+									>
+								{/if}
+								{#if item.streaming}<span class="activity-spinner" aria-hidden="true"></span>{/if}
+							</div>
+							{#if detailBlock && !isCollapsed(item, i)}
+								<pre class="item item-activity-detail">{detailBlock}</pre>
 							{/if}
 						{:else if item.kind === 'error'}
 							<div class="item item-error" in:fly|local={enterAnim}>{item.message}</div>
@@ -3557,6 +3652,148 @@
 		text-align: center;
 		padding: var(--space-2) var(--space-4);
 		font-family: var(--font-chinese);
+	}
+
+	/* ---- ACTIVITY ROW (todo op / hook / runtime reminder trace) ---- */
+	/* A quiet rail row, not a card: a hairline guide on the left, a small icon
+	   on it, then the one-line label flush-left with the conversation's text
+	   column. The variable-length why (hook block reason, reminder text) rides
+	   as a chip so a long reason never swallows the fixed-shape label. */
+	.item-activity {
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+		color: var(--text-tertiary);
+		font-size: 12px;
+		padding: 1px 0 1px var(--space-4);
+		margin-bottom: var(--space-3);
+		font-family: var(--font-chinese);
+		position: relative;
+	}
+
+	/* The rail: a hairline connecting the row to the flow above/below. */
+	.item-activity::before {
+		content: '';
+		position: absolute;
+		left: calc(var(--space-4) - var(--space-2) - 5px);
+		top: 0;
+		bottom: 0;
+		width: 1px;
+		background: color-mix(in srgb, var(--text-tertiary) 28%, transparent);
+	}
+
+	.activity-mark {
+		position: relative;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		width: 14px;
+		height: 14px;
+		flex: none;
+		/* Sit the icon on the rail: offset left so its center meets the line,
+		   with a canvas-colored halo so the line doesn't strike through it. */
+		margin-left: calc(-1 * var(--space-2) - 6px);
+		margin-right: var(--space-1);
+		background: var(--canvas-base);
+		border-radius: 50%;
+	}
+
+	.activity-mark svg {
+		width: 11px;
+		height: 11px;
+	}
+
+	.activity-label {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		flex: none;
+		max-width: 46ch;
+	}
+
+	.activity-detail {
+		font-size: 11px;
+		color: var(--text-tertiary);
+		background: color-mix(in srgb, var(--text-tertiary) 10%, transparent);
+		border-radius: var(--radius-sm);
+		padding: 0 var(--space-2);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		max-width: 34ch;
+		flex: none;
+	}
+
+	/* A hook that blocked/failed (detail = the reason): tint the chip, not the
+	   whole row — the row stays quiet, the why reads as the warning. */
+	.activity-blocked .activity-detail,
+	.activity-blocked .activity-label {
+		color: var(--warning);
+	}
+
+	.activity-blocked .activity-detail {
+		background: color-mix(in srgb, var(--warning) 12%, transparent);
+	}
+
+	.activity-spinner {
+		width: 9px;
+		height: 9px;
+		flex: none;
+		border: 1.4px solid color-mix(in srgb, currentColor 35%, transparent);
+		border-top-color: currentColor;
+		border-radius: 50%;
+		animation: activity-spin 0.7s linear infinite;
+	}
+
+	@keyframes activity-spin {
+		to {
+			transform: rotate(360deg);
+		}
+	}
+
+	/* Expandable detail (a multi-line runtime reminder): the row's label is a
+	   button with a chevron; the full text unfolds below, indented to the
+	   label column so it reads as belonging to the row above. */
+	.activity-expand {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--space-1);
+		padding: 0;
+		border: none;
+		background: none;
+		color: inherit;
+		font: inherit;
+		cursor: pointer;
+		min-width: 0;
+	}
+
+	.activity-expand:hover .activity-label {
+		color: var(--text-secondary);
+	}
+
+	.activity-chevron {
+		width: 9px;
+		height: 9px;
+		flex: none;
+		transition: transform var(--dur-fast) var(--ease-out);
+	}
+
+	.activity-chevron.open {
+		transform: rotate(90deg);
+	}
+
+	.item-activity-detail {
+		margin: calc(-1 * var(--space-2)) 0 var(--space-3);
+		padding: var(--space-2) var(--space-3);
+		padding-left: calc(var(--space-4) + 10px);
+		font-size: 11.5px;
+		line-height: 1.6;
+		color: var(--text-tertiary);
+		font-family: var(--font-mono);
+		white-space: pre-wrap;
+		word-break: break-word;
+		background: color-mix(in srgb, var(--text-tertiary) 6%, transparent);
+		border-radius: var(--radius-sm);
 	}
 
 	/* ---- TODO CARD (inline checklist + sticky dock) ---- */

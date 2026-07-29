@@ -34,7 +34,7 @@ pub use approval::{
 pub use error::AgentError;
 pub use resume::rebuild_runtime;
 pub use sink::{BlockKind, NullSink, StreamSink};
-pub use todo::{LeafOp, StepStatus, TodoItem, TodoOp};
+pub use todo::{LeafOp, StepStatus, TODO_TOOL_NAME, TodoItem, TodoOp};
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -58,7 +58,7 @@ use crate::tool::{ToolError, ToolInput, ToolRegistry};
 
 use futures_util::{FutureExt, StreamExt};
 
-use todo::{TODO_TOOL_NAME, TodoError, apply_todo_op};
+use todo::{TodoError, apply_todo_op};
 
 /// How many completion-gate nudges a turn tolerates before giving up: the model
 /// stopped without finishing the todo list this many times running (`doc/todo.md` §6).
