@@ -71,6 +71,10 @@ const STUCK_THRESHOLD: u32 = 5;
 /// Knobs for a turn that do not change between rounds.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
+    /// Retry policy for transient model-request failures (network drops,
+    /// 429/5xx engine overload). Only pre-stream handshake errors are retried;
+    /// a chunk-level failure mid-stream still aborts the round.
+    pub retry: crate::llm::RetryConfig,
     /// Model id sent to the provider (e.g. `gpt-4o`).
     pub model: String,
     /// Sampling temperature.
@@ -104,6 +108,7 @@ impl Default for AgentConfig {
         Self {
             model: String::new(),
             temperature: 0.0,
+            retry: crate::llm::RetryConfig::default(),
             max_tokens: None,
             tool_timeout: Duration::from_secs(120),
             max_rounds: 100,
@@ -1190,8 +1195,16 @@ impl TurnState<'_> {
     /// Run one model round: send the current context, persist the streamed
     /// response (forwarding deltas to the sink), and return the assembled
     /// assistant message.
+    ///
+    /// A transient handshake failure (network drop, 429/5xx — e.g. Kimi's
+    /// `engine_overloaded_error`) is retried with exponential backoff rather
+    /// than aborting the turn: each attempt is its own persisted
+    /// `RequestStarted` (a failed attempt closes with `RequestFailed`), and the
+    /// sink is notified so the front-end can show "retrying…" instead of
+    /// sitting silent. Chunk-level failures mid-stream are NOT retried —
+    /// partial content has already streamed, so re-sending would duplicate the
+    /// assistant message; they abort the round as before.
     async fn run_model_round(&mut self) -> Result<collector::RoundOutcome, AgentError> {
-        let request_id = ulid::Ulid::new().to_string();
         let tools = self.agent.tool_schemas();
         let source = self.agent.model_source();
         let config = &self.agent.config;
@@ -1209,23 +1222,49 @@ impl TurnState<'_> {
         // plus a heuristic tail (`doc/phase2-plan.md` Step 2).
         let input_tokens_estimate = self.runtime.ledger.running();
 
-        self.writer.append(
-            source.clone(),
-            EventPayload::Model(ModelEvent::RequestStarted {
-                request_id: request_id.clone(),
-                provider: self.agent.provider.name().to_owned(),
-                model: config.model.clone(),
-                temperature: config.temperature,
-                max_tokens: config.max_tokens,
-                tool_schemas_count: u32::try_from(tools.len()).unwrap_or(u32::MAX),
-                input_tokens_estimate,
-            }),
-            None,
-            Some(self.turn_id.clone()),
-        )?;
+        let max_retries = self.agent.config.retry.max_retries;
+        let mut attempt = 0u32;
+        let (request_id, stream, started) = loop {
+            let request_id = ulid::Ulid::new().to_string();
+            self.writer.append(
+                source.clone(),
+                EventPayload::Model(ModelEvent::RequestStarted {
+                    request_id: request_id.clone(),
+                    provider: self.agent.provider.name().to_owned(),
+                    model: config.model.clone(),
+                    temperature: config.temperature,
+                    max_tokens: config.max_tokens,
+                    tool_schemas_count: u32::try_from(tools.len()).unwrap_or(u32::MAX),
+                    input_tokens_estimate,
+                }),
+                None,
+                Some(self.turn_id.clone()),
+            )?;
 
-        let started = Instant::now();
-        let stream = self.agent.provider.stream(request).await?;
+            let attempt_started = Instant::now();
+            match self.agent.provider.stream(request.clone()).await {
+                Ok(stream) => break (request_id, stream, attempt_started),
+                Err(err) if attempt < max_retries && crate::llm::is_retryable(&err) => {
+                    attempt += 1;
+                    let delay = self.agent.config.retry.delay_for(attempt);
+                    self.writer.append(
+                        source.clone(),
+                        EventPayload::Model(ModelEvent::RequestFailed {
+                            request_id,
+                            duration_ms: duration_ms(attempt_started.elapsed()),
+                            error: retry_error_detail(&err),
+                        }),
+                        None,
+                        Some(self.turn_id.clone()),
+                    )?;
+                    self.sink
+                        .on_retry(attempt, max_retries, delay, &err.to_string());
+                    tokio::time::sleep(delay).await;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        };
+
         // Split-borrow disjoint fields: the `'static` stream holds no borrow of
         // `self`, so writer + sink can be borrowed mutably for collection.
         let outcome = collector::collect_round(
@@ -2116,6 +2155,30 @@ fn tool_error_parts(err: &ToolError) -> (&'static str, String) {
     }
 }
 
+/// Build the [`ErrorDetail`] recorded for a retried model request
+/// (`ModelEvent::RequestFailed`). `retryable` is always true — this event is
+/// only written when the loop is about to retry — and severity stays
+/// `Warning`: the turn is still alive, unlike the terminal `ErrorEvent` a hard
+/// failure records (`error_detail`).
+fn retry_error_detail(err: &LlmError) -> ErrorDetail {
+    let code = match err {
+        LlmError::Transport(_) => "model_transport",
+        LlmError::Status { .. } => "model_status",
+        // `run_model_round` only calls this for retryable errors, so
+        // decode/auth never reach here; the mapping exists defensively.
+        LlmError::Decode(_) => "model_decode",
+        LlmError::Auth(_) => "model_auth",
+    };
+    ErrorDetail {
+        code: code.to_owned(),
+        message: err.to_string(),
+        severity: ErrorSeverity::Warning,
+        retryable: true,
+        source_event_id: None,
+        provider_raw: None,
+    }
+}
+
 /// Build the [`ErrorDetail`] recorded for a hard turn failure. `code`,
 /// `severity`, and `retryable` are derived from the error kind so a consumer can
 /// route on them: transport hiccups and 429/5xx statuses are worth retrying;
@@ -2205,6 +2268,98 @@ mod tests {
 
         async fn stream(&self, _request: ModelRequest) -> Result<EventStream, LlmError> {
             Err(LlmError::Transport("connection refused".to_owned()))
+        }
+    }
+
+    /// A provider that fails its first `failures` calls with a retryable error,
+    /// then streams the scripted batches — counting calls so tests can assert
+    /// how many attempts went out.
+    struct FlakyProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        failures: Mutex<u32>,
+        error: LlmErrorKind,
+        rounds: Mutex<std::collections::VecDeque<Vec<StreamEvent>>>,
+    }
+
+    /// The [`LlmError`] a [`FlakyProvider`] fails with (`LlmError` is not
+    /// `Clone`, so the shape is stored and rebuilt per failure).
+    enum LlmErrorKind {
+        Transport,
+        Status429,
+        Auth,
+    }
+
+    impl FlakyProvider {
+        fn new(failures: u32, error: LlmErrorKind, rounds: Vec<Vec<StreamEvent>>) -> Self {
+            Self {
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                failures: Mutex::new(failures),
+                error,
+                rounds: Mutex::new(rounds.into_iter().collect()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for FlakyProvider {
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn name(&self) -> &str {
+            "flaky"
+        }
+
+        async fn stream(&self, _request: ModelRequest) -> Result<EventStream, LlmError> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let should_fail = {
+                let mut failures = self.failures.lock().unwrap();
+                if *failures > 0 {
+                    *failures -= 1;
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_fail {
+                return Err(match self.error {
+                    LlmErrorKind::Transport => {
+                        LlmError::Transport("connection reset by peer".to_owned())
+                    }
+                    LlmErrorKind::Status429 => LlmError::Status {
+                        status: 429,
+                        body: r#"{"error":{"message":"The engine is currently overloaded, please try again later","type":"engine_overloaded_error"}}"#
+                            .to_owned(),
+                    },
+                    LlmErrorKind::Auth => LlmError::Auth("invalid api key".to_owned()),
+                });
+            }
+            let batch = self
+                .rounds
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("provider called more times than scripted");
+            let items: Vec<Result<StreamEvent, LlmError>> = batch.into_iter().map(Ok).collect();
+            Ok(Box::pin(stream::iter(items)))
+        }
+    }
+
+    /// A sink that records every `on_retry` notification, so tests can assert
+    /// the front-end is told about each retry.
+    #[derive(Default)]
+    struct RetrySink {
+        retries: Vec<(u32, u32, std::time::Duration, String)>,
+    }
+
+    impl StreamSink for RetrySink {
+        fn on_retry(
+            &mut self,
+            attempt: u32,
+            max_retries: u32,
+            delay: std::time::Duration,
+            error: &str,
+        ) {
+            self.retries
+                .push((attempt, max_retries, delay, error.to_owned()));
         }
     }
 
@@ -2940,6 +3095,167 @@ mod tests {
             m,
             Message::Tool { content, .. } if content.contains("unknown_tool")
         )));
+    }
+
+    /// Transient handshake failures are retried with backoff: Kimi's 429
+    /// `engine_overloaded_error` on the first two attempts must not abort the
+    /// turn — the third attempt streams the answer, the sink was notified per
+    /// retry, and the log holds a `RequestStarted`/`RequestFailed` pair per
+    /// failed attempt so replay can explain the delay.
+    #[tokio::test]
+    async fn transient_model_error_retries_and_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(FlakyProvider::new(
+            2,
+            LlmErrorKind::Status429,
+            vec![text_round("recovered after retry")],
+        ));
+        let calls = Arc::clone(&provider.calls);
+        let agent = Agent::new(
+            provider,
+            ToolRegistry::new(),
+            AgentConfig {
+                model: "mock".to_owned(),
+                // Zero-delay backoff keeps the retry test instantaneous.
+                retry: crate::llm::RetryConfig {
+                    max_retries: 10,
+                    initial_delay: Duration::ZERO,
+                    max_delay: Duration::ZERO,
+                },
+                ..AgentConfig::default()
+            },
+        );
+
+        let store = SessionStore::new(dir.path().join("sessions"));
+        let mut writer = store.create_new(None, None, vec![]).unwrap();
+        let sid = writer.session_id().clone();
+        let mut runtime = SessionRuntime::default();
+        let mut sink = RetrySink::default();
+
+        let outcome = agent
+            .run_turn_with_sink(&mut writer, &mut runtime, "hi".to_owned(), &mut sink)
+            .await
+            .unwrap();
+        drop(writer);
+
+        // The turn completed through the retries, not as an error.
+        assert_eq!(outcome.answer, "recovered after retry");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 3);
+        assert_eq!(outcome.rounds, 1);
+
+        // The front-end was notified about each retry, with the 1-based
+        // attempt number and the retry budget.
+        assert_eq!(sink.retries.len(), 2);
+        assert_eq!(sink.retries[0].0, 1);
+        assert_eq!(sink.retries[1].0, 2);
+        assert_eq!(sink.retries[0].1, 10, "carries the configured budget");
+        assert!(sink.retries[0].3.contains("429"));
+
+        // Each failed attempt is a persisted RequestStarted/RequestFailed pair
+        // (retryable warning), so replay can explain the gap; the successful
+        // attempt closes with RequestCompleted as usual.
+        let events = store.read_events(&sid).unwrap();
+        let failed_requests = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.payload,
+                    EventPayload::Model(ModelEvent::RequestFailed { error, .. })
+                        if error.retryable && error.severity == ErrorSeverity::Warning
+                )
+            })
+            .count();
+        assert_eq!(failed_requests, 2, "one RequestFailed per retried attempt");
+        let completed_requests = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.payload,
+                    EventPayload::Model(ModelEvent::RequestCompleted { .. })
+                )
+            })
+            .count();
+        assert_eq!(completed_requests, 1);
+        assert!(seqs_are_contiguous(&events));
+    }
+
+    /// Non-retryable failures never enter the retry loop: an auth rejection
+    /// propagates on the first attempt — re-sending it only burns rate-limit
+    /// budget — and the sink is never notified.
+    #[tokio::test]
+    async fn non_retryable_model_error_is_not_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(FlakyProvider::new(1, LlmErrorKind::Auth, vec![]));
+        let calls = Arc::clone(&provider.calls);
+        let agent = Agent::new(
+            provider,
+            ToolRegistry::new(),
+            AgentConfig {
+                model: "mock".to_owned(),
+                retry: crate::llm::RetryConfig {
+                    max_retries: 10,
+                    initial_delay: Duration::ZERO,
+                    max_delay: Duration::ZERO,
+                },
+                ..AgentConfig::default()
+            },
+        );
+
+        let store = SessionStore::new(dir.path().join("sessions"));
+        let mut writer = store.create_new(None, None, vec![]).unwrap();
+        let mut runtime = SessionRuntime::default();
+        let mut sink = RetrySink::default();
+
+        let result = agent
+            .run_turn_with_sink(&mut writer, &mut runtime, "hi".to_owned(), &mut sink)
+            .await;
+
+        assert!(matches!(result, Err(AgentError::Model(LlmError::Auth(_)))));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(sink.retries.is_empty(), "no retry notification went out");
+    }
+
+    /// The retry budget is finite: a provider that stays overloaded eventually
+    /// aborts the turn with the last error instead of looping forever, and the
+    /// sink saw exactly `max_retries` notifications.
+    #[tokio::test]
+    async fn retries_exhausted_aborts_turn_with_last_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(FlakyProvider::new(
+            u32::MAX,
+            LlmErrorKind::Transport,
+            vec![],
+        ));
+        let agent = Agent::new(
+            provider,
+            ToolRegistry::new(),
+            AgentConfig {
+                model: "mock".to_owned(),
+                retry: crate::llm::RetryConfig {
+                    max_retries: 3,
+                    initial_delay: Duration::ZERO,
+                    max_delay: Duration::ZERO,
+                },
+                ..AgentConfig::default()
+            },
+        );
+
+        let store = SessionStore::new(dir.path().join("sessions"));
+        let mut writer = store.create_new(None, None, vec![]).unwrap();
+        let mut runtime = SessionRuntime::default();
+        let mut sink = RetrySink::default();
+
+        let result = agent
+            .run_turn_with_sink(&mut writer, &mut runtime, "hi".to_owned(), &mut sink)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(AgentError::Model(LlmError::Transport(_)))
+        ));
+        // initial attempt + 3 retries = 4 calls.
+        assert_eq!(sink.retries.len(), 3);
+        assert_eq!(sink.retries[2].0, 3);
     }
 
     /// A hard provider error aborts the turn as `Err`, but still leaves a

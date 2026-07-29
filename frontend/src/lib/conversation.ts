@@ -1053,6 +1053,16 @@ function applyDelta(
 			});
 			return { ...state, items, open, nextId: state.nextId - 1 };
 		}
+		// The model request hit a transient failure (network drop, 429/5xx engine
+		// overload) and is being retried: surface it as a transient notice so the
+		// user sees "retrying…" instead of a silent pause during the backoff.
+		case 'retrying': {
+			const seconds = Math.round(Number(ev.delay_ms) / 1000);
+			return pushTransient(state, {
+				kind: 'notice',
+				message: `model request failed (${ev.error}); retrying in ${seconds}s (attempt ${ev.attempt}/${ev.max_retries})`
+			});
+		}
 		default:
 			return assertNever(ev);
 	}

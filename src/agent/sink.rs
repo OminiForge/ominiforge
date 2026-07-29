@@ -48,6 +48,21 @@ pub trait StreamSink: Send {
     /// line — the gauge is `tokens/window`, never the derived effective limit).
     /// Live display only — these are runtime values, not persisted to the log.
     fn on_context(&mut self, _tokens: u32, _window: u32, _threshold: f32) {}
+
+    /// The model request is being retried after a transient failure (network
+    /// drop, 429/5xx — e.g. an overloaded inference engine). `attempt` is the
+    /// 1-based retry number, `max_retries` the configured budget, `delay` the
+    /// backoff about to elapse, `error` a short description of the failure.
+    /// Live display only — a front-end can show "retrying…" instead of
+    /// sitting silent during the backoff. Not persisted to the log.
+    fn on_retry(
+        &mut self,
+        _attempt: u32,
+        _max_retries: u32,
+        _delay: std::time::Duration,
+        _error: &str,
+    ) {
+    }
 }
 
 /// What kind of block just opened, passed to [`StreamSink::on_block_start`].

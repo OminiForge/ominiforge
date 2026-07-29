@@ -123,6 +123,16 @@ pub enum Delta {
     Reasoning { index: u32, text: String },
     /// Incremental tool-call argument JSON.
     ToolArgs { index: u32, json: String },
+    /// The model request is being retried after a transient failure (network
+    /// drop, 429/5xx engine overload). `attempt` is the 1-based retry number,
+    /// `max_retries` the configured budget, `delay_ms` the backoff about to
+    /// elapse. Ephemeral like every delta: not persisted, not replayed.
+    Retrying {
+        attempt: u32,
+        max_retries: u32,
+        delay_ms: u64,
+        error: String,
+    },
 }
 
 /// A command sent to a [`SessionActor`] over its inbox.
@@ -895,6 +905,21 @@ impl StreamSink for BroadcastSink {
             window,
             threshold,
         });
+    }
+
+    fn on_retry(
+        &mut self,
+        attempt: u32,
+        max_retries: u32,
+        delay: std::time::Duration,
+        error: &str,
+    ) {
+        let _ = self.tx.send(GatewayEvent::Delta(Delta::Retrying {
+            attempt,
+            max_retries,
+            delay_ms: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            error: error.to_owned(),
+        }));
     }
 }
 

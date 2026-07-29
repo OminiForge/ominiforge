@@ -1088,6 +1088,21 @@ impl<O: Write + Send, E: Write + Send> StreamSink for CliSink<O, E> {
         let _ = self.err.flush();
     }
 
+    fn on_retry(
+        &mut self,
+        attempt: u32,
+        max_retries: u32,
+        delay: std::time::Duration,
+        error: &str,
+    ) {
+        self.begin_side(&format!(
+            "[retrying in {:.0}s ({attempt}/{max_retries})] {error}",
+            delay.as_secs_f64()
+        ));
+        self.end_side();
+        self.channel = Channel::None;
+    }
+
     fn on_block_stop(&mut self, _index: u32) {
         // Close a side-channel block so the next one starts on its own line;
         // answer text keeps flowing until the turn ends.

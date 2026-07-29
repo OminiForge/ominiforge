@@ -833,6 +833,9 @@ enum UiDelta {
     Reasoning(String),
     /// Tool-call argument JSON fragment.
     ToolArgs(String),
+    /// The model request is being retried after a transient failure; carries
+    /// a pre-formatted, human-readable note.
+    Retrying(String),
 }
 
 /// Owned counterpart of [`BlockKind`] (which borrows the tool name), so it can
@@ -1096,6 +1099,7 @@ impl AppState {
             UiDelta::Text(text) => self.append_answer(&text),
             UiDelta::Reasoning(text) => self.append_reasoning(&text),
             UiDelta::ToolArgs(text) => self.append_tool_args(&text),
+            UiDelta::Retrying(message) => self.push(Block::Note(message)),
         }
     }
 
@@ -1288,6 +1292,19 @@ impl StreamSink for ChannelSink {
 
     fn on_tool_call_delta(&mut self, _index: u32, json_delta: &str) {
         let _ = self.tx.send(UiDelta::ToolArgs(json_delta.to_owned()));
+    }
+
+    fn on_retry(
+        &mut self,
+        attempt: u32,
+        max_retries: u32,
+        delay: std::time::Duration,
+        error: &str,
+    ) {
+        let _ = self.tx.send(UiDelta::Retrying(format!(
+            "model request failed ({error}); retrying in {:.0}s (attempt {attempt}/{max_retries})",
+            delay.as_secs_f64()
+        )));
     }
 }
 

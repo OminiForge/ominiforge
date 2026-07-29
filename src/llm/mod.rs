@@ -7,8 +7,10 @@
 //! (`doc/architecture.md` §9). Concrete adapters live in `crate::provider`.
 
 mod message;
+mod retry;
 
 pub use message::{Message, ModelRequest, ToolCall, ToolSchema};
+pub use retry::{RetryConfig, RetryingProvider, is_retryable};
 
 use futures_util::stream::BoxStream;
 
