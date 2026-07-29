@@ -328,7 +328,8 @@ function applyCommitted(
 				commitBase: undefined
 			};
 		}
-		if ('ContentBlock' in m) return commitBlock(next, Number(core.seq), m.ContentBlock.content);
+		if ('ContentBlock' in m)
+			return commitBlock(next, Number(core.seq), m.ContentBlock.content, m.ContentBlock.index);
 		return next;
 	}
 	if ('Tool' in payload) {
@@ -419,15 +420,18 @@ function applyCommitted(
 function commitBlock(
 	state: ConversationState,
 	seq: number,
-	content: BlockContent
+	content: BlockContent,
+	index: number
 ): ConversationState {
 	let items: Item[];
 	let commitBase = state.commitBase;
+	let truncated = false;
 
 	if (state.requestStart !== undefined && !state.requestCommitted) {
 		// First commit: replace all streaming previews with authoritative committed stream.
 		items = state.items.slice(0, state.requestStart);
 		commitBase = state.requestStart;
+		truncated = true;
 	} else if (state.requestStart === undefined) {
 		// requestStart was cleared (e.g. by turn_settled arriving before the
 		// ContentBlock events — a backend event-forwarding race).  Strip any
@@ -437,6 +441,7 @@ function commitBlock(
 		if (firstStreaming >= 0) {
 			items = state.items.slice(0, firstStreaming);
 			commitBase = firstStreaming;
+			truncated = true;
 		} else {
 			items = [...state.items];
 		}
@@ -444,21 +449,73 @@ function commitBlock(
 		items = [...state.items];
 	}
 
+	// A truncation above removed this request's streaming previews: every
+	// `open` position recorded while they streamed is now stale. Reset it —
+	// the preview replacement below looks up `open[index]`, and a stale entry
+	// either misses the replacement (duplicate card + stuck running preview)
+	// or points at the wrong card entirely.
+	const open = truncated ? {} : state.open;
+
+	// Replace the streaming preview for THIS block (keyed on the shared block
+	// `index`) instead of appending a duplicate. text/reasoning previews carry
+	// `streaming: true` and sit at open[index]; the committed block carries the
+	// same index, so completing it in place leaves no stale preview beside the
+	// authoritative copy. Skipped after a truncation (open was reset above).
+	const previewPos = open[index];
+	const preview = previewPos !== undefined ? items[previewPos] : undefined;
+
 	let item: Item;
 	if ('Text' in content) {
 		if (!content.Text.text.trim())
-			return { ...state, requestCommitted: true, commitBase, committedEnd: items.length };
+			return { ...state, open, requestCommitted: true, commitBase, committedEnd: items.length };
 		item = { kind: 'text', id: seq, text: content.Text.text, streaming: false };
+		if (preview?.kind === 'text' && preview.streaming) {
+			items[previewPos] = item;
+			return {
+				...state,
+				items,
+				open,
+				requestCommitted: true,
+				commitBase,
+				committedEnd: items.length
+			};
+		}
 		items.push(item);
 	} else if ('Reasoning' in content) {
 		if (!content.Reasoning.text.trim())
-			return { ...state, requestCommitted: true, commitBase, committedEnd: items.length };
+			return { ...state, open, requestCommitted: true, commitBase, committedEnd: items.length };
 		item = { kind: 'reasoning', id: seq, text: content.Reasoning.text, streaming: false };
+		// A live reasoning preview at this index already sits where the user
+		// read it (temporal order): complete it in place rather than splicing a
+		// duplicate at commitBase. The commitBase insert below is only for a
+		// reasoning block with NO preview (its text sibling committed earlier).
+		if (preview?.kind === 'reasoning' && preview.streaming) {
+			items[previewPos] = item;
+			return {
+				...state,
+				items,
+				open,
+				requestCommitted: true,
+				commitBase,
+				committedEnd: items.length
+			};
+		}
 		// Insert reasoning at commitBase so it appears before any text items
 		// that the collector emitted earlier (providers may open text@0 before reasoning@1).
 		const insertAt = commitBase ?? items.length;
 		items.splice(insertAt, 0, item);
 		commitBase = insertAt + 1;
+		return {
+			...state,
+			items,
+			// The splice shifted every item at/after insertAt one position up:
+			// the position books must shift with it or pairResult/preview
+			// replacement write the wrong card.
+			...shiftPositions(state, insertAt),
+			requestCommitted: true,
+			commitBase,
+			committedEnd: items.length
+		};
 	} else {
 		// Plan is a control tool: fold its op into a plan card instead of
 		// rendering a generic tool block. The card lives where `init` lands and
@@ -466,7 +523,14 @@ function commitBlock(
 		// plan, but each `init` starts a fresh card so turn history is preserved).
 		if (content.ToolCall.name === PLAN_TOOL_NAME) {
 			items = foldPlanOp(items, seq, content.ToolCall.arguments);
-			return { ...state, items, requestCommitted: true, commitBase, committedEnd: items.length };
+			return {
+				...state,
+				items,
+				open,
+				requestCommitted: true,
+				commitBase,
+				committedEnd: items.length
+			};
 		}
 		const toolSeqs = new Map(state.toolSeqs);
 		let orphanTools = state.orphanTools;
@@ -508,6 +572,7 @@ function commitBlock(
 					return {
 						...state,
 						items,
+						open,
 						toolSeqs,
 						orphanTools,
 						requestCommitted: true,
@@ -536,8 +601,36 @@ function commitBlock(
 			return {
 				...state,
 				items,
+				open,
 				toolSeqs,
 				orphanTools,
+				requestCommitted: true,
+				commitBase,
+				committedEnd: items.length
+			};
+		}
+		// Replace the streaming preview for THIS block instead of appending a
+		// duplicate (previewPos/preview computed above). Only done when the card
+		// at open[index] really is the preview (seq=-1): after a truncation
+		// `open` was reset above, so a stale position can never clobber an
+		// already-committed card.
+		if (preview?.kind === 'tool' && preview.seq === -1) {
+			toolSeqs.set(seq, previewPos);
+			items[previewPos] = {
+				kind: 'tool',
+				id: seq,
+				seq,
+				callId: content.ToolCall.id,
+				name: content.ToolCall.name,
+				args: content.ToolCall.arguments,
+				status: 'running',
+				summary: content.ToolCall.summary ?? undefined
+			};
+			return {
+				...state,
+				items,
+				open,
+				toolSeqs,
 				requestCommitted: true,
 				commitBase,
 				committedEnd: items.length
@@ -558,6 +651,7 @@ function commitBlock(
 		return {
 			...state,
 			items,
+			open,
 			toolSeqs,
 			requestCommitted: true,
 			commitBase,
@@ -565,7 +659,24 @@ function commitBlock(
 		};
 	}
 
-	return { ...state, items, requestCommitted: true, commitBase, committedEnd: items.length };
+	return { ...state, items, open, requestCommitted: true, commitBase, committedEnd: items.length };
+}
+
+/// Shift every recorded items position at/after `insertAt` up by one, after a
+/// mid-list insertion (the reasoning commitBase splice). Returns fresh maps —
+/// callers spread the result, so an untouched book keeps its identity.
+function shiftPositions(
+	state: ConversationState,
+	insertAt: number
+): Pick<ConversationState, 'toolSeqs' | 'orphanTools' | 'open'> {
+	const shift = (pos: number) => (pos >= insertAt ? pos + 1 : pos);
+	const toolSeqs = new Map<number, number>();
+	for (const [seq, pos] of state.toolSeqs) toolSeqs.set(seq, shift(pos));
+	const orphanTools = new Map<string, number>();
+	for (const [id, pos] of state.orphanTools) orphanTools.set(id, shift(pos));
+	const open: Record<number, number> = {};
+	for (const [idx, pos] of Object.entries(state.open)) open[Number(idx)] = shift(pos);
+	return { toolSeqs, orphanTools, open };
 }
 
 /// Decoded `plan` call, mirroring `PlanOp`/`LeafOp` in `src/agent/plan.rs`.

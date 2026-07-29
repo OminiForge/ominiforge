@@ -46,7 +46,8 @@ function contentBlock(
 	content:
 		| { Text: { text: string } }
 		| { Reasoning: { text: string } }
-		| { ToolCall: { id: string; name: string; arguments: string } }
+		| { ToolCall: { id: string; name: string; arguments: string } },
+	index = 0
 ): GatewayEvent {
 	return {
 		type: 'event',
@@ -59,7 +60,7 @@ function contentBlock(
 		turn_id: null,
 		payload: {
 			Model: {
-				ContentBlock: { request_id: 'r', index: 0, content }
+				ContentBlock: { request_id: 'r', index, content }
 			}
 		}
 	} as unknown as GatewayEvent;
@@ -1380,5 +1381,223 @@ describe('replay boundary (ready)', () => {
 			{ type: 'turn_settled', incomplete: null }
 		]);
 		expect(state.ready).toBe(true);
+	});
+});
+
+// ── Streaming-preview replacement (stuck running card) ──────────────
+//
+// A tool-call preview card (seq=-1, built from live deltas) must be REPLACED
+// by its committed ContentBlock, keyed on the shared block `index`. When a
+// non-tool block commits first in the same request (flipping requestCommitted),
+// the tool's ContentBlock takes the append path — which must still find and
+// complete the preview, not push a duplicate that leaves the preview running
+// forever (its seq=-1 can never be paired by a Tool::Completed).
+
+describe('streaming preview replacement', () => {
+	it('a tool preview after a text commit is replaced by its committed block, not duplicated', () => {
+		const state = fold([
+			reqStarted(1),
+			// text block commits first → requestCommitted = true
+			contentBlock(2, { Text: { text: 'let me run a command' } }, 0),
+			// model opens a tool call (block index 1) → streaming preview, partial args
+			{
+				type: 'delta',
+				delta: 'block_start',
+				index: 1,
+				kind: 'tool_call',
+				tool: 'shell'
+			} as GatewayEvent,
+			{ type: 'delta', delta: 'tool_args', index: 1, json: '{"command":"sl' } as GatewayEvent,
+			// the tool's committed ContentBlock arrives (same index 1)
+			contentBlock(
+				3,
+				{ ToolCall: { id: 'c1', name: 'shell', arguments: '{"command":"sleep 5"}' } },
+				1
+			),
+			// the tool completes against the committed seq 3
+			toolCompleted(4, 3, 'done')
+		]);
+		const tools = state.items.filter((i) => i.kind === 'tool');
+		// Exactly ONE tool card: the preview was completed in place, not left
+		// behind as a stuck running duplicate.
+		expect(tools).toHaveLength(1);
+		expect(tools[0].kind === 'tool' && tools[0].seq).toBe(3);
+		expect(tools[0].kind === 'tool' && tools[0].status).toBe('done');
+		expect(tools[0].kind === 'tool' && tools[0].callId).toBe('c1');
+	});
+
+	it('concurrent tool previews are each replaced by their own index, not confused', () => {
+		const state = fold([
+			reqStarted(1),
+			contentBlock(2, { Text: { text: 'running two commands' } }, 0),
+			// two previews open at indices 1 and 2
+			{
+				type: 'delta',
+				delta: 'block_start',
+				index: 1,
+				kind: 'tool_call',
+				tool: 'shell'
+			} as GatewayEvent,
+			{
+				type: 'delta',
+				delta: 'block_start',
+				index: 2,
+				kind: 'tool_call',
+				tool: 'shell'
+			} as GatewayEvent,
+			{ type: 'delta', delta: 'tool_args', index: 1, json: '{"command":"echo A"}' } as GatewayEvent,
+			{ type: 'delta', delta: 'tool_args', index: 2, json: '{"command":"echo B"}' } as GatewayEvent,
+			// committed blocks land (index 2 before index 1 — completion order)
+			contentBlock(
+				3,
+				{ ToolCall: { id: 'cB', name: 'shell', arguments: '{"command":"echo B"}' } },
+				2
+			),
+			contentBlock(
+				4,
+				{ ToolCall: { id: 'cA', name: 'shell', arguments: '{"command":"echo A"}' } },
+				1
+			),
+			toolCompleted(5, 3, 'B done'),
+			toolCompleted(6, 4, 'A done')
+		]);
+		const tools = state.items.filter((i) => i.kind === 'tool');
+		expect(tools).toHaveLength(2);
+		// Each preview matched its own committed block by index: no seq=-1 left.
+		expect(tools.every((t) => t.kind === 'tool' && t.seq !== -1)).toBe(true);
+		expect(tools.every((t) => t.kind === 'tool' && t.status === 'done')).toBe(true);
+		const byCallId = new Map(tools.map((t) => [t.kind === 'tool' ? t.callId : '', t]));
+		expect(byCallId.get('cA')?.kind === 'tool' && byCallId.get('cA')!.seq).toBe(4);
+		expect(byCallId.get('cB')?.kind === 'tool' && byCallId.get('cB')!.seq).toBe(3);
+	});
+
+	it('a preview already replaced must not be replaced again by a later same-index block', () => {
+		// First-commit truncation slices the preview away and the formal card
+		// takes seq>0; a later block reusing the same open[index] must not find
+		// a seq=-1 card there (the guard prevents clobbering the formal card).
+		const state = fold([
+			reqStarted(1),
+			// preview at index 0
+			{
+				type: 'delta',
+				delta: 'block_start',
+				index: 0,
+				kind: 'tool_call',
+				tool: 'shell'
+			} as GatewayEvent,
+			// FIRST commit (index 0) → truncation replaces the preview via the
+			// first-commit path; the formal card has seq=2.
+			contentBlock(2, { ToolCall: { id: 'c1', name: 'shell', arguments: '{"a":1}' } }, 0),
+			toolCompleted(3, 2, 'done')
+		]);
+		const tools = state.items.filter((i) => i.kind === 'tool');
+		expect(tools).toHaveLength(1);
+		expect(tools[0].kind === 'tool' && tools[0].status).toBe('done');
+		expect(tools[0].kind === 'tool' && tools[0].result).toBe('done');
+	});
+
+	it('a text preview after a reasoning commit is replaced, not duplicated', () => {
+		const state = fold([
+			reqStarted(1),
+			// reasoning commits first → requestCommitted = true
+			contentBlock(2, { Reasoning: { text: 'thinking' } }, 0),
+			// model streams a text preview (index 1)
+			{ type: 'delta', delta: 'text', index: 1, text: 'partial ans' } as GatewayEvent,
+			// the text's committed block arrives (append path, index 1)
+			contentBlock(3, { Text: { text: 'partial answer, complete' } }, 1)
+		]);
+		const texts = state.items.filter((i) => i.kind === 'text');
+		// Exactly ONE text item: the streaming preview was completed in place.
+		expect(texts).toHaveLength(1);
+		expect(texts[0].kind === 'text' && texts[0].streaming).toBe(false);
+		expect(texts[0].kind === 'text' && texts[0].text).toBe('partial answer, complete');
+		expect(texts[0].id).toBe(3);
+	});
+
+	it('a reasoning preview after a text commit is replaced, not duplicated', () => {
+		const state = fold([
+			reqStarted(1),
+			// text commits first (provider opened text@0 before reasoning@1)
+			contentBlock(2, { Text: { text: 'the answer' } }, 0),
+			// reasoning preview streams (index 1)
+			{ type: 'delta', delta: 'reasoning', index: 1, text: 'let me th' } as GatewayEvent,
+			// reasoning's committed block arrives (index 1)
+			contentBlock(3, { Reasoning: { text: 'let me think carefully' } }, 1)
+		]);
+		const reasoning = state.items.filter((i) => i.kind === 'reasoning');
+		expect(reasoning).toHaveLength(1);
+		expect(reasoning[0].kind === 'reasoning' && reasoning[0].streaming).toBe(false);
+		expect(reasoning[0].kind === 'reasoning' && reasoning[0].text).toBe('let me think carefully');
+		expect(reasoning[0].id).toBe(3);
+	});
+});
+
+// ── Commit-time bookkeeping integrity ─────────────────────────────
+//
+// Two position books drive all commit/pairing logic: `open` (block index →
+// items position of the streaming preview) and `toolSeqs` (committed seq →
+// items position, for Tool::Completed pairing). Both hold POSITIONS into
+// items[], so any commit-path mutation of the list (truncation, mid-list
+// splice) must keep them in sync — a stale position makes pairResult write
+// the wrong card (stuck running) or the preview replacement clobber a
+// committed card (duplicates).
+
+describe('commit-time bookkeeping integrity', () => {
+	it('a truncation resets open: a later same-index commit cannot clobber the card that slid into the stale position', () => {
+		// Provider order: tool@1 streams a preview, reasoning@2 streams after.
+		// The tool commits FIRST (text@0 was empty and dropped): truncation
+		// slices both previews, then the tool card lands at position 0 — the
+		// exact slot stale open[1] still pointed at. Without the open reset,
+		// the committed reasoning@2 would look up open[2]... and any later
+		// same-index block would overwrite the tool card at open[1]=0.
+		const state = fold([
+			reqStarted(1),
+			{
+				type: 'delta',
+				delta: 'block_start',
+				index: 1,
+				kind: 'tool_call',
+				tool: 'shell'
+			} as GatewayEvent,
+			{ type: 'delta', delta: 'tool_args', index: 1, json: '{"command":"ls"}' } as GatewayEvent,
+			{
+				type: 'delta',
+				delta: 'block_start',
+				index: 2,
+				kind: 'reasoning'
+			} as GatewayEvent,
+			{ type: 'delta', delta: 'reasoning', index: 2, text: 'post-tool thought' } as GatewayEvent,
+			// Commits arrive in collector order: tool@1 first (text@0 dropped).
+			contentBlock(2, { ToolCall: { id: 'c1', name: 'shell', arguments: '{"command":"ls"}' } }, 1),
+			contentBlock(3, { Reasoning: { text: 'post-tool thought' } }, 2),
+			toolCompleted(4, 2, 'ok')
+		]);
+		const tools = state.items.filter((i) => i.kind === 'tool');
+		// Exactly one tool card — the stale-open clobber would have replaced
+		// it with a second card or left a duplicate preview behind.
+		expect(tools).toHaveLength(1);
+		// The completed result must land on the REAL card: toolSeqs was
+		// registered at position 0, then the reasoning splice shifted the
+		// card to position 1 — only a shifted book still finds it.
+		expect(tools[0].kind === 'tool' && tools[0].status).toBe('done');
+		expect(tools[0].kind === 'tool' && tools[0].result).toBe('ok');
+	});
+
+	it('a reasoning splice shifts toolSeqs: the completed result lands on the tool card, not the spliced-in reasoning', () => {
+		// tool commits (position 0, toolSeqs: seq2→0), then a reasoning block
+		// commits and splices in at commitBase=0, pushing the card to 1. An
+		// unshifted toolSeqs would pair the result onto the reasoning item
+		// (a no-op: kind mismatch) and leave the card running forever.
+		const state = fold([
+			reqStarted(1),
+			contentBlock(2, { ToolCall: { id: 'c1', name: 'shell', arguments: '{}' } }, 0),
+			contentBlock(3, { Reasoning: { text: 'late reasoning' } }, 1),
+			toolCompleted(4, 2, 'done')
+		]);
+		const tool = state.items.find((i) => i.kind === 'tool');
+		expect(tool?.kind === 'tool' && tool.status).toBe('done');
+		expect(tool?.kind === 'tool' && tool.result).toBe('done');
+		// Reasoning stays at the head (commitBase ordering), the card after it.
+		expect(state.items.map((i) => i.kind)).toEqual(['reasoning', 'tool']);
 	});
 });
