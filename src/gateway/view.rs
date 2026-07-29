@@ -25,8 +25,8 @@ use std::collections::HashMap;
 use serde::Serialize;
 
 use crate::agent::{LeafOp, PlanOp};
-use crate::core::payload::{BlockContent, Content, EventPayload, PermissionEvent, ToolEvent};
 use crate::core::CoreEvent;
+use crate::core::payload::{BlockContent, Content, EventPayload, PermissionEvent, ToolEvent};
 
 /// One row of the rendered conversation.
 ///
@@ -38,11 +38,7 @@ use crate::core::CoreEvent;
 pub enum ViewItem {
     /// A user turn, folded from `Turn::Started.input`. `seq` is that event's
     /// seq — the fork point for branching at this turn.
-    User {
-        id: u64,
-        text: String,
-        seq: u64,
-    },
+    User { id: u64, text: String, seq: u64 },
     /// Assistant free text (committed; never streaming here — a folded view
     /// is always settled content).
     Text { id: u64, text: String },
@@ -178,8 +174,15 @@ pub fn fold_view(events: &[CoreEvent]) -> SessionView {
         last_seq = Some(seq);
         match &ev.payload {
             EventPayload::Turn(t) => {
-                if let crate::core::payload::TurnEvent::Started { input: Some(text), .. } = t {
-                    items.push(ViewItem::User { id: seq, text: text.clone(), seq });
+                if let crate::core::payload::TurnEvent::Started {
+                    input: Some(text), ..
+                } = t
+                {
+                    items.push(ViewItem::User {
+                        id: seq,
+                        text: text.clone(),
+                        seq,
+                    });
                 }
                 match t {
                     crate::core::payload::TurnEvent::Started { .. }
@@ -198,39 +201,87 @@ pub fn fold_view(events: &[CoreEvent]) -> SessionView {
                         | crate::core::payload::TurnEvent::Interrupted { .. }
                 ) {
                     for item in &mut items {
-                        if let ViewItem::Tool { approval_pending, .. } = item {
+                        if let ViewItem::Tool {
+                            approval_pending, ..
+                        } = item
+                        {
                             *approval_pending = false;
                         }
                     }
                 }
             }
-            EventPayload::Model(crate::core::payload::ModelEvent::RequestStarted { model, .. }) => {
+            EventPayload::Model(crate::core::payload::ModelEvent::RequestStarted {
+                model, ..
+            }) => {
                 if !runtime_models.contains(model) {
                     runtime_models.push(model.clone());
                 }
             }
-            EventPayload::Model(crate::core::payload::ModelEvent::ContentBlock { content, .. }) => {
-                fold_block(seq, content, &mut items, &mut tools_by_seq, &mut tools_by_call_id, &mut pending_asks);
+            EventPayload::Model(crate::core::payload::ModelEvent::ContentBlock {
+                content, ..
+            }) => {
+                fold_block(
+                    seq,
+                    content,
+                    &mut items,
+                    &mut tools_by_seq,
+                    &mut tools_by_call_id,
+                    &mut pending_asks,
+                );
             }
             EventPayload::Tool(t) => match t {
-                ToolEvent::Completed { tool_call_event_id, result, .. } => {
+                ToolEvent::Completed {
+                    tool_call_event_id,
+                    result,
+                    ..
+                } => {
                     if let Some(card) = tools_by_seq.get(&tool_call_event_id.seq) {
-                        let status = if result.is_error { ViewToolStatus::Error } else { ViewToolStatus::Done };
-                        apply_tool_outcome(&mut items, card.item_index, status, &result.content, result.error_code.clone());
+                        let status = if result.is_error {
+                            ViewToolStatus::Error
+                        } else {
+                            ViewToolStatus::Done
+                        };
+                        apply_tool_outcome(
+                            &mut items,
+                            card.item_index,
+                            status,
+                            &result.content,
+                            result.error_code.clone(),
+                        );
                     }
                 }
-                ToolEvent::Failed { tool_call_event_id, error, .. } => {
+                ToolEvent::Failed {
+                    tool_call_event_id,
+                    error,
+                    ..
+                } => {
                     if let Some(card) = tools_by_seq.get(&tool_call_event_id.seq) {
                         let content = vec![Content::Text(error.message.clone())];
-                        apply_tool_outcome(&mut items, card.item_index, ViewToolStatus::Error, &content, None);
+                        apply_tool_outcome(
+                            &mut items,
+                            card.item_index,
+                            ViewToolStatus::Error,
+                            &content,
+                            None,
+                        );
                     }
                 }
                 ToolEvent::Started { .. } => {}
             },
             EventPayload::Permission(p) => match p {
-                PermissionEvent::Requested { call_id, tool_name, input, preview } => {
+                PermissionEvent::Requested {
+                    call_id,
+                    tool_name,
+                    input,
+                    preview,
+                } => {
                     if let Some(&idx) = tools_by_call_id.get(call_id) {
-                        if let ViewItem::Tool { approval_pending, preview: slot, .. } = &mut items[idx] {
+                        if let ViewItem::Tool {
+                            approval_pending,
+                            preview: slot,
+                            ..
+                        } = &mut items[idx]
+                        {
                             *approval_pending = true;
                             slot.clone_from(preview);
                         }
@@ -238,19 +289,28 @@ pub fn fold_view(events: &[CoreEvent]) -> SessionView {
                         // The ToolCall block hasn't folded (out-of-order
                         // delivery): remember the ask; the late block
                         // backfills the card with it.
-                        pending_asks.insert(call_id.clone(), (seq, tool_name.clone(), input.clone(), preview.clone()));
+                        pending_asks.insert(
+                            call_id.clone(),
+                            (seq, tool_name.clone(), input.clone(), preview.clone()),
+                        );
                     }
                 }
                 PermissionEvent::Decided { call_id, .. } => {
                     if let Some(&idx) = tools_by_call_id.get(call_id)
-                        && let ViewItem::Tool { approval_pending, .. } = &mut items[idx] {
-                            *approval_pending = false;
-                        }
+                        && let ViewItem::Tool {
+                            approval_pending, ..
+                        } = &mut items[idx]
+                    {
+                        *approval_pending = false;
+                    }
                 }
             },
             EventPayload::Error(e) => {
                 let crate::core::payload::ErrorEvent::Raised(detail) = e;
-                items.push(ViewItem::Error { id: seq, message: detail.message.clone() });
+                items.push(ViewItem::Error {
+                    id: seq,
+                    message: detail.message.clone(),
+                });
             }
             // Session/Artifact/Injection/Hook payloads are not conversation
             // content (they drive inspect/monitoring, not the chat view).
@@ -258,7 +318,12 @@ pub fn fold_view(events: &[CoreEvent]) -> SessionView {
         }
     }
 
-    SessionView { items, last_seq, turn_running, runtime_models }
+    SessionView {
+        items,
+        last_seq,
+        turn_running,
+        runtime_models,
+    }
 }
 
 /// Fold one committed content block: text/reasoning append (empty blocks are
@@ -275,15 +340,26 @@ fn fold_block(
     match content {
         BlockContent::Text { text } => {
             if !text.trim().is_empty() {
-                items.push(ViewItem::Text { id: seq, text: text.clone() });
+                items.push(ViewItem::Text {
+                    id: seq,
+                    text: text.clone(),
+                });
             }
         }
         BlockContent::Reasoning { text } => {
             if !text.trim().is_empty() {
-                items.push(ViewItem::Reasoning { id: seq, text: text.clone() });
+                items.push(ViewItem::Reasoning {
+                    id: seq,
+                    text: text.clone(),
+                });
             }
         }
-        BlockContent::ToolCall { id, name, arguments, summary } => {
+        BlockContent::ToolCall {
+            id,
+            name,
+            arguments,
+            summary,
+        } => {
             if name == "plan" {
                 fold_plan_op(seq, arguments, items);
                 return;
@@ -325,8 +401,16 @@ fn apply_tool_outcome(
     content: &[Content],
     error_code: Option<String>,
 ) {
-    let Some(ViewItem::Tool { name, status: s, result, diagnostics, view, preview, error_code: ec, .. }) =
-        items.get_mut(item_index)
+    let Some(ViewItem::Tool {
+        name,
+        status: s,
+        result,
+        diagnostics,
+        view,
+        preview,
+        error_code: ec,
+        ..
+    }) = items.get_mut(item_index)
     else {
         return;
     };
@@ -336,7 +420,9 @@ fn apply_tool_outcome(
     for c in content {
         match c {
             Content::Text(t) => texts.push(t),
-            Content::TextView { text, audience } if audience == crate::core::payload::AUDIENCE_UI => {
+            Content::TextView { text, audience }
+                if audience == crate::core::payload::AUDIENCE_UI =>
+            {
                 ui_view = Some(text.clone());
             }
             _ => texts.push("[binary]"),
@@ -376,7 +462,11 @@ fn fold_plan_op(seq: u64, args: &str, items: &mut Vec<ViewItem>) {
             items.push(ViewItem::Plan { id: seq, steps });
         }
         PlanOp::Ops { ops } => {
-            let Some(ViewItem::Plan { steps, .. }) = items.iter_mut().rev().find(|i| matches!(i, ViewItem::Plan { .. })) else {
+            let Some(ViewItem::Plan { steps, .. }) = items
+                .iter_mut()
+                .rev()
+                .find(|i| matches!(i, ViewItem::Plan { .. }))
+            else {
                 return;
             };
             for op in ops {
@@ -392,15 +482,24 @@ fn apply_leaf(steps: &mut Vec<ViewPlanStep>, op: LeafOp) {
     match op {
         LeafOp::Start { id } => set_status(steps, &id, ViewPlanStatus::InProgress, None),
         LeafOp::Complete { id } => set_status(steps, &id, ViewPlanStatus::Completed, None),
-        LeafOp::Cancel { id, reason } => set_status(steps, &id, ViewPlanStatus::Cancelled, Some(reason)),
-        LeafOp::Block { id, reason } => set_status(steps, &id, ViewPlanStatus::Blocked, Some(reason)),
+        LeafOp::Cancel { id, reason } => {
+            set_status(steps, &id, ViewPlanStatus::Cancelled, Some(reason))
+        }
+        LeafOp::Block { id, reason } => {
+            set_status(steps, &id, ViewPlanStatus::Blocked, Some(reason))
+        }
         LeafOp::Add { content, after_id } => {
             let max = steps
                 .iter()
                 .filter_map(|s| s.id.parse::<u64>().ok())
                 .max()
                 .unwrap_or(0);
-            let step = ViewPlanStep { id: (max + 1).to_string(), content, status: ViewPlanStatus::Pending, reason: None };
+            let step = ViewPlanStep {
+                id: (max + 1).to_string(),
+                content,
+                status: ViewPlanStatus::Pending,
+                reason: None,
+            };
             match after_id.and_then(|a| steps.iter().position(|s| s.id == a)) {
                 Some(at) => steps.insert(at + 1, step),
                 None => steps.push(step),
@@ -409,7 +508,12 @@ fn apply_leaf(steps: &mut Vec<ViewPlanStep>, op: LeafOp) {
     }
 }
 
-fn set_status(steps: &mut [ViewPlanStep], id: &str, status: ViewPlanStatus, reason: Option<String>) {
+fn set_status(
+    steps: &mut [ViewPlanStep],
+    id: &str,
+    status: ViewPlanStatus,
+    reason: Option<String>,
+) {
     if let Some(step) = steps.iter_mut().find(|s| s.id == id) {
         step.status = status;
         step.reason = reason.or_else(|| step.reason.clone());
@@ -434,7 +538,10 @@ mod tests {
             seq,
             session_id: SessionId("s".to_owned()),
             timestamp: Utc.with_ymd_and_hms(2026, 6, 24, 0, 0, 0).unwrap(),
-            source: EventSource { kind: SourceKind::Runtime, id: "test".to_owned() },
+            source: EventSource {
+                kind: SourceKind::Runtime,
+                id: "test".to_owned(),
+            },
             parent_event_id: None,
             turn_id: None,
             payload,
@@ -442,21 +549,43 @@ mod tests {
     }
 
     fn block(seq: u64, content: BlockContent) -> CoreEvent {
-        ev(seq, EventPayload::Model(ModelEvent::ContentBlock { request_id: "r".into(), index: 0, content }))
+        ev(
+            seq,
+            EventPayload::Model(ModelEvent::ContentBlock {
+                request_id: "r".into(),
+                index: 0,
+                content,
+            }),
+        )
     }
 
     fn tool_call(id: &str, name: &str, args: &str) -> BlockContent {
-        BlockContent::ToolCall { id: id.into(), name: name.into(), arguments: args.into(), summary: None }
+        BlockContent::ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: args.into(),
+            summary: None,
+        }
     }
 
     fn completed(seq: u64, call_seq: u64, text: &str) -> CoreEvent {
-        ev(seq, EventPayload::Tool(ToolEvent::Completed {
-            tool_call_event_id: EventId { session_id: SessionId("s".into()), seq: call_seq },
-            result: ToolOutput { content: vec![Content::Text(text.into())], is_error: false, error_code: None },
-            duration_ms: 1,
-            output_bytes: 1,
-            artifacts_created: vec![],
-        }))
+        ev(
+            seq,
+            EventPayload::Tool(ToolEvent::Completed {
+                tool_call_event_id: EventId {
+                    session_id: SessionId("s".into()),
+                    seq: call_seq,
+                },
+                result: ToolOutput {
+                    content: vec![Content::Text(text.into())],
+                    is_error: false,
+                    error_code: None,
+                },
+                duration_ms: 1,
+                output_bytes: 1,
+                artifacts_created: vec![],
+            }),
+        )
     }
 
     /// A full turn folds into the exact item sequence the web fold produces:
@@ -465,26 +594,60 @@ mod tests {
     #[test]
     fn a_turn_folds_into_view_items() {
         let events = vec![
-            ev(0, EventPayload::Session(SessionEvent::Created { profile_id: None, tools: vec![], workspace: None })),
-            ev(1, EventPayload::Turn(TurnEvent::Started { turn_id: crate::core::TurnId("t".into()), input: Some("hello".into()) })),
-            block(2, BlockContent::Reasoning { text: "think".into() }),
-            block(3, BlockContent::Text { text: "answer".into() }),
+            ev(
+                0,
+                EventPayload::Session(SessionEvent::Created {
+                    profile_id: None,
+                    tools: vec![],
+                    workspace: None,
+                }),
+            ),
+            ev(
+                1,
+                EventPayload::Turn(TurnEvent::Started {
+                    turn_id: crate::core::TurnId("t".into()),
+                    input: Some("hello".into()),
+                }),
+            ),
+            block(
+                2,
+                BlockContent::Reasoning {
+                    text: "think".into(),
+                },
+            ),
+            block(
+                3,
+                BlockContent::Text {
+                    text: "answer".into(),
+                },
+            ),
             block(4, tool_call("c1", "read", "{\"path\":\"a.txt\"}")),
             completed(5, 4, "[a.txt]\n1:hi"),
-            ev(6, EventPayload::Turn(TurnEvent::Completed { turn_id: crate::core::TurnId("t".into()) })),
+            ev(
+                6,
+                EventPayload::Turn(TurnEvent::Completed {
+                    turn_id: crate::core::TurnId("t".into()),
+                }),
+            ),
         ];
         let view = fold_view(&events);
         assert_eq!(view.last_seq, Some(6));
-        let kinds: Vec<&str> = view.items.iter().map(|i| match i {
-            ViewItem::User { .. } => "user",
-            ViewItem::Reasoning { .. } => "reasoning",
-            ViewItem::Text { .. } => "text",
-            ViewItem::Tool { .. } => "tool",
-            ViewItem::Plan { .. } => "plan",
-            ViewItem::Error { .. } => "error",
-        }).collect();
+        let kinds: Vec<&str> = view
+            .items
+            .iter()
+            .map(|i| match i {
+                ViewItem::User { .. } => "user",
+                ViewItem::Reasoning { .. } => "reasoning",
+                ViewItem::Text { .. } => "text",
+                ViewItem::Tool { .. } => "tool",
+                ViewItem::Plan { .. } => "plan",
+                ViewItem::Error { .. } => "error",
+            })
+            .collect();
         assert_eq!(kinds, ["user", "reasoning", "text", "tool"]);
-        let ViewItem::Tool { status, result, .. } = &view.items[3] else { panic!("tool card") };
+        let ViewItem::Tool { status, result, .. } = &view.items[3] else {
+            panic!("tool card")
+        };
         assert_eq!(*status, ViewToolStatus::Done);
         assert_eq!(result.as_deref(), Some("[a.txt]\n1:hi"));
     }
@@ -494,26 +657,49 @@ mod tests {
     #[test]
     fn an_early_permission_ask_backfills_the_late_tool_card() {
         let events = vec![
-            ev(1, EventPayload::Permission(PermissionEvent::Requested {
-                call_id: "c1".into(),
-                tool_name: "write".into(),
-                input: serde_json::json!({"path":"x.txt"}),
-                preview: Some("DIFF".into()),
-            })),
+            ev(
+                1,
+                EventPayload::Permission(PermissionEvent::Requested {
+                    call_id: "c1".into(),
+                    tool_name: "write".into(),
+                    input: serde_json::json!({"path":"x.txt"}),
+                    preview: Some("DIFF".into()),
+                }),
+            ),
             block(2, tool_call("c1", "write", "{\"path\":\"x.txt\"}")),
-            ev(3, EventPayload::Permission(PermissionEvent::Decided {
-                call_id: "c1".into(),
-                outcome: PermissionOutcome::Approved,
-                decided_by: "user".into(),
-                scope: None,
-            })),
+            ev(
+                3,
+                EventPayload::Permission(PermissionEvent::Decided {
+                    call_id: "c1".into(),
+                    outcome: PermissionOutcome::Approved,
+                    decided_by: "user".into(),
+                    scope: None,
+                }),
+            ),
             completed(4, 2, "wrote x.txt"),
         ];
         let view = fold_view(&events);
-        assert_eq!(view.items.len(), 1, "one card, completed in place — never duplicated");
-        let ViewItem::Tool { approval_pending, preview, view, status, .. } = &view.items[0] else { panic!("tool card") };
+        assert_eq!(
+            view.items.len(),
+            1,
+            "one card, completed in place — never duplicated"
+        );
+        let ViewItem::Tool {
+            approval_pending,
+            preview,
+            view,
+            status,
+            ..
+        } = &view.items[0]
+        else {
+            panic!("tool card")
+        };
         assert!(!approval_pending, "the Decided cleared it");
-        assert_eq!(view.as_deref(), Some("DIFF"), "no executed view → the preview stays");
+        assert_eq!(
+            view.as_deref(),
+            Some("DIFF"),
+            "no executed view → the preview stays"
+        );
         assert_eq!(*status, ViewToolStatus::Done);
         let _ = preview;
     }
@@ -524,19 +710,33 @@ mod tests {
     fn an_interrupted_turn_disarms_a_pending_ask() {
         let events = vec![
             block(1, tool_call("c1", "shell", "{\"command\":\"x\"}")),
-            ev(2, EventPayload::Permission(PermissionEvent::Requested {
-                call_id: "c1".into(),
-                tool_name: "shell".into(),
-                input: serde_json::json!({}),
-                preview: None,
-            })),
-            ev(3, EventPayload::Turn(TurnEvent::Interrupted {
-                turn_id: crate::core::TurnId("t".into()),
-                interrupted_at_event_id: EventId { session_id: SessionId("s".into()), seq: 2 },
-            })),
+            ev(
+                2,
+                EventPayload::Permission(PermissionEvent::Requested {
+                    call_id: "c1".into(),
+                    tool_name: "shell".into(),
+                    input: serde_json::json!({}),
+                    preview: None,
+                }),
+            ),
+            ev(
+                3,
+                EventPayload::Turn(TurnEvent::Interrupted {
+                    turn_id: crate::core::TurnId("t".into()),
+                    interrupted_at_event_id: EventId {
+                        session_id: SessionId("s".into()),
+                        seq: 2,
+                    },
+                }),
+            ),
         ];
         let view = fold_view(&events);
-        let ViewItem::Tool { approval_pending, .. } = &view.items[0] else { panic!("tool card") };
+        let ViewItem::Tool {
+            approval_pending, ..
+        } = &view.items[0]
+        else {
+            panic!("tool card")
+        };
         assert!(!approval_pending);
     }
 
@@ -545,12 +745,28 @@ mod tests {
     #[test]
     fn plan_calls_fold_into_cards() {
         let events = vec![
-            block(1, tool_call("p1", "plan", r#"{"op":"init","steps":[{"content":"a"},{"content":"b"}]}"#)),
-            block(2, tool_call("p2", "plan", r#"{"ops":[{"op":"start","id":"1"},{"op":"complete","id":"1"}]}"#)),
+            block(
+                1,
+                tool_call(
+                    "p1",
+                    "plan",
+                    r#"{"op":"init","steps":[{"content":"a"},{"content":"b"}]}"#,
+                ),
+            ),
+            block(
+                2,
+                tool_call(
+                    "p2",
+                    "plan",
+                    r#"{"ops":[{"op":"start","id":"1"},{"op":"complete","id":"1"}]}"#,
+                ),
+            ),
         ];
         let view = fold_view(&events);
         assert_eq!(view.items.len(), 1);
-        let ViewItem::Plan { steps, .. } = &view.items[0] else { panic!("plan card") };
+        let ViewItem::Plan { steps, .. } = &view.items[0] else {
+            panic!("plan card")
+        };
         assert_eq!(steps.len(), 2);
         assert_eq!(steps[0].status, ViewPlanStatus::Completed);
         assert_eq!(steps[1].status, ViewPlanStatus::Pending);
@@ -562,24 +778,41 @@ mod tests {
     fn tool_outcome_splits_diagnostics_and_view() {
         let events = vec![
             block(1, tool_call("c1", "write", "{}")),
-            ev(2, EventPayload::Tool(ToolEvent::Completed {
-                tool_call_event_id: EventId { session_id: SessionId("s".into()), seq: 1 },
-                result: ToolOutput {
-                    content: vec![
-                        Content::Text("wrote a.rs".into()),
-                        Content::TextView { text: "DIFF".into(), audience: "ui".into() },
-                        Content::Text("[diagnostics: a.rs] err".into()),
-                    ],
-                    is_error: false,
-                    error_code: None,
-                },
-                duration_ms: 1,
-                output_bytes: 1,
-                artifacts_created: vec![],
-            })),
+            ev(
+                2,
+                EventPayload::Tool(ToolEvent::Completed {
+                    tool_call_event_id: EventId {
+                        session_id: SessionId("s".into()),
+                        seq: 1,
+                    },
+                    result: ToolOutput {
+                        content: vec![
+                            Content::Text("wrote a.rs".into()),
+                            Content::TextView {
+                                text: "DIFF".into(),
+                                audience: "ui".into(),
+                            },
+                            Content::Text("[diagnostics: a.rs] err".into()),
+                        ],
+                        is_error: false,
+                        error_code: None,
+                    },
+                    duration_ms: 1,
+                    output_bytes: 1,
+                    artifacts_created: vec![],
+                }),
+            ),
         ];
         let view = fold_view(&events);
-        let ViewItem::Tool { result, diagnostics, view, .. } = &view.items[0] else { panic!("tool card") };
+        let ViewItem::Tool {
+            result,
+            diagnostics,
+            view,
+            ..
+        } = &view.items[0]
+        else {
+            panic!("tool card")
+        };
         assert_eq!(result.as_deref(), Some("wrote a.rs"));
         assert_eq!(diagnostics.as_deref(), Some("[diagnostics: a.rs] err"));
         assert_eq!(view.as_deref(), Some("DIFF"));
@@ -590,23 +823,54 @@ mod tests {
     #[test]
     fn non_conversation_payloads_are_skipped() {
         let events = vec![
-            ev(0, EventPayload::Session(SessionEvent::Created { profile_id: None, tools: vec![], workspace: None })),
-            ev(1, EventPayload::Model(ModelEvent::RequestStarted {
-                request_id: "r".into(), provider: "p".into(), model: "m".into(),
-                temperature: 0.0, max_tokens: None, tool_schemas_count: 0, input_tokens_estimate: 0,
-            })),
-            ev(2, EventPayload::Model(ModelEvent::RequestCompleted {
-                request_id: "r".into(), stop_reason: StopReason::EndTurn,
-                usage: Usage::default(), duration_ms: 1, time_to_first_token_ms: None, provider_request_id: None,
-            })),
-            ev(3, EventPayload::Error(crate::core::payload::ErrorEvent::Raised(ErrorDetail {
-                code: "x".into(), message: "boom".into(), severity: ErrorSeverity::Error,
-                retryable: false, source_event_id: None, provider_raw: None,
-            }))),
+            ev(
+                0,
+                EventPayload::Session(SessionEvent::Created {
+                    profile_id: None,
+                    tools: vec![],
+                    workspace: None,
+                }),
+            ),
+            ev(
+                1,
+                EventPayload::Model(ModelEvent::RequestStarted {
+                    request_id: "r".into(),
+                    provider: "p".into(),
+                    model: "m".into(),
+                    temperature: 0.0,
+                    max_tokens: None,
+                    tool_schemas_count: 0,
+                    input_tokens_estimate: 0,
+                }),
+            ),
+            ev(
+                2,
+                EventPayload::Model(ModelEvent::RequestCompleted {
+                    request_id: "r".into(),
+                    stop_reason: StopReason::EndTurn,
+                    usage: Usage::default(),
+                    duration_ms: 1,
+                    time_to_first_token_ms: None,
+                    provider_request_id: None,
+                }),
+            ),
+            ev(
+                3,
+                EventPayload::Error(crate::core::payload::ErrorEvent::Raised(ErrorDetail {
+                    code: "x".into(),
+                    message: "boom".into(),
+                    severity: ErrorSeverity::Error,
+                    retryable: false,
+                    source_event_id: None,
+                    provider_raw: None,
+                })),
+            ),
         ];
         let view = fold_view(&events);
         assert_eq!(view.items.len(), 1);
-        let ViewItem::Error { message, .. } = &view.items[0] else { panic!("error item") };
+        let ViewItem::Error { message, .. } = &view.items[0] else {
+            panic!("error item")
+        };
         assert_eq!(message, "boom");
     }
 
@@ -616,23 +880,55 @@ mod tests {
     #[test]
     fn turn_running_tracks_the_lifecycle() {
         // An unfinished turn: running.
-        let running = fold_view(&[
-            ev(1, EventPayload::Turn(TurnEvent::Started { turn_id: crate::core::TurnId("t".into()), input: Some("go".into()) })),
-        ]);
+        let running = fold_view(&[ev(
+            1,
+            EventPayload::Turn(TurnEvent::Started {
+                turn_id: crate::core::TurnId("t".into()),
+                input: Some("go".into()),
+            }),
+        )]);
         assert!(running.turn_running);
 
         // A completed turn: not running.
         let done = fold_view(&[
-            ev(1, EventPayload::Turn(TurnEvent::Started { turn_id: crate::core::TurnId("t".into()), input: Some("go".into()) })),
-            ev(2, EventPayload::Turn(TurnEvent::Completed { turn_id: crate::core::TurnId("t".into()) })),
+            ev(
+                1,
+                EventPayload::Turn(TurnEvent::Started {
+                    turn_id: crate::core::TurnId("t".into()),
+                    input: Some("go".into()),
+                }),
+            ),
+            ev(
+                2,
+                EventPayload::Turn(TurnEvent::Completed {
+                    turn_id: crate::core::TurnId("t".into()),
+                }),
+            ),
         ]);
         assert!(!done.turn_running);
 
         // A second turn re-arms after the first settled (last-write-wins).
         let rearmed = fold_view(&[
-            ev(1, EventPayload::Turn(TurnEvent::Started { turn_id: crate::core::TurnId("t".into()), input: Some("one".into()) })),
-            ev(2, EventPayload::Turn(TurnEvent::Completed { turn_id: crate::core::TurnId("t".into()) })),
-            ev(3, EventPayload::Turn(TurnEvent::Started { turn_id: crate::core::TurnId("t2".into()), input: Some("two".into()) })),
+            ev(
+                1,
+                EventPayload::Turn(TurnEvent::Started {
+                    turn_id: crate::core::TurnId("t".into()),
+                    input: Some("one".into()),
+                }),
+            ),
+            ev(
+                2,
+                EventPayload::Turn(TurnEvent::Completed {
+                    turn_id: crate::core::TurnId("t".into()),
+                }),
+            ),
+            ev(
+                3,
+                EventPayload::Turn(TurnEvent::Started {
+                    turn_id: crate::core::TurnId("t2".into()),
+                    input: Some("two".into()),
+                }),
+            ),
         ]);
         assert!(rearmed.turn_running);
     }
@@ -642,12 +938,25 @@ mod tests {
     #[test]
     fn runtime_models_are_collected_deduped() {
         let started = |seq, model: &str| {
-            ev(seq, EventPayload::Model(ModelEvent::RequestStarted {
-                request_id: format!("r{seq}"), provider: "p".into(), model: model.into(),
-                temperature: 0.0, max_tokens: None, tool_schemas_count: 0, input_tokens_estimate: 0,
-            }))
+            ev(
+                seq,
+                EventPayload::Model(ModelEvent::RequestStarted {
+                    request_id: format!("r{seq}"),
+                    provider: "p".into(),
+                    model: model.into(),
+                    temperature: 0.0,
+                    max_tokens: None,
+                    tool_schemas_count: 0,
+                    input_tokens_estimate: 0,
+                }),
+            )
         };
-        let view = fold_view(&[started(1, "sonnet"), started(2, "sonnet"), started(3, "haiku"), started(4, "sonnet")]);
+        let view = fold_view(&[
+            started(1, "sonnet"),
+            started(2, "sonnet"),
+            started(3, "haiku"),
+            started(4, "sonnet"),
+        ]);
         assert_eq!(view.runtime_models, ["sonnet", "haiku"]);
         assert!(fold_view(&[]).runtime_models.is_empty());
     }

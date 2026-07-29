@@ -996,7 +996,9 @@ async fn sse_events(
     // ever arrive (a retired session produces no events).
     if state.registry.store().is_archived(&sid) {
         let stream = tokio_stream::iter(replay_events(&state.registry, &sid, last_seen))
-            .chain(tokio_stream::iter([Ok(sse_from_gateway(&GatewayEvent::ReplayEnd))]))
+            .chain(tokio_stream::iter([Ok(sse_from_gateway(
+                &GatewayEvent::ReplayEnd,
+            ))]))
             .chain(tokio_stream::pending());
         return Sse::new(stream)
             .keep_alive(KeepAlive::default())
@@ -2704,7 +2706,10 @@ default = "openai-main/gpt-4o"
                 break;
             }
         }
-        assert!(saw_committed, "the replay (Created event) must stream first");
+        assert!(
+            saw_committed,
+            "the replay (Created event) must stream first"
+        );
         assert!(
             saw_replay_end,
             "a replay_end boundary frame must follow the replay"
