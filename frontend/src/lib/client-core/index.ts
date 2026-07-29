@@ -5,7 +5,8 @@ export type {
 	CreateSessionOptions,
 	ProvidersView,
 	ReconfigureOptions,
-	StatusHandlers
+	StatusHandlers,
+	ConnectionState
 } from './types';
 export { GatewayTransport, type GatewayConfig } from './gateway-transport';
 export { endpoints } from './endpoints';

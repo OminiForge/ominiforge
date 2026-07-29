@@ -31,6 +31,11 @@ export interface ProvidersView {
 /** Handle to a live event subscription; call `close()` to detach. */
 export interface EventSubscription {
 	close(): void;
+	/** Abort the in-flight connection attempt so the subscription re-attaches
+	 *  immediately (resuming from the last seen seq) instead of waiting for the
+	 *  stall watchdog to notice. Optional: a transport whose connections can't
+	 *  hang silently may omit it. */
+	reconnect?(): void;
 }
 
 /** Per-session overrides for {@link SessionClient.createSession}. Each is
@@ -51,12 +56,20 @@ export interface ReconfigureOptions {
 	model?: string;
 }
 
+/** The subscription's transport-level link state. `connecting` covers the
+ *  initial connect AND every reconnect after a drop — the UI shows one
+ *  "reconnecting" affordance for both; `connected` clears it. */
+export type ConnectionState = 'connecting' | 'connected';
+
 /** Callbacks for a session's event stream. */
 export interface EventHandlers {
 	/** Each committed event or live delta, as the tagged `GatewayEvent` union. */
 	onEvent: (event: GatewayEvent) => void;
 	/** Transport-level stream error (connection dropped, parse failure). */
 	onError?: (error: unknown) => void;
+	/** Link-state transitions: `connecting` when a (re)connect attempt starts,
+	 *  `connected` once the stream is attached and bytes flow again. */
+	onConnection?: (state: ConnectionState) => void;
 }
 
 /** Callbacks for the gateway-wide session status stream. */

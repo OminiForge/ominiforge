@@ -7,7 +7,7 @@
 	import hljs from 'highlight.js/lib/common';
 	import DOMPurify from 'dompurify';
 	import { client } from '$lib/client';
-	import type { EventSubscription } from '$lib/client-core';
+	import type { ConnectionState, EventSubscription } from '$lib/client-core';
 	import type { SessionMeta } from '$lib/types/SessionMeta';
 	import type { RuntimeInfo } from '$lib/types/RuntimeInfo';
 	import type { Message } from '$lib/types/Message';
@@ -17,6 +17,7 @@
 	import {
 		applyBatch,
 		emptyState,
+		pushOptimisticUser,
 		stateFromView,
 		type ConversationState,
 		type Item,
@@ -54,6 +55,13 @@
 	 *  avoids missing the trigger due to sub-pixel rounding or small
 	 *  layout shifts. */
 	const SCROLL_BOTTOM_THRESHOLD = 80;
+
+	/** How long after a successful send we tolerate a silent event stream
+	 *  before forcing a reconnect. The gateway commits `Turn::Started` right
+	 *  after accepting the message, so a healthy stream shows it within a
+	 *  second or two; 10s leaves generous room for server load without making
+	 *  the user stare at a dead view. */
+	const SEND_LIVENESS_MS = 10_000;
 
 	let convo = $state<ConversationState>(emptyState());
 	/** Raw committed events, kept alongside the folded `items` so inspect mode
@@ -113,6 +121,12 @@
 	// which would defer them invisibly. Flushed one-at-a-time on `turn_settled`.
 	let queued = $state<QueuedMessage[]>([]);
 	let error = $state<string | null>(null);
+	/** Event-stream link state, from the transport's onConnection callback.
+	 *  `connecting` = initial attach or a reconnect after a drop — shown as a
+	 *  quiet banner instead of a scary error bar; `connected` clears it. The
+	 *  stall watchdog in the transport is what flips a silently-dead stream
+	 *  back to `connecting` (previously the UI just froze until a refresh). */
+	let connection = $state<ConnectionState>('connecting');
 	// Draft-only session config: profile / model override / workspace, chosen
 	// before the first send. Populated from the gateway when a draft opens; the
 	// real session is created with these on first send (and they're read-only
@@ -160,6 +174,8 @@
 	// Debounce handle for per-request STATS refresh (Q2): a long turn fires many
 	// RequestCompleted events; coalesce them so we don't replay the log per event.
 	let summaryDebounce: ReturnType<typeof setTimeout> | undefined;
+	/** Post-send liveness timer: cleared on each send and on destroy. */
+	let livenessTimer: ReturnType<typeof setTimeout> | undefined;
 	let sub: EventSubscription | undefined;
 	let streamEl = $state<HTMLElement | null>(null);
 	/** True while the server-folded view is being fetched (session opening). */
@@ -678,8 +694,21 @@
 					// batched fold commits, so scrolling per raw event would chase frames
 					// that do not exist yet.
 				},
-				onError: (e) => {
-					error = e instanceof Error ? e.message : String(e);
+				onError: () => {
+					// A dropped stream triggers the transport's reconnect loop — the
+					// neutral reconnecting banner (onConnection('connecting') fires on
+					// the retry) covers it; an error bar for a self-healing condition
+					// would just alarm. Non-stream errors still surface via `error`.
+				},
+				onConnection: (state) => {
+					connection = state;
+					// Link restored: flush any message that failed to send while
+					// offline (it sits at the queue head). No-op on the initial
+					// connect — an empty queue returns immediately, and a running
+					// turn defers the flush to the settle handler above. This also
+					// covers page-load recovery: the queue was persisted to
+					// localStorage, so a refresh during an outage resumes here.
+					if (state === 'connected') void flushQueue(id);
 				}
 			},
 			lastSeq
@@ -760,6 +789,7 @@
 		sub?.close();
 		if (flushRaf) cancelAnimationFrame(flushRaf);
 		clearTimeout(summaryDebounce);
+		clearTimeout(livenessTimer);
 	});
 
 	async function send() {
@@ -805,16 +835,65 @@
 				// page.params.id so the sidebar highlights + inserts the new row.
 				await client.sendMessage(realId, text);
 				input = '';
+				// Same optimistic echo on the draft view: the goto below re-subscribes
+				// and replays, but the bubble makes the accepted send visible in the
+				// gap (and the draft view resets on navigation anyway).
+				convo = pushOptimisticUser(convo, text);
 				await goto(`/workspaces/${workspaceId}/sessions/${realId}`);
 			} else {
-				await client.sendMessage(sessionId, text);
+				const id = sessionId;
+				const seqBefore = convo.lastSeq;
+				await client.sendMessage(id, text);
 				input = '';
+				// Optimistic echo: the send was ACCEPTED (202) — show the bubble now
+				// instead of waiting for Turn::Started to fold back. Normally a blink;
+				// with a silently-dead stream it's the user's only proof the message
+				// went out while the liveness check below re-attaches the stream.
+				// The committed event replaces it (matched by text), so no duplicate.
+				convo = pushOptimisticUser(convo, text);
+				if (shouldAutoScroll) scrollTailSoon();
+				// Post-send liveness check: the send succeeded (the gateway accepted
+				// the turn), so a HEALTHY stream delivers its first event within a
+				// few seconds. Silence past that means the stream died quietly
+				// (half-open TCP) — the exact "backend is running but the UI never
+				// updates until a refresh" case. Force a reconnect now instead of
+				// waiting up to ~45s for the stall watchdog.
+				clearTimeout(livenessTimer);
+				livenessTimer = setTimeout(() => {
+					if (sessionId !== id || eventBuffer.length > 0) return;
+					if (convo.lastSeq !== seqBefore) return;
+					sub?.reconnect?.();
+				}, SEND_LIVENESS_MS);
 			}
 		} catch (e) {
-			error = e instanceof Error ? e.message : String(e);
+			// A connectivity failure (offline, gateway down) enqueues the message
+			// as a pending chip — the same affordance as mid-turn queueing: visible,
+			// persisted, cancellable, and auto-sent on reconnect (see onConnection).
+			// The user pressed send; "the network hiccuped" must not leave the text
+			// sitting in the input waiting for a manual retry. A real REJECTION
+			// (archived session, dead actor) stays an error bar — auto-retrying it
+			// would loop forever, and the text stays put for the user to handle.
+			if (!isDraft && isOfflineError(e)) {
+				queued = enqueue(queued, text);
+				persistQueue();
+				input = '';
+			} else {
+				error = e instanceof Error ? e.message : String(e);
+			}
 		} finally {
 			sending = false;
 		}
+	}
+
+	/** True when `e` is a connectivity failure (fetch never got a response —
+	 *  offline, DNS, gateway down) rather than a server REJECTION. `fetch` only
+	 *  rejects with TypeError for network-level failure; any HTTP status (even
+	 *  5xx) resolves and lands in gatewayError's `gateway <status>: ...` Error
+	 *  instead. The message POST is fire-and-forget (202 = enqueued), so a
+	 *  network failure means it could not have been accepted — queueing it for
+	 *  retry can never duplicate a turn. */
+	function isOfflineError(e: unknown): boolean {
+		return e instanceof TypeError;
 	}
 
 	/** Persist the current pending queue for this session. A no-op key-clear when
@@ -842,10 +921,12 @@
 			await client.sendMessage(id, next.text);
 		} catch (e) {
 			// Re-queue at the FRONT on failure so nothing is silently dropped
-			// (fail loud): the message stays visible and retries on the next settle.
+			// (fail loud). A connectivity failure stays QUIET — the reconnecting
+			// banner already says the link is down, and the next 'connected' (or
+			// turn settle) retries. A real rejection surfaces as an error bar.
 			queued = [next, ...queued];
 			persistQueue();
-			error = e instanceof Error ? e.message : String(e);
+			if (!isOfflineError(e)) error = e instanceof Error ? e.message : String(e);
 		} finally {
 			sending = false;
 		}
@@ -1466,6 +1547,14 @@
 		{#if error}
 			<div class="error-bar">{error}</div>
 		{/if}
+		{#if connection === 'connecting' && convo.ready}
+			<!-- Reconnect banner: only AFTER the first attach (convo.ready) — the
+			     initial connect is covered by the loading skeleton, and showing
+			     "reconnecting" before anything ever connected would be wrong. -->
+			<div class="reconnect-bar" role="status">
+				<span class="reconnect-dot" aria-hidden="true"></span>连接断开，正在重连…
+			</div>
+		{/if}
 
 		<!-- CONVERSATION SCROLL -->
 		<div class="conv-viewport">
@@ -1530,7 +1619,8 @@
 						{#if item.kind === 'user'}
 							<div
 								class="item item-user"
-								data-user-anchor={i}
+								class:pending={item.pending}
+								data-user-anchor={item.pending ? undefined : i}
 								data-item-anchor={i}
 								in:fly|local={enterAnim}
 							>
@@ -1579,6 +1669,12 @@
 										{item.text}
 									{/if}
 								</div>
+								{#if item.pending}
+									<!-- Optimistic echo awaiting its committed Turn::Started.
+									     A healthy stream replaces it in a blink; this hint only
+									     lingers when the stream is dead (reconnect underway). -->
+									<span class="pending-hint">已发送 · 同步中…</span>
+								{/if}
 							</div>
 						{:else if item.kind === 'text'}
 							{#if item.text.trim()}
@@ -2770,6 +2866,34 @@
 		flex-shrink: 0;
 	}
 
+	/* Reconnect banner: the running-state amber, not error red — a transient,
+	 *  self-healing condition, not a failure. Same layout as .error-bar. */
+	.reconnect-bar {
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+		color: var(--state-running-text);
+		background: var(--state-running-bg);
+		padding: var(--space-2) var(--space-6);
+		border-bottom: 1px solid color-mix(in srgb, var(--state-running) 25%, transparent);
+		font-size: 12.5px;
+		flex-shrink: 0;
+		font-family: var(--font-chinese);
+	}
+	.reconnect-dot {
+		width: 6px;
+		height: 6px;
+		border-radius: 50%;
+		background: var(--state-running);
+		animation: pulse 1.4s ease-in-out infinite;
+		flex-shrink: 0;
+	}
+	@media (prefers-reduced-motion: reduce) {
+		.reconnect-dot {
+			animation: none;
+		}
+	}
+
 	/* ---- CONVERSATION ---- */
 	/* Positioning context for the minimap overlay; owns the flex height so the
 	   inner scroll area and the pinned minimap share the same box. */
@@ -3028,6 +3152,19 @@
 		font-family: var(--font-chinese);
 		text-wrap: pretty;
 		word-break: break-word;
+	}
+
+	/* Optimistic echo: slightly quieted until the committed Turn::Started
+	 *  replaces it — reads as "sent, syncing" without a spinner's noise. */
+	.item-user.pending .user-bubble {
+		opacity: 0.72;
+	}
+
+	.pending-hint {
+		font-size: 10.5px;
+		color: var(--text-tertiary);
+		font-family: var(--font-chinese);
+		padding-right: var(--space-1);
 	}
 
 	/* ---- TURN ACTIONS (fork today; reserved slot for a future rating control,

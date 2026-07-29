@@ -5,6 +5,13 @@
 // Reconnect: we track the last committed seq and resubscribe with a
 // `Last-Event-ID` header; the server replays committed events after that seq
 // then attaches the live stream (gateway.md §4). Live deltas are not replayed.
+//
+// Stall detection: the server emits a keep-alive comment every 15s
+// (KeepAlive::default() in server.rs), so ANY 45s stretch without a single
+// byte means the connection is silently dead (a half-open TCP the fetch API
+// never errors on — Wi-Fi switch, NAT expiry). The watchdog aborts the fetch
+// so the normal catch/reconnect path takes over; without it the UI would
+// freeze until a manual refresh.
 
 import type { SessionMeta } from '$lib/types/SessionMeta';
 import type { GatewayEvent } from '$lib/types/GatewayEvent';
@@ -305,18 +312,40 @@ export class GatewayTransport implements SessionClient {
 		const controller = new AbortController();
 		let lastSeen = lastSeq;
 		let closed = false;
+		// Stall watchdog state: the abort controller for the CURRENT fetch (the
+		// outer `controller` is subscription-lifetime; aborting it would end the
+		// whole subscription, not just the stalled attempt) and the timestamp of
+		// the last byte received. Both reset on each reconnect attempt.
+		let attemptController: AbortController | undefined;
+		let lastActivity = Date.now();
+
+		const watchdog = setInterval(() => {
+			if (Date.now() - lastActivity > STALL_TIMEOUT_MS) {
+				// Aborting makes the hung `reader.read()` reject, which lands in the
+				// catch below and becomes an ordinary reconnect. Not guarded on
+				// `closed`: close() clears this interval.
+				attemptController?.abort();
+			}
+		}, STALL_CHECK_MS);
 
 		const run = async () => {
 			while (!closed) {
+				attemptController = new AbortController();
+				const signal = AbortSignal.any([controller.signal, attemptController.signal]);
+				lastActivity = Date.now();
+				handlers.onConnection?.('connecting');
 				try {
 					const headers = this.#headers({ Accept: 'text/event-stream' });
 					if (lastSeen !== undefined) headers.set('Last-Event-ID', String(lastSeen));
 
-					const res = await fetch(url, { headers, signal: controller.signal });
+					const res = await fetch(url, { headers, signal });
 					if (!res.ok) throw await gatewayError(res);
 					if (!res.body) throw new Error('event stream has no body');
 
-					for await (const frame of parseSse(res.body, controller.signal)) {
+					handlers.onConnection?.('connected');
+					for await (const frame of parseSse(res.body, signal, () => {
+						lastActivity = Date.now();
+					})) {
 						if (frame.id !== undefined) lastSeen = Number(frame.id);
 						if (frame.data) {
 							const event = JSON.parse(frame.data) as GatewayEvent;
@@ -336,7 +365,17 @@ export class GatewayTransport implements SessionClient {
 		return {
 			close() {
 				closed = true;
+				clearInterval(watchdog);
 				controller.abort();
+			},
+			// Force the current attempt to drop so the loop re-attaches NOW
+			// (resuming from lastSeen) rather than whenever the stall watchdog
+			// next fires. Called when the UI has positive reason to suspect a
+			// silently-dead stream — e.g. a send succeeded but no event followed.
+			// Between attempts (the 1s backoff) the stale controller's abort is a
+			// harmless no-op; the pending retry IS the reconnect.
+			reconnect() {
+				attemptController?.abort();
 			}
 		};
 	}
@@ -388,13 +427,24 @@ interface SseFrame {
 	data?: string;
 }
 
+/** Watchdog cadence: one interval per subscription, woken every 10s. */
+const STALL_CHECK_MS = 10_000;
+/** No byte (not even a 15s keep-alive comment) for this long = the connection
+ *  is silently dead. 45s tolerates one missed keep-alive plus jitter before
+ *  declaring a stall, so a loaded network can't cause a spurious reconnect. */
+const STALL_TIMEOUT_MS = 45_000;
+
 /**
  * Parse an SSE byte stream into frames. Handles multi-line `data:` and `id:`
- * fields; a blank line dispatches the accumulated frame.
+ * fields; a blank line dispatches the accumulated frame. `onActivity`, when
+ * given, fires once per received chunk — the stall watchdog's heartbeat, fed
+ * by keep-alive comments as well as real frames (a cheap timestamp write, no
+ * per-chunk timer churn).
  */
 async function* parseSse(
 	body: ReadableStream<Uint8Array>,
-	signal: AbortSignal
+	signal: AbortSignal,
+	onActivity?: () => void
 ): AsyncGenerator<SseFrame> {
 	const reader = body.getReader();
 	const decoder = new TextDecoder();
@@ -406,6 +456,7 @@ async function* parseSse(
 		while (!signal.aborted) {
 			const { done, value } = await reader.read();
 			if (done) break;
+			onActivity?.();
 			buffer += decoder.decode(value, { stream: true });
 
 			let nl: number;
@@ -424,7 +475,9 @@ async function* parseSse(
 				} else if (line.startsWith('id:')) {
 					id = line.slice(3).replace(/^ /, '');
 				}
-				// Other fields (event:, retry:, comments) are ignored.
+				// Other fields (event:, retry:, comments) are ignored — keep-alive
+				// comments among them; their arrival still feeds the stall watchdog
+				// via the onActivity chunk callback above.
 			}
 		}
 	} finally {

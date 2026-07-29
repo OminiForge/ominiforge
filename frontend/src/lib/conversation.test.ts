@@ -3,6 +3,7 @@ import {
 	apply,
 	applyBatch,
 	emptyState,
+	pushOptimisticUser,
 	stateFromView,
 	type ConversationState
 } from './conversation';
@@ -111,6 +112,35 @@ function turnInterrupted(seq: number): GatewayEvent {
 }
 
 describe('conversation fold', () => {
+	// ── Optimistic user echo (send accepted, stream behind/dead) ────────
+
+	it('optimistic bubble is replaced, not duplicated, when Turn.Started folds', () => {
+		// The UX contract behind the dead-stream fix: the user sees their
+		// message immediately after the 202, and when the authoritative event
+		// finally arrives (live or via a reconnect's replay) exactly ONE bubble
+		// remains — the committed one, carrying its seq.
+		let state = pushOptimisticUser(emptyState(), 'hello');
+		expect(state.items).toHaveLength(1);
+		expect(state.items[0]).toMatchObject({ kind: 'user', text: 'hello', pending: true });
+
+		state = apply(state, turnStarted(7, 'hello'));
+		expect(state.items).toHaveLength(1);
+		expect(state.items[0]).toMatchObject({ kind: 'user', text: 'hello', seq: 7 });
+		expect(state.items[0]).not.toHaveProperty('pending');
+	});
+
+	it('Turn.Started only replaces a pending bubble with the SAME text', () => {
+		// A queued/older optimistic echo whose text differs must survive an
+		// unrelated turn start — otherwise one reconnect could eat a message
+		// that is still awaiting its own event.
+		let state = pushOptimisticUser(emptyState(), 'first');
+		state = pushOptimisticUser(state, 'second');
+		state = apply(state, turnStarted(3, 'first'));
+		expect(state.items).toHaveLength(2);
+		expect(state.items[0]).toMatchObject({ kind: 'user', text: 'second', pending: true });
+		expect(state.items[1]).toMatchObject({ kind: 'user', text: 'first', seq: 3 });
+	});
+
 	// ── Dedup by seq (cold-path overlap) ────────────────────────────────
 
 	it('dedup: a committed event with seq <= lastSeq is folded only once', () => {

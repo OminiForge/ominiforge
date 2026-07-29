@@ -35,9 +35,15 @@ export type Item =
 			text: string;
 			/** The committed `Turn::Started` event seq — the fork point for
 			 *  branching a new session at this turn (`POST /sessions/{id}/fork`).
-			 *  Absent on a draft's optimistic user item (no committed event yet),
-			 *  so fork affordances gate on `seq != null`. */
+			 *  Absent on the optimistic local echo (no committed event yet), so
+			 *  fork affordances gate on `seq != null`. */
 			seq?: number;
+			/** True on a LOCALLY inserted bubble whose send was accepted (202) but
+			 *  whose `Turn::Started` hasn't folded back yet — normally a blink,
+			 *  but with a silently-dead stream it's the only proof the message went
+			 *  out. Rendered with a quiet "sending" hint; the authoritative event
+			 *  replaces it (see pushOptimisticUser / the Turn.Started fold). */
+			pending?: boolean;
 	  }
 	| { kind: 'text'; id: number; text: string; streaming: boolean }
 	| { kind: 'reasoning'; id: number; text: string; streaming: boolean }
@@ -205,6 +211,18 @@ export function stateFromView(view: SessionView): ConversationState {
 	};
 }
 
+/** Insert a locally-echoed user bubble for a send the gateway ACCEPTED (202)
+ *  but whose `Turn::Started` hasn't folded back over the stream yet. The
+ *  committed event is normally a blink behind the POST; with a silently-dead
+ *  stream it never arrives until a reconnect — without this bubble the user
+ *  sees NOTHING for a message the backend is already running, the "did my
+ *  message even send?" ambiguity. Matching `Turn::Started` folds remove it
+ *  (same text); `subscribe()`'s state reset clears it on session switch. */
+export function pushOptimisticUser(state: ConversationState, text: string): ConversationState {
+	const pushed = push(state, { kind: 'user', id: state.nextId, text, pending: true });
+	return { ...pushed, nextId: state.nextId - 1 };
+}
+
 /** Fold many events in one call. Semantically identical to folding them one
  *  `apply` at a time (dedup by seq, ordering, streaming/commit pairing all
  *  unchanged) — this exists so the replay burst is a single state assignment
@@ -279,7 +297,15 @@ function applyCommitted(
 	if ('Turn' in payload) {
 		const t = payload.Turn;
 		if ('Started' in t) {
-			const started = { ...next, turnRunning: true };
+			// The authoritative user message: drop any matching optimistic bubble
+			// (same text, pending) before pushing the committed one, so a send
+			// that outran a dead stream doesn't show its message twice.
+			const items = t.Started.input
+				? next.items.filter(
+						(it) => !(it.kind === 'user' && it.pending && it.text === t.Started.input)
+					)
+				: next.items;
+			const started = { ...next, items, turnRunning: true };
 			return t.Started.input
 				? push(started, {
 						kind: 'user',
