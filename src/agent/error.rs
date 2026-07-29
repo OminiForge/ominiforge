@@ -6,7 +6,7 @@ use crate::session::SessionError;
 /// A hard failure that aborts a turn: the model provider or event persistence
 /// broke.
 ///
-/// A turn that merely ran out of round budget or stalled on its plan is *not*
+/// A turn that merely ran out of round budget or stalled on its todo list is *not*
 /// an error — it returns a [`TurnOutcome`] flagged incomplete with a
 /// [`TurnFailureReason`], so its side effects and partial output are preserved
 /// (see [`TurnOutcome::incomplete`]).

@@ -7,6 +7,6 @@ export type ContextSection = { compaction_threshold?: number | null,
 /**
  * Model reference (`provider/model` or short `model`) used to generate
  * compaction summaries. `None` reuses the session's current model
- * (`doc/phase2-plan.md` decision B).
+ * (`doc/context-management.md`).
  */
 compaction_model?: string | null, injection_max_tokens?: number | null, };

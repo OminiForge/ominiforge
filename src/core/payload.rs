@@ -74,7 +74,7 @@ pub enum TurnEvent {
 /// still leaves a trace: the loop records a `TurnEvent::Failed` with
 /// `reason: None` paired with an [`ErrorEvent::Raised`] carrying the detail, so
 /// `reason.is_some()` distinguishes a graceful stop from a hard abort. See
-/// `doc/event-schema.md` §4 and `doc/plan.md` §6–§7.
+/// `doc/event-schema.md` §4 and `doc/todo.md` §6–§7.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub enum TurnFailureReason {
@@ -82,8 +82,8 @@ pub enum TurnFailureReason {
     /// model rounds without the model giving a final answer.
     MaxRoundsExceeded { max_rounds: u32 },
     /// The completion gate gave up: the model kept stopping with this many
-    /// non-terminal plan steps after repeated nudges (`doc/plan.md` §6).
-    PlanStalled { incomplete_steps: u32 },
+    /// non-terminal todo items after repeated nudges (`doc/todo.md` §6).
+    TodoStalled { incomplete_steps: u32 },
     /// A `turn:start` before hook blocked the turn before any model round ran
     /// (`doc/hook-protocol.md` §7). `by` names the blocking hook.
     BlockedByHook { by: String, reason: String },
@@ -360,7 +360,7 @@ pub enum InjectionSource {
     Hook,
     /// The agent loop itself injected the text — e.g. a completion-gate or
     /// stuck-step reminder pushed into the context to keep a turn on track.
-    /// See `doc/plan.md` §8.
+    /// See `doc/todo.md` §8.
     Runtime,
     /// A project guidance file (`AGENTS.md`/`CLAUDE.md`) loaded lazily when the
     /// agent first touched a file under its directory. See `doc/agents-md.md`.

@@ -37,7 +37,7 @@ interrupted`。设计要点：
 
 - `Started.input` 记录开场用户输入；无用户输入的 turn（scheduler、自动续跑）为 `None`，
   replay 据此重建开场 user message。
-- **Failed ≠ 进程崩溃**。撞 `max_rounds` 或 plan 卡死是*优雅停止*：副作用（已写文件）依然
+- **Failed ≠ 进程崩溃**。撞 `max_rounds` 或 todo 卡死是*优雅停止*：副作用（已写文件）依然
   成立，loop 写 `Failed` 后把部分结果交还调用方（`TurnOutcome.incomplete` 带同一 `reason`）。
 - **硬错误**（provider / 持久化故障）以 `Result::Err` 冒泡，不作为 `TurnOutcome`；但抛出前
   loop 尽力先写一条 `ErrorEvent::Raised` 再写 `TurnEvent::Failed{reason:None}`。故 `reason:
@@ -83,7 +83,7 @@ interrupted`。设计要点：
 
 记录动态注入，用于 replay 还原每轮 model 实际所见的 context。来源：Memory / RAG / ACP / Hook /
 **Runtime** / **ProjectGuidance**。`Runtime` 用于 agent loop 自身注入的提醒（完成度门、卡死警告），见
-[`plan.md`](./plan.md) §6–§8，文本用 `<reminder>...</reminder>` 包裹，作为真实消息永久留在
+[`todo.md`](./todo.md) §6–§8，文本用 `<reminder>...</reminder>` 包裹，作为真实消息永久留在
 context 历史中（保 prefix cache）。`ProjectGuidance` 用于子目录 `AGENTS.md`/`CLAUDE.md` 懒加载注入
 （`<project-guidance path="...">...`），见 [`agents-md.md`](./agents-md.md)。Compaction 时历史
 injection 被摘要浓缩。

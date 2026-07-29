@@ -5,12 +5,12 @@
 //! `ModelEvent`s by [`collector`]); if the model asked for tools, each is
 //! dispatched (persisted as `ToolEvent`s) and its result fed back as a `Tool`
 //! message before the next round. The loop ends when the model stops without
-//! requesting tools **and** the working plan (if any) has no non-terminal
-//! steps left — the completion gate (`doc/plan.md` §6).
+//! requesting tools **and** the working todo list (if any) has no non-terminal
+//! steps left — the completion gate (`doc/todo.md` §6).
 //!
-//! State has three homes by lifetime (`doc/plan.md` §3):
+//! State has three homes by lifetime (`doc/todo.md` §3):
 //! - turn-invariant deps (provider, tools, config) live on [`Agent`];
-//! - session-scoped state (the conversation view and the working plan) lives in
+//! - session-scoped state (the conversation view and the working todo list) lives in
 //!   [`SessionRuntime`], owned by the caller so it survives across turns;
 //! - turn-scoped state (round counter, gate/stuck counters, output
 //!   accumulation) lives in [`TurnState`], built when a turn starts and dropped
@@ -23,18 +23,18 @@
 mod approval;
 mod collector;
 mod error;
-mod plan;
 mod resume;
 mod sink;
+mod todo;
 
 pub use approval::{
     ApprovalDecision, ApprovalGate, ApprovalOutcome, ApprovalRequest, ApprovalResolution,
     ApprovalScope, NullGate,
 };
 pub use error::AgentError;
-pub use plan::{LeafOp, PlanOp, PlanStep, StepStatus};
 pub use resume::rebuild_runtime;
 pub use sink::{BlockKind, NullSink, StreamSink};
+pub use todo::{LeafOp, StepStatus, TodoItem, TodoOp};
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -58,14 +58,14 @@ use crate::tool::{ToolError, ToolInput, ToolRegistry};
 
 use futures_util::{FutureExt, StreamExt};
 
-use plan::{PLAN_TOOL_NAME, PlanError, apply_plan_op};
+use todo::{TODO_TOOL_NAME, TodoError, apply_todo_op};
 
 /// How many completion-gate nudges a turn tolerates before giving up: the model
-/// stopped without finishing the plan this many times running (`doc/plan.md` §6).
+/// stopped without finishing the todo list this many times running (`doc/todo.md` §6).
 const MAX_GATE: u8 = 2;
 
 /// How many consecutive rounds a step may stay `in_progress` before the loop
-/// injects a one-shot stuck warning (`doc/plan.md` §7).
+/// injects a one-shot stuck warning (`doc/todo.md` §7).
 const STUCK_THRESHOLD: u32 = 5;
 
 /// Knobs for a turn that do not change between rounds.
@@ -85,7 +85,7 @@ pub struct AgentConfig {
     pub tool_timeout: Duration,
     /// Absolute safety net on model rounds in one turn. This is *not* the
     /// primary loop control — the completion gate and stuck detection
-    /// (`doc/plan.md` §6–§7) catch a misbehaving turn far earlier and more
+    /// (`doc/todo.md` §6–§7) catch a misbehaving turn far earlier and more
     /// cheaply. `max_rounds` only backstops a runaway that slips past both, so
     /// it is set generously: a routine multi-step task (read many files, run a
     /// few commands, write output) legitimately needs dozens of rounds.
@@ -122,17 +122,17 @@ impl Default for AgentConfig {
 /// Session-scoped runtime state that survives across turns.
 ///
 /// Owned by the interactive loop / CLI and borrowed by each [`TurnState`].
-/// Rebuilt from `events.jsonl` when resuming a session (replay the plan ops and
-/// the conversation view; see `doc/plan.md` §10.3 — Phase 2). In the Phase 1
+/// Rebuilt from `events.jsonl` when resuming a session (replay the todo ops and
+/// the conversation view; see `doc/todo.md` §10.3 — Phase 2). In the Phase 1
 /// single-turn CLI it is built fresh per `run` and discarded, the degenerate
 /// case of the same interface.
 #[derive(Debug, Clone, Default)]
 pub struct SessionRuntime {
     /// Conversation view sent to the model; appended each turn.
     pub context: Vec<Message>,
-    /// Working plan; survives across turns until every step reaches a terminal
-    /// state or the model replaces it via `init` (`doc/plan.md` §10).
-    pub plan: Vec<PlanStep>,
+    /// Working todo list; survives across turns until every item reaches a terminal
+    /// state or the model replaces it via `init` (`doc/todo.md` §10).
+    pub todo: Vec<TodoItem>,
     /// Running input-token estimate for the context view, calibrated each round
     /// from the provider's authoritative usage (`doc/context-management.md`).
     pub ledger: ContextLedger,
@@ -146,14 +146,14 @@ pub struct SessionRuntime {
 
 impl SessionRuntime {
     /// A runtime seeded with an initial context (typically the system message)
-    /// and an empty plan. The ledger is primed from the seed so the first turn's
+    /// and an empty todo list. The ledger is primed from the seed so the first turn's
     /// pre-request estimate already accounts for it.
     #[must_use]
     pub fn new(context: Vec<Message>) -> Self {
         let ledger = ContextLedger::seeded(&context);
         Self {
             context,
-            plan: Vec::new(),
+            todo: Vec::new(),
             ledger,
             loaded_guidance: HashSet::new(),
         }
@@ -275,7 +275,7 @@ impl Agent {
     /// and tool calls to completion, and persist every event through `writer`.
     ///
     /// `runtime` is mutated in place — the user message, the assistant message,
-    /// any tool results, and any plan changes are applied, leaving it ready for
+    /// any tool results, and any todo changes are applied, leaving it ready for
     /// the next turn.
     ///
     /// This is the headless form: streamed output is persisted but not observed
@@ -284,7 +284,7 @@ impl Agent {
     ///
     /// # Errors
     /// [`AgentError::Model`] on provider failure or [`AgentError::Session`] on a
-    /// persistence failure. Running out of round budget or stalling on the plan
+    /// persistence failure. Running out of round budget or stalling on the todo list
     /// is *not* an error: it returns `Ok` with [`TurnOutcome::incomplete`] set.
     pub async fn run_turn(
         &self,
@@ -327,9 +327,9 @@ impl Agent {
     }
 
     fn tool_schemas(&self) -> Vec<ToolSchema> {
-        // Leaf-tool descriptors plus the `plan` control-tool descriptor, all
+        // Leaf-tool descriptors plus the `todo` control-tool descriptor, all
         // sorted by name so the schema block stays byte-stable for the prefix
-        // cache (`doc/context-management.md` §3, `doc/plan.md` §5).
+        // cache (`doc/context-management.md` §3, `doc/todo.md` §5).
         let mut schemas: Vec<ToolSchema> = self
             .tools
             .descriptors()
@@ -340,7 +340,7 @@ impl Agent {
                 parameters: d.input_schema,
             })
             .collect();
-        schemas.push(plan::descriptor());
+        schemas.push(todo::descriptor());
         schemas.sort_by(|a, b| a.name.cmp(&b.name));
         schemas
     }
@@ -430,13 +430,13 @@ impl AgentConfig {
 ///
 /// Constructed when a turn starts, dropped when it ends. Owns the turn-scoped
 /// counters and output accumulation, borrows the session-scoped [`SessionRuntime`]
-/// (context + plan) plus the shared resources the turn drives. Turn-invariant
+/// (context + todo list) plus the shared resources the turn drives. Turn-invariant
 /// deps stay on [`Agent`]; round-ephemeral values stay local to the round
-/// (`doc/plan.md` §3).
+/// (`doc/todo.md` §3).
 struct TurnState<'a> {
     // turn-invariant deps (provider, tools, config)
     agent: &'a Agent,
-    // session-scoped state, borrowed for the turn (context + plan live here)
+    // session-scoped state, borrowed for the turn (context + todo list live here)
     runtime: &'a mut SessionRuntime,
     // shared resources, borrowed for the turn's duration
     writer: &'a mut SessionWriter,
@@ -451,14 +451,14 @@ struct TurnState<'a> {
     stop_reason: StopReason,
     accumulated_usage: Usage,
 
-    // turn-scoped plan control counters, reset every turn
+    // turn-scoped todo control counters, reset every turn
     gate_count: u8,
     step_stuck_rounds: HashMap<String, u32>,
 }
 
 /// What the completion gate decided when the model stopped calling tools.
 enum Gate {
-    /// Every step is terminal (or there is no plan) — exit cleanly.
+    /// Every item is terminal (or there is no todo list) — exit cleanly.
     Done,
     /// Non-terminal steps remain; a reminder was injected — run another round.
     Continue,
@@ -516,9 +516,9 @@ enum ChainResult {
 enum PhaseBOutcome {
     /// No chain — write this failure right away.
     Failed(DeferredFailure),
-    /// A `plan` control call already handled in Phase A: no chain, no deferred
-    /// failure — its message is taken from `plan_results` in the write-back.
-    Plan,
+    /// A `todo` control call already handled in Phase A: no chain, no deferred
+    /// failure — its message is taken from `todo_results` in the write-back.
+    Todo,
     /// A running chain: the call awaits only its *own* gate answer (an `ask`)
     /// and executes the moment it is approved — an `allow` chain went straight
     /// to execution — never waiting on any other call's decision.
@@ -567,13 +567,13 @@ enum PreparedCall {
         args: serde_json::Value,
         gate: Option<tokio::task::JoinHandle<ApprovalOutcome>>,
     },
-    /// A `plan` control call, intercepted before the chain machinery: it is a
+    /// A `todo` control call, intercepted before the chain machinery: it is a
     /// synchronous state op with no file/sandbox/permission concerns, so it
     /// never spawns a chain. The concurrent path must intercept it just like
     /// the serial `dispatch` does — otherwise it falls through to the leaf
-    /// registry lookup and fails `unknown_tool` (plan is a control tool, never
-    /// registered). The rendered plan message is produced in Phase A.
-    Plan,
+    /// registry lookup and fails `unknown_tool` (todo is a control tool, never
+    /// registered). The rendered todo message is produced in Phase A.
+    Todo,
 }
 
 /// Map a gate answer to what the call may do. Pure — usable inside a spawned
@@ -609,7 +609,7 @@ impl TurnState<'_> {
     /// [`run_turn_with_sink`](Agent::run_turn_with_sink); the only entry point.
     ///
     /// Records `TurnEvent::Started`, then drives the round loop. A graceful stop
-    /// (clean finish, max-rounds, plan stall) returns `Ok` from [`drive`]. A
+    /// (clean finish, max-rounds, todo stall) returns `Ok` from [`drive`]. A
     /// hard error (`AgentError::Model`/`Session`) bubbles out of `drive`; before
     /// propagating it we record a terminal trace (`ErrorEvent` + `Failed`) so no
     /// turn ends without a closing event (`doc/event-schema.md` §4).
@@ -671,7 +671,7 @@ impl TurnState<'_> {
     }
 
     /// The round loop. Returns `Ok` for every *graceful* outcome (clean finish,
-    /// max-rounds safety net, plan stall); a hard provider/persistence fault
+    /// max-rounds safety net, todo stall); a hard provider/persistence fault
     /// short-circuits as `Err` and is given a terminal trace by [`run`](Self::run).
     #[allow(clippy::too_many_lines)] // the two-phase dispatch keeps one linear narration
     async fn drive(&mut self) -> Result<TurnOutcome, AgentError> {
@@ -694,7 +694,7 @@ impl TurnState<'_> {
                     Gate::GiveUp => {
                         let incomplete = self.incomplete_step_count();
                         return self.fail(
-                            TurnFailureReason::PlanStalled {
+                            TurnFailureReason::TodoStalled {
                                 incomplete_steps: incomplete,
                             },
                             true,
@@ -704,10 +704,10 @@ impl TurnState<'_> {
             }
 
             // A round counts as progress if at least one *leaf* tool call
-            // succeeded with a non-error result. Plan ops and failed/errored
+            // succeeded with a non-error result. Todo ops and failed/errored
             // tools do not count, so a step that is genuinely working clears its
             // stuck counter while one that only spins keeps climbing toward the
-            // threshold (`doc/plan.md` §7).
+            // threshold (`doc/todo.md` §7).
             let mut progressed = false;
             let mut touched: Vec<String> = Vec::new();
             if self.agent.approval.supports_concurrent_requests() {
@@ -720,21 +720,21 @@ impl TurnState<'_> {
                 // finishes. Only the messages fed back to the model wait —
                 // they assemble afterwards, strictly in call order.
                 let mut prepared: Vec<PreparedCall> = Vec::with_capacity(tool_calls.len());
-                // Plan results ride through Phase B untouched: a plan call is a
+                // Todo results ride through Phase B untouched: a todo call is a
                 // synchronous control op, intercepted BEFORE prepare/chain
                 // (mirroring the serial path's `dispatch` intercept). Without
                 // this the concurrent path skipped the intercept and landed in
-                // `execute_tool`'s registry lookup — `unknown_tool`, so a plan
+                // `execute_tool`'s registry lookup — `unknown_tool`, so a todo
                 // op never applied and its card rendered as a failed tool.
-                let mut plan_results: Vec<Option<Message>> =
+                let mut todo_results: Vec<Option<Message>> =
                     (0..tool_calls.len()).map(|_| None).collect();
                 for (slot, call) in tool_calls.iter().enumerate() {
                     let event_id = outcome.tool_call_event_ids.get(&call.id).cloned();
                     touched.extend(touched_paths(call));
-                    if call.name == PLAN_TOOL_NAME {
-                        let message = self.dispatch_plan(call, event_id)?;
-                        plan_results[slot] = Some(message);
-                        prepared.push(PreparedCall::Plan);
+                    if call.name == TODO_TOOL_NAME {
+                        let message = self.dispatch_todo(call, event_id)?;
+                        todo_results[slot] = Some(message);
+                        prepared.push(PreparedCall::Todo);
                         continue;
                     }
                     let mut prep = self.prepare_tool(call, event_id).await?;
@@ -769,10 +769,10 @@ impl TurnState<'_> {
                         abort_handles.push(abort);
                     }
                     match outcome {
-                        // Plan was executed in Phase A; its message joins the
-                        // ordered results here (plan ops never count as progress).
-                        PhaseBOutcome::Plan => {
-                            results[slot] = plan_results[slot].take();
+                        // Todo was executed in Phase A; its message joins the
+                        // ordered results here (todo ops never count as progress).
+                        PhaseBOutcome::Todo => {
+                            results[slot] = todo_results[slot].take();
                         }
                         // Settled in phase A (bad args, hook block, policy deny):
                         // no chain to wait on — the failure writes immediately.
@@ -859,7 +859,7 @@ impl TurnState<'_> {
 
         // The tool loop ran out of round budget. This is the absolute safety
         // net, not a crash: record why, then hand back the partial outcome so
-        // the caller keeps whatever work already landed (`doc/plan.md` §7).
+        // the caller keeps whatever work already landed (`doc/todo.md` §7).
         self.fail(
             TurnFailureReason::MaxRoundsExceeded {
                 max_rounds: self.agent.config.max_rounds,
@@ -961,11 +961,11 @@ impl TurnState<'_> {
         }
     }
 
-    /// Count the plan steps still in a non-terminal state (for `PlanStalled`).
+    /// Count the todo items still in a non-terminal state (for `TodoStalled`).
     fn incomplete_step_count(&self) -> u32 {
         let n = self
             .runtime
-            .plan
+            .todo
             .iter()
             .filter(|s| !s.status.is_terminal())
             .count();
@@ -973,11 +973,11 @@ impl TurnState<'_> {
     }
 
     /// Decide whether the turn may exit now that the model stopped requesting
-    /// tools. With no plan, or all steps terminal, the turn is done. Otherwise
+    /// tools. With no todo list, or all items terminal, the turn is done. Otherwise
     /// nudge the model (up to [`MAX_GATE`] times) to finish or mark the
-    /// remaining steps (`doc/plan.md` §6).
+    /// remaining steps (`doc/todo.md` §6).
     fn completion_gate(&mut self) -> Result<Gate, AgentError> {
-        let incomplete = plan::render_incomplete(&self.runtime.plan);
+        let incomplete = todo::render_incomplete(&self.runtime.todo);
         if incomplete.is_empty() {
             return Ok(Gate::Done);
         }
@@ -985,7 +985,7 @@ impl TurnState<'_> {
             return Ok(Gate::GiveUp);
         }
         self.inject_runtime(format!(
-            "<reminder>The following plan steps are not in a terminal state. \
+            "<reminder>The following todo items are not in a terminal state. \
              Continue working on them, or mark them cancelled/blocked with a \
              reason, then give your final answer:\n{incomplete}</reminder>"
         ))?;
@@ -1000,11 +1000,11 @@ impl TurnState<'_> {
     /// unproductive rounds gets a one-shot warning. Because progress resets the
     /// count, a step that stalls, recovers, then stalls again is warned each
     /// time it crosses the threshold afresh. Steps that left `in_progress` drop
-    /// out of the map entirely (`doc/plan.md` §7).
+    /// out of the map entirely (`doc/todo.md` §7).
     fn check_stuck(&mut self, progressed: bool) -> Result<(), AgentError> {
         let in_progress: Vec<(String, String)> = self
             .runtime
-            .plan
+            .todo
             .iter()
             .filter(|s| s.status == StepStatus::InProgress)
             .map(|s| (s.id.clone(), s.content.clone()))
@@ -1033,14 +1033,14 @@ impl TurnState<'_> {
             self.inject_runtime(format!(
                 "<reminder>Step \"{content}\" has been in progress for \
                  {STUCK_THRESHOLD} rounds without progress. Consider cancelling \
-                 it or restructuring the plan.</reminder>"
+                 it or restructuring the todo list.</reminder>"
             ))?;
         }
         Ok(())
     }
 
     /// Push a runtime reminder into the context (kept permanently, for prefix
-    /// cache) and mirror it as an `InjectionEvent` (`doc/plan.md` §8).
+    /// cache) and mirror it as an `InjectionEvent` (`doc/todo.md` §8).
     fn inject_runtime(&mut self, content: String) -> Result<(), AgentError> {
         let token_count = estimate_tokens(&content);
         self.writer.append(
@@ -1310,21 +1310,21 @@ impl TurnState<'_> {
         Ok(outcome)
     }
 
-    /// Route one tool call: the `plan` control tool is intercepted and applied
-    /// to the runtime plan; every other name is a leaf tool dispatched to the
+    /// Route one tool call: the `todo` control tool is intercepted and applied
+    /// to the runtime todo list; every other name is a leaf tool dispatched to the
     /// registry. Both shapes emit the same `ToolEvent` bracket so replay and
-    /// monitoring need no special case (`doc/plan.md` §5).
+    /// monitoring need no special case (`doc/todo.md` §5).
     ///
     /// The returned `bool` is whether this call counts as *progress* for stuck
     /// detection: `true` only for a leaf tool that returned a non-error result.
-    /// Plan ops and failed/errored tools are `false` (`doc/plan.md` §7).
+    /// Todo ops and failed/errored tools are `false` (`doc/todo.md` §7).
     async fn dispatch(
         &mut self,
         call: &ToolCall,
         tool_call_event_id: Option<EventId>,
     ) -> Result<(Message, bool), AgentError> {
-        if call.name == PLAN_TOOL_NAME {
-            self.dispatch_plan(call, tool_call_event_id)
+        if call.name == TODO_TOOL_NAME {
+            self.dispatch_todo(call, tool_call_event_id)
                 .map(|m| (m, false))
         } else {
             self.dispatch_tool(call, tool_call_event_id).await
@@ -1340,10 +1340,10 @@ impl TurnState<'_> {
         })
     }
 
-    /// Apply a `plan` op to the runtime plan and return the rendered plan as the
+    /// Apply a `todo` op to the runtime todo list and return the rendered list as the
     /// tool result. Schema or id errors come back as an `is_error` result the
     /// model corrects next round — never a protocol failure.
-    fn dispatch_plan(
+    fn dispatch_todo(
         &mut self,
         call: &ToolCall,
         tool_call_event_id: Option<EventId>,
@@ -1351,7 +1351,7 @@ impl TurnState<'_> {
         let parent = self.parent_event_id(tool_call_event_id);
         let source = EventSource {
             kind: SourceKind::Tool,
-            id: PLAN_TOOL_NAME.to_owned(),
+            id: TODO_TOOL_NAME.to_owned(),
         };
         let raw: serde_json::Value = if call.arguments.trim().is_empty() {
             serde_json::Value::Object(serde_json::Map::new())
@@ -1364,7 +1364,7 @@ impl TurnState<'_> {
             source.clone(),
             EventPayload::Tool(ToolEvent::Started {
                 tool_call_event_id: parent.clone(),
-                tool_name: PLAN_TOOL_NAME.to_owned(),
+                tool_name: TODO_TOOL_NAME.to_owned(),
                 source: ToolSource::Builtin,
                 input: raw.clone(),
                 working_dir: None,
@@ -1374,12 +1374,12 @@ impl TurnState<'_> {
         )?;
 
         // Decode then apply; either step can fail benignly.
-        let result: Result<String, String> = serde_json::from_value::<PlanOp>(raw)
-            .map_err(|e| format!("invalid plan op: {e}"))
+        let result: Result<String, String> = serde_json::from_value::<TodoOp>(raw)
+            .map_err(|e| format!("invalid todo op: {e}"))
             .and_then(|op| {
-                apply_plan_op(&mut self.runtime.plan, op).map_err(|e: PlanError| e.to_string())
+                apply_todo_op(&mut self.runtime.todo, op).map_err(|e: TodoError| e.to_string())
             })
-            .map(|()| plan::render(&self.runtime.plan));
+            .map(|()| todo::render(&self.runtime.todo));
 
         let output = match &result {
             Ok(rendered) => ToolOutput {
@@ -1390,7 +1390,7 @@ impl TurnState<'_> {
             Err(message) => ToolOutput {
                 content: vec![Content::Text(message.clone())],
                 is_error: true,
-                error_code: Some("invalid_plan_op".to_owned()),
+                error_code: Some("invalid_todo_op".to_owned()),
             },
         };
         let text = render_output(&output);
@@ -1570,11 +1570,11 @@ impl TurnState<'_> {
         match prepared {
             PreparedCall::Settled(failure) => self.write_deferred_failure(call, failure).await,
             PreparedCall::Run { parent, args } => self.execute_tool(call, parent, args).await,
-            // `Plan` is only produced by the concurrent dispatcher, which
-            // intercepts plan calls before `prepare_tool`; the serial path
+            // `Todo` is only produced by the concurrent dispatcher, which
+            // intercepts todo calls before `prepare_tool`; the serial path
             // reaches `settle_prepared` via `dispatch`, whose own intercept
-            // routes plan away first. A `Plan` here is unreachable.
-            PreparedCall::Plan => unreachable!("plan calls never reach settle_prepared"),
+            // routes todo away first. A `Todo` here is unreachable.
+            PreparedCall::Todo => unreachable!("todo calls never reach settle_prepared"),
             PreparedCall::Ask { parent, args, gate } => {
                 let answer = match gate {
                     // A join error means the gate task panicked: nobody decided,
@@ -1748,9 +1748,9 @@ impl TurnState<'_> {
     ) -> (PhaseBOutcome, Option<tokio::task::AbortHandle>) {
         match prep {
             PreparedCall::Settled(failure) => (PhaseBOutcome::Failed(failure), None),
-            // Already handled in Phase A (its message is in `plan_results`):
+            // Already handled in Phase A (its message is in `todo_results`):
             // nothing to execute, no chain to join.
-            PreparedCall::Plan => (PhaseBOutcome::Plan, None),
+            PreparedCall::Todo => (PhaseBOutcome::Todo, None),
             PreparedCall::Run { parent, args } => {
                 let tool = self.agent.tools.get(&call.name);
                 let tool_name = call.name.clone();
@@ -2458,13 +2458,13 @@ mod tests {
         ]
     }
 
-    /// A round that calls the `plan` control tool with `args`.
-    fn plan_round(call_id: &str, args: &str) -> Vec<StreamEvent> {
-        tool_call_round(call_id, "plan", args)
+    /// A round that calls the `todo` control tool with `args`.
+    fn todo_round(call_id: &str, args: &str) -> Vec<StreamEvent> {
+        tool_call_round(call_id, "todo", args)
     }
 
-    /// An agent with no leaf tools (the `plan` control tool is always present).
-    fn planning_agent(provider: Arc<ScriptedProvider>) -> Agent {
+    /// An agent with no leaf tools (the `todo` control tool is always present).
+    fn bare_agent(provider: Arc<ScriptedProvider>) -> Agent {
         Agent::new(
             provider,
             ToolRegistry::new(),
@@ -2530,23 +2530,23 @@ mod tests {
         events
     }
 
-    /// The `plan` control tool is dispatched like a leaf tool — same
-    /// `ToolEvent` bracket — but applies to `runtime.plan`, and a turn does not
+    /// The `todo` control tool is dispatched like a leaf tool — same
+    /// `ToolEvent` bracket — but applies to `runtime.todo`, and a turn does not
     /// finish until every step is terminal (the completion gate).
     #[tokio::test]
-    async fn plan_drives_a_multi_round_turn_to_completion() {
+    async fn todo_drives_a_multi_round_turn_to_completion() {
         let dir = tempfile::tempdir().unwrap();
         let provider = Arc::new(ScriptedProvider::new(vec![
-            plan_round(
+            todo_round(
                 "c1",
                 r#"{"op":"init","steps":[{"content":"step one"},{"content":"step two"}]}"#,
             ),
-            plan_round("c2", r#"{"ops":[{"op":"start","id":"1"}]}"#),
-            plan_round("c3", r#"{"ops":[{"op":"complete","id":"1"}]}"#),
-            plan_round("c4", r#"{"ops":[{"op":"complete","id":"2"}]}"#),
+            todo_round("c2", r#"{"ops":[{"op":"start","id":"1"}]}"#),
+            todo_round("c3", r#"{"ops":[{"op":"complete","id":"1"}]}"#),
+            todo_round("c4", r#"{"ops":[{"op":"complete","id":"2"}]}"#),
             text_round("all done"),
         ]));
-        let agent = planning_agent(provider);
+        let agent = bare_agent(provider);
 
         let store = SessionStore::new(dir.path().join("sessions"));
         let mut writer = store.create_new(None, None, vec![]).unwrap();
@@ -2561,23 +2561,23 @@ mod tests {
 
         assert_eq!(outcome.answer, "all done");
         assert_eq!(outcome.rounds, 5);
-        // Plan reached an all-terminal state and persists in the runtime.
-        assert_eq!(runtime.plan.len(), 2);
-        assert!(runtime.plan.iter().all(|s| s.status.is_terminal()));
+        // The todo list reached an all-terminal state and persists in the runtime.
+        assert_eq!(runtime.todo.len(), 2);
+        assert!(runtime.todo.iter().all(|s| s.status.is_terminal()));
 
-        // Plan ops are recorded as ordinary builtin ToolEvents (same bracket as
+        // Todo ops are recorded as ordinary builtin ToolEvents (same bracket as
         // leaf tools), so replay/monitor need no special case.
         let events = store.read_events(&sid).unwrap();
-        let plan_completions = events
+        let todo_completions = events
             .iter()
             .filter(|e| {
                 matches!(&e.payload, EventPayload::Tool(ToolEvent::Completed { .. }))
                     && e.source.kind == SourceKind::Tool
-                    && e.source.id == "plan"
+                    && e.source.id == "todo"
             })
             .count();
-        assert_eq!(plan_completions, 4);
-        // No gate nudge was needed — the model finished the plan on its own.
+        assert_eq!(todo_completions, 4);
+        // No gate nudge was needed — the model finished the todo list on its own.
         assert_eq!(injection_count(&events), 0);
         assert!(seqs_are_contiguous(&events));
     }
@@ -2588,14 +2588,14 @@ mod tests {
     async fn completion_gate_nudges_then_lets_turn_finish() {
         let dir = tempfile::tempdir().unwrap();
         let provider = Arc::new(ScriptedProvider::new(vec![
-            plan_round("c1", r#"{"op":"init","steps":[{"content":"only step"}]}"#),
+            todo_round("c1", r#"{"op":"init","steps":[{"content":"only step"}]}"#),
             // Model tries to stop with the step still pending — gate nudges.
             text_round("I think I'm done"),
             // After the nudge it finishes the step, then answers.
-            plan_round("c2", r#"{"ops":[{"op":"complete","id":"1"}]}"#),
+            todo_round("c2", r#"{"ops":[{"op":"complete","id":"1"}]}"#),
             text_round("actually done now"),
         ]));
-        let agent = planning_agent(provider);
+        let agent = bare_agent(provider);
 
         let store = SessionStore::new(dir.path().join("sessions"));
         let mut writer = store.create_new(None, None, vec![]).unwrap();
@@ -2621,17 +2621,17 @@ mod tests {
 
     /// If the model keeps stopping with work outstanding, the gate gives up
     /// after `MAX_GATE` nudges. This is a graceful, *retryable* stop: the turn
-    /// returns `Ok` flagged `PlanStalled`, and the event log records the reason.
+    /// returns `Ok` flagged `TodoStalled`, and the event log records the reason.
     #[tokio::test]
     async fn completion_gate_gives_up_after_max_nudges() {
         let dir = tempfile::tempdir().unwrap();
         let provider = Arc::new(ScriptedProvider::new(vec![
-            plan_round("c1", r#"{"op":"init","steps":[{"content":"never done"}]}"#),
+            todo_round("c1", r#"{"op":"init","steps":[{"content":"never done"}]}"#),
             text_round("stopping 1"),
             text_round("stopping 2"),
             text_round("stopping 3"),
         ]));
-        let agent = planning_agent(provider);
+        let agent = bare_agent(provider);
 
         let store = SessionStore::new(dir.path().join("sessions"));
         let mut writer = store.create_new(None, None, vec![]).unwrap();
@@ -2647,7 +2647,7 @@ mod tests {
         // Not an error: a partial outcome flagged stalled (one step outstanding).
         assert_eq!(
             outcome.incomplete,
-            Some(TurnFailureReason::PlanStalled {
+            Some(TurnFailureReason::TodoStalled {
                 incomplete_steps: 1
             })
         );
@@ -2659,7 +2659,7 @@ mod tests {
             &e.payload,
             EventPayload::Turn(TurnEvent::Failed {
                 retryable: true,
-                reason: Some(TurnFailureReason::PlanStalled {
+                reason: Some(TurnFailureReason::TodoStalled {
                     incomplete_steps: 1
                 }),
                 ..
@@ -2675,12 +2675,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Every round calls a tool, so the loop never settles on its own and
         // must hit the cap. `start id=1` is idempotent and harmless.
-        let rounds = std::iter::once(plan_round(
+        let rounds = std::iter::once(todo_round(
             "c0",
             r#"{"op":"init","steps":[{"content":"endless"}]}"#,
         ))
         .chain(
-            (0..10).map(|i| plan_round(&format!("s{i}"), r#"{"ops":[{"op":"start","id":"1"}]}"#)),
+            (0..10).map(|i| todo_round(&format!("s{i}"), r#"{"ops":[{"op":"start","id":"1"}]}"#)),
         )
         .collect();
         let provider = Arc::new(ScriptedProvider::new(rounds));
@@ -2728,20 +2728,20 @@ mod tests {
     /// comes back as an `is_error` tool result (not a protocol failure); the
     /// model recovers on the next round.
     #[tokio::test]
-    async fn invalid_plan_op_returns_error_result_and_recovers() {
+    async fn invalid_todo_op_returns_error_result_and_recovers() {
         let dir = tempfile::tempdir().unwrap();
         let provider = Arc::new(ScriptedProvider::new(vec![
-            plan_round("c1", r#"{"op":"init","steps":[{"content":"a step"}]}"#),
+            todo_round("c1", r#"{"op":"init","steps":[{"content":"a step"}]}"#),
             // cancel without a reason — rejected at decode.
-            plan_round("c2", r#"{"ops":[{"op":"cancel","id":"1"}]}"#),
+            todo_round("c2", r#"{"ops":[{"op":"cancel","id":"1"}]}"#),
             // recovers with a proper reason.
-            plan_round(
+            todo_round(
                 "c3",
                 r#"{"ops":[{"op":"cancel","id":"1","reason":"no such tool"}]}"#,
             ),
             text_round("cancelled it"),
         ]));
-        let agent = planning_agent(provider);
+        let agent = bare_agent(provider);
 
         let store = SessionStore::new(dir.path().join("sessions"));
         let mut writer = store.create_new(None, None, vec![]).unwrap();
@@ -2755,18 +2755,18 @@ mod tests {
         drop(writer);
 
         assert_eq!(outcome.answer, "cancelled it");
-        assert_eq!(runtime.plan[0].status, StepStatus::Cancelled);
+        assert_eq!(runtime.todo[0].status, StepStatus::Cancelled);
 
-        // One plan ToolEvent::Completed carries an is_error result.
+        // One todo ToolEvent::Completed carries an is_error result.
         let events = store.read_events(&sid).unwrap();
         let had_error_result = events.iter().any(|e| {
             matches!(
                 &e.payload,
                 EventPayload::Tool(ToolEvent::Completed { result, .. })
-                    if result.is_error && e.source.id == "plan"
+                    if result.is_error && e.source.id == "todo"
             )
         });
-        assert!(had_error_result, "invalid plan op should yield is_error");
+        assert!(had_error_result, "invalid todo op should yield is_error");
     }
 
     /// A `blocked` step is terminal: it does not trip the completion gate, so
@@ -2776,14 +2776,14 @@ mod tests {
     async fn blocked_step_lets_turn_finish_and_persists() {
         let dir = tempfile::tempdir().unwrap();
         let provider = Arc::new(ScriptedProvider::new(vec![
-            plan_round("c1", r#"{"op":"init","steps":[{"content":"needs a key"}]}"#),
-            plan_round(
+            todo_round("c1", r#"{"op":"init","steps":[{"content":"needs a key"}]}"#),
+            todo_round(
                 "c2",
                 r#"{"ops":[{"op":"block","id":"1","reason":"set OPENAI_API_KEY"}]}"#,
             ),
             text_round("blocked on your input"),
         ]));
-        let agent = planning_agent(provider);
+        let agent = bare_agent(provider);
 
         let store = SessionStore::new(dir.path().join("sessions"));
         let mut writer = store.create_new(None, None, vec![]).unwrap();
@@ -2797,10 +2797,10 @@ mod tests {
 
         // Clean finish despite an unfinished-but-blocked step.
         assert_eq!(outcome.answer, "blocked on your input");
-        assert_eq!(runtime.plan.len(), 1);
-        assert_eq!(runtime.plan[0].status, StepStatus::Blocked);
+        assert_eq!(runtime.todo.len(), 1);
+        assert_eq!(runtime.todo[0].status, StepStatus::Blocked);
         assert_eq!(
-            runtime.plan[0].reason.as_deref(),
+            runtime.todo[0].reason.as_deref(),
             Some("set OPENAI_API_KEY")
         );
     }
@@ -2814,22 +2814,22 @@ mod tests {
         // stays in_progress across rounds; check_stuck runs at the end of each
         // tool-bearing round, and `start id=1` is idempotent.
         let mut rounds = vec![
-            plan_round("c0", r#"{"op":"init","steps":[{"content":"long step"}]}"#),
-            plan_round("c1", r#"{"ops":[{"op":"start","id":"1"}]}"#),
+            todo_round("c0", r#"{"op":"init","steps":[{"content":"long step"}]}"#),
+            todo_round("c1", r#"{"ops":[{"op":"start","id":"1"}]}"#),
         ];
         for i in 0..STUCK_THRESHOLD {
-            rounds.push(plan_round(
+            rounds.push(todo_round(
                 &format!("s{i}"),
                 r#"{"ops":[{"op":"start","id":"1"}]}"#,
             ));
         }
-        rounds.push(plan_round(
+        rounds.push(todo_round(
             "done",
             r#"{"ops":[{"op":"complete","id":"1"}]}"#,
         ));
         rounds.push(text_round("finished"));
         let provider = Arc::new(ScriptedProvider::new(rounds));
-        let agent = planning_agent(provider);
+        let agent = bare_agent(provider);
 
         let store = SessionStore::new(dir.path().join("sessions"));
         let mut writer = store.create_new(None, None, vec![]).unwrap();
@@ -2865,11 +2865,11 @@ mod tests {
         // init + start, then well past STUCK_THRESHOLD rounds that each succeed
         // at a real `read` while step 1 stays in_progress, then complete + answer.
         let mut rounds = vec![
-            plan_round(
+            todo_round(
                 "c0",
                 r#"{"op":"init","steps":[{"content":"long but productive"}]}"#,
             ),
-            plan_round("c1", r#"{"ops":[{"op":"start","id":"1"}]}"#),
+            todo_round("c1", r#"{"ops":[{"op":"start","id":"1"}]}"#),
         ];
         for i in 0..(STUCK_THRESHOLD + 2) {
             rounds.push(tool_call_round(
@@ -2878,7 +2878,7 @@ mod tests {
                 r#"{"path":"note.txt"}"#,
             ));
         }
-        rounds.push(plan_round(
+        rounds.push(todo_round(
             "done",
             r#"{"ops":[{"op":"complete","id":"1"}]}"#,
         ));
@@ -3514,7 +3514,7 @@ mod tests {
     #[tokio::test]
     async fn compact_produces_snapshot_with_summary() {
         let provider = Arc::new(ScriptedProvider::new(vec![text_round("CONDENSED SUMMARY")]));
-        let agent = planning_agent(provider);
+        let agent = bare_agent(provider);
 
         let mut runtime = SessionRuntime::new(vec![Message::System {
             content: "be helpful".to_owned(),
@@ -3551,7 +3551,7 @@ mod tests {
     #[tokio::test]
     async fn compact_with_only_system_is_noop() {
         let provider = Arc::new(ScriptedProvider::new(vec![]));
-        let agent = planning_agent(provider);
+        let agent = bare_agent(provider);
         let runtime = SessionRuntime::new(vec![Message::System {
             content: "be helpful".to_owned(),
         }]);
@@ -3567,7 +3567,7 @@ mod tests {
         let main = Arc::new(ScriptedProvider::new(vec![]));
         // Dedicated compaction provider yields a recognizable summary.
         let compaction = Arc::new(ScriptedProvider::new(vec![text_round("DEDICATED SUMMARY")]));
-        let agent = planning_agent(main).with_compaction_model(compaction, "cheap".to_owned());
+        let agent = bare_agent(main).with_compaction_model(compaction, "cheap".to_owned());
 
         let mut runtime = SessionRuntime::new(vec![Message::System {
             content: "be helpful".to_owned(),
@@ -3687,7 +3687,7 @@ mod tests {
                 },
             }),
         );
-        let agent = planning_agent(provider).with_hooks(hooks);
+        let agent = bare_agent(provider).with_hooks(hooks);
 
         let store = SessionStore::new(dir.path().join("sessions"));
         let mut writer = store.create_new(None, None, vec![]).unwrap();
@@ -3728,7 +3728,7 @@ mod tests {
         let provider = Arc::new(ScriptedProvider::new(vec![text_round("done")]));
         let mut hooks = HookRegistry::new();
         hooks.register_after(HookPoint::TurnEnd, Arc::new(NoopAfter { name: "notify" }));
-        let agent = planning_agent(provider).with_hooks(hooks);
+        let agent = bare_agent(provider).with_hooks(hooks);
 
         let store = SessionStore::new(dir.path().join("sessions"));
         let mut writer = store.create_new(None, None, vec![]).unwrap();
@@ -4589,18 +4589,18 @@ mod tests {
         assert!(results.iter().all(|(_, _, kind)| kind == "completed"));
     }
 
-    /// Regression: a `plan` call in a CONCURRENT round must be intercepted and
+    /// Regression: a `todo` call in a CONCURRENT round must be intercepted and
     /// applied, not fall through to the leaf registry (`unknown_tool`). The
-    /// concurrent dispatcher used to skip the serial path's `dispatch` plan
-    /// intercept, so a plan op landed in `execute_tool`'s registry lookup and
-    /// failed — the plan never advanced and its card rendered as a failed tool.
+    /// concurrent dispatcher used to skip the serial path's `dispatch` todo
+    /// intercept, so a todo op landed in `execute_tool`'s registry lookup and
+    /// failed — the todo list never advanced and its card rendered as a failed tool.
     #[tokio::test]
-    async fn concurrent_dispatch_intercepts_plan_calls() {
+    async fn concurrent_dispatch_intercepts_todo_calls() {
         let dir = tempfile::tempdir().unwrap();
         let mut tools = ToolRegistry::new();
         crate::tool::register_builtin(&mut tools, dir.path().to_path_buf());
 
-        // One round mixing a plan op with a leaf write — enough to take the
+        // One round mixing a todo op with a leaf write — enough to take the
         // concurrent two-phase path (the gate supports concurrent requests).
         let events = run_rounds_with_registry(
             dir.path(),
@@ -4608,11 +4608,11 @@ mod tests {
                 multi_tool_call_round(&[
                     (
                         "p1",
-                        "plan",
+                        "todo",
                         r#"{"op":"init","steps":[{"content":"only step"}]}"#,
                     ),
                     ("w1", "write", r#"{"path":"f.txt","content":"hi"}"#),
-                    ("p2", "plan", r#"{"ops":[{"op":"complete","id":"1"}]}"#),
+                    ("p2", "todo", r#"{"ops":[{"op":"complete","id":"1"}]}"#),
                 ]),
                 text_round("done"),
             ],
@@ -4622,27 +4622,27 @@ mod tests {
         )
         .await;
 
-        // The plan ops succeeded — no `unknown_tool` failure for `plan`.
+        // The todo ops succeeded — no `unknown_tool` failure for `todo`.
         assert!(
             !has_failed_code(&events, "unknown_tool"),
-            "plan must not hit unknown_tool on the concurrent path"
+            "todo must not hit unknown_tool on the concurrent path"
         );
-        // Both plan ops produced a successful `Completed` (the rendered plan),
+        // Both todo ops produced a successful `Completed` (the rendered list),
         // and the leaf write executed too.
-        let plan_completions = events
+        let todo_completions = events
             .iter()
             .filter(|e| {
                 matches!(&e.payload, EventPayload::Tool(ToolEvent::Completed { .. }))
                     && e.source.kind == SourceKind::Tool
-                    && e.source.id == "plan"
+                    && e.source.id == "todo"
             })
             .count();
-        assert_eq!(plan_completions, 2, "both plan ops applied");
+        assert_eq!(todo_completions, 2, "both todo ops applied");
         assert!(dir.path().join("f.txt").exists(), "leaf write executed");
-        // The rebuilt runtime holds the plan in its terminal state.
+        // The rebuilt runtime holds the todo list in its terminal state.
         let runtime = crate::agent::rebuild_runtime(&events, vec![]);
-        assert_eq!(runtime.plan.len(), 1);
-        assert!(runtime.plan.iter().all(|s| s.status.is_terminal()));
+        assert_eq!(runtime.todo.len(), 1);
+        assert!(runtime.todo.iter().all(|s| s.status.is_terminal()));
     }
 
     /// The `tool_call_id`s of the `Tool` messages in the rebuilt context — the

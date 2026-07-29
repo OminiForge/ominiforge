@@ -131,7 +131,7 @@ pub fn summarize_by_name(name: &str, input: &serde_json::Value) -> String {
             let s = input.to_string();
             if s.len() > 80 {
                 // Byte-slice at a char boundary: tool input can be arbitrary
-                // UTF-8 (e.g. CJK plan steps), and `&s[..80]` panics when 80
+                // UTF-8 (e.g. CJK todo steps), and `&s[..80]` panics when 80
                 // lands inside a multi-byte char.
                 let end = s
                     .char_indices()
@@ -408,7 +408,7 @@ mod tests {
         // ("end byte index 80 is not a char boundary"). The summary is a
         // human-facing label; it must degrade gracefully, not kill the task.
         let input = serde_json::json!({ "steps": "测试测试测试测试测试测试测试测试测试测试测试测试测试测试测试测试测试测试测试测试" });
-        let summary = summarize_by_name("plan", &input);
+        let summary = summarize_by_name("todo", &input);
         assert!(summary.len() <= 80 + '…'.len_utf8());
         assert!(summary.ends_with('…'));
     }

@@ -8,7 +8,7 @@
 //!
 //! The fold is deliberately lossy in the same way the web fold is: it keeps
 //! only what the conversation view renders (user turns, assistant text and
-//! reasoning, tool calls with their results, plan cards, errors), and it
+//! reasoning, tool calls with their results, todo cards, errors), and it
 //! resolves the pairings the view needs (tool call ↔ result, permission ask ↔
 //! card). Everything else (monitoring, injections, hooks) is not conversation
 //! content and is skipped.
@@ -24,7 +24,7 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 
-use crate::agent::{LeafOp, PlanOp};
+use crate::agent::{LeafOp, TodoOp};
 use crate::core::CoreEvent;
 use crate::core::payload::{BlockContent, Content, EventPayload, PermissionEvent, ToolEvent};
 
@@ -71,8 +71,8 @@ pub enum ViewItem {
         #[serde(skip_serializing_if = "Option::is_none")]
         preview: Option<String>,
     },
-    /// A plan checklist (one card per `init`; later ops mutate it in place).
-    Plan { id: u64, steps: Vec<ViewPlanStep> },
+    /// A todo checklist (one card per `init`; later ops mutate it in place).
+    Todo { id: u64, steps: Vec<ViewTodoStep> },
     /// A committed `Error::Raised`.
     Error { id: u64, message: String },
 }
@@ -94,13 +94,13 @@ pub enum ViewToolStatus {
     Error,
 }
 
-/// One plan step as the web client renders it (`status` lowercased, `reason`
-/// only when present), mirroring the frontend's `PlanStep`.
+/// One todo step as the web client renders it (`status` lowercased, `reason`
+/// only when present), mirroring the frontend's `TodoStep`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ViewPlanStep {
+pub struct ViewTodoStep {
     pub id: String,
     pub content: String,
-    pub status: ViewPlanStatus,
+    pub status: ViewTodoStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -108,7 +108,7 @@ pub struct ViewPlanStep {
 /// Step status with the web fold's wire spelling (lowercase).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ViewPlanStatus {
+pub enum ViewTodoStatus {
     Pending,
     InProgress,
     Completed,
@@ -327,7 +327,7 @@ pub fn fold_view(events: &[CoreEvent]) -> SessionView {
 }
 
 /// Fold one committed content block: text/reasoning append (empty blocks are
-/// dropped, mirroring the web fold); a `plan` call folds into a plan card;
+/// dropped, mirroring the web fold); a `todo` call folds into a todo card;
 /// any other tool call opens a tool card, backfilling an outstanding ask.
 fn fold_block(
     seq: u64,
@@ -360,8 +360,8 @@ fn fold_block(
             arguments,
             summary,
         } => {
-            if name == "plan" {
-                fold_plan_op(seq, arguments, items);
+            if name == "todo" {
+                fold_todo_op(seq, arguments, items);
                 return;
             }
             let (approval_pending, preview) = pending_asks
@@ -440,32 +440,32 @@ fn apply_tool_outcome(
     *ec = error_code;
 }
 
-/// Fold one committed `plan` call: `init` pushes a fresh card (ids "1".."N");
+/// Fold one committed `todo` call: `init` pushes a fresh card (ids "1".."N");
 /// `ops` mutate the LATEST card in place. Malformed ops are a benign no-op,
 /// mirroring both the runtime and the web fold.
-fn fold_plan_op(seq: u64, args: &str, items: &mut Vec<ViewItem>) {
-    let Ok(op) = serde_json::from_str::<PlanOp>(args) else {
+fn fold_todo_op(seq: u64, args: &str, items: &mut Vec<ViewItem>) {
+    let Ok(op) = serde_json::from_str::<TodoOp>(args) else {
         return;
     };
     match op {
-        PlanOp::Init { steps } => {
+        TodoOp::Init { steps } => {
             let steps = steps
                 .into_iter()
                 .enumerate()
-                .map(|(i, s)| ViewPlanStep {
+                .map(|(i, s)| ViewTodoStep {
                     id: (i + 1).to_string(),
                     content: s.content,
-                    status: ViewPlanStatus::Pending,
+                    status: ViewTodoStatus::Pending,
                     reason: None,
                 })
                 .collect();
-            items.push(ViewItem::Plan { id: seq, steps });
+            items.push(ViewItem::Todo { id: seq, steps });
         }
-        PlanOp::Ops { ops } => {
-            let Some(ViewItem::Plan { steps, .. }) = items
+        TodoOp::Ops { ops } => {
+            let Some(ViewItem::Todo { steps, .. }) = items
                 .iter_mut()
                 .rev()
-                .find(|i| matches!(i, ViewItem::Plan { .. }))
+                .find(|i| matches!(i, ViewItem::Todo { .. }))
             else {
                 return;
             };
@@ -478,15 +478,15 @@ fn fold_plan_op(seq: u64, args: &str, items: &mut Vec<ViewItem>) {
 
 /// Apply one leaf op to a step list (unknown id/anchor = no-op), mirroring
 /// the web fold's `applyLeafOp`.
-fn apply_leaf(steps: &mut Vec<ViewPlanStep>, op: LeafOp) {
+fn apply_leaf(steps: &mut Vec<ViewTodoStep>, op: LeafOp) {
     match op {
-        LeafOp::Start { id } => set_status(steps, &id, ViewPlanStatus::InProgress, None),
-        LeafOp::Complete { id } => set_status(steps, &id, ViewPlanStatus::Completed, None),
+        LeafOp::Start { id } => set_status(steps, &id, ViewTodoStatus::InProgress, None),
+        LeafOp::Complete { id } => set_status(steps, &id, ViewTodoStatus::Completed, None),
         LeafOp::Cancel { id, reason } => {
-            set_status(steps, &id, ViewPlanStatus::Cancelled, Some(reason))
+            set_status(steps, &id, ViewTodoStatus::Cancelled, Some(reason))
         }
         LeafOp::Block { id, reason } => {
-            set_status(steps, &id, ViewPlanStatus::Blocked, Some(reason))
+            set_status(steps, &id, ViewTodoStatus::Blocked, Some(reason))
         }
         LeafOp::Add { content, after_id } => {
             let max = steps
@@ -494,10 +494,10 @@ fn apply_leaf(steps: &mut Vec<ViewPlanStep>, op: LeafOp) {
                 .filter_map(|s| s.id.parse::<u64>().ok())
                 .max()
                 .unwrap_or(0);
-            let step = ViewPlanStep {
+            let step = ViewTodoStep {
                 id: (max + 1).to_string(),
                 content,
-                status: ViewPlanStatus::Pending,
+                status: ViewTodoStatus::Pending,
                 reason: None,
             };
             match after_id.and_then(|a| steps.iter().position(|s| s.id == a)) {
@@ -509,9 +509,9 @@ fn apply_leaf(steps: &mut Vec<ViewPlanStep>, op: LeafOp) {
 }
 
 fn set_status(
-    steps: &mut [ViewPlanStep],
+    steps: &mut [ViewTodoStep],
     id: &str,
-    status: ViewPlanStatus,
+    status: ViewTodoStatus,
     reason: Option<String>,
 ) {
     if let Some(step) = steps.iter_mut().find(|s| s.id == id) {
@@ -640,7 +640,7 @@ mod tests {
                 ViewItem::Reasoning { .. } => "reasoning",
                 ViewItem::Text { .. } => "text",
                 ViewItem::Tool { .. } => "tool",
-                ViewItem::Plan { .. } => "plan",
+                ViewItem::Todo { .. } => "todo",
                 ViewItem::Error { .. } => "error",
             })
             .collect();
@@ -740,16 +740,16 @@ mod tests {
         assert!(!approval_pending);
     }
 
-    /// Plan calls fold into one card per init; later ops mutate the latest
+    /// Todo calls fold into one card per init; later ops mutate the latest
     /// card in place (never a generic tool block, never a second card).
     #[test]
-    fn plan_calls_fold_into_cards() {
+    fn todo_calls_fold_into_cards() {
         let events = vec![
             block(
                 1,
                 tool_call(
                     "p1",
-                    "plan",
+                    "todo",
                     r#"{"op":"init","steps":[{"content":"a"},{"content":"b"}]}"#,
                 ),
             ),
@@ -757,19 +757,19 @@ mod tests {
                 2,
                 tool_call(
                     "p2",
-                    "plan",
+                    "todo",
                     r#"{"ops":[{"op":"start","id":"1"},{"op":"complete","id":"1"}]}"#,
                 ),
             ),
         ];
         let view = fold_view(&events);
         assert_eq!(view.items.len(), 1);
-        let ViewItem::Plan { steps, .. } = &view.items[0] else {
-            panic!("plan card")
+        let ViewItem::Todo { steps, .. } = &view.items[0] else {
+            panic!("todo card")
         };
         assert_eq!(steps.len(), 2);
-        assert_eq!(steps[0].status, ViewPlanStatus::Completed);
-        assert_eq!(steps[1].status, ViewPlanStatus::Pending);
+        assert_eq!(steps[0].status, ViewTodoStatus::Completed);
+        assert_eq!(steps[1].status, ViewTodoStatus::Pending);
     }
 
     /// The file tools split a trailing Text block off as diagnostics; other

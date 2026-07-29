@@ -3,21 +3,21 @@ import type { CoreEvent } from '$lib/types/CoreEvent';
 import type { BlockContent } from '$lib/types/BlockContent';
 import type { SessionView } from '$lib/types/SessionView';
 
-/** The control tool whose calls drive the plan card. Must match
- *  `PLAN_TOOL_NAME` in `src/agent/plan.rs` — plan calls are folded into a
- *  structured plan card instead of rendered as generic tool blocks. */
-export const PLAN_TOOL_NAME = 'plan';
+/** The control tool whose calls drive the todo card. Must match
+ *  `TODO_TOOL_NAME` in `src/agent/todo.rs` — todo calls are folded into a
+ *  structured todo card instead of rendered as generic tool blocks. */
+export const TODO_TOOL_NAME = 'todo';
 
-/** Step lifecycle, mirroring `StepStatus` in `src/agent/plan.rs`. Terminal:
+/** Step lifecycle, mirroring `StepStatus` in `src/agent/todo.rs`. Terminal:
  *  completed/cancelled/blocked; non-terminal: pending/in_progress. */
-export type PlanStatus = 'pending' | 'in_progress' | 'completed' | 'cancelled' | 'blocked';
+export type TodoStatus = 'pending' | 'in_progress' | 'completed' | 'cancelled' | 'blocked';
 
-/** One plan step, mirroring `PlanStep` in `src/agent/plan.rs`. `reason` is
+/** One todo step, mirroring `TodoItem` in `src/agent/todo.rs`. `reason` is
  *  carried by cancelled/blocked steps (the why). */
-export interface PlanStep {
+export interface TodoStep {
 	id: string;
 	content: string;
-	status: PlanStatus;
+	status: TodoStatus;
 	reason?: string;
 }
 
@@ -84,15 +84,15 @@ export type Item =
 			 *  would-be diff for `edit`/`write`, computed at ask time so the human
 			 *  approves the actual change. Shown while `approvalPending`; once the
 			 *  executed `view` arrives it takes over (identical when the file didn't
-			 *  change in between — the preview is the same plan). Absent for tools
+			 *  change in between — the preview is the same todo list). Absent for tools
 			 *  without a diff preview. */
 			preview?: string;
 	  }
-	/** A plan checklist, folded from `plan` control-tool calls (one card per
+	/** A todo checklist, folded from `todo` control-tool calls (one card per
 	 *  `init`). `streaming` marks a placeholder shown while the call's args are
 	 *  still streaming (partial JSON, not yet foldable); it is replaced by the
-	 *  real card on commit. See foldPlanOp. */
-	| { kind: 'plan'; id: number; steps: PlanStep[]; streaming: boolean }
+	 *  real card on commit. See foldTodoOp. */
+	| { kind: 'todo'; id: number; steps: TodoStep[]; streaming: boolean }
 	| { kind: 'error'; id: number; message: string }
 	| { kind: 'notice'; id: number; message: string };
 
@@ -543,12 +543,12 @@ function commitBlock(
 			committedEnd: items.length
 		};
 	} else {
-		// Plan is a control tool: fold its op into a plan card instead of
+		// Todo is a control tool: fold its op into a todo card instead of
 		// rendering a generic tool block. The card lives where `init` lands and
 		// later ops mutate it in place (mirrors the backend's single authoritative
-		// plan, but each `init` starts a fresh card so turn history is preserved).
-		if (content.ToolCall.name === PLAN_TOOL_NAME) {
-			items = foldPlanOp(items, seq, content.ToolCall.arguments);
+		// todo, but each `init` starts a fresh card so turn history is preserved).
+		if (content.ToolCall.name === TODO_TOOL_NAME) {
+			items = foldTodoOp(items, seq, content.ToolCall.arguments);
 			return {
 				...state,
 				items,
@@ -705,11 +705,11 @@ function shiftPositions(
 	return { toolSeqs, orphanTools, open };
 }
 
-/// Decoded `plan` call, mirroring `PlanOp`/`LeafOp` in `src/agent/plan.rs`.
-/// Two shapes only: `init` establishes the plan, `ops` mutates it (a single
+/// Decoded `todo` call, mirroring `TodoOp`/`LeafOp` in `src/agent/todo.rs`.
+/// Two shapes only: `init` establishes the list, `ops` mutates it (a single
 /// change is a one-element array). Only the fields each op needs are read;
 /// the rest are ignored, matching serde's tolerance on the wire.
-type PlanCall = { op: 'init'; steps?: Array<{ content: string }> } | { ops?: LeafOp[] };
+type TodoCall = { op: 'init'; steps?: Array<{ content: string }> } | { ops?: LeafOp[] };
 
 type LeafOp =
 	| { op: 'start'; id: string }
@@ -729,43 +729,43 @@ function pushTransient(
 	return { ...pushed, nextId: state.nextId - 1 };
 }
 
-/// Fold one committed `plan` tool call into the items list.
+/// Fold one committed `todo` tool call into the items list.
 ///
-/// Strategy mirrors the backend (`src/agent/plan.rs`): `init` replaces the plan
-/// with a fresh card; every op in `ops` mutates the *latest* plan card in
+/// Strategy mirrors the backend (`src/agent/todo.rs`): `init` replaces the list
+/// with a fresh card; every op in `ops` mutates the *latest* todo card in
 /// place, in array order. The frontend keeps one card per `init` (not a single
-/// global plan) so the conversation preserves the plan of each turn as history
+/// global list) so the conversation preserves the todo list of each turn as history
 /// — the newest card is always the live one that subsequent ops target.
 ///
 /// Robustness: the args are authoritative committed JSON, but a malformed op or
 /// a mutation with no card to target is ignored (the items list is returned
 /// unchanged), mirroring the backend's benign `is_error` handling — the model
 /// corrects itself next round and we never throw mid-fold.
-function foldPlanOp(items: Item[], id: number, args: string): Item[] {
-	let call: PlanCall;
+function foldTodoOp(items: Item[], id: number, args: string): Item[] {
+	let call: TodoCall;
 	try {
-		call = JSON.parse(args) as PlanCall;
+		call = JSON.parse(args) as TodoCall;
 	} catch {
 		return items;
 	}
 	if (!call || typeof call !== 'object') return items;
 
 	if ('op' in call && call.op === 'init') {
-		const steps: PlanStep[] = (call.steps ?? []).map((s, i) => ({
+		const steps: TodoStep[] = (call.steps ?? []).map((s, i) => ({
 			id: String(i + 1),
 			content: s.content,
 			status: 'pending'
 		}));
-		return [...items, { kind: 'plan', id, steps, streaming: false }];
+		return [...items, { kind: 'todo', id, steps, streaming: false }];
 	}
 
 	if (!('ops' in call) || !Array.isArray(call.ops)) return items;
 
-	// Mutate the latest plan card. No card → benign no-op (model misused plan).
-	const pos = lastPlanIndex(items);
+	// Mutate the latest todo card. No card → benign no-op (model misused todo).
+	const pos = lastTodoIndex(items);
 	if (pos === -1) return items;
 	const card = items[pos];
-	if (card.kind !== 'plan') return items;
+	if (card.kind !== 'todo') return items;
 	let steps = card.steps;
 	for (const op of call.ops) {
 		steps = applyLeafOp(steps, op);
@@ -778,8 +778,8 @@ function foldPlanOp(items: Item[], id: number, args: string): Item[] {
 
 /// Apply one leaf op to a step list, returning a new list (or the same
 /// reference unchanged when the target id/anchor is absent — a benign no-op
-/// matching the backend's `PlanError` → `is_error` path).
-function applyLeafOp(steps: PlanStep[], op: LeafOp): PlanStep[] {
+/// matching the backend's `TodoError` → `is_error` path).
+function applyLeafOp(steps: TodoStep[], op: LeafOp): TodoStep[] {
 	if (!op || typeof op !== 'object') return steps;
 	switch (op.op) {
 		case 'start':
@@ -791,7 +791,7 @@ function applyLeafOp(steps: PlanStep[], op: LeafOp): PlanStep[] {
 		case 'block':
 			return setStatus(steps, op.id, 'blocked', op.reason);
 		case 'add': {
-			const step: PlanStep = { id: nextPlanId(steps), content: op.content, status: 'pending' };
+			const step: TodoStep = { id: nextTodoId(steps), content: op.content, status: 'pending' };
 			if (op.after_id == null) return [...steps, step];
 			const at = steps.findIndex((s) => s.id === op.after_id);
 			if (at === -1) return steps; // unknown anchor → no-op
@@ -804,7 +804,7 @@ function applyLeafOp(steps: PlanStep[], op: LeafOp): PlanStep[] {
 
 /// Set a step's status (and reason). Returns the same reference when no step
 /// matches `id`, so callers can detect the no-op.
-function setStatus(steps: PlanStep[], id: string, status: PlanStatus, reason?: string): PlanStep[] {
+function setStatus(steps: TodoStep[], id: string, status: TodoStatus, reason?: string): TodoStep[] {
 	const at = steps.findIndex((s) => s.id === id);
 	if (at === -1) return steps;
 	const next = [...steps];
@@ -815,7 +815,7 @@ function setStatus(steps: PlanStep[], id: string, status: PlanStatus, reason?: s
 
 /// Next `add` id: one past the largest numeric id present (matches the backend,
 /// so ids stay stable across cancellations).
-function nextPlanId(steps: PlanStep[]): string {
+function nextTodoId(steps: TodoStep[]): string {
 	const max = steps.reduce((m, s) => {
 		const n = Number(s.id);
 		return Number.isInteger(n) && n > m ? n : m;
@@ -823,11 +823,11 @@ function nextPlanId(steps: PlanStep[]): string {
 	return String(max + 1);
 }
 
-/// Index of the most recent plan card, or -1. The newest card is the live plan
-/// that non-init ops mutate, and what the UI surfaces as the current plan.
-function lastPlanIndex(items: Item[]): number {
+/// Index of the most recent todo card, or -1. The newest card is the live list
+/// that non-init ops mutate, and what the UI surfaces as the current todo list.
+function lastTodoIndex(items: Item[]): number {
 	for (let i = items.length - 1; i >= 0; i--) {
-		if (items[i].kind === 'plan') return i;
+		if (items[i].kind === 'todo') return i;
 	}
 	return -1;
 }
@@ -891,7 +891,7 @@ function pairResult(
 		// The executed view takes over from the approval preview. When the call
 		// produced no view (a no-op edit, or a failure) keep the preview so the
 		// card never flashes empty between approve and settle — the preview was
-		// the same plan, and on a rejected/failed call it is all there is.
+		// the same todo list, and on a rejected/failed call it is all there is.
 		view: view ?? call.preview,
 		error_code: output.error_code ?? undefined
 	};
@@ -985,13 +985,13 @@ function applyDelta(
 			const kind =
 				ev.kind === 'reasoning' ? 'reasoning' : ev.kind === 'tool_call' ? 'tool_call' : 'text';
 			if (kind === 'tool_call') {
-				// Plan is a control tool: show a single streaming placeholder card,
+				// Todo is a control tool: show a single streaming placeholder card,
 				// not a generic tool block. Its args stream as partial JSON (not
 				// foldable mid-stream), so we ignore tool_args for it and let the
 				// committed ContentBlock replace the placeholder with the real card.
-				if (ev.tool === PLAN_TOOL_NAME) {
+				if (ev.tool === TODO_TOOL_NAME) {
 					open[ev.index] = items.length;
-					items.push({ kind: 'plan', id: state.nextId, steps: [], streaming: true });
+					items.push({ kind: 'todo', id: state.nextId, steps: [], streaming: true });
 				} else {
 					// Tool calls: immediate creation, index-based tracking
 					open[ev.index] = items.length;
@@ -1061,9 +1061,9 @@ function applyDelta(
 		case 'tool_args': {
 			const pos = open[ev.index];
 			const cur = pos !== undefined ? items[pos] : undefined;
-			// Plan placeholder: args stream as partial JSON, not foldable until the
+			// Todo placeholder: args stream as partial JSON, not foldable until the
 			// committed ContentBlock arrives — ignore the stream for it.
-			if (cur?.kind === 'plan') return { ...state, items, open };
+			if (cur?.kind === 'todo') return { ...state, items, open };
 			if (cur?.kind === 'tool') {
 				items[pos] = { ...cur, args: cur.args + ev.json };
 				return { ...state, items, open };

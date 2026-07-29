@@ -65,7 +65,7 @@ pub enum GatewayEvent {
     /// reconnect (the committed `Event` is the authoritative record).
     Delta(Delta),
     /// A turn settled. `incomplete` is `None` on a clean finish, else a short
-    /// reason (round budget, plan stall, hook block).
+    /// reason (round budget, todo stall, hook block).
     TurnSettled { incomplete: Option<String> },
     /// The session was compacted into a new one; the client should follow
     /// `new_session_id` for subsequent events.

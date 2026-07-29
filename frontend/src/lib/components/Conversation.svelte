@@ -21,7 +21,7 @@
 		stateFromView,
 		type ConversationState,
 		type Item,
-		type PlanStep
+		type TodoStep
 	} from '$lib/conversation';
 	import type { GatewayEvent } from '$lib/types/GatewayEvent';
 	import ToolBlock from '$lib/components/tools/ToolBlock.svelte';
@@ -1059,28 +1059,28 @@
 		if (i in collapsed) return collapsed[i];
 		// Auto-collapse finished reasoning (tools stay open per user preference)
 		if (item.kind === 'reasoning') return !item.streaming;
-		// Auto-collapse a plan once every step is terminal (the work is done);
-		// keep an active plan open so the running task stays visible.
-		if (item.kind === 'plan') return item.steps.length > 0 && planDone(item.steps);
+		// Auto-collapse a todo list once every step is terminal (the work is done);
+		// keep an active todo list open so the running task stays visible.
+		if (item.kind === 'todo') return item.steps.length > 0 && todoDone(item.steps);
 		return false;
 	}
 
-	/** Whether every step has reached a terminal state. An empty plan is not
+	/** Whether every step has reached a terminal state. An empty todo list is not
 	 *  "done" — it is a placeholder still being established. */
-	function planDone(steps: PlanStep[]): boolean {
+	function todoDone(steps: TodoStep[]): boolean {
 		return steps.length > 0 && steps.every((s) => isTerminal(s.status));
 	}
 
-	function isTerminal(status: PlanStep['status']): boolean {
+	function isTerminal(status: TodoStep['status']): boolean {
 		return status === 'completed' || status === 'cancelled' || status === 'blocked';
 	}
 
-	/** Resolved-step count over total, for the plan header progress. Cancelled
+	/** Resolved-step count over total, for the todo header progress. Cancelled
 	 *  counts as resolved (the step was objectively unreachable and dealt with),
 	 *  so the bar only stays short while a step is still pending/in_progress or
 	 *  BLOCKED — i.e. a sub-100% bar signals a step is waiting on the user, not
-	 *  merely cancelled. See StepStatus in `src/agent/plan.rs`. */
-	function planProgress(steps: PlanStep[]): { done: number; total: number } {
+	 *  merely cancelled. See StepStatus in `src/agent/todo.rs`. */
+	function todoProgress(steps: TodoStep[]): { done: number; total: number } {
 		const done = steps.filter((s) => s.status === 'completed' || s.status === 'cancelled').length;
 		return { done, total: steps.length };
 	}
@@ -1391,27 +1391,27 @@
 		return null;
 	});
 
-	// The plan shown in the sticky dock: the latest committed plan card (running
-	// OR finished). Once any plan exists it stays docked, so a later plan swaps in
+	// The todo list shown in the sticky dock: the latest committed todo card (running
+	// OR finished). Once any todo list exists it stays docked, so a later list swaps in
 	// place rather than the dock vanishing and a new one popping in abruptly.
-	// Older plans (superseded by a newer `init`) fall back to inline history.
+	// Older todo lists (superseded by a newer `init`) fall back to inline history.
 	// Carrying the index lets the inline render skip it — shown in one place only.
-	const dockPlan = $derived.by<{ steps: PlanStep[]; index: number } | null>(() => {
+	const dockTodo = $derived.by<{ steps: TodoStep[]; index: number } | null>(() => {
 		for (let i = convo.items.length - 1; i >= 0; i--) {
 			const it = convo.items[i];
 			// Skip streaming placeholders (empty, half-arrived) so the dock never
-			// blanks between ops; the last committed card is the live plan.
-			if (it.kind === 'plan' && !it.streaming && it.steps.length > 0) {
+			// blanks between ops; the last committed card is the live list.
+			if (it.kind === 'todo' && !it.streaming && it.steps.length > 0) {
 				return { steps: it.steps, index: i };
 			}
 		}
 		return null;
 	});
 
-	// Collapsed state for the sticky dock. Defaults collapsed so the plan + input
+	// Collapsed state for the sticky dock. Defaults collapsed so the todo list + input
 	// don't eat a big vertical slab; the user expands to see steps. Separate from
 	// the inline-item `collapsed` map (keyed by item index).
-	let pinnedPlanCollapsed = $state(true);
+	let pinnedTodoCollapsed = $state(true);
 
 	/** One-line label for the config trigger: the chosen profile (or "default")
 	 *  and the chosen model's bare id (or "default model"). On a draft this is
@@ -1746,18 +1746,18 @@
 							<div class="item" data-item-anchor={i} in:fly|local={enterAnim}>
 								<ToolBlock {item} onDecide={decideApproval} />
 							</div>
-						{:else if item.kind === 'plan'}
+						{:else if item.kind === 'todo'}
 							<!-- Streaming placeholders (item.streaming) render nothing: a flashing
-					     inline "planning…" card on every plan op is pure eye-strain, and
-					     the dock already shows the live plan. The docked card is shown in
+					     inline "planning…" card on every todo op is pure eye-strain, and
+					     the dock already shows the live list. The docked card is shown in
 					     the dock, so skip it here too — only committed history cards render. -->
-							{#if !item.streaming && i !== dockPlan?.index}
-								{@const prog = planProgress(item.steps)}
+							{#if !item.streaming && i !== dockTodo?.index}
+								{@const prog = todoProgress(item.steps)}
 								<div class="item" data-item-anchor={i} in:fly|local={enterAnim}>
 									<div
 										class="plan-card"
 										class:expanded={!isCollapsed(item, i)}
-										class:done={planDone(item.steps)}
+										class:done={todoDone(item.steps)}
 									>
 										<button
 											class="plan-head"
@@ -1775,7 +1775,7 @@
 											>
 												<path d="M3 3h8M3 7h8M3 11h5" />
 											</svg>
-											<span class="plan-title">Plan</span>
+											<span class="plan-title">Todo</span>
 											<span class="plan-progress">{prog.done}/{prog.total}</span>
 											<span class="plan-track"
 												><span
@@ -1918,19 +1918,19 @@
 			{/if}
 		</div>
 
-		<!-- ACTIVE PLAN (sticky above input) — the latest plan stays docked (running
-	     or done) so a later plan swaps in place instead of popping in abruptly.
+		<!-- ACTIVE TODO (sticky above input) — the latest todo list stays docked (running
+	     or done) so a later list swaps in place instead of popping in abruptly.
 	     Default collapsed to spare vertical space; the dock carries the divider
 	     line so it reads as one zone with the input below. -->
-		{#if dockPlan}
-			{@const prog = planProgress(dockPlan.steps)}
+		{#if dockTodo}
+			{@const prog = todoProgress(dockTodo.steps)}
 			<div class="plan-dock">
 				<div class="plan-dock-inner">
-					<div class="plan-card pinned" class:expanded={!pinnedPlanCollapsed}>
+					<div class="plan-card pinned" class:expanded={!pinnedTodoCollapsed}>
 						<button
 							class="plan-head"
-							onclick={() => (pinnedPlanCollapsed = !pinnedPlanCollapsed)}
-							aria-expanded={!pinnedPlanCollapsed}
+							onclick={() => (pinnedTodoCollapsed = !pinnedTodoCollapsed)}
+							aria-expanded={!pinnedTodoCollapsed}
 						>
 							<svg
 								class="plan-icon"
@@ -1943,7 +1943,7 @@
 							>
 								<path d="M3 3h8M3 7h8M3 11h5" />
 							</svg>
-							<span class="plan-title">Plan</span>
+							<span class="plan-title">Todo</span>
 							<span class="plan-progress">{prog.done}/{prog.total}</span>
 							<span class="plan-track"
 								><span
@@ -1963,9 +1963,9 @@
 								<polyline points="4,2 8,6 4,10" />
 							</svg>
 						</button>
-						{#if !pinnedPlanCollapsed}
+						{#if !pinnedTodoCollapsed}
 							<ol class="plan-steps">
-								{#each dockPlan.steps as step (step.id)}
+								{#each dockTodo.steps as step (step.id)}
 									<li class="plan-step" data-status={step.status}>
 										<span class="plan-step-mark" aria-hidden="true">
 											{#if step.status === 'completed'}
@@ -2027,7 +2027,7 @@
 		{/if}
 
 		<!-- INPUT AREA -->
-		<div class="input-area" class:seamless={dockPlan}>
+		<div class="input-area" class:seamless={dockTodo}>
 			<div class="input-inner">
 				{#if queued.length > 0}
 					<!-- Pending queue: messages the user sent while a turn was running.
@@ -3559,9 +3559,9 @@
 		font-family: var(--font-chinese);
 	}
 
-	/* ---- PLAN CARD (inline checklist + sticky dock) ---- */
+	/* ---- TODO CARD (inline checklist + sticky dock) ---- */
 	/* Neutral surface, tool-block family — the indigo accent is rationed to the
-	   Plan label/icon only (like reasoning's indigo label), so the card blends
+	   Todo label/icon only (like reasoning's indigo label), so the card blends
 	   into the conversation and the input dock rather than shouting. */
 	.plan-card {
 		border-radius: var(--radius-md);
@@ -3572,7 +3572,7 @@
 	}
 
 	/* Sticky dock variant: matches the input box — same radius/surface/border so
-	   the running plan reads as part of the composer zone. */
+	   the running todo list reads as part of the composer zone. */
 	.plan-card.pinned {
 		border-radius: var(--radius-lg);
 		border-color: var(--border-default);
@@ -3746,7 +3746,7 @@
 		animation: spin 700ms linear infinite;
 	}
 
-	/* Sticky dock: pins the active plan above the input, sharing the composer's
+	/* Sticky dock: pins the active todo list above the input, sharing the composer's
 	   width + horizontal padding so it lines up with the input box. */
 	/* Sticky dock owns the conversation↔composer divider (border-top); the input
 	   below drops its own top border when docked (.input-area.seamless) so there's
@@ -3799,7 +3799,7 @@
 		flex-shrink: 0;
 	}
 
-	/* Docked plan above: the dock already drew the divider, so drop ours to avoid
+	/* Docked todo above: the dock already drew the divider, so drop ours to avoid
 	   a double seam squeezed between the dock and the input box. */
 	.input-area.seamless {
 		border-top: none;
@@ -4066,7 +4066,7 @@
 	/* ---- DRAFT CONFIG PICKER (profile / model / workspace) ---- */
 	/* Anchors the popover; lives in the input-actions row just left of Send so the
 	   pre-send config sits in the composer cluster (the space above the input is
-	   taken by the plan dock). Draft-only — gone once the session is real. */
+	   taken by the todo dock). Draft-only — gone once the session is real. */
 	.cfg {
 		position: relative;
 		display: flex;

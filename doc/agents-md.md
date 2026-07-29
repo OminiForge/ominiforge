@@ -24,7 +24,7 @@
    目录向上查找**最近**的指引文件（到 workspace 根之前为止——根目录那份已在 system prompt），
    命中且**本 session 尚未加载过**则作为一条 `InjectionEvent` 注入，去重后不再重复。
 
-`shell`、MCP tool、`plan` 控制 tool 没有单一路径，不触发子目录加载。
+`shell`、MCP tool、`todo` 控制 tool 没有单一路径，不触发子目录加载。
 
 ## 3. 注入时机与去重
 

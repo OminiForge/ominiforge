@@ -9,6 +9,6 @@
  * still leaves a trace: the loop records a `TurnEvent::Failed` with
  * `reason: None` paired with an [`ErrorEvent::Raised`] carrying the detail, so
  * `reason.is_some()` distinguishes a graceful stop from a hard abort. See
- * `doc/event-schema.md` §4 and `doc/plan.md` §6–§7.
+ * `doc/event-schema.md` §4 and `doc/todo.md` §6–§7.
  */
-export type TurnFailureReason = { "MaxRoundsExceeded": { max_rounds: number, } } | { "PlanStalled": { incomplete_steps: number, } } | { "BlockedByHook": { by: string, reason: string, } };
+export type TurnFailureReason = { "MaxRoundsExceeded": { max_rounds: number, } } | { "TodoStalled": { incomplete_steps: number, } } | { "BlockedByHook": { by: string, reason: string, } };

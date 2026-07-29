@@ -163,6 +163,6 @@ diff 构建逻辑从「前端复刻」移回后端，直接长在 tool 已有的
 
 - 不给 view 做 streaming（§5 行为变化，已确认接受）。
 - 不改 `result` 的简报形态（模型 token 经济性不变）。
-- 不动 plan 卡片的折叠逻辑（它是前端交互态，且 plan 不产生 view）。
+- 不动 todo 卡片的折叠逻辑（它是前端交互态，且 todo 不产生 view）。
 - 不动 permission 的 `resolveEffective`（§6，单独立项）。
 - 不改 `ToolEvent::Completed` 的事件形状（view 走 content 块，不加事件字段——见 §2 的旧日志/重放理由）。

@@ -1,10 +1,10 @@
 //! Rebuild a [`SessionRuntime`] from a session's persisted event stream.
 //!
 //! Resuming a session means reconstructing exactly what the model last saw: the
-//! conversation view (`Vec<Message>`) and the working plan. Both are derived
+//! conversation view (`Vec<Message>`) and the working todo list. Both are derived
 //! from `events.jsonl` — the source of truth — so a session picked up in a new
 //! process continues as if it never stopped (`doc/context-management.md` §6,
-//! `doc/plan.md` §10.3).
+//! `doc/todo.md` §10.3).
 //!
 //! This module is pure: it takes already-read events and returns state, with no
 //! I/O. The caller (the chat loop) reads the events, seeds the system message
@@ -31,7 +31,7 @@
 //! - `InjectionEvent::ContextInjected` → a `User` message (runtime reminders are
 //!   pushed as user turns by [`super::TurnState::inject_runtime`]).
 //!
-//! The plan is rebuilt separately by replaying each `plan` tool call's op, with
+//! The todo list is rebuilt separately by replaying each `todo` tool call's op, with
 //! the same error tolerance as live dispatch (a bad op was never applied, so
 //! replay skips it too).
 
@@ -44,8 +44,8 @@ use crate::core::payload::{
 };
 use crate::llm::{Message, ToolCall};
 
-use super::plan::{PLAN_TOOL_NAME, PlanOp, apply_plan_op};
-use super::{PlanStep, SessionRuntime, render_output};
+use super::todo::{TODO_TOOL_NAME, TodoOp, apply_todo_op};
+use super::{SessionRuntime, TodoItem, render_output};
 
 /// Rebuild a [`SessionRuntime`] from `events`, seeded with `system` (the system
 /// message(s) the caller derived from the profile).
@@ -58,7 +58,7 @@ pub fn rebuild_runtime(events: &[CoreEvent], system: Vec<Message>) -> SessionRun
     // authoritative token count forward, so the first request after resume
     // recalibrates it from real usage (`doc/context-management.md`).
     let mut runtime = SessionRuntime::new(rebuild_context(events, system));
-    runtime.plan = rebuild_plan(events);
+    runtime.todo = rebuild_todo(events);
     runtime.loaded_guidance = rebuild_loaded_guidance(events);
     runtime
 }
@@ -310,24 +310,24 @@ impl ContextRebuilder {
     }
 }
 
-/// Rebuild the working plan by replaying each `plan` tool call's op in order.
+/// Rebuild the working todo list by replaying each `todo` tool call's op in order.
 ///
 /// An op that fails to decode or apply is skipped — live dispatch never applied
-/// it either (a bad op yields an `is_error` result, leaving the plan unchanged),
-/// so the replayed plan matches the runtime plan at the time the session stopped.
-fn rebuild_plan(events: &[CoreEvent]) -> Vec<PlanStep> {
-    let mut plan = Vec::new();
+/// it either (a bad op yields an `is_error` result, leaving the list unchanged),
+/// so the replayed list matches the runtime list at the time the session stopped.
+fn rebuild_todo(events: &[CoreEvent]) -> Vec<TodoItem> {
+    let mut todo = Vec::new();
     for event in events {
-        if event.source.kind != SourceKind::Tool || event.source.id != PLAN_TOOL_NAME {
+        if event.source.kind != SourceKind::Tool || event.source.id != TODO_TOOL_NAME {
             continue;
         }
         if let EventPayload::Tool(ToolEvent::Started { input, .. }) = &event.payload
-            && let Ok(op) = serde_json::from_value::<PlanOp>(input.clone())
+            && let Ok(op) = serde_json::from_value::<TodoOp>(input.clone())
         {
-            let _ = apply_plan_op(&mut plan, op);
+            let _ = apply_todo_op(&mut todo, op);
         }
     }
-    plan
+    todo
 }
 
 /// Rebuild the set of nested project-guidance files already injected, so a
@@ -517,13 +517,13 @@ mod tests {
         assert!(!content.contains("@@"));
     }
 
-    fn plan_started(input: serde_json::Value) -> EventPayload {
+    fn todo_started(input: serde_json::Value) -> EventPayload {
         EventPayload::Tool(ToolEvent::Started {
             tool_call_event_id: EventId {
                 session_id: sid(),
                 seq: 0,
             },
-            tool_name: PLAN_TOOL_NAME.to_owned(),
+            tool_name: TODO_TOOL_NAME.to_owned(),
             source: ToolSource::Builtin,
             input,
             working_dir: None,
@@ -570,7 +570,7 @@ mod tests {
                 },
             ]
         );
-        assert!(rt.plan.is_empty());
+        assert!(rt.todo.is_empty());
     }
 
     /// A tool-calling round rebuilds into an assistant message carrying the call
@@ -704,7 +704,7 @@ mod tests {
                 runtime_src(),
                 EventPayload::Injection(InjectionEvent::ContextInjected {
                     source: InjectionSource::Runtime,
-                    content: "<reminder>finish the plan</reminder>".to_owned(),
+                    content: "<reminder>finish the todo list</reminder>".to_owned(),
                     token_count: 5,
                 }),
             ),
@@ -715,51 +715,51 @@ mod tests {
         assert_eq!(
             rt.context.last().unwrap(),
             &Message::User {
-                content: "<reminder>finish the plan</reminder>".to_owned()
+                content: "<reminder>finish the todo list</reminder>".to_owned()
             }
         );
     }
 
-    /// The plan is rebuilt by replaying plan ops; a malformed op is skipped just
-    /// as live dispatch never applied it, so the final plan matches runtime state.
+    /// The todo list is rebuilt by replaying todo ops; a malformed op is skipped just
+    /// as live dispatch never applied it, so the final list matches runtime state.
     #[test]
-    fn rebuilds_plan_by_replaying_ops_and_skips_bad_ones() {
+    fn rebuilds_todo_by_replaying_ops_and_skips_bad_ones() {
         let events = vec![
             ev(0, runtime_src(), started("two-step task")),
             ev(
                 1,
-                tool_src(PLAN_TOOL_NAME),
-                plan_started(serde_json::json!({
+                tool_src(TODO_TOOL_NAME),
+                todo_started(serde_json::json!({
                     "op": "init",
                     "steps": [{"content": "step one"}, {"content": "step two"}]
                 })),
             ),
             ev(
                 2,
-                tool_src(PLAN_TOOL_NAME),
-                plan_started(serde_json::json!({"ops": [{"op": "start", "id": "1"}]})),
+                tool_src(TODO_TOOL_NAME),
+                todo_started(serde_json::json!({"ops": [{"op": "start", "id": "1"}]})),
             ),
             // Malformed op (cancel without reason) — must be skipped, not panic.
             ev(
                 3,
-                tool_src(PLAN_TOOL_NAME),
-                plan_started(serde_json::json!({"ops": [{"op": "cancel", "id": "2"}]})),
+                tool_src(TODO_TOOL_NAME),
+                todo_started(serde_json::json!({"ops": [{"op": "cancel", "id": "2"}]})),
             ),
             ev(
                 4,
-                tool_src(PLAN_TOOL_NAME),
-                plan_started(serde_json::json!({"ops": [{"op": "complete", "id": "1"}]})),
+                tool_src(TODO_TOOL_NAME),
+                todo_started(serde_json::json!({"ops": [{"op": "complete", "id": "1"}]})),
             ),
         ];
 
         let rt = rebuild_runtime(&events, vec![]);
 
-        assert_eq!(rt.plan.len(), 2);
-        assert_eq!(rt.plan[0].id, "1");
-        assert_eq!(rt.plan[0].status, super::super::StepStatus::Completed);
+        assert_eq!(rt.todo.len(), 2);
+        assert_eq!(rt.todo[0].id, "1");
+        assert_eq!(rt.todo[0].status, super::super::StepStatus::Completed);
         // Step two stayed pending: the cancel op was malformed and skipped.
-        assert_eq!(rt.plan[1].id, "2");
-        assert_eq!(rt.plan[1].status, super::super::StepStatus::Pending);
+        assert_eq!(rt.todo[1].id, "2");
+        assert_eq!(rt.todo[1].status, super::super::StepStatus::Pending);
     }
 
     /// A `ProjectGuidance` injection rebuilds two things on resume: its wrapped
@@ -806,7 +806,7 @@ mod tests {
         }];
         let rt = rebuild_runtime(&[], system.clone());
         assert_eq!(rt.context, system);
-        assert!(rt.plan.is_empty());
+        assert!(rt.todo.is_empty());
     }
 
     /// A tool call whose turn died before any result event landed (abort,
