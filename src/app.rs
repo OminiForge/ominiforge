@@ -3,7 +3,7 @@
 //!
 //! This is the one place that loads config, resolves the model, builds the
 //! provider, registers tools (built-in + MCP + skills), and attaches hooks. The
-//! CLI (`run`, TUI) and the gateway (one assembly per live session) both call
+//! gateway (one assembly per live session) and the eval runner both call
 //! [`assemble`] so every entry point gets the *same* agent — the core stays
 //! UI-agnostic (`doc/architecture.md` §2.1).
 //!
@@ -309,7 +309,7 @@ pub async fn assemble(
         },
     );
 
-    // Optional dedicated compaction model (`doc/phase2-plan.md` decision B). It
+    // Optional dedicated compaction model (`doc/context-management.md`). It
     // may name a different provider, so resolve and build it independently; a bad
     // reference is fatal (the user asked for it explicitly).
     if let Some(model_ref) = profile.context.compaction_model.as_deref() {

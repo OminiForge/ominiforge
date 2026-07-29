@@ -1,11 +1,10 @@
 //! HTTP/SSE/WebSocket gateway for Web, mobile, and external integrations.
-//! Feature-gated (`gateway`). See `doc/architecture.md` §18 and `doc/gateway.md`.
+//! See `doc/architecture.md` §18 and `doc/gateway.md`.
 //!
-//! The gateway is the single backend for every non-TUI front-end. It runs as a
-//! user-level service (`ominiforge serve`); the TUI/CLI talk to the core
-//! directly and never go through it. The core stays UI-agnostic — the gateway
-//! is one more consumer of the same [`Agent`], [`SessionStore`], and event
-//! stream the CLI uses (`doc/architecture.md` §2.1).
+//! The gateway is the single backend for every interactive front-end. It runs
+//! as a user-level service (`ominiforge serve`); the core stays UI-agnostic —
+//! the gateway is a consumer of the same [`Agent`], [`SessionStore`], and
+//! event stream (`doc/architecture.md` §2.1).
 //!
 //! ## Shape
 //!

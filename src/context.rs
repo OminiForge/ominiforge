@@ -1,8 +1,7 @@
-//! Context-window token accounting (Phase 2, Step 2).
+//! Context-window token accounting.
 //!
 //! Compaction, dynamic injection, and prefix-cache discipline follow in later
-//! steps. See `doc/context-management.md` and `doc/phase2-plan.md` Step 2
-//! (decision A).
+//! steps. See `doc/context-management.md`.
 //!
 //! ## Why a ledger and not a single counter
 //!

@@ -108,8 +108,6 @@ diff 构建逻辑从「前端复刻」移回后端，直接长在 tool 已有的
   失败结果本身就是全部信息，debug 折层可见。
 - **大小**：view 与 result 同受 64KB artifact spill 约束（`doc/tool-protocol.md` §8），
   超大 diff 由 runtime spill 成 `ArtifactRef`，前端按引用取——与 result 同一机制。
-- **TUI**：忽略 `TextView` 块（其 render 同样只挑 `Text`），行为不变；后续可选择
-  消费 view 渲染 diff，非本次范围。
 
 ## 5. 前端：映射式渲染 + debug 折层
 
@@ -168,4 +166,3 @@ diff 构建逻辑从「前端复刻」移回后端，直接长在 tool 已有的
 - 不动 plan 卡片的折叠逻辑（它是前端交互态，且 plan 不产生 view）。
 - 不动 permission 的 `resolveEffective`（§6，单独立项）。
 - 不改 `ToolEvent::Completed` 的事件形状（view 走 content 块，不加事件字段——见 §2 的旧日志/重放理由）。
-- 不给 TUI 加 view 消费（向后兼容，后续可选）。

@@ -18,7 +18,7 @@ use crate::config::ConfigError;
 const DEFAULT_BIND: &str = "127.0.0.1:7878";
 
 /// Default idle timeout before a live session actor is evicted (releasing its
-/// event-log lock so the CLI/TUI can reopen it). 30 minutes.
+/// event-log lock so the session can be reopened on demand). 30 minutes.
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 1800;
 
 /// Default sandbox network policy when neither the profile nor this file names

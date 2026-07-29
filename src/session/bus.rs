@@ -1,5 +1,5 @@
 //! `EventBus`: a broadcast channel that fans out persisted events to live
-//! subscribers (the monitor, the TUI) without touching the write path.
+//! subscribers (the monitor, the gateway) without touching the write path.
 //!
 //! Events are published *after* they are durably appended to `events.jsonl`, so
 //! the log stays the source of truth and a subscriber only ever sees committed

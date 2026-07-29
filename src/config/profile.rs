@@ -128,7 +128,7 @@ pub struct ContextSection {
     pub compaction_threshold: Option<f32>,
     /// Model reference (`provider/model` or short `model`) used to generate
     /// compaction summaries. `None` reuses the session's current model
-    /// (`doc/phase2-plan.md` decision B).
+    /// (`doc/context-management.md`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

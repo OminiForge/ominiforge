@@ -577,7 +577,7 @@ pub struct SessionWriter {
     log: EventLog,
     next_seq: u64,
     /// Optional bus to publish each appended event to live subscribers
-    /// (monitor, TUI). Set via [`SessionWriter::with_bus`]; `None` is headless.
+    /// (monitor, gateway). Set via [`SessionWriter::with_bus`]; `None` is headless.
     bus: Option<EventBus>,
 }
 
@@ -595,7 +595,7 @@ impl SessionWriter {
     }
 
     /// Attach an [`EventBus`] so each appended event is also published to live
-    /// subscribers (e.g. the monitor, the TUI) after it is persisted. Persisting
+    /// subscribers (e.g. the monitor, the gateway) after it is persisted. Persisting
     /// to the log stays the source of truth; the broadcast is best-effort
     /// (`doc/monitor.md` §9).
     #[must_use]

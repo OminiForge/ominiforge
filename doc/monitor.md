@@ -161,7 +161,7 @@ MCP server 作为子进程，额外追踪：
 ## 8. Session 级汇总
 
 Session 结束时生成 `SessionSummary`（turns / model requests / tool calls / input+output
-tokens / cost / cache_hit_rate / duration / tools_used / errors），用于 CLI/TUI 结束展示、
+tokens / cost / cache_hit_rate / duration / tools_used / errors），用于 `inspect` 离线展示、
 evolution 分析、Web dashboard 报告。结构与离线入口 `summarize` 见 `src/monitor.rs`。
 
 ## 9. Monitor 实现架构

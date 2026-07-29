@@ -134,7 +134,7 @@ pub struct SessionRuntime {
     /// state or the model replaces it via `init` (`doc/plan.md` §10).
     pub plan: Vec<PlanStep>,
     /// Running input-token estimate for the context view, calibrated each round
-    /// from the provider's authoritative usage (`doc/phase2-plan.md` Step 2).
+    /// from the provider's authoritative usage (`doc/context-management.md`).
     pub ledger: ContextLedger,
     /// Workspace-relative paths of nested project-guidance files
     /// (`AGENTS.md`/`CLAUDE.md`) already injected this session, so each is loaded
@@ -184,11 +184,11 @@ pub struct TurnOutcome {
     /// `reason` on the persisted `TurnEvent::Failed`.
     pub incomplete: Option<TurnFailureReason>,
     /// Running input-token estimate for the context view at turn end, calibrated
-    /// from the provider's usage where available (`doc/phase2-plan.md` Step 2).
+    /// from the provider's usage where available (`doc/context-management.md`).
     pub context_tokens: u32,
     /// The token budget the context should stay under (`threshold × window −
     /// max_output`), or `None` when the context window is unknown. `context_tokens`
-    /// exceeding this is the compaction trigger (Step 3); Step 2 only warns.
+    /// exceeding this is the compaction trigger.
     pub context_limit: Option<u32>,
 }
 
@@ -198,7 +198,7 @@ pub struct Agent {
     tools: ToolRegistry,
     config: AgentConfig,
     /// Optional dedicated provider + model id for compaction summaries
-    /// (`doc/phase2-plan.md` decision B). `None` reuses the main provider/model.
+    /// (`doc/context-management.md`). `None` reuses the main provider/model.
     compaction: Option<(Arc<dyn Provider>, String)>,
     /// Hooks fired at fixed pipeline points (`doc/hook-protocol.md`). Empty by
     /// default — a no-op until the caller attaches a registry.
@@ -231,7 +231,7 @@ impl Agent {
     }
 
     /// Use a dedicated provider + model for compaction summaries instead of the
-    /// session's current model (`doc/phase2-plan.md` decision B).
+    /// session's current model (`doc/context-management.md`).
     #[must_use]
     pub fn with_compaction_model(mut self, provider: Arc<dyn Provider>, model: String) -> Self {
         self.compaction = Some((provider, model));
@@ -381,7 +381,7 @@ impl Agent {
         });
 
         // Use the dedicated compaction provider/model if configured, else the
-        // session's current one (`doc/phase2-plan.md` decision B).
+        // session's current one.
         let (provider, model) = self.compaction.as_ref().map_or_else(
             || (&self.provider, self.config.model.clone()),
             |(p, m)| (p, m.clone()),
@@ -1219,7 +1219,7 @@ impl TurnState<'_> {
 
         // Best pre-request estimate of the prefix we're about to send: the
         // ledger's running count, authoritative for everything measured so far
-        // plus a heuristic tail (`doc/phase2-plan.md` Step 2).
+        // plus a heuristic tail (`doc/context-management.md`).
         let input_tokens_estimate = self.runtime.ledger.running();
 
         let max_retries = self.agent.config.retry.max_retries;
@@ -1285,8 +1285,8 @@ impl TurnState<'_> {
 
         // Per-round context snapshot for live display: the freshly-calibrated
         // running estimate + the full window + compaction threshold. The gauge is
-        // `tokens/window` (threshold is a tick, not the denominator — matches the
-        // TUI status line). Emitted through the sink, not persisted.
+        // `tokens/window` (threshold is a tick, not the denominator). Emitted
+        // through the sink, not persisted.
         self.sink.on_context(
             self.runtime.ledger.running(),
             self.agent.config.context_window,
@@ -3721,7 +3721,7 @@ mod tests {
     }
 
     /// A clean turn fires `turn:end` after hooks, recorded as an observed
-    /// `HookEvent` (the `doc/todo.md` Phase 4 acceptance check).
+    /// `HookEvent` (`doc/hook-protocol.md`).
     #[tokio::test]
     async fn turn_end_after_hook_is_recorded() {
         let dir = tempfile::tempdir().unwrap();

@@ -142,7 +142,7 @@ fn golden_monitor_summary_aggregates_correctly() {
 }
 
 /// The opening turn's user input is captured as the session title.
-/// Breaking this means the session list and TUI picker would show blank titles.
+/// Breaking this means the session list in a front-end would show blank titles.
 #[test]
 fn golden_first_user_input_captured() {
     let (store, id) = fixture_store();

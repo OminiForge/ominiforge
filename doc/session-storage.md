@@ -57,7 +57,7 @@ fork_at_seq = 42           # 仅 fork 时存在
 
 - **不含 session_id**。避免同一 session 内每行重复，节省存储。Session_id 从目录名获取。
 - **首条事件为 SessionEvent::Created**。记录初始 config 快照（profile_id、tool list 等），使 replay 自包含。
-- **不生成 transcript.md**。人类可读展示由前端（TUI/Web/App）从 events.jsonl 解析渲染。
+- **不生成 transcript.md**。人类可读展示由前端（Web/App）从 events.jsonl 解析渲染。
 
 ## 4. context_snapshot.json
 
@@ -154,7 +154,7 @@ Session 的退役分两级——**archive（归档，安全、日常）** 与 **
 设计决策：
 
 - **归档标记 = sidecar 文件，不是 `session.toml` 字段**（§2 例外）。保住"无 status 字段"原则，schema 零改、向后兼容天然。标记的**存在**即信号，内容不用。
-- **`list()` 过滤 archived**。三个活跃枚举入口（`GET /sessions`、workspace 分组、CLI/TUI resume 选择器）都不再返回 archived；但按 id 读 `session.toml` / `events.jsonl` 仍可用——这正是"保留供分析"。
+- **`list()` 过滤 archived**。两个活跃枚举入口（`GET /sessions`、workspace 分组）都不再返回 archived；但按 id 读 `session.toml` / `events.jsonl` 仍可用——这正是"保留供分析"。
 - **单点运行门控**。archived 的运行拦截只加在 `get_or_spawn`(所有 run/stream 路径的唯一入口),覆盖全部、且不误伤只读路径。文件系统是唯一真相源(每次 `list()`/门控都重新 stat,无缓存),外部手动增删 `.archived` 下次即生效——但注意手动 `touch` 只切换"列表可见性 + 运行门控",不触发 release;完整退役须走 API。
 - **release 失败则中止归档**（fail loud），不泄漏沙箱环境。
 - **幂等**。重复 archive 是 no-op 成功。

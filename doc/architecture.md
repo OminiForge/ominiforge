@@ -4,7 +4,7 @@
 
 Ominiforge 目标是构建一个使用 Rust 实现的高性能、强执行能力、高扩展性的 agent 平台。系统应能够通过扩展成为 coding agent、个人研究助手、自动化助手，并逐步接入日常生活、软件开发、知识管理、外部应用协作等场景。
 
-系统需要支持多种使用入口，包括 CLI、TUI、Web 页面，并为后续桌面应用、移动应用、第三方应用接入预留架构空间。不同入口不应各自实现 agent 逻辑，而应共享同一个核心运行时、同一套 session 管理、同一套事件协议和同一套监控记录。
+系统需要支持多种使用入口，包括 Web 页面、桌面应用、移动应用和第三方应用接入。不同入口不应各自实现 agent 逻辑，而应共享同一个核心运行时、同一套 session 管理、同一套事件协议和同一套监控记录。所有交互式入口都经 Gateway 访问核心；命令行只作为运维工具（`serve` / `init` / `inspect` / `eval`），不是对话入口。
 
 系统还需要具备自我进化能力。自我进化不是指系统未经确认自动修改自身，而是指系统能够基于 session 历史、失败记录、使用频率、成本数据和 tool/skill 运行结果，生成可审查的优化建议、skill 草案、配置变更建议或代码 patch。所有影响系统行为的进化结果都应由用户批准后再应用。
 
@@ -12,7 +12,7 @@ Ominiforge 目标是构建一个使用 Rust 实现的高性能、强执行能力
 
 ### 2.1 核心无 UI
 
-核心 agent 运行时不应依赖 CLI、TUI、Web 或桌面环境。核心只负责执行任务、管理状态、发出事件。UI 层只负责收集用户输入、渲染事件流、展示状态和提交控制指令。
+核心 agent 运行时不应依赖任何前端环境（Web、桌面、移动端等）。核心只负责执行任务、管理状态、发出事件。UI 层只负责收集用户输入、渲染事件流、展示状态和提交控制指令。
 
 这样设计是因为项目需要支持多个前端形态。如果 agent 逻辑与某个 UI 绑定，后续接入 Web、移动端、桌面端或第三方应用时会重复实现逻辑，并导致行为不一致。
 
@@ -30,7 +30,7 @@ Session 的原始历史应采用 append-only 模型保存。任何压缩、fork�
 
 ### 2.4 可读历史优先，数据库作为索引
 
-完整 session 历史不应只存在 SQLite 等数据库中。数据库适合索引、查询和缓存，但不适合作为唯一历史来源。系统应保存机器可读的 event log（events.jsonl），人类可读展示由前端（TUI/Web/App）从 event log 解析渲染。索引数据库可从 event log 重建。
+完整 session 历史不应只存在 SQLite 等数据库中。数据库适合索引、查询和缓存，但不适合作为唯一历史来源。系统应保存机器可读的 event log（events.jsonl），人类可读展示由前端（Web/App）从 event log 解析渲染。索引数据库可从 event log 重建。
 
 这样设计是因为把所有历史放入单个数据库会增加迁移、损坏恢复和长期扩展成本。Event log 作为 source of truth，索引数据库随时可重建。
 
@@ -40,7 +40,7 @@ Session 的原始历史应采用 append-only 模型保存。任何压缩、fork�
 
 事件协议采用统一 envelope + 分域 payload enum 设计。所有事件共享 schema_version、seq、session_id、timestamp、source 等信封字段，payload 按 Turn/Model/Tool/Session/Artifact/Error 分域。详见 [`doc/event-schema.md`](./event-schema.md)。
 
-这样设计是因为 streaming agent、TUI、WebSocket、监控和回放都天然需要事件流。事件协议稳定后，CLI/TUI/Web/移动端可以共享行为语义。
+这样设计是因为 streaming agent、WebSocket、监控和回放都天然需要事件流。事件协议稳定后，Web/桌面/移动端可以共享行为语义。
 
 ### 2.6 进化只生成提案
 
@@ -50,31 +50,27 @@ Session 的原始历史应采用 append-only 模型保存。任何压缩、fork�
 
 ## 3. 入口形态
 
-### 3.1 CLI
+### 3.1 命令行（运维工具）
 
-CLI 是命令行接口，适合一次性命令、脚本、管道和自动化场景。例如：
+命令行是运维/自动化入口，不是对话界面。对话交互一律走 Gateway 驱动的
+Web/桌面/移动前端。现有的几个子命令都面向“起服务 / 看数据 / 跑评测”：
 
 ```text
-ominiforge run "summarize this file"
-ominiforge session list
-ominiforge tool install ...
+ominiforge serve            # 起 Gateway（所有交互前端的后端）
+ominiforge init             # 脚手架 .omini/ 配置
+ominiforge inspect <id>     # 离线分析一个 session 的 metrics
+ominiforge eval <suite>     # 跑 eval 套件
 ```
 
-CLI 应保持可组合、可脚本化、输出结构清晰。CLI 不等同于 TUI。
+CLI 应保持可组合、可脚本化、输出结构清晰。
 
-### 3.2 TUI
-
-TUI 是终端全屏交互界面，适合长任务、多面板、快捷键、实时日志、session 切换、tool 执行状态展示等场景。TUI 可以参考 oh-my-pi 类产品中“命令执行”和“agent 对话”自由切换的体验。
-
-TUI 仍然不应实现核心 agent 逻辑。它应通过 service runtime 或本地 API 驱动 agent，并订阅事件流渲染界面。
-
-### 3.3 Web
+### 3.2 Web
 
 Web 页面用于远程访问 agent、查看 session、监控执行状态、浏览报告、审批自我进化提案，以及管理配置、profile、tool 和 skill。
 
 Web 前端应通过 gateway 连接服务层。它不应直接操作底层 session 文件或插件运行时。
 
-### 3.4 Desktop 和 Mobile
+### 3.3 Desktop 和 Mobile
 
 桌面端和移动端作为后续入口，应复用 gateway/service runtime 的协议。它们主要负责用户体验、通知、离线能力和本地系统集成，不应复制核心 agent 执行逻辑。
 
@@ -82,8 +78,6 @@ Web 前端应通过 gateway 连接服务层。它不应直接操作底层 sessio
 
 ```text
 UI / Integration Layer
-├─ CLI
-├─ TUI
 ├─ Web
 ├─ Desktop
 ├─ Mobile
@@ -167,17 +161,16 @@ src/
 ├── monitor/       # trace, usage, cost (EventBus subscriber)
 ├── evolution/     # session analysis, proposal generation
 ├── agent/         # agent loop, orchestration
-├── gateway/       # HTTP/WS server (feature-gated)
-├── cli/           # 命令解析、子命令
-├── tui/           # 终端 UI 渲染
+├── gateway/       # HTTP/SSE/WS server（所有交互前端的后端）
+├── cli/           # 命令解析、子命令（serve/init/inspect/eval）
 └── main.rs        # 入口分发
 ```
 
 依赖方向：
 
 ```text
-main.rs → cli/ / tui/ / gateway/
-cli/ tui/ gateway/ → agent/ + session/ + monitor/
+main.rs → cli/ → gateway/
+cli/ gateway/ → agent/ + session/ + monitor/
 agent/ → core/ + llm/ + tool/ + mcp/ + hook/ + context/ + memory/ + skill/
 tool/ → core/
 mcp/ → core/ + tool/
@@ -191,10 +184,12 @@ core → 不依赖任何上层 module
 
 | Feature   | 控制范围              | 默认 |
 |-----------|----------------------|------|
-| `gateway` | gateway/ module 编译 | on   |
-| `tui`     | tui/ 相关依赖(ratatui 等) | on   |
 | `provider-openai`  | OpenAI provider | on   |
 | `provider-xiaomi`  | Xiaomi MiMo provider | on   |
+
+Gateway（axum 栈）是无条件编译的——命令行的主用途就是 `serve`，没有“不带 gateway
+的 CLI-only 构建”这种形态。剩下两个 feature 是真 opt-in：`sandbox-boxlite`（microVM
+沙箱后端，Linux + Apple Silicon）和 `ts-export`（前端类型绑定生成，仅开发期）。
 
 ### 5.2 何时再拆
 
@@ -502,8 +497,6 @@ workspace = "/home/user/project/foo"   # 可选
 
 | 入口 | workspace |
 |------|-----------|
-| CLI `ominiforge run` | 默认 CWD，可 `--workspace` 覆盖 |
-| CLI `ominiforge tui` | 默认 CWD |
 | Web/Gateway 创建 session | 用户显式选择，或不指定 |
 | Scheduler 触发 | 任务定义中声明 |
 
@@ -557,7 +550,7 @@ observed → proposed → approved → applied → evaluated
 5. 拆分 workspace 基础 crates。
 6. 建立 session storage 原型。
 7. 接入 monitor trace 和 usage 记录。
-8. 做 CLI/TUI 入口。
+8. 做 CLI 入口（`serve` / `init` / `inspect` / `eval`）。
 9. 做 gateway 和 Web 入口。
 10. 做 evolution worker 原型。
 

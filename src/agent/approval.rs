@@ -4,9 +4,9 @@
 //! The [`permission`](crate::permission) policy decides *whether* a call needs
 //! human sign-off; this trait decides *how* that human is reached. It is the
 //! same shape of dependency as [`StreamSink`](super::StreamSink): the agent core
-//! stays front-end-agnostic, and each front-end supplies its own gate — a
-//! terminal prompt in the CLI/TUI, an actor-routed request/response in the
-//! gateway (`doc/permission.md` §5). The agent never blocks the turn itself; it
+//! stays front-end-agnostic, and each front-end supplies its own gate — the
+//! gateway routes a request/response to the client over the wire
+//! (`doc/permission.md` §5). The agent never blocks the turn itself; it
 //! awaits [`ApprovalGate::request`], and the gate implementation owns the
 //! suspend/resume mechanics.
 //!
@@ -122,9 +122,8 @@ pub trait ApprovalGate: Send + Sync {
     /// Whether the gate can field multiple concurrent `request`s. A gate that
     /// routes decisions over a shared channel (the gateway) returns `true`, so
     /// the agent dispatches a round's tool calls in two phases — preparing all
-    /// of them (and publishing every `ask`) before settling any. Interactive
-    /// prompts (the CLI) and the null gate keep the serial default: the agent
-    /// then dispatches one call at a time, exactly as before.
+    /// of them (and publishing every `ask`) before settling any. Other gates
+    /// keep the serial default: the agent then dispatches one call at a time.
     fn supports_concurrent_requests(&self) -> bool {
         false
     }

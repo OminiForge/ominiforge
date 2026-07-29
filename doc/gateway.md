@@ -1,7 +1,7 @@
 # Gateway 系统
 
-Gateway 是所有非 TUI 入口（Web / 桌面 / 手机 / 第三方）的唯一后端。TUI/CLI 本地直接调
-core，不经 Gateway（`doc/architecture.md` §18）。Gateway 不实现 agent 逻辑——它是
+Gateway 是所有交互式入口（Web / 桌面 / 手机 / 第三方）的唯一后端
+（`doc/architecture.md` §18）。Gateway 不实现 agent 逻辑——它是
 core 之上又一个 event 流消费者，复用同一套 `Agent` / `SessionStore` / `EventBus`。
 
 **精确类型与签名以代码为准**：配置见 [`src/gateway/config.rs`](../src/gateway/config.rs)；
@@ -13,9 +13,8 @@ session actor 见 [`src/gateway/actor.rs`](../src/gateway/actor.rs)；registry �
 
 `SessionStore::open` / `create_*` 返回的 `SessionWriter` 持有该 session events.jsonl 的
 OS 文件锁，直到 writer 被 drop。**一个 session 同一时刻只能在一处可写**。这不是限制，
-是 append-only 历史不可变（§2.2）的执行保障：CLI 在跑某 session 时，Gateway 打开同一
-session 会拿到 `Locked`，反之亦然——这正是 §18.1“多入口经共享文件系统协调”的落地方式，
-靠 flock 强制而非约定。
+是 append-only 历史不可变（§2.2）的执行保障：Gateway 打开一个已被其它进程持有的
+session 会拿到 `Locked`——靠 flock 强制而非约定。
 
 推论：网络侧多客户端 fan-in 到一个 session，必须串行经过单一所有者。→ **session-actor
 模型**（被锁逼出来的，不是选出来的）。
@@ -24,11 +23,11 @@ session 会拿到 `Locked`，反之亦然——这正是 §18.1“多入口经�
 
 ```text
 ominiforge serve
-  ├─ axum HTTP/SSE/WS server（feature "gateway"）
+  ├─ axum HTTP/SSE/WS server
   ├─ auth middleware（单用户静态 bearer token）
   ├─ SessionRegistry          # session_id → 活跃 SessionActor handle
   └─ 每 session 一个 SessionActor task
-       ├─ owns (SessionWriter, SessionRuntime)   # 轮间持有，同 TUI
+       ├─ owns (SessionWriter, SessionRuntime)   # 轮间持有
        ├─ mpsc inbox: Send | Cancel | Compact | Shutdown
        ├─ 每 session 一条 outbound broadcast（committed events + live deltas）
        └─ idle 超时 → 自我关停 → drop writer → 释放 flock
@@ -36,12 +35,12 @@ ominiforge serve
 
 ### 2.1 SessionActor
 
-一个 tokio task 拥有一个活跃 session。轮间持有 `(SessionWriter, SessionRuntime)`（和 TUI
-轮间持有方式一致），从 mpsc inbox 顺序处理命令，**保证一个 session 上两个 turn 永不交错**。
+一个 tokio task 拥有一个活跃 session。轮间持有 `(SessionWriter, SessionRuntime)`，
+从 mpsc inbox 顺序处理命令，**保证一个 session 上两个 turn 永不交错**。
 
 turn 在 spawn 出的子 task 上运行（writer+runtime move 进去、跑完 move 回来），因此 `Cancel`
 能 `abort` 它；abort 后 writer 被 drop（锁释放），actor 从 event log 重建 runtime 续跑——
-和 TUI 的 cancel 恢复同源，根植于“log 是 source of truth”。
+根植于“log 是 source of truth”。
 
 两路输出合并到一条 broadcast（`GatewayEvent`）：
 
@@ -49,17 +48,17 @@ turn 在 spawn 出的子 task 上运行（writer+runtime move 进去、跑完 mo
   来自 session `EventBus`（publish-after-durable-append，订阅者只见已提交事件）。
 - **live deltas**：token 级流式（`Delta`），瞬态，**不重放**（重连从 committed events 重建）。
 - **live context**：每个 model round 校准 ledger 后发 `ContextUpdated{tokens, window, threshold}`
-  —— 上下文占用快照（gauge 为 `tokens/window`，`threshold` 是压缩刻度，非分母；对齐 TUI
-  状态行）。同 `Delta` 瞬态、**不重放**，运行时值不落 log。
+  —— 上下文占用快照（gauge 为 `tokens/window`，`threshold` 是压缩刻度，非分母）。
+  同 `Delta` 瞬态、**不重放**，运行时值不落 log。
 
 turn 跑完发 `TurnSettled`；超阈值自动 compaction 并发 `Compacted{new_session_id}`，actor
-跟随新 session（同 TUI poll_turn 逻辑）。turn 进行中收到的 `Send`/`Compact` 入队延后执行。
+跟随新 session。turn 进行中收到的 `Send`/`Compact` 入队延后执行。
 
 ### 2.2 SessionRegistry
 
 `session_id → ActorHandle`。冷 session 查找时即时 spawn：assemble 一个**每 session 隔离的**
 agent（独立 provider + 独立 MCP 子进程），`open` 取锁，从 log 重建 runtime。锁已被占用
-（CLI/TUI 或未知的在跑 actor）→ `open` 失败 → 查找上报冲突（server 映射为 HTTP 409）。
+（另一个在跑的 actor）→ `open` 失败 → 查找上报冲突（server 映射为 HTTP 409）。
 
 `create`（新 session）/ `fork`（在某 seq 分叉）各自 assemble agent、铸造 session、spawn
 actor。fork 用父 session 截至 `at_seq` 重建的 context 做 snapshot，自包含（父可删，§6.2）。
@@ -93,8 +92,7 @@ session API 统一挂在 `/api/*` 下，避免与前端 SPA 自身的 client-sid
 | GET  | `/api/sessions/{id}/events` | SSE event 流（见 §4） |
 | GET  | `/api/sessions/{id}/ws` | WebSocket：events 出 + `{type:"send",text}` / `{type:"cancel"}` 入 |
 
-`message` 立即返回 202；turn 在 actor 内跑，输出走 event 流。这把“提交”与“观察”解耦，
-和 TUI（spawn turn + 订阅 bus）同构。
+`message` 立即返回 202；turn 在 actor 内跑，输出走 event 流。这把“提交”与“观察”解耦。
 
 ## 4. 重连 / 续传
 
@@ -108,7 +106,7 @@ session API 统一挂在 `/api/*` 下，避免与前端 SPA 自身的 client-sid
 单用户静态 bearer token。`gateway.toml` 的 `api_key_env` 指定环境变量名（密钥不入配置文件，
 §15）；配置了才启用鉴权，`/healthz` 永远开放，其余路由要 `Authorization: Bearer <token>`。
 未配置 = 开放网关（仅在 loopback + 可信反代后安全，启动会告警）。GitHub OAuth + 多用户隔离
-延后（`feature-requests.md`）。
+延后。
 
 ## 6. TLS / 暴露模型（已决策）
 

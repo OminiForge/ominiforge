@@ -44,8 +44,8 @@ pub trait StreamSink: Send {
     /// model round calibrates the ledger. `tokens` is the ledger's running
     /// input-token estimate ([`ContextLedger::running`](crate::context::ContextLedger::running));
     /// `window` is the model's full context window (`0` when unknown); `threshold`
-    /// is the compaction fraction (drawn as a gauge tick, mirroring the TUI status
-    /// line — the gauge is `tokens/window`, never the derived effective limit).
+    /// is the compaction fraction (drawn as a gauge tick — the gauge is
+    /// `tokens/window`, never the derived effective limit).
     /// Live display only — these are runtime values, not persisted to the log.
     fn on_context(&mut self, _tokens: u32, _window: u32, _threshold: f32) {}
 

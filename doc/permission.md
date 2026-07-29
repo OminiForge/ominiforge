@@ -188,10 +188,7 @@ pub trait ApprovalGate: Send + Sync {
 
 - **NullGate**（默认）：fail-closed，`ask` 一律 `AutoDenied`。用于 headless / eval / 测试——
   `ask` 绝不因没接 gate 而变成隐式 allow。
-- **CLI（`ominiforge run`）**：`CliApprovalGate`（`src/cli.rs`）同步终端提示，打印 tool + 参数到 stderr，
-  读 stdin 一行；`y`/`yes` → `Approved`，明确的其它输入 → `RejectedByUser`，**EOF/io 错误 → `AutoDenied`**
-  （无人应答，非用户拒绝）。非 tty stdin（管道）直接 `AutoDenied`。stdin 阻塞读取走 `spawn_blocking`。
-- **Gateway（Web）**：`GatewayApprovalGate`（`src/gateway/approval.rs`）挂起-恢复闭环：
+- **Gateway（Web / 桌面 / 手机）**：`GatewayApprovalGate`（`src/gateway/approval.rs`）挂起-恢复闭环：
   1. turn task 在 `dispatch_tool` 建 `oneshot`、插入共享 `PendingApprovals` 表（keyed by call_id）；
   2. publish `ActivityStatus::AwaitingApproval` + 发 `GatewayEvent::ApprovalRequested`；
   3. `rx.await` 挂起——此时 actor 的 `run_turn_phase` select-loop 仍在监听 inbox；
@@ -250,8 +247,7 @@ pub enum PermissionEvent {
   旧日志无此字段仍可正常反序列化。
 
 - `scope: Option<ApprovalScope>`（serde default + None 不序列化）：人做了决定时记录其作用域
-  （含 `once`，审计统一）；policy deny、fail-closed 兜底、以及 `CliApprovalGate`（终端提示无作用域
-  选择，恒 `scope: None`——CLI 的人为批准也记为 None，与「审计统一」措辞一致）为 `None`。
+  （含 `once`，审计统一）；policy deny、fail-closed 兜底（无人应答的 `AutoDenied`）为 `None`。
   旧日志无此字段仍可正常反序列化。
 - 持久化写 log：既是完整审计轨，又让前端在**刷新/重连**后从事件流 fold 重建待审批提示
   （committed 事件会 replay）。
@@ -290,7 +286,6 @@ Web 审批（tool 卡内 ApprovalControls，含作用域选择）+ 三层 Web �
 gateway 工具默认表、生效结果视图；`frontend/DESIGN.md` §4.10）。
 
 待后续：
-- **TUI 交互审批**（当前 TUI 走默认 gate，ask 即 fail-closed 拒绝）。
 - 规则匹配升级：`substring`/`prefix` + `field` 定位 + `negate` 白名单**已实现**（§3 规则模型）；未来可加 glob / regex。
 - monitor 层聚合审批/拒绝计数进 `SessionSummary`（当前审计已由 event log 覆盖）。
 - 内置 permission-guard hook 与 profile `[hooks]` 的 name 绑定（`doc/hook-protocol.md` §13）。

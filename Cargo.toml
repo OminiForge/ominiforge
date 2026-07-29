@@ -52,11 +52,6 @@ tokio = { version = "1", features = [
 ] }
 toml = "0.8"
 ulid = "1"
-ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
-crossterm = "0.28"
-unicode-width = "=0.2.0"
-catppuccin = "2.8.0"
-git2 = "0.21.0"
 
 # Sandbox backend (feature `sandbox-boxlite`, doc/sandbox.md §4): libkrun microVM
 # runtime for isolated per-session execution. Optional and OFF by default —
@@ -68,16 +63,17 @@ git2 = "0.21.0"
 # (both sandbox-escape CVEs, patched >= 0.9.0).
 boxlite = { version = "0.9.7", optional = true }
 
-# Gateway (feature `gateway`): HTTP/SSE/WS server for Web/desktop/mobile.
-# Optional so a `--no-default-features` build (e.g. an embedded CLI-only target)
-# drops the axum stack entirely. See doc/architecture.md §5.1, §18.
-axum = { version = "0.8", optional = true, features = ["ws"] }
-tokio-stream = { version = "0.1", optional = true, features = ["sync"] }
+# Gateway: HTTP/SSE/WS server — the single backend every interactive front-end
+# (Web/desktop/mobile) talks to. Unconditional: with the local chat front-ends
+# removed, the command line is operator tooling (`serve`, `init`, `inspect`,
+# `eval`), and `serve` is the product. See doc/architecture.md §5.1, §18.
+axum = { version = "0.8", features = ["ws"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 # Response compression (gzip/br) for the gateway. The folded conversation
 # view (`GET /sessions/{id}/view`) is multi-MB of highly compressible JSON;
 # over a relayed link (SSH forward / reverse proxy) compression is the
 # difference between a 10s and a 1s session open.
-tower-http = { version = "0.6", optional = true, features = ["compression-gzip", "compression-br"] }
+tower-http = { version = "0.6", features = ["compression-gzip", "compression-br"] }
 
 # ts-rs (feature `ts-export`): generate the TS type bindings the frontend
 # consumes from the Rust wire types (events, gateway frames, session meta). Dev
@@ -92,10 +88,9 @@ ignore = "0.4.31"
 globset = "0.4.19"
 
 [features]
-# Gateway on by default (doc/architecture.md §5.1); build without it via
-# `--no-default-features`.
-default = ["gateway"]
-gateway = ["dep:axum", "dep:tokio-stream", "dep:tower-http"]
+# No default features: the gateway is always compiled in (see the axum entry
+# above). The remaining features are genuine opt-ins.
+default = []
 # BoxLite microVM sandbox backend (doc/sandbox.md §4). OFF by default: libkrun is
 # Linux + Apple-Silicon only and heavy. Enable on a supported host with
 # `--features sandbox-boxlite`.

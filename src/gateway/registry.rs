@@ -5,8 +5,8 @@
 //! fresh actor: build a per-session agent (isolated provider + MCP subprocesses,
 //! the user's per-session-isolation choice), open the session for appending
 //! (taking the event-log lock), and rebuild its runtime from the log. If the
-//! lock is already held — by the CLI/TUI, or a still-running actor we don't know
-//! about — `open` fails and the lookup surfaces it as a conflict (the server
+//! lock is already held — by a still-running actor we don't know about —
+//! `open` fails and the lookup surfaces it as a conflict (the server
 //! maps it to HTTP 409).
 //!
 //! Creating a *new* session (or a fork) assembles an agent, mints the session,
@@ -958,7 +958,7 @@ impl SessionRegistry {
     ///
     /// # Errors
     /// - session not found
-    /// - the session is locked by another writer (CLI/TUI) — surfaced so the
+    /// - the session is locked by another writer — surfaced so the
     ///   server can return 409
     /// - agent assembly failure (bad config)
     // The actors-map guard is intentionally held across the assemble/open awaits:

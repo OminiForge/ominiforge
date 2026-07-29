@@ -4,8 +4,8 @@
 //! held for the [`SessionWriter`]'s lifetime (`src/session`). A network gateway
 //! has many clients fanning into one session, so they must serialize through one
 //! owner — this actor. It owns the `(SessionWriter, SessionRuntime)` pair between
-//! turns (exactly as the TUI holds it between turns) and processes commands from
-//! an mpsc inbox one at a time, so two turns never interleave on one session.
+//! turns and processes commands from an mpsc inbox one at a time, so two turns
+//! never interleave on one session.
 //!
 //! Two streams flow out over one [`broadcast`] channel ([`GatewayEvent`]):
 //! - **committed events** — every persisted [`CoreEvent`], carrying a `seq` so a
@@ -16,9 +16,8 @@
 //!
 //! A turn runs on a spawned task that *moves* the writer+runtime in and returns
 //! them out, so a `Cancel` can `abort` the task; after the abort the writer is
-//! dropped (releasing the lock) and the actor rebuilds the runtime from the log
-//! — the same recovery the TUI uses, grounded in the log being the source of
-//! truth.
+//! dropped (releasing the lock) and the actor rebuilds the runtime from the
+//! log, which is the source of truth.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -77,7 +76,7 @@ pub enum GatewayEvent {
     /// after each model round calibrates the ledger. `tokens` is the running
     /// estimate; `window` the model's full context window (`0` when unknown);
     /// `threshold` the compaction fraction (a gauge tick — the gauge is
-    /// `tokens/window`, not `tokens/effective_limit`, mirroring the TUI). Ephemeral
+    /// `tokens/window`, not `tokens/effective_limit`). Ephemeral
     /// like [`Delta`]: not persisted, not replayed — a fresh snapshot arrives next round.
     ContextUpdated {
         tokens: u32,
@@ -409,7 +408,7 @@ impl SessionActor {
                     },
                     () = tokio::time::sleep(self.idle_timeout) => {
                         // Idle too long: drop the writer (releases the lock) and
-                        // exit so the CLI/TUI can reopen this session.
+                        // exit so the session can be reopened on demand.
                         return;
                     }
                 }

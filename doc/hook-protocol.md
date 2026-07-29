@@ -229,9 +229,7 @@ stdin JSON 通信，完整 OS 能力）。废弃理由见 [`architecture.md`](./
 Phase 4 已实现：4 个 hook point（`turn:start`、`turn:end`、`tool:invoke:before`、
 `tool:invoke:after`）、Rust trait（`BeforeHook`/`AfterHook`）+ shell hook runner、
 `HookRegistry`（priority 链式 + block 短路 + failure_mode）、`hooks.toml` 加载、agent
-接入、`HookEvent::Executed` 写 event log。详见 [`todo.md`](./todo.md) Phase 4。
-
-待后续完善：
+接入、`HookEvent::Executed` 写 event log。
 - 其余 6 个 hook point（`model:request:*`、`artifact:create:*`、`session:*`）的挂载点与
   payload 详细 schema。
 - 内置 hook（permission-guard / cost-limiter）—— 依赖 permission / cost 子系统；profile

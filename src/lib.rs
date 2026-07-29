@@ -1,15 +1,14 @@
 //! Ominiforge — a high-performance, extensible Rust agent platform.
 //!
 //! The core runtime is UI-agnostic: it executes tasks, manages session state,
-//! and emits a unified event stream that every front-end (CLI / TUI / Web)
-//! consumes. See `doc/architecture.md` for the full design and `doc/todo.md`
-//! for the phased implementation plan.
+//! and emits a unified event stream that every front-end (Web / desktop /
+//! mobile, all via the gateway) consumes. See `doc/architecture.md` for the
+//! full design.
 
 pub mod core;
 
-// Subsystems below are scaffolded and filled in incrementally per the phase
-// plan in `doc/todo.md`. Dependency direction (see `doc/workspace-plan.md`):
-// everything points down to `core`; `core` depends on nothing above it.
+// Dependency direction: everything points down to `core`; `core` depends on
+// nothing above it.
 pub mod agent;
 pub mod agents_md;
 pub mod app;
@@ -19,7 +18,6 @@ pub mod context;
 pub mod env;
 pub mod eval;
 pub mod evolution;
-#[cfg(feature = "gateway")]
 pub mod gateway;
 pub mod hook;
 pub mod llm;
@@ -35,4 +33,3 @@ pub mod secrets;
 pub mod session;
 pub mod skill;
 pub mod tool;
-pub mod tui;
