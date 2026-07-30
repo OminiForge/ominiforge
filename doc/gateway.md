@@ -90,7 +90,6 @@ session API 统一挂在 `/api/*` 下，避免与前端 SPA 自身的 client-sid
 | POST | `/api/sessions/{id}/cancel` | abort 正在跑的 turn |
 | POST | `/api/sessions/{id}/compact` | body 可选 `{keep_last}` → 摘要并切换 compaction session |
 | GET  | `/api/sessions/{id}/events` | SSE event 流（见 §4） |
-| GET  | `/api/sessions/{id}/ws` | WebSocket：events 出 + `{type:"send",text}` / `{type:"cancel"}` 入 |
 
 `message` 立即返回 202；turn 在 actor 内跑，输出走 event 流。这把“提交”与“观察”解耦。
 
@@ -151,5 +150,4 @@ loginctl enable-linger $USER               # logout 后续跑
 - API key 存储与轮换机制（当前静态 env）。
 - Rate limiting 策略。
 - 共享 agent/MCP 池（per-session 隔离的性能优化）。
-- WebSocket 协议细节扩展（当前仅 send/cancel 入站）。
 - Web 前端（Phase 6）、桌面/手机（Phase 9/10）经此 API 接入。

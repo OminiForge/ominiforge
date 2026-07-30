@@ -27,7 +27,6 @@ export const endpoints = {
 		`${API}/sessions/${encodeURIComponent(id)}/fork-preview?at_seq=${atSeq}`,
 	runtime: (id: string) => `${API}/sessions/${encodeURIComponent(id)}/runtime`,
 	events: (id: string) => `${API}/sessions/${encodeURIComponent(id)}/events`,
-	ws: (id: string) => `${API}/sessions/${encodeURIComponent(id)}/ws`,
 	/** Gateway-wide session activity status stream (all sessions, all workspaces). */
 	statusEvents: () => `${API}/status/events`,
 	profiles: () => `${API}/profiles`,

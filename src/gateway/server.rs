@@ -1,9 +1,9 @@
-//! The axum HTTP/SSE/WebSocket server.
+//! The axum HTTP/SSE server.
 //!
-//! Control plane is REST; the live event stream is SSE (`GET …/events`) or
-//! WebSocket (`GET …/ws`). All routes except `/healthz` require a bearer token
-//! when one is configured (`doc/gateway.md`). TLS is *not* handled here — the
-//! gateway binds loopback and a reverse proxy terminates TLS for public exposure
+//! Control plane is REST; the live event stream is SSE (`GET …/events`). All
+//! routes except `/healthz` require a bearer token when one is configured
+//! (`doc/gateway.md`). TLS is *not* handled here — the gateway binds loopback
+//! and a reverse proxy terminates TLS for public exposure
 //! (`doc/architecture.md` §18.1).
 //!
 //! ### Reconnect / resume
@@ -21,10 +21,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use axum::Json;
 use axum::Router;
-use axum::extract::{
-    Path, Query, Request, State,
-    ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
-};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -42,7 +39,7 @@ use crate::core::SessionId;
 use crate::monitor::{self, PricingTable};
 use crate::session::SessionMeta;
 
-use super::actor::{ActorHandle, Command, GatewayEvent};
+use super::actor::{Command, GatewayEvent};
 use super::config::GatewayConfig;
 use super::registry::SessionRegistry;
 use super::status::SessionStatus;
@@ -132,7 +129,6 @@ fn router(state: AppState) -> Router {
         .route("/sessions/{id}/fork-preview", get(fork_preview))
         .route("/sessions/{id}/runtime", get(session_runtime))
         .route("/sessions/{id}/events", get(sse_events))
-        .route("/sessions/{id}/ws", get(ws_events))
         .route("/status/events", get(status_events))
         .route("/profiles", get(list_profiles))
         .route(
@@ -1033,7 +1029,7 @@ async fn sse_events(
 }
 
 /// `GET /status/events` — the gateway-wide session-activity stream: one SSE
-/// feed carrying every session's `running | awaiting_approval | idle` status,
+/// feed carrying every session's `running | awaiting_input | idle` status,
 /// across all workspaces, so the session list lights up without subscribing to
 /// each session's own event stream.
 ///
@@ -1113,89 +1109,6 @@ fn sse_from_gateway(gw: &GatewayEvent) -> SseEvent {
         event.id(core.seq.to_string())
     } else {
         event
-    }
-}
-
-/// `GET /sessions/{id}/ws` — bidirectional WebSocket: events stream out, and a
-/// client text frame `{"text": "..."}` enqueues a turn.
-async fn ws_events(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    ws: WebSocketUpgrade,
-) -> Response {
-    let sid = SessionId(id);
-    let handle = match state.registry.get_or_spawn(&sid).await {
-        Ok(h) => h,
-        Err(e) => return conflict_or_not_found(&e),
-    };
-    ws.on_upgrade(move |socket| ws_loop(socket, handle))
-}
-
-/// What a WebSocket client may send.
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum WsClientMessage {
-    /// Enqueue a turn.
-    Send { text: String },
-    /// Abort the running turn.
-    Cancel,
-    /// Deliver a decision for a suspended `ask` tool call. `scope` (`once` /
-    /// `session` / `profile` / `gateway`) defaults to `once`.
-    Approve {
-        call_id: String,
-        decision: ApprovalDecision,
-        #[serde(default)]
-        scope: Option<ApprovalScope>,
-    },
-}
-
-/// Drive one WebSocket connection: forward outbound events to the client and
-/// translate inbound frames into actor commands. Ends when either side closes.
-async fn ws_loop(socket: WebSocket, handle: ActorHandle) {
-    use futures_util::{SinkExt, StreamExt as _};
-
-    let mut rx = handle.subscribe();
-    let (mut sink, mut stream) = socket.split();
-
-    loop {
-        tokio::select! {
-            // Outbound: a session event → JSON text frame.
-            event = rx.recv() => match event {
-                Ok(gw) => {
-                    let text = serde_json::to_string(&gw).unwrap_or_else(|_| "{}".to_owned());
-                    if sink.send(WsMessage::Text(text.into())).await.is_err() {
-                        return; // client gone
-                    }
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => {} // skip gap
-                Err(broadcast::error::RecvError::Closed) => return, // actor stopped
-            },
-            // Inbound: a client frame → actor command.
-            msg = futures_util::StreamExt::next(&mut stream) => match msg {
-                Some(Ok(WsMessage::Text(text))) => {
-                    if let Ok(cmd) = serde_json::from_str::<WsClientMessage>(&text) {
-                        let command = match cmd {
-                            WsClientMessage::Send { text } => Command::Send { text },
-                            WsClientMessage::Cancel => Command::Cancel,
-                            WsClientMessage::Approve { call_id, decision, scope } => {
-                                Command::Approve {
-                                    call_id,
-                                    decision,
-                                    scope: scope.unwrap_or(ApprovalScope::Once),
-                                }
-                            }
-                        };
-                        if handle.send(command).await.is_err() {
-                            return;
-                        }
-                    }
-                }
-                // Close, end-of-stream, or a transport error all end the loop.
-                Some(Ok(WsMessage::Close(_)) | Err(_)) | None => return,
-                // Other frame kinds (binary/ping/pong) are ignored.
-                Some(Ok(_)) => {}
-            },
-        }
     }
 }
 
