@@ -624,6 +624,31 @@ fn progress_sink(
     }))
 }
 
+/// Run one tool call on a spawned chain: invoke it (timing the wall clock),
+/// or yield the `unknown_tool` failure when the name isn't registered. Shared
+/// by the Run and Ask chain arms so the invoke-and-report boilerplate lives
+/// once, not twice.
+async fn run_chain_tool(
+    tool: Option<std::sync::Arc<dyn crate::tool::Tool>>,
+    tool_name: &str,
+    input: ToolInput,
+) -> ChainResult {
+    match tool {
+        Some(tool) => {
+            let started = Instant::now();
+            let result = tool.invoke(input).await;
+            ChainResult::Executed {
+                result: (result, started.elapsed()),
+            }
+        }
+        None => ChainResult::Failed {
+            code: "unknown_tool",
+            reason: format!("no such tool: {tool_name}"),
+            after_payload: None,
+        },
+    }
+}
+
 impl TurnState<'_> {
     /// Drive the turn to completion. Built by
     /// [`run_turn_with_sink`](Agent::run_turn_with_sink); the only entry point.
@@ -1812,20 +1837,7 @@ impl TurnState<'_> {
                     progress: progress_sink(&call.id, progress_tx, block_index),
                 };
                 let handle = tokio::spawn(async move {
-                    match tool {
-                        Some(tool) => {
-                            let started = Instant::now();
-                            let result = tool.invoke(input).await;
-                            ChainResult::Executed {
-                                result: (result, started.elapsed()),
-                            }
-                        }
-                        None => ChainResult::Failed {
-                            code: "unknown_tool",
-                            reason: format!("no such tool: {tool_name}"),
-                            after_payload: None,
-                        },
-                    }
+                    run_chain_tool(tool, &tool_name, input).await
                 });
                 let abort = handle.abort_handle();
                 (PhaseBOutcome::Chained { parent, handle }, Some(abort))
@@ -1862,27 +1874,19 @@ impl TurnState<'_> {
                     // hard) is harmless — the chain's own work continues.
                     let _ = verdict_tx.send((slot, answer));
                     match ask_verdict(answer.resolution, &tool_name) {
-                        AskVerdict::Approved => match tool {
-                            Some(tool) => {
-                                let started = Instant::now();
-                                let result = tool
-                                    .invoke(ToolInput {
-                                        call_id,
-                                        input: args,
-                                        timeout,
-                                        progress,
-                                    })
-                                    .await;
-                                ChainResult::Executed {
-                                    result: (result, started.elapsed()),
-                                }
-                            }
-                            None => ChainResult::Failed {
-                                code: "unknown_tool",
-                                reason: format!("no such tool: {tool_name}"),
-                                after_payload: None,
-                            },
-                        },
+                        AskVerdict::Approved => {
+                            run_chain_tool(
+                                tool,
+                                &tool_name,
+                                ToolInput {
+                                    call_id,
+                                    input: args,
+                                    timeout,
+                                    progress,
+                                },
+                            )
+                            .await
+                        }
                         AskVerdict::Blocked { code, reason } => ChainResult::Failed {
                             code,
                             reason,
