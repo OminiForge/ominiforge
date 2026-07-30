@@ -1,6 +1,6 @@
 // Shared, app-level session activity status — one SSE subscription for the whole
 // app, consumed by every session-list instance. Backend owns the machine status
-// (running / awaiting_approval / idle); this layer adds the client-only
+// (running / awaiting_input / idle); this layer adds the client-only
 // seen/unseen split by comparing each idle session's latest committed seq against
 // a locally-remembered "acknowledged" seq (persisted to localStorage), because
 // the gateway cannot know what a user has actually looked at.
@@ -11,6 +11,7 @@
 import { client } from '$lib/client';
 import type { SessionStatus } from '$lib/types/SessionStatus';
 import type { EventSubscription } from '$lib/client-core';
+import type { GatewayEvent } from '$lib/types/GatewayEvent';
 
 /** What a session-list row should render. `unseen`/`seen` are the two client-side
  *  refinements of the backend's `idle`. */
@@ -35,6 +36,30 @@ const latestSeqs = $state<Record<string, number>>(loadLatestSeqs());
 
 let sub: EventSubscription | null = null;
 let refCount = 0;
+
+/** Feed one session event (from the conversation view's own subscription) into
+ *  the status layer. A `Turn::Started` on a session the hub still shows as
+ *  `idle` flips the row to `running` NOW: the backend only publishes `Running`
+ *  when the actor DEQUEUES the send, so there is a window after the turn opens
+ *  (worst case: the actor is parked on an `ask` from the previous turn, which
+ *  holds the loop until the user answers) where the row would otherwise sit on
+ *  "done". Self-correcting — the hub's authoritative `running`/`idle` deltas
+ *  supersede this optimistic entry as soon as they arrive; `onStatus` guards
+ *  a stale `idle` from overwriting it in between. */
+export function notifySessionEvent(event: GatewayEvent): void {
+	if (event.type !== 'event') return;
+	if (!('Turn' in event.payload) || !('Started' in event.payload.Turn)) return;
+	const id = event.session_id;
+	const cur = statuses[id];
+	if (!cur || cur.status === 'idle') {
+		statuses[id] = {
+			session_id: id,
+			workspace_id: cur?.workspace_id ?? '',
+			status: 'running',
+			latest_seq: event.seq
+		};
+	}
+}
 
 function loadAcked(): Record<string, number> {
 	if (typeof localStorage === 'undefined') return {};
@@ -74,6 +99,27 @@ function persistLatestSeqs() {
 	}
 }
 
+/** Merge one incoming hub status into the last-known map. Last-write-wins by
+ *  session id, with ONE exception: an `idle` whose `latest_seq` predates an
+ *  optimistic turn-open (see `notifySessionEvent`) is a STALE snapshot
+ *  published before the turn existed and is ignored, or the row would flip
+ *  back to "done" while the turn is running. An `idle` at or after the
+ *  turn-open seq is the turn's real settle and MUST land — otherwise a lost
+ *  `running` delta (broadcast lag, mid-flight connect) would wedge the row on
+ *  running forever. Exported for direct unit testing; the status stream calls
+ *  it for every delta/snapshot entry. */
+export function applyHubStatus(s: SessionStatus): void {
+	const cur = statuses[s.session_id];
+	if (
+		s.status === 'idle' &&
+		cur?.status === 'running' &&
+		Number(s.latest_seq) < Number(cur.latest_seq)
+	) {
+		return;
+	}
+	statuses[s.session_id] = s;
+}
+
 /** Start the shared status subscription if it isn't already running, and return a
  *  disposer. Ref-counted so multiple list instances share ONE SSE connection; the
  *  stream closes when the last consumer disposes. Call from a component's
@@ -83,9 +129,9 @@ export function connectStatus(): () => void {
 	if (!sub) {
 		sub = client.subscribeStatus({
 			onStatus(s) {
-				// Last-write-wins by session id; `latest_seq` arrives as a JS number
-				// over the wire (ts-rs types it bigint, but serde_json emits a number).
-				statuses[s.session_id] = s;
+				// `latest_seq` arrives as a JS number over the wire (ts-rs types it
+				// bigint, but serde_json emits a number).
+				applyHubStatus(s);
 
 				// Persist latest_seq so the unseen→seen split survives page refreshes.
 				const seq = Number(s.latest_seq) || 0;
@@ -137,7 +183,7 @@ export function viewState(sessionId: string, seed?: number): ViewState {
 	const effectiveSeed = seed ?? persistedSeed;
 	if (s) {
 		if (s.status === 'running') return 'running';
-		if (s.status === 'awaiting_approval') return 'awaiting';
+		if (s.status === 'awaiting_input') return 'awaiting';
 		// idle → seen/unseen by seq compare.
 		const latest = Math.max(Number(s.latest_seq) || 0, effectiveSeed);
 		return latest > (acked[sessionId] ?? 0) ? 'unseen' : 'seen';
@@ -154,4 +200,3 @@ export function viewState(sessionId: string, seed?: number): ViewState {
 export function latestSeqOf(sessionId: string): number {
 	return latestSeqs[sessionId] ?? 0;
 }
-

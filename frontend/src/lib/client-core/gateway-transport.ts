@@ -309,21 +309,62 @@ export class GatewayTransport implements SessionClient {
 
 	subscribeEvents(id: string, handlers: EventHandlers, lastSeq?: number): EventSubscription {
 		const url = this.#baseUrl + endpoints.events(id);
-		const controller = new AbortController();
 		let lastSeen = lastSeq;
+		return this.#sseSubscribe(
+			(signal, headers) => {
+				if (lastSeen !== undefined) headers.set('Last-Event-ID', String(lastSeen));
+				return fetch(url, { headers, signal });
+			},
+			(frame) => {
+				if (frame.id !== undefined) lastSeen = Number(frame.id);
+				if (frame.data) handlers.onEvent(JSON.parse(frame.data) as GatewayEvent);
+			},
+			handlers,
+			'event stream has no body'
+		);
+	}
+
+	subscribeStatus(handlers: StatusHandlers): EventSubscription {
+		// Same SSE machinery as subscribeEvents, minus Last-Event-ID: this stream
+		// isn't resumed by seq — a reconnect just re-snapshots the current status
+		// of every session.
+		const url = this.#baseUrl + endpoints.statusEvents();
+		return this.#sseSubscribe(
+			(signal, headers) => fetch(url, { headers, signal }),
+			(frame) => {
+				if (frame.data) handlers.onStatus(JSON.parse(frame.data) as SessionStatus);
+			},
+			handlers,
+			'status stream has no body'
+		);
+	}
+
+	/** One SSE-over-fetch subscription loop, shared by the per-session event
+	 *  stream and the gateway-wide status stream: bearer headers, reconnect with
+	 *  a 1s backoff, and the stall watchdog (any byte — a frame or a keep-alive
+	 *  comment — resets it; 45s of silence aborts the hung fetch so the normal
+	 *  catch/reconnect path takes over). `connect` issues the request (the event
+	 *  stream's `Last-Event-ID` is the only per-caller difference); `onFrame`
+	 *  receives each parsed frame. The returned subscription exposes `reconnect`
+	 *  for BOTH streams: callers with positive evidence of a dead connection
+	 *  (e.g. a send succeeded but nothing arrived) force an immediate re-attach
+	 *  instead of waiting out the watchdog. */
+	#sseSubscribe(
+		connect: (signal: AbortSignal, headers: Headers) => Promise<Response>,
+		onFrame: (frame: SseFrame) => void,
+		handlers: {
+			onConnection?: (s: 'connecting' | 'connected') => void;
+			onError?: (e: unknown) => void;
+		},
+		noBodyError: string
+	): EventSubscription {
+		const controller = new AbortController();
 		let closed = false;
-		// Stall watchdog state: the abort controller for the CURRENT fetch (the
-		// outer `controller` is subscription-lifetime; aborting it would end the
-		// whole subscription, not just the stalled attempt) and the timestamp of
-		// the last byte received. Both reset on each reconnect attempt.
 		let attemptController: AbortController | undefined;
 		let lastActivity = Date.now();
 
 		const watchdog = setInterval(() => {
 			if (Date.now() - lastActivity > STALL_TIMEOUT_MS) {
-				// Aborting makes the hung `reader.read()` reject, which lands in the
-				// catch below and becomes an ordinary reconnect. Not guarded on
-				// `closed`: close() clears this interval.
 				attemptController?.abort();
 			}
 		}, STALL_CHECK_MS);
@@ -336,27 +377,22 @@ export class GatewayTransport implements SessionClient {
 				handlers.onConnection?.('connecting');
 				try {
 					const headers = this.#headers({ Accept: 'text/event-stream' });
-					if (lastSeen !== undefined) headers.set('Last-Event-ID', String(lastSeen));
-
-					const res = await fetch(url, { headers, signal });
+					const res = await connect(signal, headers);
 					if (!res.ok) throw await gatewayError(res);
-					if (!res.body) throw new Error('event stream has no body');
+					if (!res.body) throw new Error(noBodyError);
 
 					handlers.onConnection?.('connected');
 					for await (const frame of parseSse(res.body, signal, () => {
 						lastActivity = Date.now();
 					})) {
-						if (frame.id !== undefined) lastSeen = Number(frame.id);
-						if (frame.data) {
-							const event = JSON.parse(frame.data) as GatewayEvent;
-							handlers.onEvent(event);
-						}
+						onFrame(frame);
 					}
 				} catch (err) {
 					if (closed || controller.signal.aborted) return;
 					handlers.onError?.(err);
 				}
-				// Reconnect after a brief backoff, resuming from lastSeen.
+				// Reconnect after a brief backoff; the server replays (event stream)
+				// or re-snapshots (status stream) from there.
 				if (!closed) await delay(1000);
 			}
 		};
@@ -368,54 +404,12 @@ export class GatewayTransport implements SessionClient {
 				clearInterval(watchdog);
 				controller.abort();
 			},
-			// Force the current attempt to drop so the loop re-attaches NOW
-			// (resuming from lastSeen) rather than whenever the stall watchdog
-			// next fires. Called when the UI has positive reason to suspect a
-			// silently-dead stream — e.g. a send succeeded but no event followed.
-			// Between attempts (the 1s backoff) the stale controller's abort is a
-			// harmless no-op; the pending retry IS the reconnect.
+			// Force the current attempt to drop so the loop re-attaches NOW rather
+			// than whenever the stall watchdog next fires. Between attempts (the 1s
+			// backoff) the stale controller's abort is a harmless no-op; the pending
+			// retry IS the reconnect.
 			reconnect() {
 				attemptController?.abort();
-			}
-		};
-	}
-
-	subscribeStatus(handlers: StatusHandlers): EventSubscription {
-		// Same SSE-over-fetch machinery as subscribeEvents (bearer header, manual
-		// parseSse), minus Last-Event-ID: this stream isn't resumed by seq — a
-		// reconnect just re-snapshots the current status of every session.
-		const url = this.#baseUrl + endpoints.statusEvents();
-		const controller = new AbortController();
-		let closed = false;
-
-		const run = async () => {
-			while (!closed) {
-				try {
-					const headers = this.#headers({ Accept: 'text/event-stream' });
-					const res = await fetch(url, { headers, signal: controller.signal });
-					if (!res.ok) throw await gatewayError(res);
-					if (!res.body) throw new Error('status stream has no body');
-
-					for await (const frame of parseSse(res.body, controller.signal)) {
-						if (frame.data) {
-							const status = JSON.parse(frame.data) as SessionStatus;
-							handlers.onStatus(status);
-						}
-					}
-				} catch (err) {
-					if (closed || controller.signal.aborted) return;
-					handlers.onError?.(err);
-				}
-				// Reconnect after a brief backoff; the server re-sends a fresh snapshot.
-				if (!closed) await delay(1000);
-			}
-		};
-		void run();
-
-		return {
-			close() {
-				closed = true;
-				controller.abort();
 			}
 		};
 	}

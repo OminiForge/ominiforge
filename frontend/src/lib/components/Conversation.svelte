@@ -28,7 +28,7 @@
 	import Skeleton from '$lib/components/Skeleton.svelte';
 	import type { ApprovalScope } from '$lib/types/ApprovalScope';
 	import { num, statLabel, formatCost, cacheLabel, topTools } from '$lib/stats';
-	import { markSeen } from '$lib/status.svelte';
+	import { markSeen, notifySessionEvent } from '$lib/status.svelte';
 	import { loadQueue, saveQueue, enqueue, removeFromQueue, type QueuedMessage } from '$lib/queue';
 	import { activeTick, jumpTarget } from '$lib/minimap';
 	import { setPendingFork, takePendingFork, type PendingFork } from '$lib/fork';
@@ -656,6 +656,11 @@
 			id,
 			{
 				onEvent: (ev) => {
+					// Feed the status layer FIRST: a Turn::Started flips the sidebar
+					// row to running even before the gateway's status hub publishes
+					// (the actor dequeues the send later — e.g. while parked on an
+					// approval from the previous turn).
+					notifySessionEvent(ev);
 					eventBuffer.push(ev);
 					scheduleFlush();
 					if (ev.type === 'event') {
