@@ -95,9 +95,42 @@ impl PassthroughSandbox {
     }
 }
 
+/// Spawn a task forwarding each chunk read from `pipe` as `(is_err, chunk)`.
+/// The task ends on EOF, error, or a closed receiver.
+fn spawn_pipe_reader<R>(mut pipe: R, is_err: bool, tx: tokio::sync::mpsc::UnboundedSender<(bool, Vec<u8>)>)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    use tokio::io::AsyncReadExt;
+    tokio::spawn(async move {
+        let mut buf = [0u8; 8192];
+        loop {
+            match pipe.read(&mut buf).await {
+                Ok(n) if n > 0 => {
+                    if tx.send((is_err, buf[..n].to_vec())).is_err() {
+                        break;
+                    }
+                }
+                // EOF (Ok(0)) or a read error ends the reader.
+                _ => break,
+            }
+        }
+    });
+}
+
 #[async_trait::async_trait]
 impl Sandbox for PassthroughSandbox {
     async fn exec(&self, command: &str, timeout: Duration) -> Result<ExecOutput, SandboxError> {
+        // Non-streaming is streaming with the chunks dropped.
+        self.exec_streaming(command, timeout, Box::new(|_| {})).await
+    }
+
+    async fn exec_streaming(
+        &self,
+        command: &str,
+        timeout: Duration,
+        mut on_output: Box<dyn for<'a> FnMut(&'a [u8]) + Send>,
+    ) -> Result<ExecOutput, SandboxError> {
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c").arg(command).current_dir(&self.workspace);
         apply_env_overlay(&mut cmd, &self.env_overlay);
@@ -105,20 +138,57 @@ impl Sandbox for PassthroughSandbox {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let child = cmd
+        let mut child = cmd
             .spawn()
             .map_err(|e| SandboxError::Exec(format!("failed to spawn shell: {e}")))?;
 
-        let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(e)) => return Err(SandboxError::Exec(e.to_string())),
-            Err(_) => return Err(SandboxError::Timeout(timeout)),
+        // Both pipes were set to `piped()` above, so they are always present.
+        let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+            return Err(SandboxError::Exec("failed to capture shell pipes".to_owned()));
+        };
+
+        // Read both pipes concurrently, forwarding each chunk live and
+        // accumulating for the final ExecOutput. The whole read is bounded by
+        // the same wall-clock timeout; on expiry the child is killed.
+        let run = async {
+            use tokio::sync::mpsc;
+            // Each pipe gets a reader task forwarding `(is_stderr, chunk)`; the
+            // main loop merges them in arrival order and accumulates per-stream.
+            let (tx, mut rx) = mpsc::unbounded_channel::<(bool, Vec<u8>)>();
+            spawn_pipe_reader(stdout, false, tx.clone());
+            spawn_pipe_reader(stderr, true, tx.clone());
+            drop(tx); // rx ends when both reader tasks finish
+
+            let mut out_buf: Vec<u8> = Vec::new();
+            let mut err_buf: Vec<u8> = Vec::new();
+            while let Some((is_err, chunk)) = rx.recv().await {
+                on_output(&chunk);
+                if is_err {
+                    err_buf.extend_from_slice(&chunk);
+                } else {
+                    out_buf.extend_from_slice(&chunk);
+                }
+            }
+            let status = child
+                .wait()
+                .await
+                .map_err(|e| SandboxError::Exec(e.to_string()))?;
+            Ok((out_buf, err_buf, status))
+        };
+
+        #[allow(clippy::single_match_else)] // the Err arm returns, the Ok arm unwraps
+        let (out_buf, err_buf, status) = match tokio::time::timeout(timeout, run).await {
+            Ok(res) => res?,
+            Err(_) => {
+                let _ = child.kill().await;
+                return Err(SandboxError::Timeout(timeout));
+            }
         };
 
         Ok(ExecOutput {
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            exit_code: output.status.code(),
+            stdout: String::from_utf8_lossy(&out_buf).into_owned(),
+            stderr: String::from_utf8_lossy(&err_buf).into_owned(),
+            exit_code: status.code(),
         })
     }
 
@@ -203,6 +273,27 @@ mod tests {
 
         let result = sb.exec("sleep 5", Duration::from_millis(50)).await;
         assert!(matches!(result, Err(SandboxError::Timeout(_))));
+    }
+
+    #[tokio::test]
+    async fn exec_streaming_forwards_chunks_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path().to_path_buf());
+        let chunks = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let chunks2 = std::sync::Arc::clone(&chunks);
+        // Two writes separated by a pause arrive as (at least) two chunks, and
+        // the assembled ExecOutput still carries the full streams.
+        let out = sb
+            .exec_streaming(
+                "printf one; sleep 0.05; printf two",
+                Duration::from_secs(5),
+                Box::new(move |c| chunks2.lock().unwrap().push(String::from_utf8_lossy(c).into_owned())),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.stdout, "onetwo");
+        let got = chunks.lock().unwrap().join("");
+        assert_eq!(got, "onetwo", "every byte forwarded live, in order");
     }
 
     #[tokio::test]

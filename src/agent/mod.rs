@@ -604,6 +604,26 @@ fn ask_verdict(resolution: ApprovalResolution, tool_name: &str) -> AskVerdict {
     }
 }
 
+/// Build the live-progress sink for one tool call on a spawned chain
+/// (`doc/tool-streaming.md` §5): a closure forwarding each view snapshot to
+/// the progress channel tagged with the call's stream block index, so the
+/// write-back select can route it to the right streaming card. `None` when
+/// the call has no block index (shouldn't happen for a real call) — the tool
+/// then just streams nothing, and the settled stage-3 view is unaffected.
+fn progress_sink(
+    call_id: &str,
+    progress_tx: &tokio::sync::mpsc::UnboundedSender<(u32, String)>,
+    block_index: &std::collections::HashMap<String, u32>,
+) -> Option<Box<dyn FnMut(String) + Send>> {
+    let index = *block_index.get(call_id)?;
+    let tx = progress_tx.clone();
+    Some(Box::new(move |view: String| {
+        // A dead receiver means the turn ended — dropping a frame is harmless
+        // (each snapshot is self-contained and superseded by the next).
+        let _ = tx.send((index, view));
+    }))
+}
+
 impl TurnState<'_> {
     /// Drive the turn to completion. Built by
     /// [`run_turn_with_sink`](Agent::run_turn_with_sink); the only entry point.
@@ -757,6 +777,13 @@ impl TurnState<'_> {
                 // channel the moment they land.
                 let (verdict_tx, mut verdict_rx) =
                     tokio::sync::mpsc::unbounded_channel::<(usize, ApprovalOutcome)>();
+                // Live result-streaming channel (`doc/tool-streaming.md` §5):
+                // a chain's tool (currently `shell`) sends `(block_index, view)`
+                // snapshots here; the write-back select below forwards each to
+                // the sink, which can only be touched on the turn task (never
+                // from inside a spawned chain).
+                let (progress_tx, mut progress_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<(u32, String)>();
                 // Tool-result messages accumulate per slot and are pushed after
                 // the loop, so the model always sees them in `tool_call` order.
                 let mut results: Vec<Option<Message>> =
@@ -764,7 +791,14 @@ impl TurnState<'_> {
                 let mut completions = futures_util::stream::FuturesUnordered::new();
                 let mut abort_handles = Vec::new();
                 for (slot, (call, prep)) in tool_calls.iter().zip(prepared).enumerate() {
-                    let (outcome, abort) = self.spawn_chain(slot, call, prep, verdict_tx.clone());
+                    let (outcome, abort) = self.spawn_chain(
+                        slot,
+                        call,
+                        prep,
+                        verdict_tx.clone(),
+                        &progress_tx,
+                        &outcome.tool_call_block_index,
+                    );
                     if let Some(abort) = abort {
                         abort_handles.push(abort);
                     }
@@ -799,15 +833,17 @@ impl TurnState<'_> {
                 // (`doc/permission.md` §5.2). On the normal path the loop
                 // drains every chain and the guard's aborts are no-ops.
                 let _chain_guard = ChainAbortGuard(abort_handles);
-                // The verdict channel closes once every ask chain dropped its
-                // sender (chains hold theirs to the end of their run).
+                // The verdict/progress channels close once every chain dropped
+                // its sender (chains hold theirs to the end of their run).
                 drop(verdict_tx);
+                drop(progress_tx);
                 // Write-back driver: a verdict is audited the moment it arrives
-                // (a human's approval is visible at once), and each chain's
-                // result event commits the moment the chain finishes — the
-                // front-end watches every call complete in real time, in
-                // completion order. The select never waits on one call's chain
-                // to write another call's events.
+                // (a human's approval is visible at once), each chain's result
+                // event commits the moment the chain finishes, and a tool's
+                // live progress frame forwards to the sink as it lands — the
+                // front-end watches every call stream and complete in real
+                // time, in completion order. The select never waits on one
+                // call's chain to write another call's events.
                 loop {
                     tokio::select! {
                         // Verdicts first: a decision is audited as soon as it
@@ -823,6 +859,13 @@ impl TurnState<'_> {
                             progressed |= made_progress;
                             results[slot] = Some(message);
                         }
+                        // Live result-streaming frames (shell output): forward
+                        // to the streaming card at `index`. Lowest priority —
+                        // a frame is ephemeral (the next snapshot overwrites
+                        // it), so it never delays a verdict or a completion.
+                        Some((index, view)) = progress_rx.recv() => {
+                            self.sink.on_tool_call_progress(index, &view);
+                        }
                         // The verdict channel is closed and drained, and every
                         // chain completed — nothing left to wait for. (A
                         // verdict always precedes its chain's completion, so a
@@ -831,9 +874,13 @@ impl TurnState<'_> {
                     }
                 }
                 // Belt and braces, in case the race reasoning above ever
-                // changes: mop up any straggler rather than drop a decision.
+                // changes: mop up any straggler rather than drop a decision or
+                // a final progress frame.
                 while let Ok((vslot, answer)) = verdict_rx.try_recv() {
                     self.audit_answer(&tool_calls[vslot], answer)?;
+                }
+                while let Ok((index, view)) = progress_rx.try_recv() {
+                    self.sink.on_tool_call_progress(index, &view);
                 }
                 // The model sees tool results strictly in `tool_call` order,
                 // however the executions finished.
@@ -1715,6 +1762,12 @@ impl TurnState<'_> {
             call_id: call.id.clone(),
             input: args,
             timeout: self.agent.config.tool_timeout,
+            // No live progress on the serial path (`doc/tool-streaming.md` §5):
+            // it only runs when the approval gate can't field concurrent
+            // requests (headless/eval — no one watching live output), and
+            // keeping it progress-free means ONE progress mechanism (the
+            // concurrent channel) to maintain, not two.
+            progress: None,
         };
         let started = Instant::now();
         let result = tool.invoke(input).await;
@@ -1741,6 +1794,8 @@ impl TurnState<'_> {
         call: &ToolCall,
         prep: PreparedCall,
         verdict_tx: tokio::sync::mpsc::UnboundedSender<(usize, ApprovalOutcome)>,
+        progress_tx: &tokio::sync::mpsc::UnboundedSender<(u32, String)>,
+        block_index: &std::collections::HashMap<String, u32>,
     ) -> (PhaseBOutcome, Option<tokio::task::AbortHandle>) {
         match prep {
             PreparedCall::Settled(failure) => (PhaseBOutcome::Failed(failure), None),
@@ -1754,6 +1809,7 @@ impl TurnState<'_> {
                     call_id: call.id.clone(),
                     input: args,
                     timeout: self.agent.config.tool_timeout,
+                    progress: progress_sink(&call.id, progress_tx, block_index),
                 };
                 let handle = tokio::spawn(async move {
                     match tool {
@@ -1780,6 +1836,7 @@ impl TurnState<'_> {
                 let timeout = self.agent.config.tool_timeout;
                 let tool_name = call.name.clone();
                 let call_id = call.id.clone();
+                let progress = progress_sink(&call.id, progress_tx, block_index);
                 let handle = tokio::spawn(async move {
                     let answer = match gate {
                         // A join error means the gate task panicked: nobody
@@ -1813,6 +1870,7 @@ impl TurnState<'_> {
                                         call_id,
                                         input: args,
                                         timeout,
+                                        progress,
                                     })
                                     .await;
                                 ChainResult::Executed {
@@ -4526,6 +4584,86 @@ mod tests {
         let results = result_events_in_order(&events);
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|(_, _, kind)| kind == "completed"));
+    }
+
+    /// A sink recording live progress frames (`on_tool_call_progress`) so a
+    /// test can assert a result-streaming tool drove the channel.
+    #[derive(Default)]
+    struct ProgressSink {
+        frames: Vec<(u32, String)>,
+    }
+    impl StreamSink for ProgressSink {
+        fn on_tool_call_progress(&mut self, index: u32, view: &str) {
+            self.frames.push((index, view.to_owned()));
+        }
+    }
+
+    /// Stage-2 shell output streaming end to end on the CONCURRENT path
+    /// (`doc/tool-streaming.md` §5): a `shell` call whose command emits output
+    /// in bursts drives `on_tool_call_progress` with self-contained
+    /// `terminal` view snapshots at its stream block index, and the settled
+    /// stage-3 result still lands.
+    #[tokio::test]
+    async fn shell_output_streams_progress_on_the_concurrent_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::new();
+        crate::tool::register_builtin(&mut tools, dir.path().to_path_buf());
+
+        // A command emitting output in two bursts separated by a pause, so the
+        // throttle sees more than one frame.
+        let shell_round = vec![
+            StreamEvent::BlockStart {
+                index: 0,
+                block_type: ContentBlockType::ToolCall {
+                    id: "s1".to_owned(),
+                    name: "shell".to_owned(),
+                },
+            },
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                json_delta: r#"{"command":"printf one; sleep 0.2; printf two"}"#.to_owned(),
+            },
+            StreamEvent::BlockStop { index: 0 },
+            StreamEvent::Completed {
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            },
+        ];
+
+        let provider = Arc::new(ScriptedProvider::new(vec![shell_round, text_round("done")]));
+        let agent = Agent::new(
+            provider,
+            tools,
+            AgentConfig {
+                model: "mock".to_owned(),
+                ..AgentConfig::default()
+            },
+        )
+        .with_permission(PermissionPolicy::default())
+        .with_approval_gate(ConcurrentGate::approve_all());
+
+        let store = SessionStore::new(dir.path().join("sessions"));
+        let mut writer = store.create_new(None, None, vec![]).unwrap();
+        let mut runtime = SessionRuntime::default();
+        let mut sink = ProgressSink::default();
+        agent
+            .run_turn_with_sink(&mut writer, &mut runtime, "run".to_owned(), &mut sink)
+            .await
+            .unwrap();
+
+        // At least one live frame arrived, addressed to the shell call's block
+        // index (0), as a `terminal` envelope whose output ends with the full
+        // text by the final frame.
+        assert!(
+            !sink.frames.is_empty(),
+            "shell output streams live progress frames"
+        );
+        assert!(sink.frames.iter().all(|(idx, _)| *idx == 0));
+        let last: serde_json::Value =
+            serde_json::from_str(&sink.frames.last().unwrap().1).unwrap();
+        assert_eq!(last["kind"], "terminal");
+        let output = last["output"].as_str().unwrap();
+        assert!(output.contains("one"), "frame carries the screen: {output}");
     }
 
     /// Regression: a `todo` call in a CONCURRENT round must be intercepted and

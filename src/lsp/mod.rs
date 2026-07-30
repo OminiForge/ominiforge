@@ -556,6 +556,7 @@ while True:
             call_id: "c1".to_owned(),
             input: serde_json::json!({ "path": "lib.rs", "content": "fn oops( {\n" }),
             timeout: std::time::Duration::from_secs(5),
+            progress: None,
         };
         let text = |out: &crate::core::payload::ToolOutput| {
             out.content

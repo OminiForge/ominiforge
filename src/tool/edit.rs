@@ -743,6 +743,7 @@ mod tests {
             call_id: "c1".to_owned(),
             input: serde_json::json!({ "edits": edits }),
             timeout: Duration::from_secs(5),
+            progress: None,
         }
     }
 
@@ -1139,6 +1140,7 @@ b
             call_id: "c1".to_owned(),
             input: serde_json::json!({ "edits": { "path": "f.txt", "old": ["b"], "new": ["B"] } }),
             timeout: Duration::from_secs(5),
+            progress: None,
         };
         let out = t.invoke(input).await.unwrap();
         assert!(!out.is_error, "{:?}", out.content);

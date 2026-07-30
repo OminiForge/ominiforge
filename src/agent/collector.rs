@@ -47,6 +47,10 @@ pub struct RoundOutcome {
     /// Maps each tool-call id to the `ContentBlock` event that recorded it, so
     /// tool execution can record `tool_call_event_id`.
     pub tool_call_event_ids: HashMap<String, EventId>,
+    /// Maps each tool-call id to its stream block index, so a tool that
+    /// streams RESULTS mid-execution (`shell` output, `doc/tool-streaming.md`
+    /// §5) can address live progress frames to the right streaming card.
+    pub tool_call_block_index: HashMap<String, u32>,
 }
 
 /// One in-progress content block, accumulating its streamed pieces in order.
@@ -243,6 +247,7 @@ impl<'a> Collector<'a> {
         let mut text = String::new();
         let mut tool_calls = Vec::new();
         let mut tool_call_event_ids = HashMap::new();
+        let mut tool_call_block_index = HashMap::new();
 
         for (index, block) in blocks.into_iter().enumerate() {
             let index = u32::try_from(index).unwrap_or(u32::MAX);
@@ -313,6 +318,7 @@ impl<'a> Collector<'a> {
             )?;
 
             if is_tool_call && let Some(id) = call_id {
+                tool_call_block_index.insert(id.clone(), index);
                 tool_call_event_ids.insert(
                     id,
                     EventId {
@@ -332,6 +338,7 @@ impl<'a> Collector<'a> {
             stop_reason,
             usage,
             tool_call_event_ids,
+            tool_call_block_index,
         })
     }
 }

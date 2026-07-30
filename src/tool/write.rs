@@ -210,6 +210,7 @@ mod tests {
             call_id: "c1".to_owned(),
             input: serde_json::json!({ "path": path, "content": content }),
             timeout: Duration::from_secs(5),
+            progress: None,
         }
     }
 

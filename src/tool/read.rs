@@ -312,6 +312,7 @@ mod tests {
             call_id: "c1".to_owned(),
             input: serde_json::json!({ "path": path }),
             timeout: Duration::from_secs(5),
+            progress: None,
         }
     }
 
@@ -323,6 +324,7 @@ mod tests {
                 "range": { "start": start, "end": end }
             }),
             timeout: Duration::from_secs(5),
+            progress: None,
         }
     }
 

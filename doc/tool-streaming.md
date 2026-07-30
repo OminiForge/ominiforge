@@ -111,8 +111,33 @@ pub trait StreamPresenter: Send {
   最后一帧。presenter 经 `collect_round(.., tools: Option<&ToolRegistry>)` 注入；无 registry
   （测试/headless）则 presenter 从不挂载，行为同骨架期。
 
-每个后续工具的流式方案写在它自己的源文件头部注释里（`edit.rs` / `shell.rs` 等），实现时
-对照即可。
+每个后续工具的流式方案写在它自己的源文件头部注释里（`shell.rs` 等），实现时对照即可。
+
+## 4.1 结果流式（Phase 5，与 args 流式不同的通道）
+
+`write`/`edit` 流式的是 **args**（模型生成输入的过程，在 collector、执行之前）；`shell` 流式的是
+**result**（命令运行的 stdout/stderr，在工具执行**期间**、`Sandbox::exec` 内部）。两者共用
+`Delta::ToolProgress`/`view` 快照协议与前端同一条渲染路径，但**产生位置与通道不同**：
+
+- `src/tool/terminal.rs` — 最小终端屏幕模型。shell 命令不一定是增长输出：进度条（`\r` 覆盖）、
+  spinner、全屏面板（ANSI 光标/清屏）会**原地刷新**。流式 `terminal` view 渲染「当前屏幕」
+  自包含快照，而非字节拼接——普通命令表现为增长，面板命令表现为原地刷新。处理 `\n`/`\r`/
+  常见 ANSI（清屏、光标、行覆盖）；全屏 TUI 的复杂寻址降级为「大致可读」，不做像素级还原。
+- `src/sandbox/mod.rs` + `passthrough.rs` — `Sandbox::exec_streaming(command, timeout, on_output)`：
+  边读管道边调 `on_output(chunk)`。默认实现忽略回调走 `exec`（`BoxLite` 自动退化为只在结束时
+  输出，TODO 接流式）；Passthrough 用 reader task 把两管道 chunk 经 mpsc 合并转发。`exec` 复用
+  `exec_streaming`（丢回调）。
+- `src/tool/shell.rs` — `OutputStream`：有 `progress` 时用 `exec_streaming`，字节喂终端模型、
+  节流（120ms）渲染 `terminal` view；无则走原 `exec`。
+- `ToolInput.progress: Option<Box<dyn FnMut(String)+Send>>` — 工具执行内部到前端的进度回调。
+  与 `stream_presenter`（流 args，执行前）区分：这个流 result（执行中）。
+- **progress channel**（`src/agent/mod.rs`）：并发派发路径根本拿不到 `&mut sink`（spawn 的任务
+  无法共享可变借用），故加 `progress_tx/rx: UnboundedChannel<(block_index, view)>`——与既有
+  `verdict_tx` 同构。三条并发路径的 progress 闭包把 `(index, view)` 发到 channel；写回 select!
+  循环加一支 `progress_rx.recv()` 调 `sink.on_tool_call_progress(index, view)`。block index 由
+  collector 的 `RoundOutcome::tool_call_block_index`（call.id → index）提供。
+- **仅并发路径生效**：串行派发路径（审批门 `supports_concurrent_requests()=false`，即
+  headless/eval）`progress=None`——该场景无人看流式，且保持「一套 progress 机制」而非两套。
 
 ## 5. 阶段计划（拆 session 执行）
 
@@ -122,7 +147,7 @@ pub trait StreamPresenter: Send {
 | **2** | **`stream_args` 提取器 + write presenter**：渐进 view（新文件生长 code 视图、覆盖场景对截断旧文件 diff），节流在 collector。第一个端到端可用的流式工具。 | ✅ 本次 |
 | **3** | **审批与 view 解耦**：删除整个 preview 机制（`Permission::Requested.preview`、`Tool::preview()`、前端 `Item.preview`）。审批不再自算自存 diff，人在卡片已有的阶段二 view 上审批。 | ✅ 本次 |
 | **4** | **edit presenter（累积渲染）**：entry 闭合即对原文件定位并按 abs_path 分组累积 splices，活跃 entry 随 new 生长；`A B A` 合并为一组；累积收敛 ≡ 阶段三 `plan_view`。 | ✅ 本次 |
-| **5** | **shell 输出流式**：结果流式（非 args 流式），独立特性，协议可复用快照模式。 | 待做 |
+| **5** | **shell 输出流式**：结果流式（非 args 流式）。终端模型渲染「当前屏幕」快照（面板命令原地刷新）；progress channel 复用 verdict_tx 模式；仅并发派发路径生效。 | ✅ 本次 |
 | **6** | **删除 `Delta::ToolArgs` / `on_tool_call_delta`**：第一个 presenter 证明 ToolProgress 通路后，移除原始 args 透传与前端裸显路径，args 改由阶段三 debug 折层一次性给出。 | 待做 |
 | **7** | **通用兜底 + 收尾**：MCP/未知工具的字段级进度；read/find 确认无需流式；TUI 对齐。 | 待做 |
 

@@ -15,6 +15,7 @@ mod find;
 mod read;
 mod shell;
 pub mod stream_args;
+mod terminal;
 mod write;
 mod write_stream;
 
@@ -291,8 +292,8 @@ pub fn builtin_catalog() -> Vec<ToolInfo> {
     ]
 }
 
-/// A single invocation request.
-#[derive(Debug, Clone)]
+/// A single invocation request. Not `Clone`: the optional `progress` sink is
+/// a one-shot callback. `Debug` is manual to skip that sink.
 pub struct ToolInput {
     /// The model-assigned tool-call id (correlates result back to the call).
     pub call_id: String,
@@ -300,6 +301,25 @@ pub struct ToolInput {
     pub input: serde_json::Value,
     /// Wall-clock budget for this invocation.
     pub timeout: Duration,
+    /// Optional live-progress sink for tools that stream RESULTS mid-execution
+    /// (currently `shell` output, `doc/tool-streaming.md` §5). The tool calls it
+    /// with self-contained view snapshots (the same envelope as the settled
+    /// view); the agent wires it to `StreamSink::on_tool_call_progress`. `None`
+    /// (tests, headless) means no live frames — the settled view at stage 3 is
+    /// unaffected. Distinct from `stream_presenter`, which streams ARGS before
+    /// execution; this streams the RESULT during it.
+    pub progress: Option<Box<dyn FnMut(String) + Send>>,
+}
+
+impl std::fmt::Debug for ToolInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolInput")
+            .field("call_id", &self.call_id)
+            .field("input", &self.input)
+            .field("timeout", &self.timeout)
+            .field("progress", &self.progress.as_ref().map(|_| "<sink>"))
+            .finish()
+    }
 }
 
 /// A name-indexed set of tools.
