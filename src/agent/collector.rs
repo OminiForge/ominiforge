@@ -150,7 +150,11 @@ impl<'a> Collector<'a> {
                 }
             }
             StreamEvent::ToolCallDelta { index, json_delta } => {
-                sink.on_tool_call_delta(index, &json_delta);
+                // Raw args are NOT forwarded to the sink (`doc/tool-streaming.md`
+                // §6): the live channel carries render-ready view snapshots
+                // (`render_progress` below), and the full args land at stage 3
+                // for the debug fold. Only the accumulation (presenter input +
+                // the persisted ContentBlock) happens here.
                 if let Some(Block::ToolCall { arguments, .. }) = self.block_mut(index) {
                     arguments.push_str(&json_delta);
                 }
@@ -376,7 +380,6 @@ mod tests {
     struct RecordingSink {
         text: String,
         reasoning: String,
-        tool_args: String,
         block_starts: Vec<String>,
         /// Stage-2 view snapshots received, in order (`on_tool_call_progress`).
         progress: Vec<String>,
@@ -396,9 +399,6 @@ mod tests {
         }
         fn on_reasoning(&mut self, _index: u32, text: &str) {
             self.reasoning.push_str(text);
-        }
-        fn on_tool_call_delta(&mut self, _index: u32, json_delta: &str) {
-            self.tool_args.push_str(json_delta);
         }
         fn on_tool_call_progress(&mut self, _index: u32, view: &str) {
             self.progress.push(view.to_owned());
@@ -579,7 +579,6 @@ mod tests {
         };
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].arguments, "{\"cmd\":\"ls\"}");
-        assert_eq!(sink.tool_args, "{\"cmd\":\"ls\"}");
 
         // The reported event id points at the persisted ContentBlock event.
         let event_id = outcome.tool_call_event_ids.get("call_9").unwrap();

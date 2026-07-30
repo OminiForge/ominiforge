@@ -30,9 +30,6 @@ pub trait StreamSink: Send {
     /// Incremental reasoning/thinking text.
     fn on_reasoning(&mut self, _index: u32, _text: &str) {}
 
-    /// Incremental tool-call argument JSON.
-    fn on_tool_call_delta(&mut self, _index: u32, _json_delta: &str) {}
-
     /// A render-ready snapshot of a tool call's live state (stage 2 of the
     /// streaming tool-call pipeline, `doc/tool-streaming.md`). Two sources:
     /// a tool's `StreamPresenter` renders its in-progress ARGS before

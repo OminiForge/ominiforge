@@ -248,18 +248,6 @@ describe('conversation fold', () => {
 
 	// ── Streaming: tool calls keep index-based tracking ────────────────
 
-	it('streaming: tool args extend by index, not temporal order', () => {
-		const events: GatewayEvent[] = [
-			{ type: 'delta', delta: 'block_start', index: 0, kind: 'tool_call', tool: 'shell' },
-			{ type: 'delta', delta: 'tool_args', index: 0, json: '{"cmd' },
-			{ type: 'delta', delta: 'tool_args', index: 0, json: '":"ls"}' }
-		];
-
-		const items = fold(events).items;
-		expect(items).toHaveLength(1);
-		expect(items[0].kind === 'tool' && items[0].args).toBe('{"cmd":"ls"}');
-	});
-
 	// ── Committed events ───────────────────────────────────────────────
 
 	it('committed ContentBlock replaces the streaming preview, not appends', () => {
@@ -377,7 +365,6 @@ describe('conversation fold', () => {
 		const events: GatewayEvent[] = [
 			reqStarted(1),
 			{ type: 'delta', delta: 'block_start', index: 0, kind: 'tool_call', tool: 'read' },
-			{ type: 'delta', delta: 'tool_args', index: 0, json: '{"path":"f.txt"}' },
 			contentBlock(2, { ToolCall: { id: 'c1', name: 'read', arguments: '{"path":"f.txt"}' } }),
 
 			{ type: 'delta', delta: 'block_start', index: 0, kind: 'reasoning', tool: null },
@@ -509,7 +496,6 @@ describe('conversation fold', () => {
 			reqStarted(2),
 			// Round 1: tool call (committed normally before turn_settled)
 			{ type: 'delta', delta: 'block_start', index: 0, kind: 'tool_call', tool: 'read' },
-			{ type: 'delta', delta: 'tool_args', index: 0, json: '{"path":"f.txt"}' },
 			contentBlock(3, { ToolCall: { id: 'c1', name: 'read', arguments: '{"path":"f.txt"}' } }),
 			// Round 2: reasoning + text with the race
 			reqStarted(4),
@@ -773,8 +759,6 @@ describe('todo fold', () => {
 		const state = fold([
 			reqStarted(1),
 			{ type: 'delta', delta: 'block_start', index: 0, kind: 'tool_call', tool: 'todo' },
-			{ type: 'delta', delta: 'tool_args', index: 0, json: '{"op":"in' },
-			{ type: 'delta', delta: 'tool_args', index: 0, json: 'it","steps":[{"content":"a"}]}' },
 			todoCall(2, { op: 'init', steps: [{ content: 'a' }] }),
 			todoStarted(3, { op: 'init', steps: [{ content: 'a' }] })
 		]);
@@ -1596,7 +1580,6 @@ describe('streaming preview replacement', () => {
 				kind: 'tool_call',
 				tool: 'shell'
 			} as GatewayEvent,
-			{ type: 'delta', delta: 'tool_args', index: 1, json: '{"command":"sl' } as GatewayEvent,
 			// the tool's committed ContentBlock arrives (same index 1)
 			contentBlock(
 				3,
@@ -1634,8 +1617,6 @@ describe('streaming preview replacement', () => {
 				kind: 'tool_call',
 				tool: 'shell'
 			} as GatewayEvent,
-			{ type: 'delta', delta: 'tool_args', index: 1, json: '{"command":"echo A"}' } as GatewayEvent,
-			{ type: 'delta', delta: 'tool_args', index: 2, json: '{"command":"echo B"}' } as GatewayEvent,
 			// committed blocks land (index 2 before index 1 — completion order)
 			contentBlock(
 				3,
@@ -1748,7 +1729,6 @@ describe('commit-time bookkeeping integrity', () => {
 				kind: 'tool_call',
 				tool: 'shell'
 			} as GatewayEvent,
-			{ type: 'delta', delta: 'tool_args', index: 1, json: '{"command":"ls"}' } as GatewayEvent,
 			{
 				type: 'delta',
 				delta: 'block_start',

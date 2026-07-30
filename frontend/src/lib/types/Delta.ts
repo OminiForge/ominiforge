@@ -11,4 +11,4 @@ kind: string,
 /**
  * Present for a `tool_call` block.
  */
-tool: string | null, } | { "delta": "text", index: number, text: string, } | { "delta": "reasoning", index: number, text: string, } | { "delta": "tool_args", index: number, json: string, } | { "delta": "tool_progress", index: number, view: string, } | { "delta": "retrying", attempt: number, max_retries: number, delay_ms: bigint, error: string, };
+tool: string | null, } | { "delta": "text", index: number, text: string, } | { "delta": "reasoning", index: number, text: string, } | { "delta": "tool_progress", index: number, view: string, } | { "delta": "retrying", attempt: number, max_retries: number, delay_ms: bigint, error: string, };

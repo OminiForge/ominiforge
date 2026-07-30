@@ -1166,40 +1166,15 @@ function applyDelta(
 			}
 			return { ...state, items, open };
 		}
-		// `tool_args` deltas stream partial JSON as the model's call arguments
-		// arrive, keeping the raw args visible live in the debug fold while the
-		// call runs. The diff view itself arrives with the committed result
-		// (`doc/tool-view.md`) — it is not previewed mid-stream.
-		case 'tool_args': {
-			const pos = open[ev.index];
-			const cur = pos !== undefined ? items[pos] : undefined;
-			// Todo placeholder: args stream as partial JSON, not foldable until the
-			// committed ContentBlock arrives — ignore the stream for it.
-			// Todo streams as a transient activity row, not a foldable card —
-			// ignore its partial-JSON args.
-			if (cur?.kind === 'activity') return { ...state, items, open };
-			if (cur?.kind === 'tool') {
-				items[pos] = { ...cur, args: cur.args + ev.json };
-				return { ...state, items, open };
-			}
-			open[ev.index] = items.length;
-			items.push({
-				kind: 'tool',
-				id: state.nextId,
-				seq: -1,
-				name: '',
-				args: ev.json,
-				status: 'running'
-			});
-			return { ...state, items, open, nextId: state.nextId - 1 };
-		}
-		// A render-ready snapshot of a tool call's in-progress args (stage 2 of
-		// the streaming tool-call pipeline, `doc/tool-streaming.md`). Written into
-		// the SAME `view` field the settled TextView lands in, so the card renders
-		// stage 2 and stage 3 with one code path — the snapshot just grows until
-		// the settled view replaces it. Snapshots are self-contained (never a
-		// delta), so a stale one is simply overwritten. Not yet produced by the
-		// backend (skeleton only), so this branch is inert until phase 2.
+		// A render-ready snapshot of a tool call's live state (stage 2 of the
+		// streaming tool-call pipeline, `doc/tool-streaming.md`): a presenter's
+		// growing args view (`write`/`edit`) or a result-streaming tool's output
+		// (`shell`). Written into the SAME `view` field the settled TextView lands
+		// in, so the card renders stage 2 and stage 3 with one code path — the
+		// snapshot just grows until the settled view replaces it. Snapshots are
+		// self-contained (never a delta), so a stale one is simply overwritten.
+		// Raw args are no longer streamed live (the old `tool_args` path is gone);
+		// the full args land at stage 3 for the debug fold.
 		case 'tool_progress': {
 			const pos = open[ev.index];
 			const cur = pos !== undefined ? items[pos] : undefined;
