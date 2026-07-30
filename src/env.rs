@@ -243,24 +243,26 @@ pub(crate) async fn session_env(
     workspace: &Path,
     cache: Option<&WorkspaceEnvCache>,
     activation: &EnvActivation,
-    on_warn: &(dyn Fn(&str) + Sync),
 ) -> BTreeMap<String, Option<String>> {
     let envrc = workspace.join(".envrc");
     if !envrc.is_file() {
         return BTreeMap::new();
     }
 
+    let started = std::time::Instant::now();
     match direnv_export(workspace, &activation.cmd, activation.fast_timeout).await {
         Ok(env) => {
-            on_warn(&format!(
-                "loaded {} env vars from {} via direnv",
-                env.len(),
-                envrc.display()
-            ));
+            // Routine success: not worth an operator's attention by default.
+            tracing::debug!(
+                vars = env.len(),
+                envrc = %envrc.display(),
+                elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "loaded env via direnv"
+            );
             if let Some(cache) = cache
                 && let Err(e) = cache.store(workspace, &env)
             {
-                on_warn(&format!("warning: failed to persist env cache: {e}"));
+                tracing::warn!("failed to persist env cache: {e}");
             }
             env
         }
@@ -273,20 +275,20 @@ pub(crate) async fn session_env(
                 spawn_refresh(workspace.to_path_buf(), cache.clone(), activation.clone());
             }
             if let Some(cached) = cache.and_then(|c| c.load(workspace)) {
-                on_warn(&format!(
-                    "warning: direnv export for {} unavailable ({e}); \
+                tracing::warn!(
+                    "direnv export for {} unavailable ({e}, after {}ms); \
                      using the env prepared {}s ago",
                     envrc.display(),
+                    started.elapsed().as_millis(),
                     now_unix().saturating_sub(cached.prepared_at)
-                ));
+                );
                 cached.env
             } else {
-                on_warn(&format!(
-                    "warning: direnv export for {} unavailable ({e}); \
-                     running without the workspace env — check `direnv allow` \
-                     and that the .envrc evaluates in a shell",
+                tracing::warn!(
+                    "direnv export for {} unavailable ({e}); running without the workspace \
+                     env — check `direnv allow` and that the .envrc evaluates in a shell",
                     envrc.display()
-                ));
+                );
                 BTreeMap::new()
             }
         }
@@ -308,8 +310,8 @@ fn in_flight() -> std::sync::MutexGuard<'static, HashSet<PathBuf>> {
 }
 
 /// Spawn a background cache refresh for `workspace` unless one is already
-/// running. A detached task has no session to warn, so the outcome goes to
-/// stderr: failures loud, success one line.
+/// running. A detached task has no session to warn, so the outcome is logged:
+/// failures loud, success one line.
 pub(crate) fn spawn_refresh(
     workspace: PathBuf,
     cache: WorkspaceEnvCache,
@@ -322,11 +324,12 @@ pub(crate) fn spawn_refresh(
         let outcome = refresh_cache(&workspace, &cache, &activation).await;
         in_flight().remove(&workspace);
         match outcome {
-            Ok(()) => eprintln!("env: prepared workspace env for {}", workspace.display()),
-            Err(e) => eprintln!(
-                "env: background env refresh for {} failed: {e}",
-                workspace.display()
-            ),
+            Ok(()) => {
+                tracing::debug!(workspace = %workspace.display(), "prepared workspace env");
+            }
+            Err(e) => {
+                tracing::warn!(workspace = %workspace.display(), "background env refresh failed: {e}");
+            }
         }
     });
 }
@@ -357,7 +360,6 @@ mod tests {
 
     use super::*;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::Arc;
 
     /// A mock direnv that answers instantly with a payload covering a set var,
     /// an unset var, and direnv bookkeeping (which must be filtered out).
@@ -413,14 +415,6 @@ exit 1
         ws.canonicalize().unwrap()
     }
 
-    fn warn_log() -> (impl Fn(&str) + Sync, Arc<Mutex<Vec<String>>>) {
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let clone = Arc::clone(&log);
-        (
-            move |msg: &str| clone.lock().unwrap().push(msg.to_owned()),
-            log,
-        )
-    }
 
     /// direnv's JSON export becomes a per-workspace overlay; non-string values
     /// are ignored, and `DIRENV_*` bookkeeping never reaches a child env.
@@ -453,13 +447,11 @@ exit 1
         let ws = envrc_workspace(&tmp);
         let mock = mock_direnv(tmp.path(), MOCK_GOOD);
         let cache = WorkspaceEnvCache::anchored_at(tmp.path());
-        let (on_warn, _) = warn_log();
 
         let env = session_env(
             &ws,
             Some(&cache),
             &activation(&mock, Duration::from_secs(5), Duration::from_secs(5)),
-            &on_warn,
         )
         .await;
 
@@ -487,23 +479,16 @@ exit 1
         let mut seeded = BTreeMap::new();
         seeded.insert("SEEDED".to_owned(), Some("1".to_owned()));
         cache.store(&ws, &seeded).unwrap();
-        let (on_warn, log) = warn_log();
 
         let env = session_env(
             &ws,
             Some(&cache),
             &activation(&mock, Duration::from_millis(50), Duration::from_secs(5)),
-            &on_warn,
         )
         .await;
 
+        // The degraded path must return the snapshot, not fail the session.
         assert_eq!(env, seeded);
-        assert!(
-            log.lock()
-                .unwrap()
-                .iter()
-                .any(|m| m.contains("unavailable"))
-        );
     }
 
     /// `refresh_cache` is the background task body: export with the prepare
@@ -541,23 +526,15 @@ exit 1
         let cache = WorkspaceEnvCache::anchored_at(tmp.path());
         let act = activation(&mock, Duration::from_secs(5), Duration::from_millis(50));
 
-        // Without a snapshot: empty overlay + a warning naming the fix.
-        let (on_warn, log) = warn_log();
-        let env = session_env(&ws, Some(&cache), &act, &on_warn).await;
+        // Without a snapshot: empty overlay, never a failed session.
+        let env = session_env(&ws, Some(&cache), &act).await;
         assert!(env.is_empty());
-        assert!(
-            log.lock()
-                .unwrap()
-                .iter()
-                .any(|m| m.contains("direnv allow"))
-        );
 
         // With a snapshot: the snapshot wins.
         let mut seeded = BTreeMap::new();
         seeded.insert("SEEDED".to_owned(), Some("1".to_owned()));
         cache.store(&ws, &seeded).unwrap();
-        let (on_warn, _) = warn_log();
-        let env = session_env(&ws, Some(&cache), &act, &on_warn).await;
+        let env = session_env(&ws, Some(&cache), &act).await;
         assert_eq!(env, seeded);
     }
 
@@ -573,13 +550,10 @@ exit 1
             tmp.path(),
             &format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
         );
-        let (on_warn, _) = warn_log();
-
         let env = session_env(
             &ws,
             Some(&WorkspaceEnvCache::anchored_at(tmp.path())),
             &activation(&mock, Duration::from_secs(5), Duration::from_secs(5)),
-            &on_warn,
         )
         .await;
 
@@ -609,8 +583,7 @@ exit 1
         let ws = PathBuf::from(ws).canonicalize().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let cache = WorkspaceEnvCache::anchored_at(tmp.path());
-        let (on_warn, _) = warn_log();
-        let env = session_env(&ws, Some(&cache), &EnvActivation::default(), &on_warn).await;
+        let env = session_env(&ws, Some(&cache), &EnvActivation::default()).await;
         assert_eq!(
             env.get("OMINI_SMOKE").and_then(|v| v.as_deref()),
             Some("hello")

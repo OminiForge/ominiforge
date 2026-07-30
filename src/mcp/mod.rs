@@ -35,13 +35,12 @@ use crate::tool::ToolRegistry;
 /// them alive for the session (dropping a client kills its subprocess).
 ///
 /// # Errors
-/// Never returns `Err`: per-server failures are reported via `on_warn` and
+/// Never returns `Err`: per-server failures are logged via `tracing` and
 /// skipped. The signature stays `Result` for forward compatibility.
 pub async fn connect_all(
     config: &McpConfig,
     env_overlay: &BTreeMap<String, Option<String>>,
     registry: &mut ToolRegistry,
-    on_warn: impl Fn(&str),
 ) -> Vec<Arc<McpClient>> {
     let mut clients = Vec::new();
     for server in &config.servers {
@@ -56,13 +55,10 @@ pub async fn connect_all(
                         tool,
                     )));
                 }
-                on_warn(&format!(
-                    "mcp: connected `{}` ({count} tool(s))",
-                    server.name
-                ));
+                tracing::info!(server = %server.name, tools = count, "mcp: connected");
                 clients.push(client);
             }
-            Err(e) => on_warn(&format!("mcp: skipping `{}` — {e}", server.name)),
+            Err(e) => tracing::warn!(server = %server.name, "mcp: skipping — {e}"),
         }
     }
     clients
@@ -110,7 +106,7 @@ for line in sys.stdin:
         };
 
         let mut registry = ToolRegistry::new();
-        let clients = connect_all(&config, &BTreeMap::new(), &mut registry, |_| {}).await;
+        let clients = connect_all(&config, &BTreeMap::new(), &mut registry).await;
 
         assert_eq!(clients.len(), 1);
         assert_eq!(
@@ -135,14 +131,9 @@ for line in sys.stdin:
             }],
         };
         let mut registry = ToolRegistry::new();
-        let warned = std::cell::Cell::new(false);
-        let clients = connect_all(&config, &BTreeMap::new(), &mut registry, |_| {
-            warned.set(true);
-        })
-        .await;
+        let clients = connect_all(&config, &BTreeMap::new(), &mut registry).await;
 
         assert!(clients.is_empty());
         assert!(registry.is_empty());
-        assert!(warned.get());
     }
 }

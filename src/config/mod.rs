@@ -311,10 +311,10 @@ impl ConfigStore {
     /// Deliberately infallible and shallow: it parses only each file's
     /// `[profile]` table (name + description) and does **not** resolve `extends`,
     /// so a profile with a broken parent still lists. A file that fails to parse
-    /// or read is skipped with a warning via `on_warn` (same posture as a broken
+    /// or read is skipped with a `tracing` warning (same posture as a broken
     /// MCP server / hook — one bad profile must not blank the whole list).
     #[must_use]
-    pub fn list_profiles(&self, on_warn: &(dyn Fn(&str) + Sync)) -> Vec<ProfileSummary> {
+    pub fn list_profiles(&self) -> Vec<ProfileSummary> {
         /// Minimal view over a profile file: just its `[profile]` table. Parsing
         /// this instead of the full [`Profile`] keeps enumeration cheap and
         /// tolerant of sections this build does not yet act on.
@@ -338,7 +338,7 @@ impl ConfigStore {
                 let text = match std::fs::read_to_string(&path) {
                     Ok(text) => text,
                     Err(e) => {
-                        on_warn(&format!("skipping profile {}: {e}", path.display()));
+                        tracing::warn!("skipping profile {}: {e}", path.display());
                         continue;
                     }
                 };
@@ -353,7 +353,7 @@ impl ConfigStore {
                         }
                     }
                     Err(e) => {
-                        on_warn(&format!("skipping profile {}: {e}", path.display()));
+                        tracing::warn!("skipping profile {}: {e}", path.display());
                     }
                 }
             }

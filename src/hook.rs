@@ -193,7 +193,14 @@ impl HookRegistry {
     /// Whether any hook is registered at all (lets the agent skip the machinery).
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.before.values().all(Vec::is_empty) && self.after.values().all(Vec::is_empty)
+        self.hook_count() == 0
+    }
+
+    /// Total registered hooks across both chains.
+    #[must_use]
+    fn hook_count(&self) -> usize {
+        self.before.values().map(Vec::len).sum::<usize>()
+            + self.after.values().map(Vec::len).sum::<usize>()
     }
 
     /// Register a before hook at `point`, keeping the chain sorted by ascending
@@ -412,16 +419,17 @@ impl HookConfig {
     }
 
     /// Build a [`HookRegistry`] from the configured shell hooks, skipping any
-    /// whose `hook_point` is unknown / not yet wired (reported via `on_warn`).
+    /// whose `hook_point` is unknown / not yet wired (logged via `tracing`).
     #[must_use]
-    pub fn into_registry(self, on_warn: impl Fn(&str)) -> HookRegistry {
+    pub fn into_registry(self) -> HookRegistry {
         let mut registry = HookRegistry::new();
         for spec in self.hooks {
             let Some(point) = HookPoint::parse(&spec.hook_point) else {
-                on_warn(&format!(
-                    "hook: skipping `{}` — unknown hook_point `{}`",
-                    spec.name, spec.hook_point
-                ));
+                tracing::warn!(
+                    hook = %spec.name,
+                    hook_point = %spec.hook_point,
+                    "hook: skipping — unknown hook_point"
+                );
                 continue;
             };
             let hook = std::sync::Arc::new(ShellHook::new(spec, point));
@@ -895,12 +903,11 @@ command = "~/.omini/hooks/notify.sh"
                 },
             ],
         };
-        let skipped = std::cell::RefCell::new(Vec::new());
-        let registry = config.into_registry(|m| skipped.borrow_mut().push(m.to_owned()));
+        let registry = config.into_registry();
+        // The unknown point (`model:request:before`) was skipped; the two wired
+        // hooks made it into the registry.
         assert!(!registry.is_empty());
-        let skipped = skipped.into_inner();
-        assert_eq!(skipped.len(), 1, "unknown point reported");
-        assert!(skipped[0].contains("model:request:before"));
+        assert_eq!(registry.hook_count(), 2);
     }
 
     /// A missing hooks.toml everywhere is an empty config, not an error.

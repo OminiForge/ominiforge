@@ -76,7 +76,6 @@ pub async fn run_case(case: &EvalCase, config: &RunConfig<'_>) -> Result<CaseRes
         crate::permission::PermissionPolicy::default(),
         // Eval runs on passthrough; no auxiliary mounts.
         Vec::new(),
-        &|_msg| {},
     )
     .await
     .context("failed to assemble agent for eval case")?;

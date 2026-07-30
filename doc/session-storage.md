@@ -58,6 +58,7 @@ fork_at_seq = 42           # 仅 fork 时存在
 - **不含 session_id**。避免同一 session 内每行重复，节省存储。Session_id 从目录名获取。
 - **首条事件为 SessionEvent::Created**。记录初始 config 快照（profile_id、tool list 等），使 replay 自包含。
 - **不生成 transcript.md**。人类可读展示由前端（Web/App）从 events.jsonl 解析渲染。
+- **业务事件不进系统日志**。`events.jsonl` 是 agent loop 的唯一真相（source of truth）；gateway/serve 的运维诊断（启动行、MCP 连接失败、sandbox 降级、direnv 慢等）走 `tracing` 到 stderr，由 `RUST_LOG` 控制级别，不写进 session 目录。两者刻意分离：事件日志回答“agent 做了什么”，系统日志回答“服务进程发生了什么”。
 
 ## 4. context_snapshot.json
 

@@ -1187,7 +1187,7 @@ mod tests {
             profile: "default".to_owned(),
             no_dotenv: true,
         };
-        let registry = SessionRegistry::new(defaults, &GatewayConfig::default(), &|_| {}).unwrap();
+        let registry = SessionRegistry::new(defaults, &GatewayConfig::default()).unwrap();
         (registry, dir)
     }
 
@@ -1242,7 +1242,7 @@ default = "openai-main/gpt-4o"
             profile: "coding".to_owned(),
             no_dotenv: true,
         };
-        let registry = SessionRegistry::new(defaults, &GatewayConfig::default(), &|_| {}).unwrap();
+        let registry = SessionRegistry::new(defaults, &GatewayConfig::default()).unwrap();
         (registry, dir)
     }
 
@@ -1340,7 +1340,7 @@ default = "openai-main/gpt-4o"
             profile: "default".to_owned(),
             no_dotenv: true,
         };
-        let registry = SessionRegistry::new(defaults, &GatewayConfig::default(), &|_| {}).unwrap();
+        let registry = SessionRegistry::new(defaults, &GatewayConfig::default()).unwrap();
 
         // Create a session with a few events (Created = seq 0, plus appends).
         let store = registry.store();

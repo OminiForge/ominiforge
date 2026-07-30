@@ -310,18 +310,14 @@ impl MountAnchors {
 
 impl SessionRegistry {
     /// Build a registry over `defaults`, with actors evicted after the config's
-    /// idle timeout. Non-fatal diagnostics (e.g. an `auto` sandbox fallback) go
-    /// to `on_warn`.
+    /// idle timeout. Non-fatal diagnostics (e.g. an `auto` sandbox fallback)
+    /// are logged via `tracing`.
     ///
     /// # Errors
     /// Fails if the configured sandbox backend is `boxlite` but boxlite cannot
     /// start on this host (`doc/sandbox.md` §3.2) — an explicit isolation
     /// request must not silently degrade.
-    pub fn new(
-        defaults: SessionDefaults,
-        config: &GatewayConfig,
-        on_warn: &(dyn Fn(&str) + Sync),
-    ) -> Result<Self> {
+    pub fn new(defaults: SessionDefaults, config: &GatewayConfig) -> Result<Self> {
         // The workspace map + per-workspace config dir live beside the session
         // store, under `.omini` (the gateway's trusted config root, not the
         // agent-writable project dir — `doc/workspace-config.md`).
@@ -337,7 +333,7 @@ impl SessionRegistry {
             super::workspace_config::WorkspaceConfigStore::new(omini_dir.join("workspaces"));
         let mount_anchors = MountAnchors { omini: omini_dir };
         let sandbox_manager =
-            crate::sandbox::manager::SandboxManager::from_choice(config.sandbox_backend, on_warn)
+            crate::sandbox::manager::SandboxManager::from_choice(config.sandbox_backend)
                 .context("failed to initialize sandbox backend")?;
         let default_network = config
             .default_network_policy()
@@ -405,7 +401,7 @@ impl SessionRegistry {
             // (which would silently lose the seeded entries on restart) is
             // diagnosable rather than invisible (fail loud).
             if let Err(e) = ws.seed_from_metas(&metas) {
-                eprintln!("gateway: failed to persist workspace map seed: {e:#}");
+                tracing::warn!("failed to persist workspace map seed: {e:#}");
             }
         }
         Ok(metas)
@@ -574,15 +570,12 @@ impl SessionRegistry {
                 };
                 match task.await {
                     Ok(Ok(())) => {}
-                    Ok(Err(e)) => eprintln!(
-                        "gateway: failed to persist approval rule for session `{}`: {e:#}",
-                        sid.0
+                    Ok(Err(e)) => tracing::warn!(
+                        session = %sid.0,
+                        "failed to persist approval rule: {e:#}"
                     ),
                     Err(e) => {
-                        eprintln!(
-                            "gateway: persistence task for session `{}` failed: {e}",
-                            sid.0
-                        );
+                        tracing::warn!(session = %sid.0, "persistence task failed: {e}");
                     }
                 }
             });
@@ -777,9 +770,9 @@ impl SessionRegistry {
                         // wanted the tool list, `kill_on_drop`).
                     }
                     Err(e) => {
-                        eprintln!(
-                            "gateway: skipping MCP server `{}` in tool listing: {e}",
-                            server.name
+                        tracing::warn!(
+                            server = %server.name,
+                            "skipping MCP server in tool listing: {e}"
                         );
                     }
                 }
@@ -940,7 +933,6 @@ impl SessionRegistry {
                     workspace,
                     env_cache.as_ref(),
                     &crate::env::EnvActivation::default(),
-                    &|msg| eprintln!("gateway: {msg}"),
                 )
                 .await,
             );
@@ -1063,9 +1055,15 @@ impl SessionRegistry {
         // exists) can resolve a `session`-anchored mount to `sessions/<id>/`
         // (`doc/sandbox.md` §3.7); the same id is then persisted below.
         let id = self.store().mint_id();
+        let assemble_started = std::time::Instant::now();
         let assembled = self
             .assemble_with(&id, profile, model, workspace, None)
             .await?;
+        tracing::info!(
+            session = %id.0,
+            elapsed_ms = u64::try_from(assemble_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "session assembled"
+        );
         // Stamp the model only when the caller actually chose one (a per-session
         // override); a `None` stays `None` so the session tracks the profile
         // default rather than freezing today's default into `session.toml`. When
@@ -1296,8 +1294,7 @@ impl SessionRegistry {
     }
 
     /// Assemble a fresh, isolated agent for one session (its own provider + MCP
-    /// subprocesses), on the gateway defaults. Diagnostics go to stderr (the
-    /// server's log).
+    /// subprocesses), on the gateway defaults. Diagnostics go through `tracing`.
     async fn assemble(&self, session_id: &SessionId) -> Result<Assembled> {
         // Respawn on the session's *stamped* model (`session.toml`), not the
         // gateway default: a session created with a per-session model override
@@ -1314,7 +1311,7 @@ impl SessionRegistry {
     /// (a `provider/model_id` or bare `model_id`) overrides the profile's default
     /// model when set. Used by [`create_with`](Self::create_with) so a Web client
     /// can choose profile/model/workspace for a *new* session without changing
-    /// config. Diagnostics go to stderr (the server's log).
+    /// config. Diagnostics go through `tracing`.
     async fn assemble_with(
         &self,
         session_id: &SessionId,
@@ -1329,6 +1326,7 @@ impl SessionRegistry {
         let d = &self.inner.defaults;
         let workspace = workspace.unwrap_or_else(|| d.workspace.clone());
         let profile = profile.unwrap_or(&d.profile);
+        tracing::debug!(session = %session_id.0, workspace = %workspace.display(), "assembling agent");
         // Load the per-workspace config once: it carries both the network
         // override (top of the §6.2 chain) and the auxiliary mounts (§3.7). A
         // present-but-broken file fails the session start (fail-loud) rather than
@@ -1388,7 +1386,6 @@ impl SessionRegistry {
             default_permission,
             workspace_config.permission.clone(),
             mounts,
-            &|msg| eprintln!("gateway: {msg}"),
         )
         .await
     }
@@ -1398,10 +1395,7 @@ impl SessionRegistry {
     /// malformed profile file is skipped with a warning to the server log.
     #[must_use]
     pub fn list_profiles(&self) -> Vec<ProfileSummary> {
-        self.inner
-            .defaults
-            .config
-            .list_profiles(&|msg| eprintln!("gateway: {msg}"))
+        self.inner.defaults.config.list_profiles()
     }
 
     /// List the models available for a per-session override, flattened from the

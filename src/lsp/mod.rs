@@ -75,26 +75,24 @@ impl LspManager {
     /// servers start lazily on first touch. Returns `None` when no servers are
     /// configured, so callers can skip the assist entirely with zero overhead.
     ///
-    /// `on_warn` reports the configured servers at setup (mirrors
+    /// Configured servers are logged at setup (mirrors
     /// [`crate::mcp::connect_all`]) so a present-but-bad `lsp.toml` is at least
-    /// visible; per-start failures surface later on stderr (§12 fail-loud —
-    /// there is no session-scoped warn sink at lazy-start time).
+    /// visible; per-start failures surface later via `tracing` (§12 fail-loud).
     #[must_use]
     pub fn new(
         config: &LspConfig,
         workspace: PathBuf,
         env_overlay: BTreeMap<String, Option<String>>,
-        on_warn: &dyn Fn(&str),
     ) -> Option<Arc<Self>> {
         if config.servers.is_empty() {
             return None;
         }
         for server in &config.servers {
-            on_warn(&format!(
-                "lsp: configured `{}` for [{}] (starts on first touch)",
-                server.name,
-                server.extensions.join(", ")
-            ));
+            tracing::info!(
+                server = %server.name,
+                extensions = %server.extensions.join(", "),
+                "lsp: configured (starts on first touch)"
+            );
         }
         let servers = config
             .servers
@@ -152,15 +150,14 @@ impl LspManager {
                 // The cached client is broken — typically the server process
                 // died mid-session. Drop it and mark the failure so a later op
                 // respawns through the same cooldown that guards start
-                // failures, and say so on stderr instead of the assist silently
-                // vanishing for the rest of the session (§12 fail-loud).
+                // failures, and log instead of the assist silently vanishing
+                // for the rest of the session (§12 fail-loud).
                 *server.client.lock().await = None;
                 *server.last_failed_at.lock().await = Some(std::time::Instant::now());
-                eprintln!(
-                    "lsp: server `{}` stopped responding ({e}); client dropped, \
-                     diagnostics disabled for {}s",
-                    server.config.name,
-                    START_RETRY_COOLDOWN.as_secs()
+                tracing::warn!(
+                    server = %server.config.name,
+                    cooldown_secs = START_RETRY_COOLDOWN.as_secs(),
+                    "lsp: server stopped responding ({e}); client dropped, diagnostics disabled"
                 );
                 return None;
             }
@@ -208,12 +205,11 @@ impl LspManager {
             }
             Err(e) => {
                 *server.last_failed_at.lock().await = Some(std::time::Instant::now());
-                // No session-scoped warn sink reaches this lazy path; stderr keeps
-                // a misconfigured server from failing 100% silently (§12).
-                eprintln!(
-                    "lsp: server `{}` failed to start ({e}); diagnostics disabled for {}s",
-                    server.config.name,
-                    START_RETRY_COOLDOWN.as_secs()
+                // A misconfigured server must not fail 100% silently (§12).
+                tracing::warn!(
+                    server = %server.config.name,
+                    cooldown_secs = START_RETRY_COOLDOWN.as_secs(),
+                    "lsp: server failed to start ({e}); diagnostics disabled"
                 );
                 None
             }
@@ -300,20 +296,14 @@ mod tests {
     }
 
     fn manager(cfg: &LspConfig) -> Arc<LspManager> {
-        LspManager::new(cfg, PathBuf::from("/ws"), BTreeMap::new(), &|_| {}).unwrap()
+        LspManager::new(cfg, PathBuf::from("/ws"), BTreeMap::new()).unwrap()
     }
 
     /// No configured servers → no manager at all, so callers pay nothing.
     #[test]
     fn empty_config_yields_no_manager() {
         assert!(
-            LspManager::new(
-                &LspConfig::default(),
-                PathBuf::from("/ws"),
-                BTreeMap::new(),
-                &|_| {}
-            )
-            .is_none()
+            LspManager::new(&LspConfig::default(), PathBuf::from("/ws"), BTreeMap::new()).is_none()
         );
     }
 
@@ -481,7 +471,7 @@ while True:
         let dir = tempfile::tempdir().unwrap();
         let config = mock_lsp_config(dir.path());
         let manager =
-            LspManager::new(&config, dir.path().to_path_buf(), BTreeMap::new(), &|_| {}).unwrap();
+            LspManager::new(&config, dir.path().to_path_buf(), BTreeMap::new()).unwrap();
 
         let file = dir.path().join("lib.rs");
         let diags = manager
@@ -501,7 +491,7 @@ while True:
         let dir = tempfile::tempdir().unwrap();
         let config = mock_lsp_config(dir.path());
         let manager =
-            LspManager::new(&config, dir.path().to_path_buf(), BTreeMap::new(), &|_| {}).unwrap();
+            LspManager::new(&config, dir.path().to_path_buf(), BTreeMap::new()).unwrap();
         let file = dir.path().join("lib.rs");
 
         let first = manager.diagnostics(&file, "first version\n").await.unwrap();
@@ -532,7 +522,7 @@ while True:
         };
         let dir = tempfile::tempdir().unwrap();
         let manager =
-            LspManager::new(&config, dir.path().to_path_buf(), BTreeMap::new(), &|_| {}).unwrap();
+            LspManager::new(&config, dir.path().to_path_buf(), BTreeMap::new()).unwrap();
         let file = dir.path().join("lib.rs");
         assert!(manager.diagnostics(&file, "x\n").await.is_none());
     }
@@ -550,7 +540,7 @@ while True:
         let dir = tempfile::tempdir().unwrap();
         let config = mock_lsp_config(dir.path());
         let manager =
-            LspManager::new(&config, dir.path().to_path_buf(), BTreeMap::new(), &|_| {}).unwrap();
+            LspManager::new(&config, dir.path().to_path_buf(), BTreeMap::new()).unwrap();
 
         let input = || ToolInput {
             call_id: "c1".to_owned(),

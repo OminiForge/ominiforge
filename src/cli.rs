@@ -203,6 +203,17 @@ struct EvalBootstrapArgs {
 /// # Errors
 /// Surfaces configuration, provider, and session errors to the process exit.
 pub async fn run() -> Result<()> {
+    // Operator diagnostics to stderr. Business/agent events never go here —
+    // they belong to `events.jsonl` (doc/session-storage.md). Default to
+    // `info` for our own crate; RUST_LOG overrides (e.g. `RUST_LOG=debug`).
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("ominiforge=info")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
     let cli = Cli::parse();
     let config_dir = cli.config_dir;
     match cli.command {
@@ -237,7 +248,7 @@ async fn serve_cmd(config_dir: Option<PathBuf>, args: ServeArgs) -> Result<()> {
     let launch_cwd = std::env::current_dir().context("cannot determine current directory")?;
     let config_store = ConfigStore::discover_with(config_dir.as_deref(), &launch_cwd);
     if !args.no_dotenv {
-        app::load_dotenv(config_store.roots(), &workspace, &|msg| eprintln!("{msg}"));
+        app::load_dotenv(config_store.roots(), &workspace);
     }
 
     let mut gateway_config =
@@ -247,14 +258,14 @@ async fn serve_cmd(config_dir: Option<PathBuf>, args: ServeArgs) -> Result<()> {
     }
 
     let authenticated = gateway_config.resolve_api_key().is_some();
-    eprintln!("ominiforge gateway listening on {}", gateway_config.bind);
+    tracing::info!(bind = %gateway_config.bind, "ominiforge gateway listening");
     if authenticated {
-        eprintln!(
+        tracing::info!(
             "auth: bearer token required (from ${})",
             gateway_config.api_key_env.as_deref().unwrap_or("?")
         );
     } else {
-        eprintln!(
+        tracing::warn!(
             "auth: DISABLED — no api_key_env configured. Only safe behind \
              loopback + a trusted reverse proxy (doc/architecture.md §18.1)."
         );
@@ -272,7 +283,7 @@ async fn serve_cmd(config_dir: Option<PathBuf>, args: ServeArgs) -> Result<()> {
         profile: args.profile,
         no_dotenv: args.no_dotenv,
     };
-    let registry = SessionRegistry::new(defaults, &gateway_config, &|msg| eprintln!("{msg}"))?;
+    let registry = SessionRegistry::new(defaults, &gateway_config)?;
     serve(registry, &gateway_config, pricing).await
 }
 
@@ -657,7 +668,7 @@ fn inspect(config_dir: Option<&Path>, args: &InspectArgs) -> Result<()> {
     let launch_cwd = std::env::current_dir().context("cannot determine current directory")?;
     let config = ConfigStore::discover_with(config_dir, &launch_cwd);
     if !args.no_dotenv {
-        app::load_dotenv(config.roots(), &workspace, &|msg| eprintln!("{msg}"));
+        app::load_dotenv(config.roots(), &workspace);
     }
 
     // Pricing is best-effort: a missing/empty table just means cost is unpriced.

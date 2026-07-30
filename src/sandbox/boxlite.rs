@@ -374,7 +374,7 @@ fn jailer_unsupported_here() -> bool {
             } else {
                 "this is NixOS (upstream boxlite jailer is incompatible, doc/sandbox.md §5.2)"
             };
-            eprintln!(
+            tracing::warn!(
                 "boxlite: host-side jailer DISABLED because {why}. The guest is \
                  still KVM/microVM-isolated; only host-side shim hardening \
                  (seccomp/chroot/uid-drop) is off."

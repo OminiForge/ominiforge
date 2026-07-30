@@ -8,9 +8,9 @@
 //! UI-agnostic (`doc/architecture.md` §2.1).
 //!
 //! The only thing kept out is *what to do with the result*: one turn, an
-//! interactive loop, or a network session. Diagnostics (a skipped MCP server, a
-//! loaded `.env`) are routed through an `on_warn` callback rather than hardcoded
-//! to stderr, so the gateway can send them to its log instead.
+//! interactive loop, or a network session. Operator diagnostics (a skipped MCP
+//! server, a loaded `.env`) go through `tracing`; business/agent events stay in
+//! the session's `events.jsonl` (doc/session-storage.md).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -128,9 +128,8 @@ fn resolve_permission(
 /// independent of the session's workspace). `workspace` is only the tool sandbox
 /// root + where sessions/skills live.
 ///
-/// `on_warn` receives non-fatal diagnostics (a `.env` that was loaded, an MCP
-/// server that failed to connect, a hook at an unknown point). The CLI routes it
-/// to stderr; the gateway to its log.
+/// Non-fatal diagnostics (a `.env` that was loaded, an MCP server that failed
+/// to connect, a hook at an unknown point) are emitted via `tracing`.
 ///
 /// # Errors
 /// Fatal configuration problems surface as [`anyhow::Error`]: no providers
@@ -154,7 +153,6 @@ pub async fn assemble(
     default_permission: crate::permission::PermissionPolicy,
     workspace_permission: crate::permission::PermissionPolicy,
     mounts: Vec<crate::sandbox::VolumeMount>,
-    on_warn: &(dyn Fn(&str) + Sync),
 ) -> Result<Assembled> {
     let workspace = resolve_workspace(&workspace)?;
 
@@ -176,13 +174,13 @@ pub async fn assemble(
             &workspace,
             env_cache.as_ref(),
             &crate::env::EnvActivation::default(),
-            on_warn,
         )
         .await;
-        load_dotenv(store.roots(), &workspace, on_warn);
+        load_dotenv(store.roots(), &workspace);
         env
     };
 
+    let assemble_started = std::time::Instant::now();
     let providers = store
         .load_providers()
         .context("failed to load providers.toml")?;
@@ -244,11 +242,7 @@ pub async fn assemble(
     // start lazily on the first file of their language.
     let lsp_manager = crate::lsp::LspConfig::load(store.roots())
         .context("failed to load lsp.toml")
-        .map(|cfg| {
-            crate::lsp::LspManager::new(&cfg, workspace.clone(), env_overlay.clone(), &|msg| {
-                on_warn(msg);
-            })
-        })?;
+        .map(|cfg| crate::lsp::LspManager::new(&cfg, workspace.clone(), env_overlay.clone()))?;
 
     register_profile_tools(
         &mut tools,
@@ -264,8 +258,7 @@ pub async fn assemble(
     // alive for the session.
     let mcp_config =
         crate::mcp::McpConfig::load(store.roots()).context("failed to load mcp.toml")?;
-    let mcp_clients =
-        crate::mcp::connect_all(&mcp_config, &env_overlay, &mut tools, |msg| on_warn(msg)).await;
+    let mcp_clients = crate::mcp::connect_all(&mcp_config, &env_overlay, &mut tools).await;
 
     // Skills: list those enabled by the profile (empty = all) and inject their
     // index into the system prompt. The `load_skill` tool is registered only
@@ -326,7 +319,7 @@ pub async fn assemble(
     // never fatal — same posture as a broken MCP server.
     let hooks = crate::hook::HookConfig::load(store.roots())
         .context("failed to load hooks.toml")?
-        .into_registry(|msg| on_warn(msg));
+        .into_registry();
     if !hooks.is_empty() {
         agent = agent.with_hooks(hooks);
     }
@@ -346,6 +339,12 @@ pub async fn assemble(
     if !permission.is_empty() {
         agent = agent.with_permission(permission);
     }
+
+    tracing::debug!(
+        workspace = %workspace.display(),
+        elapsed_ms = u64::try_from(assemble_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "agent assembled"
+    );
 
     Ok(Assembled {
         agent,
@@ -410,13 +409,13 @@ pub fn resolve_workspace(requested: &Path) -> Result<PathBuf> {
 /// `.omini`), then `<workspace>/.env` as a fallback. The first file found is
 /// loaded and the search stops. `dotenvy` never overwrites variables already
 /// present in the environment, so real env vars / direnv / CI always win.
-pub fn load_dotenv(roots: &[PathBuf], workspace: &Path, on_warn: &(dyn Fn(&str) + Sync)) {
+pub fn load_dotenv(roots: &[PathBuf], workspace: &Path) {
     let Some(path) = pick_dotenv_path(roots, workspace) else {
         return;
     };
     match dotenvy::from_path(&path) {
-        Ok(()) => on_warn(&format!("loaded env from {}", path.display())),
-        Err(e) => on_warn(&format!("warning: failed to load {}: {e}", path.display())),
+        Ok(()) => tracing::debug!(path = %path.display(), "loaded env"),
+        Err(e) => tracing::warn!("failed to load {}: {e}", path.display()),
     }
 }
 
