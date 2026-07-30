@@ -1274,6 +1274,7 @@ impl TurnState<'_> {
             &source,
             &request_id,
             &self.turn_id,
+            Some(&self.agent.tools),
         )
         .await?;
 

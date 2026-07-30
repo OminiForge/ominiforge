@@ -13,7 +13,9 @@ mod error;
 mod find;
 mod read;
 mod shell;
+pub mod stream_args;
 mod write;
+mod write_stream;
 
 pub use edit::EditTool;
 pub use error::ToolError;
@@ -82,6 +84,43 @@ pub trait Tool: Send + Sync {
     async fn preview(&self, _input: &serde_json::Value) -> Option<String> {
         None
     }
+
+    /// A streaming presenter for stage 2 of the tool-call pipeline
+    /// (`doc/tool-streaming.md`): turns this call's args into render-ready view
+    /// snapshots as they stream in. The default is `None` — the card shows the
+    /// block-start skeleton and jumps straight to the settled view at stage 3,
+    /// which is the correct behavior for most tools (small args: read/find/
+    /// shell; non-renderable: todo/MCP). Override ONLY for tools with large
+    /// streamed args where a live view adds real value (currently: `write`).
+    ///
+    /// A fresh presenter is created per tool call (it may hold per-call state,
+    /// e.g. a cached pre-edit file snapshot).
+    fn stream_presenter(&self) -> Option<Box<dyn StreamPresenter>> {
+        None
+    }
+}
+
+/// Turns a tool call's accumulated raw args into a render-ready view snapshot.
+///
+/// The args arrive as a growing JSON string, possibly truncated mid-token. One
+/// presenter instance per tool call, driven by the collector under throttle
+/// (`doc/tool-streaming.md` §4). Async so a presenter may read the pre-edit
+/// file once (lazily, cached) before it can diff.
+///
+/// Contract:
+/// - `accumulated_args` is the FULL args text so far, never a delta — snapshots
+///   are self-contained so the gateway may coalesce (drop stale, keep newest).
+/// - The output is the SAME `TextView` envelope as stage 3's
+///   `preview()`/`invoke` view, so the front-end renders stage 2 and stage 3
+///   with one code path.
+/// - Return `None` when the args aren't yet renderable (e.g. `path` still
+///   streaming); the caller keeps the last good snapshot.
+/// - Must be cheap: this runs on the model stream's hot path under throttle.
+#[async_trait::async_trait]
+pub trait StreamPresenter: Send {
+    /// Render a snapshot from the accumulated args, or `None` if not yet
+    /// renderable.
+    async fn render(&mut self, accumulated_args: &str) -> Option<String>;
 }
 
 /// Static dispatch for `summarize` by tool name.
@@ -302,6 +341,13 @@ impl ToolRegistry {
         self.tools.get(name).cloned()
     }
 
+    /// A streaming presenter for `name`'s next call, or `None` if the tool has
+    /// no stage-2 streaming (the default — `doc/tool-streaming.md` §4).
+    #[must_use]
+    pub fn stream_presenter(&self, name: &str) -> Option<Box<dyn StreamPresenter>> {
+        self.tools.get(name).and_then(|t| t.stream_presenter())
+    }
+
     /// The [`ToolSource`] of a registered tool, or [`ToolSource::Builtin`] if
     /// the name is unknown (the loop reports the started event before confirming
     /// the tool exists; an unknown name is treated as builtin for that event).
@@ -345,7 +391,7 @@ impl std::fmt::Debug for ToolRegistry {
 /// guard rail for the file tools: components are normalized without touching
 /// the filesystem (so it works for not-yet-created files), and any `..` that
 /// would climb above the workspace root is rejected.
-fn resolve_in_workspace(workspace: &Path, requested: &str) -> Result<PathBuf, ToolError> {
+pub(crate) fn resolve_in_workspace(workspace: &Path, requested: &str) -> Result<PathBuf, ToolError> {
     let joined = workspace.join(requested);
     let mut normalized = PathBuf::new();
     for component in joined.components() {

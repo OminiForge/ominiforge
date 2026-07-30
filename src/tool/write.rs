@@ -132,6 +132,15 @@ impl Tool for WriteTool {
         let old = tokio::fs::read_to_string(&path).await.ok();
         write_view(&args.path, old.as_deref(), &args.content)
     }
+
+    /// Stage-2 streaming (`doc/tool-streaming.md`): a per-call presenter that
+    /// grows a code view (new file) or a live old→new diff (overwrite) as the
+    /// `content` arg streams in.
+    fn stream_presenter(&self) -> Option<Box<dyn super::StreamPresenter>> {
+        Some(Box::new(super::write_stream::WriteStreamPresenter::new(
+            self.workspace.clone(),
+        )))
+    }
 }
 
 /// The write UI view as a JSON envelope (`doc/tool-view.md`): an overwrite is a
