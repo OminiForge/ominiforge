@@ -1077,71 +1077,6 @@ function pairResult(
 	return { ...state, items };
 }
 
-/** Parse a `read` tool result (`[path]\n1:line1\n...`) into a lines array.
- *  Returns `null` if the text doesn't look like a file result (e.g. a directory
- *  listing) so callers can skip the cache update without special-casing. */
-function parseReadResult(text: string): string[] | null {
-	const lines = text.split('\n');
-	if (lines.length === 0) return null;
-	const header = lines[0];
-	// File header: "[path]" — directory listing header: "[path/]"
-	if (!header.startsWith('[') || !header.endsWith(']') || header.endsWith('/]')) return null;
-	// Strip "N:" prefix from each content line. The colon is the first one found
-	// (safe because line numbers never embed colons).
-	const result: string[] = [];
-	for (let i = 1; i < lines.length; i++) {
-		const colon = lines[i].indexOf(':');
-		if (colon === -1) return null; // unexpected format
-		result.push(lines[i].slice(colon + 1));
-	}
-	return result;
-}
-
-/** Set the file cache from a committed `write` call's args (`{path, content}`),
- *  splitting the new content into lines. Returns `cache` unchanged if the args
- *  don't parse as expected (committed args should always be well-formed JSON by
- *  this point, but a parse failure degrades to the cache-miss preview path
- *  rather than throwing mid-fold). */
-function cacheWriteArgs(cache: Map<string, string[]>, argsJson: string): Map<string, string[]> {
-	try {
-		const args = JSON.parse(argsJson) as { path?: unknown; content?: unknown };
-		if (typeof args.path === 'string' && typeof args.content === 'string') {
-			const next = new Map(cache);
-			next.set(args.path, splitFileLines(args.content));
-			return next;
-		}
-	} catch {
-		// Malformed args JSON: fall back to the unchanged cache.
-	}
-	return cache;
-}
-
-/** Split file content the way the backend's `str::lines()`-based read path
- *  does, so a `write` and a `read` of the same bytes leave the identical lines
- *  array in the cache (a write→edit chain matches tail lines against it):
- *  no phantom trailing line from a final newline, and each line's `\r`
- *  stripped (CRLF tolerance). */
-function splitFileLines(content: string): string[] {
-	const lines = content.split('\n');
-	if (lines[lines.length - 1] === '') lines.pop();
-	return lines.map((l) => (l.endsWith('\r') ? l.slice(0, -1) : l));
-}
-
-/** The cache's content for a `write` call's target path *before* this call's
- *  args advance it — `undefined` for a new file (no prior cache entry) or
- *  unparseable args. See `Item.prevLines`'s doc comment for why this must be
- *  captured at commit time rather than read later from the (by-then-advanced)
- *  cache. */
-function writePrevLinesFor(cache: Map<string, string[]>, argsJson: string): string[] | undefined {
-	try {
-		const args = JSON.parse(argsJson) as { path?: unknown };
-		if (typeof args.path === 'string') return cache.get(args.path);
-	} catch {
-		// Malformed args JSON: no prior content to report.
-	}
-	return undefined;
-}
-
 /// Fold one live streaming delta into the conversation state.
 ///
 /// Text and reasoning blocks use **temporal (append-at-end) ordering** to match
@@ -1265,6 +1200,25 @@ function applyDelta(
 				status: 'running'
 			});
 			return { ...state, items, open, nextId: state.nextId - 1 };
+		}
+		// A render-ready snapshot of a tool call's in-progress args (stage 2 of
+		// the streaming tool-call pipeline, `doc/tool-streaming.md`). Written into
+		// the SAME `view` field the settled TextView lands in, so the card renders
+		// stage 2 and stage 3 with one code path — the snapshot just grows until
+		// the settled view replaces it. Snapshots are self-contained (never a
+		// delta), so a stale one is simply overwritten. Not yet produced by the
+		// backend (skeleton only), so this branch is inert until phase 2.
+		case 'tool_progress': {
+			const pos = open[ev.index];
+			const cur = pos !== undefined ? items[pos] : undefined;
+			if (cur?.kind === 'tool') {
+				items[pos] = { ...cur, view: ev.view };
+				return { ...state, items, open };
+			}
+			// No card at this index (e.g. a snapshot raced ahead of its
+			// block_start): drop it — the next snapshot or the settled view
+			// repaints. Self-contained snapshots make a dropped frame harmless.
+			return { ...state, items, open };
 		}
 		// The model request hit a transient failure (network drop, 429/5xx engine
 		// overload) and is being retried: surface it as a transient notice so the

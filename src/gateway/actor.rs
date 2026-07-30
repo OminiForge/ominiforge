@@ -122,6 +122,11 @@ pub enum Delta {
     Reasoning { index: u32, text: String },
     /// Incremental tool-call argument JSON.
     ToolArgs { index: u32, json: String },
+    /// A render-ready snapshot of a tool call's in-progress args (stage 2 of
+    /// the streaming tool-call pipeline). `view` is the settled result's
+    /// `TextView` envelope, grown progressively; self-contained, so transports
+    /// may coalesce. Not yet produced — skeleton only (`doc/tool-streaming.md`).
+    ToolProgress { index: u32, view: String },
     /// The model request is being retried after a transient failure (network
     /// drop, 429/5xx engine overload). `attempt` is the 1-based retry number,
     /// `max_retries` the configured budget, `delay_ms` the backoff about to
@@ -895,6 +900,13 @@ impl StreamSink for BroadcastSink {
         let _ = self.tx.send(GatewayEvent::Delta(Delta::ToolArgs {
             index,
             json: json_delta.to_owned(),
+        }));
+    }
+
+    fn on_tool_call_progress(&mut self, index: u32, view: &str) {
+        let _ = self.tx.send(GatewayEvent::Delta(Delta::ToolProgress {
+            index,
+            view: view.to_owned(),
         }));
     }
 
