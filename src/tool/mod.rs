@@ -8,7 +8,8 @@
 //! inline. See `doc/tool-protocol.md`.
 
 pub(crate) mod diffview;
-mod edit;
+pub(crate) mod edit;
+mod edit_stream;
 mod error;
 mod find;
 mod read;

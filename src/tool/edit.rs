@@ -181,6 +181,16 @@ impl Tool for EditTool {
         }
     }
 
+    /// Stage-2 streaming (`doc/tool-streaming.md`): a per-call presenter that
+    /// renders the entry the model is currently writing — the file read once
+    /// `path` closes, the anchor located once `old` closes, and the
+    /// replacement grown as `new` streams in.
+    fn stream_presenter(&self) -> Option<Box<dyn super::StreamPresenter>> {
+        Some(Box::new(super::edit_stream::EditStreamPresenter::new(
+            self.workspace.clone(),
+        )))
+    }
+
     async fn invoke(&self, input: ToolInput) -> ToolResult {
         let planned = match self.plan_all(input.input).await {
             Ok(planned) => planned,
@@ -498,7 +508,7 @@ impl EditTool {
 /// Every start index (0-based) at which `needle` occurs as a contiguous run in
 /// `haystack`, scanning left to right and skipping past a match so overlapping
 /// occurrences are not double-counted under `replace_all`.
-fn find_matches(haystack: &[&str], needle: &[String]) -> Vec<usize> {
+pub fn find_matches(haystack: &[&str], needle: &[String]) -> Vec<usize> {
     if needle.is_empty() || needle.len() > haystack.len() {
         return Vec::new();
     }

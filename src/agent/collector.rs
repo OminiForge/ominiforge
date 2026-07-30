@@ -661,4 +661,68 @@ mod tests {
         assert_eq!(last["path"], "n.txt");
         assert!(last["content"].as_str().unwrap().ends_with("tail"));
     }
+
+    /// End-to-end stage 2 for `edit`: streaming an edit's args drives
+    /// `on_tool_call_progress` with a diff-envelope snapshot of the active
+    /// entry, rendered against the real pre-edit file (`doc/tool-streaming.md`).
+    #[tokio::test]
+    async fn edit_call_streams_progress_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let mut writer = store.create_new(None, None, vec![]).unwrap();
+        let turn_id = TurnId("01TESTTURN".to_owned());
+
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("f.txt"), "a\nb\nc\n").unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.register(std::sync::Arc::new(crate::tool::EditTool::new(
+            ws.path().to_path_buf(),
+        )));
+
+        // Args long enough to clear the growth threshold; one delta suffices.
+        let args = format!(
+            "{{\"edits\": [{{\"path\":\"f.txt\",\"old\":[\"b\"],\"new\":[\"{}\"]}}]}}",
+            "B".repeat(200)
+        );
+        let events = vec![
+            StreamEvent::BlockStart {
+                index: 0,
+                block_type: ContentBlockType::ToolCall {
+                    id: "c1".to_owned(),
+                    name: "edit".to_owned(),
+                },
+            },
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                json_delta: args,
+            },
+            StreamEvent::BlockStop { index: 0 },
+            StreamEvent::Completed {
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            },
+        ];
+
+        let mut sink = RecordingSink::default();
+        collect_round(
+            &mut writer,
+            &mut sink,
+            ok_stream(events),
+            &model_source(),
+            "req_1",
+            &turn_id,
+            Some(&registry),
+        )
+        .await
+        .unwrap();
+        drop(writer);
+
+        assert!(!sink.progress.is_empty(), "edit streams a diff snapshot");
+        let last: serde_json::Value =
+            serde_json::from_str(sink.progress.last().unwrap()).unwrap();
+        assert_eq!(last["kind"], "diff");
+        assert_eq!(last["files"][0]["path"], "f.txt");
+        let patch = last["files"][0]["patch"].as_str().unwrap();
+        assert!(patch.contains("-b"), "old shown as removed: {patch}");
+    }
 }

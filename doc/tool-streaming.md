@@ -99,6 +99,13 @@ pub trait StreamPresenter: Send {
 - `src/tool/write_stream.rs` — `WriteStreamPresenter`：`path` 闭合后读一次旧文件并缓存；
   新文件生长 `code` 视图、覆盖场景对**截断到前缀行数**的旧文件 diff（避免把未到达的尾部
   误显为删除，且只 diff 完整行——末行可能被流式截断）。
+- `src/tool/edit_stream.rs` — `EditStreamPresenter`（Phase 4，**累积渲染**）：每个 entry 闭合
+  就用 `find_matches` 对原始文件定位、把 splices **加入**按绝对路径分组的累积集合（首现序）；
+  正在流的 entry 每帧贡献一个随 `new` 生长的临时 splice。因所有 entry 与 `plan_path` 一样锚定
+  同一原始快照，累积 view 在 args 闭合时**逐字节收敛于**阶段三的 `plan_view`（文件流式期间
+  不变的前提下；阶段三仍对活文件重算，外部改动不会出错）。`A B A` 合并为两组（A 含两 entry、
+  B），不会重复出现 A。多 entry 单调累积、不闪没。乐观渲染：ambiguous 取第一个匹配、重叠
+  照渲染——`not_found`/`ambiguous`/`overlapping_edits` 由阶段三权威报告。
 - `src/agent/collector.rs` — 节流驱动：`ToolCallDelta` 累积后在节流下调用 presenter
   （`PROGRESS_MIN_INTERVAL` 120ms + `PROGRESS_MIN_GROWTH` 64B），`BlockStop` 前强制 flush
   最后一帧。presenter 经 `collect_round(.., tools: Option<&ToolRegistry>)` 注入；无 registry
@@ -114,7 +121,7 @@ pub trait StreamPresenter: Send {
 | **1** | **协议骨架**（本改动）：`on_tool_call_progress` + `Delta::ToolProgress` + 前端 `case 'tool_progress'` + 本文档。行为零变化。 | ✅ 本次 |
 | **2** | **`stream_args` 提取器 + write presenter**：渐进 view（新文件生长 code 视图、覆盖场景对截断旧文件 diff），节流在 collector。第一个端到端可用的流式工具。 | ✅ 本次 |
 | **3** | **审批与 view 解耦**：删除整个 preview 机制（`Permission::Requested.preview`、`Tool::preview()`、前端 `Item.preview`）。审批不再自算自存 diff，人在卡片已有的阶段二 view 上审批。 | ✅ 本次 |
-| **4** | **edit presenter（深方案）**：`edits[i]` 按 path→old→new 流式，锚点定位 + 渐进替换。先留浅方案（结构化进度）作为中间态。 | 待做 |
+| **4** | **edit presenter（累积渲染）**：entry 闭合即对原文件定位并按 abs_path 分组累积 splices，活跃 entry 随 new 生长；`A B A` 合并为一组；累积收敛 ≡ 阶段三 `plan_view`。 | ✅ 本次 |
 | **5** | **shell 输出流式**：结果流式（非 args 流式），独立特性，协议可复用快照模式。 | 待做 |
 | **6** | **删除 `Delta::ToolArgs` / `on_tool_call_delta`**：第一个 presenter 证明 ToolProgress 通路后，移除原始 args 透传与前端裸显路径，args 改由阶段三 debug 折层一次性给出。 | 待做 |
 | **7** | **通用兜底 + 收尾**：MCP/未知工具的字段级进度；read/find 确认无需流式；TUI 对齐。 | 待做 |
