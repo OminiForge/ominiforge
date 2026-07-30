@@ -8,4 +8,4 @@
  * against a locally-remembered acknowledged seq — the gateway cannot know what a
  * user has *looked at*, only what the session is *doing*.
  */
-export type ActivityStatus = "running" | "awaiting_approval" | "idle";
+export type ActivityStatus = "running" | "awaiting_input" | "idle";

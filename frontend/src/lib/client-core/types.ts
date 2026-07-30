@@ -212,7 +212,7 @@ export interface SessionClient {
 	subscribeEvents(id: string, handlers: EventHandlers, lastSeq?: number): EventSubscription;
 	/**
 	 * Subscribe to the gateway-wide session activity status stream: one feed
-	 * carrying every session's `running | awaiting_approval | idle` status across
+	 * carrying every session's `running | awaiting_input | idle` status across
 	 * all workspaces (the session list's cross-session read source). The transport
 	 * sends a snapshot of current statuses on connect, then live deltas; apply them
 	 * idempotently (last-write-wins by session id). Reconnect re-snapshots.

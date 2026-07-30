@@ -107,7 +107,7 @@ pub struct ApprovalOutcome {
 /// Resolves an [`ApprovalRequest`] to an [`ApprovalOutcome`].
 ///
 /// Implementations own the interaction: a terminal gate prompts and reads stdin;
-/// the gateway gate publishes an `AwaitingApproval` status and awaits a command
+/// the gateway gate publishes an `AwaitingInput` status and awaits a command
 /// carrying the decision. `request` may suspend for as long as the human takes —
 /// the turn is paused, not spinning.
 ///

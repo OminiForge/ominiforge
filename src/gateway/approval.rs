@@ -6,7 +6,7 @@
 //! awaits [`GatewayApprovalGate::request`], which:
 //!   1. parks a [`oneshot::Sender`] in a shared [`PendingApprovals`] table keyed
 //!      by the tool call id,
-//!   2. publishes `AwaitingApproval` to the status hub (lighting the session up
+//!   2. publishes `AwaitingInput` to the status hub (lighting the session up
 //!      in the list) and emits an `ApprovalRequested` event on the outbound
 //!      stream so a connected client can prompt the user, then
 //!   3. suspends on the receiver.
@@ -96,7 +96,7 @@ pub struct GatewayApprovalGate {
     pending: PendingApprovals,
     /// The session's outbound stream — carries the `ApprovalRequested` event.
     outbound: broadcast::Sender<GatewayEvent>,
-    /// Process-wide status publisher, so the list shows `AwaitingApproval`.
+    /// Process-wide status publisher, so the list shows `AwaitingInput`.
     status: StatusHub,
     session_id: SessionId,
     workspace_id: WorkspaceId,
@@ -270,9 +270,9 @@ impl ApprovalGate for GatewayApprovalGate {
             );
         }
 
-        self.publish(ActivityStatus::AwaitingApproval);
+        self.publish(ActivityStatus::AwaitingInput);
         // Ephemeral, like a `Delta`: a client connecting after this fires learns
-        // of the pending ask from the `AwaitingApproval` status, not a replay.
+        // of the pending ask from the `AwaitingInput` status, not a replay.
         // Cloned — the request itself is still needed after the await to
         // compile a scoped rule.
         let _ = self.outbound.send(GatewayEvent::ApprovalRequested {
@@ -320,12 +320,12 @@ impl ApprovalGate for GatewayApprovalGate {
         // The turn is resuming — but light the session back to `Running` only
         // when no ask of this session is still pending: with parallel asks
         // outstanding the first answer must not flap the status while the rest
-        // still wait. A poisoned lock keeps the safer `AwaitingApproval`.
+        // still wait. A poisoned lock keeps the safer `AwaitingInput`.
         let no_pending = self.pending.lock().map_or(false, |p| p.is_empty());
         self.publish(if no_pending {
             ActivityStatus::Running
         } else {
-            ActivityStatus::AwaitingApproval
+            ActivityStatus::AwaitingInput
         });
         outcome
     }

@@ -86,7 +86,7 @@ pub enum GatewayEvent {
     /// A tool call classified `ask` by the permission policy is suspended,
     /// awaiting a human decision (`doc/permission.md` §5). Ephemeral like
     /// [`Delta`]: a client that connects later learns of it from the session's
-    /// `AwaitingApproval` status, not a replay. Answer with `Command::Approve`
+    /// `AwaitingInput` status, not a replay. Answer with `Command::Approve`
     /// carrying the same `call_id`.
     ApprovalRequested {
         call_id: String,

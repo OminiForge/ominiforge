@@ -4,7 +4,7 @@
 //!
 //! This complements the per-session [`EventBus`](crate::session::EventBus): that
 //! fans out one session's committed events to whoever is viewing *that* session;
-//! this fans out a coarse `running | awaiting_approval | idle` status for *all*
+//! this fans out a coarse `running | awaiting_input | idle` status for *all*
 //! sessions to whoever is viewing the *list*. Like the bus, publishing is
 //! best-effort and off the hot turn path (called at turn boundaries, not per
 //! token), and a lagging subscriber resyncs from [`snapshot`](StatusHub::snapshot)
@@ -42,11 +42,13 @@ const DEFAULT_CAPACITY: usize = 1024;
 pub enum ActivityStatus {
     /// A turn is running (the actor is mid-turn).
     Running,
-    /// A tool call is suspended pending user approval (`doc/permission.md` §5).
-    /// Published by `GatewayApprovalGate` while a gated `ask` waits for a decision
-    /// and cleared back to `Running`/`Idle` once resolved; the session-list icon
+    /// The turn is suspended waiting on the user: currently a tool call pending
+    /// approval (`doc/permission.md` §5), later any decision the user must make
+    /// before the turn can continue (e.g. an option picker). Published by
+    /// `GatewayApprovalGate` while a gated `ask` waits for a decision and
+    /// cleared back to `Running`/`Idle` once resolved; the session-list icon
     /// renders it as the amber awaiting state.
-    AwaitingApproval,
+    AwaitingInput,
     /// No turn running. The common resting state.
     Idle,
 }
@@ -69,6 +71,13 @@ pub struct SessionStatus {
     pub status: ActivityStatus,
     /// The session's latest committed event `seq` at the time of this status.
     pub latest_seq: u64,
+    // Deliberately NO `awaiting: Option<AwaitingKind>` field yet: today the only
+    // source of `AwaitingInput` is approval, so a kind tag would be a dead
+    // field. When a second awaiting source lands (option picker, plan confirm,
+    // free-form prompt), add it here as an optional enum (`Approval` / `Choice`
+    // / ...) — wire-compatible (serde ignores a missing optional field), and it
+    // lets the session page pick the right card while the list keeps reading
+    // only the coarse `status`.
 }
 
 /// A cheap, clonable handle to publish and subscribe to session status. Shares
