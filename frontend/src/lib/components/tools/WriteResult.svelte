@@ -11,37 +11,33 @@
 	 *  confirmation (`wrote PATH (new, N lines)` / `(~, +A -B)` / `(no change)`),
 	 *  so we parse its first line for the meta and move the confirmation itself
 	 *  to the debug fold. A failure's message (`write_failed`) is diagnostic
-	 *  detail and stays in the primary view. While running there is no view
-	 *  yet — the streaming args remain visible in the debug fold. */
+	 *  detail and stays in the primary view. While running, `view` is the stage-2
+	 *  streaming snapshot (a growing code view or diff), flushed complete at
+	 *  BlockStop — so an awaiting-approval card already shows the full change. */
 	let {
 		args,
 		result,
 		diagnostics,
 		status,
 		view,
-		preview
+		pending
 	}: {
 		args: string;
 		result?: string;
 		diagnostics?: string;
 		status: 'running' | 'done' | 'error';
 		view?: string;
-		/** The approval-gate would-be diff/content, shown while the call awaits a
-		 *  human decision. Same shape as `view`. */
-		preview?: string;
+		/** True while the call awaits a permission decision: the badge reads
+		 *  "awaiting approval". The card's `view` already shows the change. */
+		pending?: boolean;
 	} = $props();
 
-	// While awaiting approval there is no executed `view` — show the gate's
-	// preview. The preview's shape (diff vs raw content) is decided by its
-	// `kind`, not by `meta` (which only exists on the executed result).
-	const shown = $derived(view ?? preview);
-	const parsed = $derived(shown ? parseView(shown) : null);
+	const parsed = $derived(view ? parseView(view) : null);
 
 	const errorText = $derived(status === 'error' ? result : undefined);
-	const pending = $derived(!view && preview !== undefined && status === 'running');
 
-	// A diff (overwrite, executed or preview) carries `kind: "diff"`; a new
-	// file's shown text is `kind: "code"`.
+	// A diff (overwrite) carries `kind: "diff"`; a new file's view is
+	// `kind: "code"`.
 	const files = $derived(parsed?.kind === 'diff' ? parsed.files : []);
 	const code = $derived(parsed?.kind === 'code' ? parsed : null);
 </script>

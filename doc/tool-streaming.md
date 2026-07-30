@@ -18,7 +18,7 @@
 2. **复杂度前倾**：前端为这套裸显维护了一条「流式占位 → commit 时 truncate 重放」的
    脆弱路径（`open` map、`streaming` 标记、`seq=-1` 占位卡片）。
 3. **正确价值在后端**：工具调用真正可渲染的中间形态（一行摘要、diff 预览）后端都有
-   现成能力（`summarize_by_name`、`tool.preview()`），只是送达时机太晚（commit / 审批 /
+   现成能力（`summarize_by_name`、diff 构建），只是送达时机太晚（commit / 审批 /
    完成时才到）。
 
 新管线把「加工」收回后端：后端在流式阶段就产出**与最终同构的 view**，前端用一条渲染
@@ -44,8 +44,8 @@
         │  到达——模型与前端同时拿到，不构成额外的「晚发」阶段
         └─ 前端把完整 args 作为 debug 折层展示（替代被删的流式 args 裸显）
 
-审批门  维持在 args 完整之后（现状，不改）：用户必须看到完整 preview 才能审批。
-        preview 计算从审批门提前到 args 完整时，与阶段二共用同一条 diff 管线。
+审批门  维持在 args 完整之后（现状，不改）。审批与 view 已解耦（Phase 3）：门不再
+        自算自存 preview，人在卡片已有的阶段二 view（BlockStop flush 的完整快照）上审批。
 ```
 
 **关键设计：阶段二写进和阶段三相同的 `view` 字段。** 前端 fold 里 `tool_progress`
@@ -113,7 +113,7 @@ pub trait StreamPresenter: Send {
 |---|---|---|
 | **1** | **协议骨架**（本改动）：`on_tool_call_progress` + `Delta::ToolProgress` + 前端 `case 'tool_progress'` + 本文档。行为零变化。 | ✅ 本次 |
 | **2** | **`stream_args` 提取器 + write presenter**：渐进 view（新文件生长 code 视图、覆盖场景对截断旧文件 diff），节流在 collector。第一个端到端可用的流式工具。 | ✅ 本次 |
-| **3** | **preview 管线前置**：`tool.preview()` 从审批门提前到 args 完整时，与阶段二共用 diff 构建。审批时机不变。 | 待做 |
+| **3** | **审批与 view 解耦**：删除整个 preview 机制（`Permission::Requested.preview`、`Tool::preview()`、前端 `Item.preview`）。审批不再自算自存 diff，人在卡片已有的阶段二 view 上审批。 | ✅ 本次 |
 | **4** | **edit presenter（深方案）**：`edits[i]` 按 path→old→new 流式，锚点定位 + 渐进替换。先留浅方案（结构化进度）作为中间态。 | 待做 |
 | **5** | **shell 输出流式**：结果流式（非 args 流式），独立特性，协议可复用快照模式。 | 待做 |
 | **6** | **删除 `Delta::ToolArgs` / `on_tool_call_delta`**：第一个 presenter 证明 ToolProgress 通路后，移除原始 args 透传与前端裸显路径，args 改由阶段三 debug 折层一次性给出。 | 待做 |

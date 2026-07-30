@@ -8,34 +8,30 @@
 	 *  the real pre-edit content — NOT rebuilt client-side. `result` is only the
 	 *  terse confirmation (`edited PATH (N replacements)`), so it moves to the
 	 *  debug fold; a failure's message (e.g. `not_found`/`ambiguous`) is
-	 *  diagnostic detail and stays in the primary view. While running there is
-	 *  no view yet — the streaming args remain visible in the debug fold. */
+	 *  diagnostic detail and stays in the primary view. While running, `view` is
+	 *  the stage-2 streaming snapshot once `edit` gains a presenter (phase 4);
+	 *  until then a running/awaiting card shows args in the debug fold. */
 	let {
 		args,
 		result,
 		diagnostics,
 		status,
 		view,
-		preview
+		pending
 	}: {
 		args: string;
 		result?: string;
 		diagnostics?: string;
 		status: 'running' | 'done' | 'error';
 		view?: string;
-		/** The approval-gate would-be diff, shown while the call awaits a human
-		 *  decision (`Permission::Requested.preview`). Same shape as `view`. */
-		preview?: string;
+		/** True while the call awaits a permission decision: the badge reads
+		 *  "awaiting approval". The card's `view` shows the change when present. */
+		pending?: boolean;
 	} = $props();
 
-	// While the card awaits approval there is no executed `view` yet — show the
-	// gate's preview diff so the human approves the actual change. Once the call
-	// runs, the executed `view` (identical when the file didn't change) replaces it.
-	const shown = $derived(view ?? preview);
-	const parsed = $derived(shown ? parseView(shown) : null);
+	const parsed = $derived(view ? parseView(view) : null);
 	const files = $derived(parsed?.kind === 'diff' ? parsed.files : []);
 	const errorText = $derived(status === 'error' ? result : undefined);
-	const pending = $derived(!view && preview !== undefined && status === 'running');
 </script>
 
 <div class="result">

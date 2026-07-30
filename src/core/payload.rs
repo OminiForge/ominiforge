@@ -431,14 +431,6 @@ pub enum PermissionEvent {
         call_id: String,
         tool_name: String,
         input: serde_json::Value,
-        /// The would-be UI diff for content tools (`edit`/`write`), computed
-        /// against the file as it is *now* so the human approves the actual
-        /// change, not abstract args. `None` for other tools or when the
-        /// preview can't be computed (the gate then shows raw args). Optional
-        /// so older logs deserialize; the executed `TextView` stays the source
-        /// of truth once approved (`doc/permission.md` §6).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        preview: Option<String>,
     },
     /// The gate resolved. `decided_by` is `"user"` (a human answered an ask) or
     /// `"policy"` (a deny rule, or the fail-closed default, auto-resolved it).

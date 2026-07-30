@@ -1150,7 +1150,6 @@ impl TurnState<'_> {
         &mut self,
         call: &ToolCall,
         input: &serde_json::Value,
-        preview: Option<String>,
     ) -> Result<(), AgentError> {
         self.writer.append(
             runtime_source(),
@@ -1158,7 +1157,6 @@ impl TurnState<'_> {
                 call_id: call.id.clone(),
                 tool_name: call.name.clone(),
                 input: input.clone(),
-                preview,
             }),
             None,
             Some(self.turn_id.clone()),
@@ -1541,14 +1539,11 @@ impl TurnState<'_> {
                     // An `ask` genuinely requests a human decision — audit the
                     // request now, so every ask of a round is published before
                     // any of them settles; the gate itself is awaited in the
-                    // settle half (`doc/permission.md` §6). For content tools
-                    // (`edit`/`write`) attach the would-be diff so the human
-                    // approves the actual change, not abstract args.
-                    let preview = match self.agent.tools.get(&call.name) {
-                        Some(tool) => tool.preview(&args).await,
-                        None => None,
-                    };
-                    self.record_permission_requested(call, &args, preview)?;
+                    // settle half (`doc/permission.md` §6). The human sees what
+                    // the call will change via the card's live view (stage 2 of
+                    // the streaming pipeline), not a gate-computed preview —
+                    // approval and view are decoupled (`doc/tool-streaming.md`).
+                    self.record_permission_requested(call, &args)?;
                     return Ok(PreparedCall::Ask {
                         parent,
                         args,
@@ -4254,74 +4249,17 @@ mod tests {
         assert_eq!(rebuilt_tool_result_ids(&events), ["c1", "c2"]);
     }
 
-    /// An `ask` on a content tool carries the would-be diff in `Requested.preview`
-    /// (`doc/permission.md` §6): the human approves the actual change, not
-    /// abstract args. The preview is computed at gate time and must NOT have
-    /// written the file yet (the gate is still pending).
-    #[tokio::test]
-    async fn ask_on_write_carries_a_diff_preview() {
-        let dir = tempfile::tempdir().unwrap();
-        // Pre-existing file so the write is an overwrite with a real diff.
-        std::fs::write(dir.path().join("a.txt"), "old\n").unwrap();
-        let policy = PermissionPolicy {
-            deny: vec![],
-            allow: vec![],
-            ask: vec![deny_rule("write", &[])],
-        };
-        let gate = ConcurrentGate::approve_all();
-        let events = run_rounds_under_policy(
-            dir.path(),
-            vec![
-                vec![
-                    StreamEvent::BlockStart {
-                        index: 0,
-                        block_type: ContentBlockType::ToolCall {
-                            id: "c1".to_owned(),
-                            name: "write".to_owned(),
-                        },
-                    },
-                    StreamEvent::ToolCallDelta {
-                        index: 0,
-                        json_delta: r#"{"path":"a.txt","content":"new\n"}"#.to_owned(),
-                    },
-                    StreamEvent::BlockStop { index: 0 },
-                    StreamEvent::Completed {
-                        stop_reason: StopReason::ToolUse,
-                        usage: Usage::default(),
-                    },
-                ],
-                text_round("done"),
-            ],
-            policy,
-            gate,
-        )
-        .await;
-
-        let preview = events.iter().find_map(|e| match &e.payload {
-            EventPayload::Permission(PermissionEvent::Requested { preview, .. }) => preview.clone(),
-            _ => None,
-        });
-        let preview = preview.expect("Requested carries a preview for write");
-        // The preview is the same JSON envelope the executed `TextView` carries.
-        let json: serde_json::Value = serde_json::from_str(&preview).unwrap();
-        assert_eq!(json["kind"], "diff");
-        let patch = json["files"][0]["patch"].as_str().unwrap();
-        assert!(
-            json["files"][0]["path"] == "a.txt" && patch.contains("-old") && patch.contains("+new"),
-            "preview is the old→new diff: {preview}"
-        );
-    }
-
-    /// Older logs lack `Requested.preview` — the field is optional and defaults
-    /// to `None`, so a pre-preview event still deserializes (`doc/event-schema.md`).
+    /// Older logs may carry a `Requested.preview` field (the now-removed
+    /// approval-gate diff, `doc/tool-streaming.md`): serde ignores unknown
+    /// fields, so such an event still deserializes after the field's removal.
     #[test]
-    fn requested_without_preview_deserializes() {
+    fn requested_with_legacy_preview_deserializes() {
         let v = serde_json::json!({
-            "Requested": { "call_id": "c1", "tool_name": "write", "input": {"path":"a.txt"} }
+            "Requested": { "call_id": "c1", "tool_name": "write", "input": {"path":"a.txt"}, "preview": "DIFF" }
         });
         let ev: PermissionEvent = serde_json::from_value(v).unwrap();
         match ev {
-            PermissionEvent::Requested { preview, .. } => assert_eq!(preview, None),
+            PermissionEvent::Requested { call_id, .. } => assert_eq!(call_id, "c1"),
             PermissionEvent::Decided { .. } => panic!("expected Requested"),
         }
     }

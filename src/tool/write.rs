@@ -121,18 +121,6 @@ impl Tool for WriteTool {
         }
     }
 
-    /// Render the would-be UI diff WITHOUT writing — the approval-gate preview
-    /// (`doc/permission.md` §6). Mirrors `invoke`'s view logic against the file
-    /// as it is now: an overwrite diffs old→new; a new file's preview is its
-    /// full content. Unresolvable path / unparsable args yield `None` (the gate
-    /// shows raw args; the real execute reports the error after approval).
-    async fn preview(&self, input: &serde_json::Value) -> Option<String> {
-        let args: WriteArgs = serde_json::from_value(input.clone()).ok()?;
-        let path = resolve_in_workspace(&self.workspace, &args.path).ok()?;
-        let old = tokio::fs::read_to_string(&path).await.ok();
-        write_view(&args.path, old.as_deref(), &args.content)
-    }
-
     /// Stage-2 streaming (`doc/tool-streaming.md`): a per-call presenter that
     /// grows a code view (new file) or a live old→new diff (overwrite) as the
     /// `content` arg streams in.
@@ -251,45 +239,6 @@ mod tests {
             Content::TextView { text, audience } if audience == "ui" => Some(text.as_str()),
             _ => None,
         })
-    }
-
-    /// The approval-gate preview for an overwrite diffs old→new WITHOUT
-    /// writing (`doc/permission.md` §6); the envelope matches the executed
-    /// `TextView` so the gate shows what the card will.
-    #[tokio::test]
-    async fn preview_diffs_overwrite_without_writing() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("f.txt"), "a\nb\nc\n").unwrap();
-        let tool = WriteTool::new(dir.path().to_path_buf());
-        let input = serde_json::json!({ "path": "f.txt", "content": "a\nB\nc\n" });
-        let preview = tool.preview(&input).await.unwrap();
-        let json: serde_json::Value = serde_json::from_str(&preview).unwrap();
-        assert_eq!(json["kind"], "diff");
-        assert_eq!(json["files"][0]["path"], "f.txt");
-        assert_eq!(
-            json["files"][0]["patch"].as_str().unwrap(),
-            "@@ -1,3 +1,3 @@\n a\n-b\n+B\n c"
-        );
-        // Dry-run: the file is unchanged.
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
-            "a\nb\nc\n"
-        );
-    }
-
-    /// A new-file write previews as the full content (no "before" side), as a
-    /// `code` envelope.
-    #[tokio::test]
-    async fn preview_new_file_is_full_content() {
-        let dir = tempfile::tempdir().unwrap();
-        let tool = WriteTool::new(dir.path().to_path_buf());
-        let input = serde_json::json!({ "path": "new.txt", "content": "hello\nworld\n" });
-        let preview = tool.preview(&input).await.unwrap();
-        let json: serde_json::Value = serde_json::from_str(&preview).unwrap();
-        assert_eq!(json["kind"], "code");
-        assert_eq!(json["path"], "new.txt");
-        assert_eq!(json["content"], "hello\nworld\n");
-        assert!(!dir.path().join("new.txt").exists());
     }
 
     /// A new file's view is its full content (the front-end renders it as a

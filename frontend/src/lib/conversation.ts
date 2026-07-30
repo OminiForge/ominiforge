@@ -80,13 +80,6 @@ export type Item =
 			 *  Rendered verbatim by the result component — never rebuilt
 			 *  client-side. Absent while running and for tools that produce none. */
 			view?: string;
-			/** The approval-gate preview (`Permission::Requested.preview`): the
-			 *  would-be diff for `edit`/`write`, computed at ask time so the human
-			 *  approves the actual change. Shown while `approvalPending`; once the
-			 *  executed `view` arrives it takes over (identical when the file didn't
-			 *  change in between — the preview is the same todo list). Absent for tools
-			 *  without a diff preview. */
-			preview?: string;
 	  }
 	/** A todo checklist, folded from `todo` control-tool calls (one card per
 	 *  `init`). `streaming` marks a placeholder shown while the call's args are
@@ -491,14 +484,15 @@ function applyCommitted(
 			// register it as an orphan so the late ContentBlock completes THIS
 			// card instead of pushing a duplicate (see commitBlock).
 			const r = perm.Requested;
-			// The would-be diff the gate computed for content tools (`edit`/`write`)
-			// — shown in the card while it awaits the human's decision.
-			const preview = r.preview ?? undefined;
+			// The human sees what the call will change via the card's live `view`
+			// (stage 2 of the streaming pipeline, already flushed at BlockStop); the
+			// gate itself carries no view — approval and view are decoupled
+			// (`doc/tool-streaming.md`).
 			const pos = next.items.findIndex((it) => it.kind === 'tool' && it.callId === r.call_id);
 			if (pos >= 0) {
 				const items = [...next.items];
 				const it = items[pos];
-				if (it.kind === 'tool') items[pos] = { ...it, approvalPending: true, preview };
+				if (it.kind === 'tool') items[pos] = { ...it, approvalPending: true };
 				return { ...next, items };
 			}
 			const orphanTools = new Map(next.orphanTools);
@@ -511,8 +505,7 @@ function applyCommitted(
 				name: r.tool_name,
 				args: JSON.stringify(r.input),
 				status: 'running',
-				approvalPending: true,
-				preview
+				approvalPending: true
 			});
 			return { ...pushed, orphanTools };
 		}
@@ -1066,11 +1059,10 @@ function pairResult(
 		status: failed || output.is_error ? 'error' : 'done',
 		result: text,
 		diagnostics,
-		// The executed view takes over from the approval preview. When the call
-		// produced no view (a no-op edit, or a failure) keep the preview so the
-		// card never flashes empty between approve and settle — the preview was
-		// the same todo list, and on a rejected/failed call it is all there is.
-		view: view ?? call.preview,
+		// The executed view replaces the stage-2 streaming snapshot (same
+		// envelope, now complete). Absent on a no-op edit or a failure — the
+		// card then keeps whatever stage-2 view it had, or none.
+		view,
 		error_code: output.error_code ?? undefined
 	};
 

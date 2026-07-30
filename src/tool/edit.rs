@@ -239,22 +239,11 @@ impl Tool for EditTool {
         Ok(output)
     }
 
-    /// Compute the UI diff this call would produce WITHOUT writing — the
-    /// approval-gate preview (`doc/permission.md`). Runs the same plan the
-    /// real execute uses, so the preview matches the eventual diff when the
-    /// file hasn't changed in between; any business failure (bad args, no
-    /// match) yields `None` — the gate then shows the raw args, and the real
-    /// execute reports the error after approval.
-    async fn preview(&self, input: &serde_json::Value) -> Option<String> {
-        let planned = self.plan_all(input.clone()).await.ok()?;
-        let text = plan_view(&planned);
-        (!text.is_empty()).then_some(text)
-    }
 }
 
 /// Render the planned files' diff views into a JSON envelope
 /// `{ kind: "diff", files: [{ path, patch }] }` (same shape as the executed
-/// `TextView`). Shared by `invoke` (post-write view) and `preview`.
+/// `TextView`). Used by `invoke` (post-write view).
 fn plan_view(planned: &[PlannedWrite]) -> String {
     let mut files: Vec<serde_json::Value> = Vec::new();
     for plan in planned {
@@ -838,45 +827,6 @@ b
             .unwrap();
         assert!(!out.is_error);
         assert!(view(&out).is_none());
-    }
-
-    /// The approval-gate preview renders the would-be diff WITHOUT touching the
-    /// file (`doc/permission.md` §6): same body the executed `TextView` would
-    /// carry, but the on-disk content is unchanged.
-    #[tokio::test]
-    async fn preview_renders_diff_without_writing() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("f.txt"), "a\nb\nc\n").unwrap();
-        let t = tool(dir.path().to_path_buf());
-        let input =
-            serde_json::json!({ "edits": [{ "path": "f.txt", "old": ["b"], "new": ["B"] }] });
-        let preview = t.preview(&input).await.unwrap();
-        // The preview is the same JSON envelope the executed `TextView` carries.
-        let preview_json: serde_json::Value = serde_json::from_str(&preview).unwrap();
-        assert_eq!(preview_json["kind"], "diff");
-        assert_eq!(preview_json["files"][0]["path"], "f.txt");
-        assert_eq!(
-            preview_json["files"][0]["patch"].as_str().unwrap(),
-            "@@ -1,3 +1,3 @@\n a\n-b\n+B\n c"
-        );
-        // Not written: the preview is a dry-run.
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
-            "a\nb\nc\n"
-        );
-    }
-
-    /// A preview the planner can't resolve (no match) yields `None` — the gate
-    /// falls back to raw args and the real execute reports the error after
-    /// approval.
-    #[tokio::test]
-    async fn preview_is_none_when_edit_would_fail() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("f.txt"), "a\nb\n").unwrap();
-        let t = tool(dir.path().to_path_buf());
-        let input =
-            serde_json::json!({ "edits": [{ "path": "f.txt", "old": ["zzz"], "new": ["Z"] }] });
-        assert!(t.preview(&input).await.is_none());
     }
 
     #[tokio::test]

@@ -959,7 +959,7 @@ describe('activity fold', () => {
 	});
 });
 
-function permRequested(seq: number, callId: string, tool: string, preview?: string): GatewayEvent {
+function permRequested(seq: number, callId: string, tool: string): GatewayEvent {
 	return {
 		type: 'event',
 		schema_version: 'ominiforge.event.v1',
@@ -971,7 +971,7 @@ function permRequested(seq: number, callId: string, tool: string, preview?: stri
 		turn_id: null,
 		payload: {
 			Permission: {
-				Requested: { call_id: callId, tool_name: tool, input: { path: 'x.txt' }, preview }
+				Requested: { call_id: callId, tool_name: tool, input: { path: 'x.txt' } }
 			}
 		}
 	} as unknown as GatewayEvent;
@@ -1124,25 +1124,25 @@ describe('permission approval fold', () => {
 		expect(t?.kind === 'tool' && t.result).toContain('denied_by_user');
 	});
 
-	it('Requested carries the would-be diff preview onto the gated card', () => {
-		// The gate computed the diff for edit/write; it lands on the card so the
-		// human approves the actual change, not abstract args (doc/permission.md §6).
+	it('Requested marks the gated card pending; the card shows its stage-2 view', () => {
+		// Approval and view are decoupled (doc/tool-streaming.md): the gate
+		// carries no view — it only flips `approvalPending`. What the call will
+		// change is already on the card via the stage-2 streaming view.
 		const state = fold([
 			contentBlock(1, { ToolCall: { id: 'c1', name: 'edit', arguments: '{"edits":[]}' } }),
-			permRequested(2, 'c1', 'edit', '--- a/f\n+++ b/f\n@@ -1,1 +1,1 @@\n-x\n+y')
+			permRequested(2, 'c1', 'edit')
 		]);
 		const t = state.items.find((i) => i.kind === 'tool');
 		expect(t?.kind === 'tool' && t.approvalPending).toBe(true);
-		expect(t?.kind === 'tool' && t.preview).toContain('@@ -1,1 +1,1 @@');
 	});
 
-	it('the executed view replaces the preview; a no-view result keeps the preview', () => {
-		// Approved call runs: the executed `view` (TextView) takes over. When the
-		// call produced no view (e.g. a no-op edit), the preview stays so the card
-		// never flashes empty between approve and settle.
+	it('the executed view settles on the card; a no-view result leaves it empty', () => {
+		// Approved call runs: the executed `view` (TextView) lands. A call that
+		// produces no view (e.g. a no-op edit) has none — there is no separate
+		// approval preview to fall back to.
 		const withView = fold([
 			contentBlock(1, { ToolCall: { id: 'c1', name: 'edit', arguments: '{}' } }),
-			permRequested(2, 'c1', 'edit', 'PREVIEW'),
+			permRequested(2, 'c1', 'edit'),
 			permDecided(3, 'c1', 'Approved'),
 			toolCompletedView(4, 1, 'edited f (1 replacement)', 'FINAL')
 		]);
@@ -1151,12 +1151,12 @@ describe('permission approval fold', () => {
 
 		const noView = fold([
 			contentBlock(1, { ToolCall: { id: 'c1', name: 'edit', arguments: '{}' } }),
-			permRequested(2, 'c1', 'edit', 'PREVIEW'),
+			permRequested(2, 'c1', 'edit'),
 			permDecided(3, 'c1', 'Approved'),
 			toolCompleted(4, 1, 'edited f (no change)')
 		]);
 		const t2 = noView.items.find((i) => i.kind === 'tool');
-		expect(t2?.kind === 'tool' && t2.view).toBe('PREVIEW');
+		expect(t2?.kind === 'tool' && t2.view).toBeUndefined();
 	});
 
 	it('a Decided for an unknown call id leaves the pending flag untouched', () => {

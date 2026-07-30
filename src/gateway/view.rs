@@ -71,8 +71,6 @@ pub enum ViewItem {
         approval_pending: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         view: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        preview: Option<String>,
     },
     /// A todo checklist (one card per `init`; later ops mutate it in place).
     Todo { id: u64, steps: Vec<ViewTodoStep> },
@@ -184,8 +182,7 @@ pub fn fold_view(events: &[CoreEvent]) -> SessionView {
     let mut tools_by_call_id: HashMap<String, usize> = HashMap::new();
     // call id → the Requested event's data, for an ask that arrived before
     // its ToolCall block (out-of-order delivery): the late block backfills.
-    let mut pending_asks: HashMap<String, (u64, String, serde_json::Value, Option<String>)> =
-        HashMap::new();
+    let mut pending_asks: HashMap<String, (u64, String, serde_json::Value)> = HashMap::new();
     let mut last_seq: Option<u64> = None;
     let mut turn_running = false;
     // Insertion order is preserved so the client's divergence display is
@@ -335,38 +332,36 @@ fn fold_tool(
     }
 }
 
-/// Fold a permission gate event: a `Requested` attaches its prompt (and the
-/// would-be diff preview) to the gated call's card — or, if the `ToolCall`
-/// block hasn't folded yet (out-of-order delivery), is remembered for the
-/// late block to backfill. `Decided` disarms the prompt.
+/// Fold a permission gate event: a `Requested` marks the gated call's card as
+/// awaiting a decision — or, if the `ToolCall` block hasn't folded yet
+/// (out-of-order delivery), is remembered for the late block to backfill.
+/// `Decided` disarms the prompt. The card's live view (stage 2 of the
+/// streaming pipeline) shows what the call will change; the gate itself
+/// carries no view (`doc/tool-streaming.md`).
 fn fold_permission(
     seq: u64,
     p: &PermissionEvent,
     items: &mut [ViewItem],
     tools_by_call_id: &HashMap<String, usize>,
-    pending_asks: &mut HashMap<String, (u64, String, serde_json::Value, Option<String>)>,
+    pending_asks: &mut HashMap<String, (u64, String, serde_json::Value)>,
 ) {
     match p {
         PermissionEvent::Requested {
             call_id,
             tool_name,
             input,
-            preview,
         } => {
             if let Some(&idx) = tools_by_call_id.get(call_id) {
                 if let ViewItem::Tool {
-                    approval_pending,
-                    preview: slot,
-                    ..
+                    approval_pending, ..
                 } = &mut items[idx]
                 {
                     *approval_pending = true;
-                    slot.clone_from(preview);
                 }
             } else {
                 pending_asks.insert(
                     call_id.clone(),
-                    (seq, tool_name.clone(), input.clone(), preview.clone()),
+                    (seq, tool_name.clone(), input.clone()),
                 );
             }
         }
@@ -435,7 +430,7 @@ fn fold_block(
     items: &mut Vec<ViewItem>,
     tools_by_seq: &mut HashMap<u64, ToolCard>,
     tools_by_call_id: &mut HashMap<String, usize>,
-    pending_asks: &mut HashMap<String, (u64, String, serde_json::Value, Option<String>)>,
+    pending_asks: &mut HashMap<String, (u64, String, serde_json::Value)>,
 ) {
     match content {
         BlockContent::Text { text } => {
@@ -464,9 +459,7 @@ fn fold_block(
                 fold_todo_op(seq, arguments, items);
                 return;
             }
-            let (approval_pending, preview) = pending_asks
-                .remove(id)
-                .map_or((false, None), |(_, _, _, p)| (true, p));
+            let approval_pending = pending_asks.remove(id).is_some();
             let item_index = items.len();
             items.push(ViewItem::Tool {
                 id: seq,
@@ -481,7 +474,6 @@ fn fold_block(
                 call_id: Some(id.clone()),
                 approval_pending,
                 view: None,
-                preview,
             });
             tools_by_seq.insert(seq, ToolCard { item_index });
             tools_by_call_id.insert(id.clone(), item_index);
@@ -492,8 +484,7 @@ fn fold_block(
 /// Apply a settled outcome to a tool card: status + the result/diagnostics/
 /// view split, mirroring the web fold's `pairResult` exactly — `TextView`
 /// (audience "ui") becomes `view`; `Text` blocks join into the result; the
-/// built-in file tools split trailing `Text` off as LSP diagnostics; a
-/// missing view keeps the approval preview.
+/// built-in file tools split trailing `Text` off as LSP diagnostics.
 fn apply_tool_outcome(
     items: &mut [ViewItem],
     item_index: usize,
@@ -507,7 +498,6 @@ fn apply_tool_outcome(
         result,
         diagnostics,
         view,
-        preview,
         error_code: ec,
         ..
     }) = items.get_mut(item_index)
@@ -536,7 +526,7 @@ fn apply_tool_outcome(
     *s = status;
     *result = Some(text);
     *diagnostics = diag;
-    *view = ui_view.or_else(|| preview.clone());
+    *view = ui_view;
     *ec = error_code;
 }
 
@@ -816,7 +806,6 @@ mod tests {
                     call_id: "c1".into(),
                     tool_name: "write".into(),
                     input: serde_json::json!({"path":"x.txt"}),
-                    preview: Some("DIFF".into()),
                 }),
             ),
             block(2, tool_call("c1", "write", "{\"path\":\"x.txt\"}")),
@@ -839,8 +828,6 @@ mod tests {
         );
         let ViewItem::Tool {
             approval_pending,
-            preview,
-            view,
             status,
             ..
         } = &view.items[0]
@@ -848,13 +835,7 @@ mod tests {
             panic!("tool card")
         };
         assert!(!approval_pending, "the Decided cleared it");
-        assert_eq!(
-            view.as_deref(),
-            Some("DIFF"),
-            "no executed view → the preview stays"
-        );
         assert_eq!(*status, ViewToolStatus::Done);
-        let _ = preview;
     }
 
     /// A turn ending mid-ask disarms the zombie prompt (its Decided can never
@@ -869,7 +850,6 @@ mod tests {
                     call_id: "c1".into(),
                     tool_name: "shell".into(),
                     input: serde_json::json!({}),
-                    preview: None,
                 }),
             ),
             ev(

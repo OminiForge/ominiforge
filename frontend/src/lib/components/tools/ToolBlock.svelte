@@ -102,7 +102,7 @@
 				status={item.status}
 				error_code={item.error_code}
 				view={item.view}
-				preview={item.approvalPending ? item.preview : undefined}
+				pending={item.approvalPending === true}
 			/>
 			{#if item.status === 'running' && !awaiting}
 				<div class="running-indicator">

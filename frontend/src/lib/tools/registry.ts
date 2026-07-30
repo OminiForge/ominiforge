@@ -26,14 +26,15 @@ export interface ResultProps {
 	/** The backend's UI-only rendering of this call's result (`Content::TextView`,
 	 *  `doc/tool-view.md`): the precise diff for `edit`/`write`, or the full
 	 *  content for a `write` new file. The front-end renders it verbatim — it
-	 *  never rebuilds diffs client-side. `undefined` while running (no view yet)
-	 *  and for tools that produce none. */
+	 *  never rebuilds diffs client-side. While running it is the stage-2
+	 *  streaming snapshot (for tools with a presenter, currently `write`),
+	 *  flushed complete at BlockStop; `undefined` for tools that produce none. */
 	view?: string;
-	/** The approval-gate preview (`Permission::Requested.preview`): the would-be
-	 *  diff/content for `edit`/`write`, shown while the call awaits a human
-	 *  decision. Same shape as `view`; the executed `view` replaces it. Only set
-	 *  while `approvalPending`. */
-	preview?: string;
+	/** True while the call awaits a permission decision: the body badge reads
+	 *  "awaiting approval". The card's `view` (already flushed complete at
+	 *  BlockStop for a streaming tool) shows what the call will change — the
+	 *  gate itself carries no view (`doc/tool-streaming.md`). */
+	pending?: boolean;
 }
 
 const REGISTRY: Record<string, Component<ResultProps>> = {
