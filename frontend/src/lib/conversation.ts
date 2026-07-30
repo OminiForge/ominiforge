@@ -126,7 +126,8 @@ export interface ConversationState {
 	lastSeq?: number;
 	lastSettle?: string | null;
 	/** block index → items position, current request streaming. Only used for tool_call tracking;
-	 *  text/reasoning use temporal (append-at-end) ordering to match TUI behavior. */
+	 *  text/reasoning use temporal (append-at-end) ordering to match the user's
+	 *  expected reading order. */
 	open: Record<number, number>;
 	/** Position in items[] where current request's blocks start (set on RequestStarted).
 	 *  Used once by commitBlock to truncate streaming previews, then stays defined
@@ -1071,10 +1072,10 @@ function pairResult(
 
 /// Fold one live streaming delta into the conversation state.
 ///
-/// Text and reasoning blocks use **temporal (append-at-end) ordering** to match
-/// the TUI: when the model opens a text block at index 0 but fills it after a
-/// reasoning block at index 1, the text content still appears after reasoning —
-/// matching the user's expected reading order.
+/// Text and reasoning blocks use **temporal (append-at-end) ordering**: when
+/// the model opens a text block at index 0 but fills it after a reasoning
+/// block at index 1, the text content still appears after reasoning — matching
+/// the user's expected reading order.
 ///
 /// Tool-call blocks keep index-based tracking (via `open`) because tool argument
 /// deltas must be matched to the correct tool call.

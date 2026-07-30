@@ -167,8 +167,8 @@
 	let summary = $state<SessionSummary | null>(null);
 	// Live context-window occupancy, from the per-round `context_updated` event.
 	// `tokens` is the running estimate; `window` the model's full context window
-	// (0 = unknown); `threshold` the compaction fraction (drawn as a gauge tick,
-	// mirroring the TUI — the gauge is tokens/window, NOT tokens/effective_limit).
+	// (0 = unknown); `threshold` the compaction fraction (drawn as a gauge tick —
+	// the gauge is tokens/window, NOT tokens/effective_limit).
 	// Reset on session switch.
 	let context = $state<{ tokens: number; window: number; threshold: number } | null>(null);
 	// Debounce handle for per-request STATS refresh (Q2): a long turn fires many
@@ -505,17 +505,17 @@
 
 	/** One rendered line of inherited context: the parent conversation a branched
 	 *  session carries, flattened from the snapshot's `Message[]` into the few
-	 *  kinds we display (system prompt is identity, not conversation, so skipped —
-	 *  mirroring the TUI's seed_history). Tool results are folded onto their call. */
+	 *  kinds we display (system prompt is identity, not conversation, so skipped).
+	 *  Tool results are folded onto their call. */
 	type InheritedItem =
 		| { kind: 'user'; text: string }
 		| { kind: 'text'; text: string }
 		| { kind: 'tool'; name: string; args: string; result?: string };
 
-	/** Map a snapshot `Message[]` into `InheritedItem[]` for dimmed display.
-	 *  Mirrors `src/tui/mod.rs` seed_history: System is dropped; Assistant text and
-	 *  each tool call become items; a Tool result attaches to the most recent tool
-	 *  item (by call id) so it renders under the call that produced it. */
+	/** Map a snapshot `Message[]` into `InheritedItem[]` for dimmed display:
+	 *  System is dropped; Assistant text and each tool call become items; a Tool
+	 *  result attaches to the most recent tool item (by call id) so it renders
+	 *  under the call that produced it. */
 	function mapInherited(messages: Message[]): InheritedItem[] {
 		const items: InheritedItem[] = [];
 		// call id → tool item, so a later Tool message finds the call it answers.
@@ -2416,7 +2416,7 @@
 										title={`${context.tokens.toLocaleString()} / ${context.window.toLocaleString()} tokens · compaction at ${(context.threshold * 100).toFixed(0)}%`}
 									>
 										<span class="ctx-fill" class:warn={overThreshold} style="width: {pct}%"></span>
-										<!-- compaction-threshold tick, mirroring the TUI gauge marker -->
+										<!-- compaction-threshold tick -->
 										<span class="ctx-tick" style="left: {context.threshold * 100}%"></span>
 									</div>
 									<span class="ctx-pct" class:warn={overThreshold}>{pct.toFixed(0)}%</span>
@@ -2784,7 +2784,7 @@
 	.ctx-fill.warn {
 		background: var(--state-error-text);
 	}
-	/* Compaction-threshold marker (TUI gauge tick equivalent). */
+	/* Compaction-threshold marker. */
 	.ctx-tick {
 		position: absolute;
 		top: 0;
@@ -3174,7 +3174,7 @@
 	}
 
 	/* Separator marking the branch point: a hairline rule with a centered mono
-	   label, echoing the TUI's "resumed; continue below" divider. */
+	   label ("resumed; continue below"). */
 	.inherited-sep {
 		display: flex;
 		align-items: center;

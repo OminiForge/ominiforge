@@ -1266,7 +1266,7 @@ describe('tool view fold', () => {
 						result: {
 							content: [
 								{ Text: 'edited a.txt (1 replacement)' },
-								{ TextView: { text: 'tui-only', audience: 'tui' } }
+								{ TextView: { text: 'not-for-ui', audience: 'unknown' } }
 							],
 							is_error: false,
 							error_code: null

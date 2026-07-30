@@ -52,23 +52,28 @@
 直接更新卡片的 `view`，阶段三到达时 settled view 覆盖它——一条渲染路径，无缝衔接。
 工具没有 presenter 时前端零改动（骨架 → settled view）。
 
-## 3. 后端骨架（已落地）
+## 3. 后端管线
 
 ```
 provider ──StreamEvent──▶ collector ──▶ StreamSink ──▶ GatewayEvent::Delta ──SSE──▶ 前端
                               │             │
-              累积 args（已有）│             │ on_tool_call_progress(index, view)
+              累积 args ──────┤   on_tool_call_progress(index, view)
                               ▼             ▼
-                    [未来] StreamPresenter.render(累积args) ──▶ Delta::ToolProgress
+                    StreamPresenter.render(累积args) ──▶ Delta::ToolProgress
+                    （args 流式：write/edit）
+
+工具执行（spawn 链）──exec_streaming──▶ progress channel ──▶ sink
+                    （result 流式：shell 输出，§4.1）
 ```
 
-- `StreamSink::on_tool_call_progress(index, view)`：新增回调，**默认 no-op**。注释标明
-  「NOT YET PRODUCED」——协议就位，尚无 presenter 调用它，流式行为与之前完全一致。
-- `Delta::ToolProgress { index, view }`：新增 SSE 事件，`ts-rs` 已导出到前端。
+- `StreamSink::on_tool_call_progress(index, view)`：统一的 live 快照回调，两种来源——
+  args 流式（`StreamPresenter`，执行前，`write`/`edit`）与 result 流式（`shell` 输出，
+  执行中，经 progress channel，§4.1）。`view` 都是与阶段三同构的 TextView 信封。
+- `Delta::ToolProgress { index, view }`：SSE 事件，`ts-rs` 导出到前端。
 - `BroadcastSink::on_tool_call_progress`：把快照广播出去。
 
-骨架期刻意不触碰的 `on_tool_call_delta` / `Delta::ToolArgs`（原始 args 透传 + 前端裸显）
-已在 **Phase 6 删除**（见 §5.1）——live 通道只载 render-ready 的 view 快照，完整 args 随
+骨架期的 `on_tool_call_delta` / `Delta::ToolArgs`（原始 args 透传 + 前端裸显）已在
+**Phase 6 删除**——live 通道只载 render-ready 的 view 快照，完整 args 随
 阶段三的 ContentBlock 进 debug 折层。
 
 ## 4. `StreamPresenter` 与 `stream_args`（Phase 2 已落地）
@@ -149,47 +154,15 @@ pub trait StreamPresenter: Send {
 | **4** | **edit presenter（累积渲染）**：entry 闭合即对原文件定位并按 abs_path 分组累积 splices，活跃 entry 随 new 生长；`A B A` 合并为一组；累积收敛 ≡ 阶段三 `plan_view`。 | ✅ 本次 |
 | **5** | **shell 输出流式**：结果流式（非 args 流式）。终端模型渲染「当前屏幕」快照（面板命令原地刷新）；progress channel 复用 verdict_tx 模式；仅并发派发路径生效。 | ✅ 本次 |
 | **6** | **删除 `Delta::ToolArgs` / `on_tool_call_delta`**：移除原始 args 透传与前端裸显路径，args 改由阶段三 debug 折层一次性给出。 | ✅ 本次 |
-| **7** | **通用兜底 + 收尾**：MCP/未知工具的字段级进度；read/find 确认无需流式；TUI 对齐。 | 待做 |
+| **7** | **收尾**：read/find 确认无需流式；MCP/未知工具维持默认无流式（渲染形态未知，不做字段级兜底——那是被 Phase 6 删除的裸显 args 的变体）；清理骨架期注释与 TUI 残余。 | ✅ 本次 |
 
 每个 Phase 独立可合、可回滚；Phase 2 落地前框架本身不引入任何行为变化。
 
-### 5.1 冗余删除清单（Phase 6/7 收尾时照勾，不靠记忆）
-
-骨架与后续 Phase 会留下一批「过渡期代码」，全部完成后**必须**删除。以下为完整清单，
-收尾 session 逐项核实后勾掉；任何一项的删除前提都标注在括号里。
-
-**后端（Phase 6，已删）**
-
-- [x] `StreamSink::on_tool_call_delta`（`src/agent/sink.rs`）
-- [x] `Delta::ToolArgs` 变体（`src/gateway/actor.rs`，已重跑 ts-export）
-- [x] `BroadcastSink::on_tool_call_delta`（`src/gateway/actor.rs`）
-- [x] collector 里 `sink.on_tool_call_delta(...)` 调用点——`arguments.push_str` 累积**保留**
-      （presenter + 持久化的输入），只删了转发那一行
-- [x] `RecordingSink.tool_args` 测试字段及相关断言
-
-**前端（Phase 6，已删）**
-
-- [x] `applyDelta` 的 `case 'tool_args'` 分支（`frontend/src/lib/conversation.ts`）
-- [x] `tool` item 的流式 args 拼接（`seq=-1` 占位卡片的 `args` 累积）——阶段三 commit 用
-      完整 args 填 debug 折层；相关 `tool_args` 测试已删
-
-**核实后保留（非 tool_args 专属，仍在用）**
-
-- [x] `open` map 的 tool_call index 追踪——block_start 建骨架占位、tool_progress 更新 view、
-      commitBlock 替换，**仍在用，保留**
-- [x] `commitBlock` 的 tool 占位替换（`seq=-1` 骨架 → 完整卡片）——服务「骨架占位 → 定稿」，
-      非 tool_args 流式专属，**仍在用，保留**
-
-**Phase 7 收尾**
-
-- [ ] 骨架期注释的「NOT YET PRODUCED / skeleton only / inert until phase 2」字样全部
-      摘除（`sink.rs` / `actor.rs` / `conversation.ts`），文档 §3 的「尚无 presenter」
-      表述更新为现状
-- [ ] 本清单勾完后，删除本小节（§5.1）
-
-> 注：旧前端 diff-builder 方案（`tool-view.md` §1）的既存死代码 `parseReadResult` /
-> `cacheWriteArgs` / `splitFileLines` / `writePrevLinesFor` 已于骨架期独立清理（与本
-> 重构无关的顺手清理，故不列入上方清单）。
+**MCP/未知工具的流式决策**：不做通用兜底。其渲染形态未知——`stream_presenter` 默认 `None`
+（骨架卡片 → 阶段三 result + summary）就是正确行为。所谓「字段级进度」（逐字段推 `key: 摘要`）
+本质是 Phase 6 刚删除的「裸显 args」的变体，与「渲染有意义的 view」的方向相悖。若未来出现
+「某 MCP 工具 args 巨大、流式有明确价值」的具体案例，再为它单独设计（那时有真实 schema 与
+需求）。`read`/`find` 的 args 极小（`{path,range?}`/`{pattern}`），瞬间完整，同样无需流式。
 
 ## 6. 不变量
 
