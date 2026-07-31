@@ -554,18 +554,19 @@ impl SessionActor {
     /// that drop has happened before we reopen. `None` means reopen failed and
     /// the actor stops.
     ///
-    /// Before rebuilding, persist a `TurnEvent::Interrupted` for the open turn.
-    /// The abort tears the writer down without recording why the turn stopped, so
+    /// Before rebuilding, reconcile the open turn (backfill dangling tool calls,
+    /// persist the `Interrupted` terminator — see [`reconcile_open_turn`]). The
+    /// abort tears the writer down without recording why the turn stopped, so
     /// the log would otherwise end on a dangling `Turn::Started` — and a client
     /// replaying that history (no live `TurnSettled` on reconnect) can't tell the
     /// turn ended, leaving a turn-running UI (e.g. a stale Cancel button) stuck on.
     /// Writing the committed terminator makes the stop durable. Reopening to append
     /// is safe: the aborted task already released the lock.
     ///
-    /// One `store.open` serves the backfill, the terminator, AND the resumed
-    /// session: every open is another fd on the same events.jsonl (in-process
-    /// flock never excludes itself), so a gateway that cancels often would
-    /// otherwise leak descriptors toward EMFILE.
+    /// One `store.open` serves the reconciliation AND the resumed session: every
+    /// open is another fd on the same events.jsonl (in-process flock never
+    /// excludes itself), so a gateway that cancels often would otherwise leak
+    /// descriptors toward EMFILE.
     async fn cancel_turn(&self, handle: JoinHandle<TurnResult>) -> Option<Session> {
         self.clear_pending();
         handle.abort();
@@ -577,144 +578,24 @@ impl SessionActor {
         // it left dangling (the abort can win the race against the fail-closed
         // gate writing `denied_no_approval`) *before* the terminator, so the
         // Interrupted event stays the log's tail. A failed open is best-effort:
-        // skip the backfill and let `reopen_after_abort` surface the error.
+        // skip the reconciliation and let `reopen_after_abort` surface the error.
         let Ok(writer) = self.store.open(&self.session_id) else {
             self.publish_status(ActivityStatus::Idle);
             return self.reopen_after_abort();
         };
         let mut writer = writer.with_bus(self.bus.clone());
-        if let Some(last_seq) = self.record_cancelled_tool_calls(&mut writer) {
-            self.record_interrupted(&mut writer, last_seq);
+        if let Some(seq) =
+            reconcile_open_turn(&mut writer, &self.session_id, ReconcileCause::Cancelled)
+        {
+            // Advance the cached tail synchronously, so the `Idle` status
+            // published right after carries the terminator's seq without
+            // waiting on the async forwarder to catch up.
+            self.latest_seq.fetch_max(seq, Ordering::Relaxed);
         }
         // The turn is over. Publish after the terminator so the status'
         // `latest_seq` includes it.
         self.publish_status(ActivityStatus::Idle);
         Some(self.resume_with(writer))
-    }
-
-    /// Backfill a `ToolEvent::Failed { code: "cancelled" }` for every tool call
-    /// of the open turn that has no `Completed`/`Failed` pairing.
-    ///
-    /// The abort in [`cancel_turn`](Self::cancel_turn) can kill the turn task
-    /// mid-dispatch — parked on an `ask`, or inside `tool.invoke` — before the
-    /// fail-closed path writes its failure event. Without a result event the
-    /// assistant's `tool_call` dangles in the log, and the next turn's provider
-    /// request fails the pairing check (`tool_call_ids did not have response
-    /// messages`). The task is already dead when this runs, so the scan races
-    /// nothing; a call the task did settle (the gate won the race) is in the
-    /// settled set and skipped. Best-effort like [`record_interrupted`]: a
-    /// reopen/append failure leaves the pre-existing behavior, and
-    /// `rebuild_runtime` synthesizes the missing result on read either way.
-    ///
-    /// Both writers share one `store.open` (one fd — see `cancel_turn`); the
-    /// terminator's seq lands in `latest_seq` for the `Idle` status that
-    /// follows.
-    fn record_cancelled_tool_calls(&self, writer: &mut SessionWriter) -> Option<u64> {
-        let events = self.store.read_events(&self.session_id).unwrap_or_default();
-        let Some(turn_id) = open_turn_id(&events) else {
-            return None; // no open turn — nothing can be dangling
-        };
-        // The universe is the open turn's tool-call content blocks (block seq →
-        // tool name); a call is settled when any `Completed`/`Failed` points at
-        // its block's seq. Restricting to the open turn keeps an older, cleanly
-        // settled turn's calls untouched.
-        let mut calls: Vec<(u64, String)> = Vec::new();
-        let mut settled: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        for event in &events {
-            if event.turn_id.as_ref() != Some(&turn_id) {
-                continue;
-            }
-            match &event.payload {
-                EventPayload::Model(ModelEvent::ContentBlock {
-                    content: BlockContent::ToolCall { name, .. },
-                    ..
-                }) => calls.push((event.seq, name.clone())),
-                EventPayload::Tool(
-                    ToolEvent::Completed {
-                        tool_call_event_id, ..
-                    }
-                    | ToolEvent::Failed {
-                        tool_call_event_id, ..
-                    },
-                ) => {
-                    settled.insert(tool_call_event_id.seq);
-                }
-                _ => {}
-            }
-        }
-        let dangling: Vec<(u64, String)> = calls
-            .into_iter()
-            .filter(|(seq, _)| !settled.contains(seq))
-            .collect();
-        let mut last_seq = None;
-        for (seq, tool_name) in dangling {
-            let call_event = EventId {
-                session_id: self.session_id.clone(),
-                seq,
-            };
-            last_seq = writer
-                .append(
-                    EventSource {
-                        kind: SourceKind::Tool,
-                        id: tool_name,
-                    },
-                    EventPayload::Tool(ToolEvent::Failed {
-                        tool_call_event_id: call_event.clone(),
-                        duration_ms: 0,
-                        error: ErrorDetail {
-                            code: "cancelled".to_owned(),
-                            message: "turn cancelled by user".to_owned(),
-                            severity: ErrorSeverity::Error,
-                            retryable: false,
-                            source_event_id: Some(call_event.clone()),
-                            provider_raw: None,
-                        },
-                    }),
-                    Some(call_event),
-                    Some(turn_id.clone()),
-                )
-                .ok();
-        }
-        Some(last_seq.unwrap_or_else(|| writer.next_seq().saturating_sub(1)))
-    }
-
-    /// Append a committed `TurnEvent::Interrupted` for the turn left open by an
-    /// abort. `last_seq` is the seq the terminator points at (the last cancelled
-    /// tool call, or the log's tail when nothing dangled).
-    ///
-    /// This makes the stop durable: history replay carries a turn terminator, so
-    /// a reconnecting client (which never re-sees the live `TurnSettled`) can tell
-    /// the turn ended. Best-effort — if the open turn can't be found or the write
-    /// fails, the session still reopens from the log; the worst case is the
-    /// pre-existing dangling-turn behavior, not a crash. The append publishes on
-    /// the bus, so live clients also receive the terminator (the forwarder turns
-    /// it into an outbound committed `Event`).
-    fn record_interrupted(&self, writer: &mut SessionWriter, last_seq: u64) {
-        let events = self.store.read_events(&self.session_id).unwrap_or_default();
-        let Some(turn_id) = open_turn_id(&events) else {
-            return; // no turn open (already terminated) — nothing to record
-        };
-        let interrupted_at = EventId {
-            session_id: self.session_id.clone(),
-            seq: last_seq,
-        };
-        if let Ok(seq) = writer.append(
-            EventSource {
-                kind: SourceKind::Runtime,
-                id: "ominiforge".to_owned(),
-            },
-            EventPayload::Turn(TurnEvent::Interrupted {
-                turn_id: turn_id.clone(),
-                interrupted_at_event_id: interrupted_at,
-            }),
-            None,
-            Some(turn_id),
-        ) {
-            // Advance the cached tail synchronously, so the `Idle` status that
-            // `cancel_turn` publishes right after carries this terminator's seq
-            // without waiting on the async forwarder to catch up.
-            self.latest_seq.fetch_max(seq, Ordering::Relaxed);
-        }
     }
 
     /// Reopen the current session and rebuild its runtime from the event log,
@@ -834,6 +715,145 @@ fn spawn_event_forwarder(
             }
         }
     });
+}
+
+/// Why an open turn is being reconciled. Only the failure semantics differ.
+#[derive(Debug, Clone, Copy)]
+pub enum ReconcileCause {
+    /// The user cancelled the turn (`Command::Cancel`).
+    Cancelled,
+    /// The gateway process stopped mid-turn (kill/crash) and a later spawn
+    /// found the log ending on an open turn (`SessionRegistry::get_or_spawn`).
+    Interrupted,
+}
+
+/// Close out a turn the log leaves open: backfill a `ToolEvent::Failed` for
+/// every tool call of that turn with no `Completed`/`Failed` pairing, then
+/// append the `TurnEvent::Interrupted` terminator.
+///
+/// Two callers, one invariant — **the log must never end on a turn that is not
+/// actually running**:
+/// - [`SessionActor::cancel_turn`]: the abort can kill the turn task
+///   mid-dispatch (parked on an `ask`, or inside `tool.invoke`) before the
+///   fail-closed path writes its failure event. The task is already dead when
+///   this runs, so the scan races nothing; a call the task did settle (the
+///   gate won the race) is in the settled set and skipped.
+/// - `SessionRegistry::get_or_spawn`: a gateway killed mid-turn leaves exactly
+///   the same dangling log. Without reconciliation the fold renders those
+///   calls `running` forever and `turn_running` stays true — the client then
+///   queues sends instead of posting them, waiting on a settle that can never
+///   come (the turn died with the process), so the session is unrecoverable
+///   from the UI.
+///
+/// Without a result event the assistant's `tool_call` would also dangle for
+/// the next turn's provider request — the pairing check (`tool_call_ids did
+/// not have response messages`) fails with a 400. `rebuild_runtime`
+/// synthesizes a `[cancelled]` result on read as a second layer of defense,
+/// but writing the failure event keeps the log itself well-formed.
+///
+/// The terminator makes the stop durable: history replay carries a turn
+/// terminator, so a reconnecting client (which never re-sees the live
+/// `TurnSettled`) can tell the turn ended. The appends publish on the writer's
+/// bus (if attached), so live clients receive them as committed `Event`s.
+///
+/// Returns the terminator's seq (or the seq it points at when nothing
+/// dangled), `None` when no turn is open. Best-effort: append failures skip
+/// the remaining writes — the read-time synthesis still keeps the session
+/// usable, which is the pre-existing dangling-turn behavior, not a crash.
+pub fn reconcile_open_turn(
+    writer: &mut SessionWriter,
+    session_id: &SessionId,
+    cause: ReconcileCause,
+) -> Option<u64> {
+    let events = writer.events();
+    let turn_id = open_turn_id(events)?;
+    // The universe is the open turn's tool-call content blocks (block seq →
+    // tool name); a call is settled when any `Completed`/`Failed` points at
+    // its block's seq. Restricting to the open turn keeps an older, cleanly
+    // settled turn's calls untouched.
+    let mut calls: Vec<(u64, String)> = Vec::new();
+    let mut settled: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for event in events {
+        if event.turn_id.as_ref() != Some(&turn_id) {
+            continue;
+        }
+        match &event.payload {
+            EventPayload::Model(ModelEvent::ContentBlock {
+                content: BlockContent::ToolCall { name, .. },
+                ..
+            }) => calls.push((event.seq, name.clone())),
+            EventPayload::Tool(
+                ToolEvent::Completed {
+                    tool_call_event_id, ..
+                }
+                | ToolEvent::Failed {
+                    tool_call_event_id, ..
+                },
+            ) => {
+                settled.insert(tool_call_event_id.seq);
+            }
+            _ => {}
+        }
+    }
+    let (code, message) = match cause {
+        ReconcileCause::Cancelled => ("cancelled", "turn cancelled by user"),
+        ReconcileCause::Interrupted => (
+            "interrupted",
+            "the gateway stopped while this call was running",
+        ),
+    };
+    let mut last_seq = None;
+    for (seq, tool_name) in calls.into_iter().filter(|(seq, _)| !settled.contains(seq)) {
+        let call_event = EventId {
+            session_id: session_id.clone(),
+            seq,
+        };
+        last_seq = writer
+            .append(
+                EventSource {
+                    kind: SourceKind::Tool,
+                    id: tool_name,
+                },
+                EventPayload::Tool(ToolEvent::Failed {
+                    tool_call_event_id: call_event.clone(),
+                    duration_ms: 0,
+                    error: ErrorDetail {
+                        code: code.to_owned(),
+                        message: message.to_owned(),
+                        severity: ErrorSeverity::Error,
+                        retryable: false,
+                        source_event_id: Some(call_event.clone()),
+                        provider_raw: None,
+                    },
+                }),
+                Some(call_event),
+                Some(turn_id.clone()),
+            )
+            .ok();
+    }
+    // The terminator points at the last backfilled failure, or the log's tail
+    // when nothing dangled. A failed append leaves `last_seq` at its previous
+    // value, so the pointer still targets an event that exists.
+    let last_seq = last_seq.unwrap_or_else(|| writer.next_seq().saturating_sub(1));
+    let interrupted_at = EventId {
+        session_id: session_id.clone(),
+        seq: last_seq,
+    };
+    let terminator = writer
+        .append(
+            EventSource {
+                kind: SourceKind::Runtime,
+                id: "ominiforge".to_owned(),
+            },
+            EventPayload::Turn(TurnEvent::Interrupted {
+                turn_id: turn_id.clone(),
+                interrupted_at_event_id: interrupted_at,
+            }),
+            None,
+            Some(turn_id),
+        )
+        .ok();
+    Some(terminator.unwrap_or(last_seq))
 }
 
 /// The turn id left open at the tail of the log, if any. Turns never overlap, so
@@ -1717,6 +1737,189 @@ mod tests {
             usage: Usage::default(),
         });
         events
+    }
+
+    // ── Crash reconciliation (`reconcile_open_turn`) ───────────────────────
+
+    /// Commit one event to `writer` (test helper for building dangling logs).
+    /// `turn` mirrors the live loop: every event of a turn carries the turn id
+    /// in its envelope (reconciliation scopes its scan by it).
+    fn commit(
+        writer: &mut SessionWriter,
+        source: EventSource,
+        payload: EventPayload,
+        turn: Option<&str>,
+    ) {
+        writer
+            .append(source, payload, None, turn.map(|t| TurnId(t.to_owned())))
+            .unwrap();
+    }
+
+    fn rt_source() -> EventSource {
+        EventSource {
+            kind: SourceKind::Runtime,
+            id: "ominiforge".to_owned(),
+        }
+    }
+
+    fn model_block(name: &str) -> EventPayload {
+        EventPayload::Model(ModelEvent::ContentBlock {
+            request_id: "r".to_owned(),
+            index: 0,
+            content: BlockContent::ToolCall {
+                id: "call-1".to_owned(),
+                name: name.to_owned(),
+                arguments: "{}".to_owned(),
+                summary: None,
+            },
+        })
+    }
+
+    fn turn_started(id: &str) -> EventPayload {
+        EventPayload::Turn(TurnEvent::Started {
+            turn_id: TurnId(id.to_owned()),
+            input: Some("go".to_owned()),
+        })
+    }
+
+    /// A gateway killed mid-turn leaves the log ending on an open turn whose
+    /// tool call never settled. Reconciliation must backfill an `interrupted`
+    /// failure (distinct from a user `cancelled` one — the post-mortem matters)
+    /// and terminate the turn, so the view fold stops rendering the call — and
+    /// the turn — as `running`, unblocking the client (which queues sends while
+    /// `turn_running`).
+    #[test]
+    fn reconcile_interrupted_backfills_and_terminates() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let mut writer = store.create_new(None, None, vec![]).unwrap();
+        let sid = writer.session_id().clone();
+        commit(&mut writer, rt_source(), turn_started("t1"), Some("t1"));
+        commit(
+            &mut writer,
+            EventSource {
+                kind: SourceKind::Model,
+                id: "test/m".to_owned(),
+            },
+            model_block("shell"),
+            Some("t1"),
+        );
+        // ← the gateway dies here: no Completed/Failed, no turn terminator.
+
+        reconcile_open_turn(&mut writer, &sid, ReconcileCause::Interrupted);
+
+        let events = writer.events();
+        assert_eq!(open_turn_id(events), None, "the turn must read as closed");
+        assert_eq!(
+            pair_log(events),
+            vec![(
+                "call-1".to_owned(),
+                CallPairing::Failed("interrupted".to_owned())
+            )]
+        );
+        assert!(matches!(
+            events.last().map(|e| &e.payload),
+            Some(EventPayload::Turn(TurnEvent::Interrupted { .. }))
+        ));
+        // The UI contract: the fold the client opens with shows a settled call
+        // and no running turn — a send POSTs instead of queueing forever.
+        let view = crate::gateway::view::fold_view(events);
+        assert!(!view.turn_running);
+        let tool = view
+            .items
+            .iter()
+            .find(|i| matches!(i, crate::gateway::view::ViewItem::Tool { .. }))
+            .expect("the tool call folds into a card");
+        let crate::gateway::view::ViewItem::Tool { status, .. } = tool else {
+            unreachable!()
+        };
+        assert_eq!(*status, crate::gateway::view::ViewToolStatus::Error);
+    }
+
+    /// A cleanly settled session reconciles to nothing: no open turn means no
+    /// writes (an idle eviction respawns on a settled log — the common case —
+    /// and must not append terminators to it).
+    #[test]
+    fn reconcile_is_a_no_op_on_a_settled_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let mut writer = store.create_new(None, None, vec![]).unwrap();
+        let sid = writer.session_id().clone();
+        commit(&mut writer, rt_source(), turn_started("t1"), Some("t1"));
+        commit(
+            &mut writer,
+            rt_source(),
+            EventPayload::Turn(TurnEvent::Completed {
+                turn_id: TurnId("t1".to_owned()),
+            }),
+            Some("t1"),
+        );
+        let len = writer.events().len();
+
+        assert_eq!(
+            reconcile_open_turn(&mut writer, &sid, ReconcileCause::Interrupted),
+            None
+        );
+        assert_eq!(writer.events().len(), len, "nothing may be appended");
+    }
+
+    /// An open turn whose calls all settled still gets the terminator — the
+    /// gateway may have died after the last tool result but before the turn
+    /// completed. Only the terminator lands; no failure is invented for a call
+    /// that already has a result.
+    #[test]
+    fn reconcile_terminates_a_turn_with_no_dangling_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let mut writer = store.create_new(None, None, vec![]).unwrap();
+        let sid = writer.session_id().clone();
+        commit(&mut writer, rt_source(), turn_started("t1"), Some("t1"));
+        commit(
+            &mut writer,
+            EventSource {
+                kind: SourceKind::Model,
+                id: "test/m".to_owned(),
+            },
+            model_block("shell"),
+            Some("t1"),
+        );
+        let call_seq = writer.next_seq() - 1;
+        commit(
+            &mut writer,
+            EventSource {
+                kind: SourceKind::Tool,
+                id: "shell".to_owned(),
+            },
+            EventPayload::Tool(ToolEvent::Completed {
+                tool_call_event_id: EventId {
+                    session_id: sid.clone(),
+                    seq: call_seq,
+                },
+                result: crate::core::payload::ToolOutput {
+                    content: vec![crate::core::payload::Content::Text("ok".to_owned())],
+                    is_error: false,
+                    error_code: None,
+                },
+                duration_ms: 1,
+                output_bytes: 2,
+                artifacts_created: vec![],
+            }),
+            Some("t1"),
+        );
+        // ← the gateway dies after the result committed, before Turn::Completed.
+
+        reconcile_open_turn(&mut writer, &sid, ReconcileCause::Interrupted);
+
+        let events = writer.events();
+        assert_eq!(
+            pair_log(events),
+            vec![("call-1".to_owned(), CallPairing::Completed)],
+            "the settled call stays untouched"
+        );
+        assert!(matches!(
+            events.last().map(|e| &e.payload),
+            Some(EventPayload::Turn(TurnEvent::Interrupted { .. }))
+        ));
     }
 
     /// How one tool-call content block settled in the log — the invariant

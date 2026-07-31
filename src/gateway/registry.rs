@@ -986,16 +986,25 @@ impl SessionRegistry {
 
         // Cold: assemble an isolated agent and open the session (takes the lock).
         let assembled = self.assemble(id).await?;
-        let events = self
-            .store()
-            .read_events(id)
-            .with_context(|| format!("failed to read session `{}`", id.0))?;
-        let writer = self
+        let mut writer = self
             .store()
             .open(id)
             .with_context(|| format!("session `{}` is unavailable (locked or missing)", id.0))?;
+        // A gateway killed mid-turn leaves the log ending on an open turn with
+        // possibly dangling tool calls. Reconcile before resuming — without the
+        // terminator the view fold renders the turn (and its calls) `running`
+        // forever, and a client that trusts `turn_running` queues sends waiting
+        // on a settle that can never come (the turn died with the process), so
+        // the session is unrecoverable from the UI. Headless here (no bus yet):
+        // the writer carries no live subscribers until the actor attaches its
+        // own bus, and SSE replays these events from the log on subscribe.
+        super::actor::reconcile_open_turn(
+            &mut writer,
+            id,
+            super::actor::ReconcileCause::Interrupted,
+        );
         let system = Self::system_seed(&assembled);
-        let runtime = crate::agent::rebuild_runtime(&events, system.clone());
+        let runtime = crate::agent::rebuild_runtime(writer.events(), system.clone());
 
         // Register the (freshly assembled) sandbox so `fork` can reach a resumed
         // session by id. With passthrough this fresh host sandbox is equivalent

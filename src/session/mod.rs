@@ -141,6 +141,7 @@ impl SessionStore {
             session_id,
             log,
             next_seq: 0,
+            events: Vec::new(),
             bus: None,
         };
 
@@ -177,6 +178,7 @@ impl SessionStore {
             session_id: session_id.clone(),
             log,
             next_seq,
+            events,
             bus: None,
         })
     }
@@ -399,6 +401,7 @@ impl SessionStore {
             session_id,
             log,
             next_seq: 0,
+            events: Vec::new(),
             bus: None,
         };
 
@@ -467,6 +470,7 @@ impl SessionStore {
             session_id,
             log,
             next_seq: 0,
+            events: Vec::new(),
             bus: None,
         };
 
@@ -530,6 +534,7 @@ impl SessionStore {
             session_id,
             log,
             next_seq: 0,
+            events: Vec::new(),
             bus: None,
         };
 
@@ -576,6 +581,10 @@ pub struct SessionWriter {
     session_id: SessionId,
     log: EventLog,
     next_seq: u64,
+    /// Committed events, cached at `open` and kept current by `append` —
+    /// readers (crash reconciliation, resume) see the full log through
+    /// [`SessionWriter::events`] without a second read pass over the file.
+    events: Vec<CoreEvent>,
     /// Optional bus to publish each appended event to live subscribers
     /// (monitor, gateway). Set via [`SessionWriter::with_bus`]; `None` is headless.
     bus: Option<EventBus>,
@@ -592,6 +601,14 @@ impl SessionWriter {
     #[must_use]
     pub const fn next_seq(&self) -> u64 {
         self.next_seq
+    }
+
+    /// Every committed event so far, in seq order: the log as read at `open`
+    /// plus everything this writer appended since. Equivalent to a fresh
+    /// `SessionStore::read_events`, but free (no second pass over the file).
+    #[must_use]
+    pub fn events(&self) -> &[CoreEvent] {
+        &self.events
     }
 
     /// Attach an [`EventBus`] so each appended event is also published to live
@@ -631,6 +648,7 @@ impl SessionWriter {
         };
         self.log.append(&event)?;
         self.next_seq += 1;
+        self.events.push(event.clone());
         if let Some(bus) = &self.bus {
             bus.publish(&event);
         }

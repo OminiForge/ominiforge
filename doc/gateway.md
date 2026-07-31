@@ -60,6 +60,14 @@ turn 跑完发 `TurnSettled`；超阈值自动 compaction 并发 `Compacted{new_
 agent（独立 provider + 独立 MCP 子进程），`open` 取锁，从 log 重建 runtime。锁已被占用
 （另一个在跑的 actor）→ `open` 失败 → 查找上报冲突（server 映射为 HTTP 409）。
 
+spawn 前先 **reconcile**：gateway 若在 turn 进行中被 kill，log 尾部停留在一个未终结的
+`Turn::Started`（tool call 可能悬空）。`open` 之后、重建 runtime 之前，为悬空的 tool call
+补写 `Tool::Failed{code:"interrupted"}` 并追加 `Turn::Interrupted` 终结符（与 cancel 路径
+同一套收尾，仅错误文案不同）。没有这一步，view fold 会把这些 call 和整个 turn 渲染为
+`running` 永不结束，客户端因 `turn_running=true` 只排队不发送，session 从 UI 上无法恢复。
+不自动续跑：tool 的执行上下文随进程消失，副作用可能已部分生效，重放比中断更危险——
+恢复语义是「日志闭合 + 用户发下一条消息继续」。
+
 `create`（新 session）/ `fork`（在某 seq 分叉）各自 assemble agent、铸造 session、spawn
 actor。fork 用父 session 截至 `at_seq` 重建的 context 做 snapshot，自包含（父可删，§6.2）。
 
