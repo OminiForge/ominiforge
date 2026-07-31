@@ -247,9 +247,9 @@ const RENDER_CAP: usize = 20;
 ///
 /// Empty input yields an empty string (nothing to append). Positions are
 /// converted from LSP's 0-based line/character to the 1-based `line:col` the
-/// `read` tool and humans use. Over [`RENDER_CAP`], only the first `RENDER_CAP`
+/// file tools and humans use. Over [`RENDER_CAP`], only the first `RENDER_CAP`
 /// are listed; the header still reports the true count and a trailing line
-/// names how many were omitted.
+/// names how many were omitted (with their line spans).
 #[must_use]
 pub fn render_diagnostics(path_label: &str, diagnostics: &[Diagnostic]) -> String {
     if diagnostics.is_empty() {
@@ -259,6 +259,7 @@ pub fn render_diagnostics(path_label: &str, diagnostics: &[Diagnostic]) -> Strin
         "\n[diagnostics: {path_label}] {} issue(s)",
         diagnostics.len()
     );
+    let mut outside: Vec<usize> = Vec::new();
     for d in diagnostics.iter().take(RENDER_CAP) {
         let line = d.range.start.line + 1;
         let col = d.range.start.character + 1;
@@ -267,10 +268,48 @@ pub fn render_diagnostics(path_label: &str, diagnostics: &[Diagnostic]) -> Strin
         let message = d.message.replace('\n', " ");
         let _ = write!(out, "\n  {line}:{col} {severity}: {message}");
     }
-    if diagnostics.len() > RENDER_CAP {
-        let _ = write!(out, "\n  … and {} more", diagnostics.len() - RENDER_CAP);
+    outside.extend(
+        diagnostics
+            .iter()
+            .skip(RENDER_CAP)
+            .map(|d| d.range.start.line as usize + 1),
+    );
+    if !outside.is_empty() {
+        outside.sort_unstable();
+        let _ = write!(
+            out,
+            "\n  … and {} more (lines {})",
+            outside.len(),
+            line_spans(&outside)
+        );
     }
     out
+}
+
+/// Compact sorted 1-based lines into `a-b` spans: `[3,4,5,9]` → `"3-5, 9"`.
+fn line_spans(lines: &[usize]) -> String {
+    let mut spans: Vec<String> = Vec::new();
+    let mut start = lines[0];
+    let mut prev = lines[0];
+    for &l in &lines[1..] {
+        if l == prev + 1 {
+            prev = l;
+            continue;
+        }
+        spans.push(span(start, prev));
+        start = l;
+        prev = l;
+    }
+    spans.push(span(start, prev));
+    spans.join(", ")
+}
+
+fn span(lo: usize, hi: usize) -> String {
+    if lo == hi {
+        lo.to_string()
+    } else {
+        format!("{lo}-{hi}")
+    }
 }
 
 #[cfg(test)]
@@ -371,7 +410,7 @@ mod tests {
         let diags: Vec<Diagnostic> = (0..30).map(one).collect();
         let rendered = render_diagnostics("big.rs", &diags);
         assert!(rendered.contains("[diagnostics: big.rs] 30 issue(s)"));
-        assert!(rendered.contains("… and 10 more"));
+        assert!(rendered.contains("… and 10 more (lines 21-30)"));
         // Exactly RENDER_CAP detail lines rendered (+ header + summary).
         assert_eq!(rendered.matches("warning:").count(), RENDER_CAP);
     }
@@ -575,4 +614,5 @@ while True:
         let out = without.invoke(input()).await.unwrap();
         assert!(!text(&out).contains("[diagnostics:"));
     }
+
 }

@@ -67,7 +67,7 @@ extensions = ["py", "pyi"]
 诊断作为**独立的 `Content` 条目**追加到 `ToolOutput.content`（主结果为 `content[0]`，诊断为其后条目）：
 
 - **给模型**：`src/agent/mod.rs` 的 `render_output` 把整个 `content` 数组扁平化进 tool_result 消息——诊断照常进入模型上下文。
-- **给用户**：前端 `conversation.ts` 的 `pairResult` 把 `content[0]`（主结果）与其后条目（诊断）分开：主结果进 `item.result`（`read` 的文件体、`write`/`edit` 的 diff 基底、fileCache 都只吃它），诊断进 `item.diagnostics`，**只在 `RawArgs` 调试折叠区渲染**，标注「发送给模型」。这样保证：诊断进了模型，但不污染主视图；同时用户能在 debug 区看到发给模型的确切内容（透明性）。
+- **给用户**：前端 `conversation.ts` 的 `pairResult` 把 `content[0]`（主结果）与其后条目（诊断）分开：主结果进 `item.result`（`write`/`edit` 的 diff 基底、fileCache 都只吃它），诊断进 `item.diagnostics`，**只在 `RawArgs` 调试折叠区渲染**，标注「发送给模型」。这样保证：诊断进了模型，但不污染主视图；同时用户能在 debug 区看到发给模型的确切内容（透明性）。
 
 > 前端的逻辑改动只有 `pairResult` 的结果拆分与 `Item.diagnostics` 新字段；`ToolBlock`/`registry`/三个 Result 组件只是把该 props 透传到 `RawArgs`。未动状态机（`DESIGN.md` §7 铁律）。
 
