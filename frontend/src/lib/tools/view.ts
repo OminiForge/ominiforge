@@ -9,11 +9,19 @@ export interface DiffFile {
 	patch: string;
 }
 
-/** A file's full content for syntax highlighting. */
+/** A file's content. Whole-file reads carry raw content (numbered 1..N by
+ *  the renderer); a ranged read carries the WHOLE file plus the resolved
+ *  window (`numbered: true` + `start`/`end`) — the renderer slices to the
+ *  window, gutter numbered by the window's absolute lines. */
 export interface CodeView {
 	kind: 'code';
 	path: string;
 	content: string;
+	/** True when `content` rows are already numbered (`N:line`, absolute). */
+	numbered?: boolean;
+	/** The requested (pre-clamp) 1-based inclusive window, for ranged reads. */
+	start?: number;
+	end?: number;
 }
 
 /** A terminal command + output + exit code. */
@@ -92,7 +100,10 @@ export function parseView(text: string): ToolView | null {
 			return {
 				kind: 'code',
 				path: String(obj.path ?? ''),
-				content: String(obj.content ?? '')
+				content: String(obj.content ?? ''),
+				numbered: obj.numbered === true ? true : undefined,
+				start: typeof obj.start === 'number' ? obj.start : undefined,
+				end: typeof obj.end === 'number' ? obj.end : undefined
 			};
 		case 'terminal':
 			return {

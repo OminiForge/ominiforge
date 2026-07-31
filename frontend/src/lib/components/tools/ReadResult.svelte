@@ -29,7 +29,13 @@
 
 <div class="result">
 	{#if parsed?.kind === 'code'}
-		<CodeView path={parsed.path} code={parsed.content} />
+		<CodeView
+			path={parsed.path}
+			code={parsed.content}
+			numbered={parsed.numbered}
+			start={parsed.start}
+			end={parsed.end}
+		/>
 	{:else if parsed?.kind === 'listing'}
 		<div class="head"><span class="path">{parsed.path}</span></div>
 		<ul class="dir">
