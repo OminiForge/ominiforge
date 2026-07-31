@@ -13,6 +13,7 @@ mod edit_stream;
 mod error;
 mod find;
 mod read;
+mod search;
 mod shell;
 pub mod stream_args;
 mod terminal;
@@ -23,6 +24,7 @@ pub use edit::EditTool;
 pub use error::ToolError;
 pub use find::FindTool;
 pub use read::ReadTool;
+pub use search::SearchTool;
 pub use shell::ShellTool;
 pub use write::WriteTool;
 
@@ -158,6 +160,16 @@ pub fn summarize_by_name(name: &str, input: &serde_json::Value) -> String {
                     .join(", ")
             })
             .unwrap_or_default(),
+        "search" => input
+            .get("patterns")
+            .and_then(|p| p.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default(),
         _ => {
             let s = input.to_string();
             if s.len() > 80 {
@@ -253,6 +265,19 @@ pub fn builtin_catalog() -> Vec<ToolInfo> {
                 label: "通配符".to_owned(),
                 is_path: false,
             }],
+        },
+        ToolInfo {
+            name: "search".to_owned(),
+            label: Some("搜内容".to_owned()),
+            description: Some("按正则搜索工作区内文件的文本内容（遵循 .gitignore，跳过二进制）".to_owned()),
+            fields: vec![
+                ToolField {
+                    key: "patterns".to_owned(),
+                    label: "正则".to_owned(),
+                    is_path: false,
+                },
+                path_field("限定的目录"),
+            ],
         },
         ToolInfo {
             name: "read".to_owned(),
@@ -426,10 +451,11 @@ pub(crate) fn resolve_in_workspace(workspace: &Path, requested: &str) -> Result<
     Ok(normalized)
 }
 
-/// Register the built-in tools (find, read, write, edit, shell), all scoped to
-/// `workspace`.
+/// Register the built-in tools (find, search, read, write, edit, shell), all
+/// scoped to `workspace`.
 pub fn register_builtin(registry: &mut ToolRegistry, workspace: PathBuf) {
     registry.register(Arc::new(FindTool::new(workspace.clone())));
+    registry.register(Arc::new(SearchTool::new(workspace.clone())));
     registry.register(Arc::new(ReadTool::new(workspace.clone())));
     registry.register(Arc::new(WriteTool::new(workspace.clone())));
     registry.register(Arc::new(EditTool::new(workspace.clone())));
@@ -449,7 +475,10 @@ mod tests {
         let mut reg = ToolRegistry::new();
         register_builtin(&mut reg, PathBuf::from("/tmp/ws"));
         let names: Vec<String> = reg.descriptors().into_iter().map(|d| d.name).collect();
-        assert_eq!(names, vec!["edit", "find", "read", "shell", "write"]);
+        assert_eq!(
+            names,
+            vec!["edit", "find", "read", "search", "shell", "write"]
+        );
     }
 
     #[test]

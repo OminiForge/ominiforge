@@ -92,6 +92,12 @@ ts-rs = { version = "12", optional = true, features = [
 ] }
 ignore = "0.4.31"
 globset = "0.4.19"
+# Content search (src/tool/search.rs): ripgrep's own crates, pure Rust — no
+# external grep/rg binary, so behavior is identical on every platform (Windows
+# included). Same ecosystem as `ignore` (already used by `find`); the searcher
+# gives us binary-file detection and line-oriented matching for free.
+grep-regex = "0.1"
+grep-searcher = "0.1"
 
 [features]
 # No default features: the gateway is always compiled in (see the axum entry
