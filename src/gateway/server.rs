@@ -36,7 +36,7 @@ use tokio_stream::wrappers::BroadcastStream;
 
 use crate::config::ConfigError;
 use crate::core::SessionId;
-use crate::monitor::{self, PricingTable};
+use crate::monitor;
 use crate::session::SessionMeta;
 
 use super::actor::{Command, GatewayEvent};
@@ -52,9 +52,6 @@ struct AppState {
     registry: SessionRegistry,
     /// Resolved bearer token; `None` means the gateway runs unauthenticated.
     api_key: Option<Arc<str>>,
-    /// Pricing table for deriving session cost on the summary endpoint. Empty
-    /// means cost is reported as unpriced.
-    pricing: Arc<PricingTable>,
 }
 
 /// Run the gateway server until the process is signalled. Binds the configured
@@ -62,17 +59,9 @@ struct AppState {
 ///
 /// # Errors
 /// Binding the listener or a fatal serve error.
-pub async fn serve(
-    registry: SessionRegistry,
-    config: &GatewayConfig,
-    pricing: PricingTable,
-) -> Result<()> {
+pub async fn serve(registry: SessionRegistry, config: &GatewayConfig) -> Result<()> {
     let api_key = config.resolve_api_key().map(Arc::from);
-    let state = AppState {
-        registry,
-        api_key,
-        pricing: Arc::new(pricing),
-    };
+    let state = AppState { registry, api_key };
 
     let app = router(state);
 
@@ -851,8 +840,10 @@ async fn compact_session(
 
 /// `GET /sessions/{id}/summary` — derived monitor metrics for one session,
 /// computed by replaying its committed `events.jsonl` through the monitor fold
-/// (`doc/monitor.md` §8). Cost is priced with the gateway's pricing table at
-/// read time, so it reflects current prices.
+/// (`doc/monitor.md` §8). A branched session (fork/compaction/reconfiguration)
+/// folds the estimated size of its inherited `context_snapshot.json` into
+/// `context_tokens`, so the number reflects the context the next request will
+/// actually send instead of reading as empty right after the branch.
 async fn session_summary(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let sid = SessionId(id);
     let events = state
@@ -862,11 +853,24 @@ async fn session_summary(State(state): State<AppState>, Path(id): Path<String>) 
         .with_context(|| format!("failed to read session `{}`", sid.0));
     match events {
         Ok(events) => {
-            let summary = monitor::summarize(&events, (*state.pricing).clone());
+            let mut summary = monitor::summarize(&events);
+            if let Ok(snapshot) = state.registry.store().read_snapshot(&sid) {
+                summary.context_tokens = summary
+                    .context_tokens
+                    .saturating_add(snapshot_tokens(&snapshot));
+            }
             Json(summary).into_response()
         }
         Err(e) => not_found(&e),
     }
+}
+
+/// Estimated token footprint of a context snapshot, using the ledger's
+/// byte-heuristic so a fork's context reads on the same scale as the estimate
+/// its first request will report.
+fn snapshot_tokens(snapshot: &[crate::llm::Message]) -> u32 {
+    let bytes: usize = snapshot.iter().map(crate::context::message_bytes).sum();
+    crate::context::bytes_to_tokens(bytes)
 }
 
 /// `GET /sessions/{id}/view` — the folded conversation view: the session's
@@ -1266,7 +1270,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: Some(Arc::from("secret")),
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
         let resp = reqwest::get(format!("{base}/healthz")).await.unwrap();
@@ -1281,7 +1284,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: Some(Arc::from("s3cret")),
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
         let client = reqwest::Client::new();
@@ -1321,7 +1323,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
         let resp = reqwest::get(format!("{base}/api/sessions")).await.unwrap();
@@ -1372,8 +1373,8 @@ default = "openai-main/gpt-4o"
 
     /// `GET /sessions/{id}/summary` returns a derived `SessionSummary` as typed
     /// JSON for an existing session. A fresh session with no model/tool activity
-    /// folds to all-zero counts and an unpriced (`null`) cost — proving the
-    /// endpoint replays the log through the monitor rather than 404ing.
+    /// folds to all-zero counts — proving the endpoint replays the log through
+    /// the monitor rather than 404ing.
     #[tokio::test]
     async fn summary_endpoint_returns_typed_json() {
         let (registry, _dir) = test_registry();
@@ -1385,7 +1386,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
 
@@ -1397,8 +1397,56 @@ default = "openai-main/gpt-4o"
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["total_turns"], 0);
         assert_eq!(body["total_tool_calls"], 0);
-        assert!(body["cost_usd"].is_null(), "no priced model ran");
+        assert_eq!(body["context_tokens"], 0);
         assert!(body["tools_used"].is_object());
+    }
+
+    /// A branched session's summary folds the inherited snapshot's estimated
+    /// size into `context_tokens` — the number answers "how full is the
+    /// context" from the moment of the fork, not just after its first request.
+    #[tokio::test]
+    async fn summary_endpoint_folds_snapshot_into_context_tokens() {
+        let (registry, _dir) = test_registry();
+        let store = registry.store();
+        let parent = store.create_new(None, None, vec![]).unwrap();
+        let parent_id = parent.session_id().clone();
+        drop(parent);
+        let snapshot = vec![
+            crate::llm::Message::System {
+                content: "s".repeat(400),
+            },
+            crate::llm::Message::User {
+                content: "u".repeat(400),
+            },
+        ];
+        let writer = store
+            .create_fork(
+                store.mint_id(),
+                parent_id,
+                0,
+                None,
+                None,
+                None,
+                vec![],
+                &snapshot,
+            )
+            .unwrap();
+        let sid = writer.session_id().clone();
+        drop(writer);
+
+        let state = AppState {
+            registry,
+            api_key: None,
+        };
+        let base = serve_test(state).await;
+
+        let resp = reqwest::get(format!("{base}/api/sessions/{}/summary", sid.0))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        // No requests yet, so the whole reading is the snapshot: 800 bytes / 4.
+        assert_eq!(body["context_tokens"], 200);
     }
 
     /// An unknown session id yields 404 from the summary endpoint, not a 500 or
@@ -1409,7 +1457,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
 
@@ -1427,7 +1474,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
 
@@ -1451,7 +1497,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
 
@@ -1479,7 +1524,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
         let client = reqwest::Client::new();
@@ -1521,7 +1565,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
         let client = reqwest::Client::new();
@@ -1560,7 +1603,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
         let client = reqwest::Client::new();
@@ -1613,7 +1655,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
         let client = reqwest::Client::new();
@@ -1667,7 +1708,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
 
@@ -1691,7 +1731,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
 
@@ -1734,7 +1773,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
         let client = reqwest::Client::new();
@@ -1785,7 +1823,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
         let client = reqwest::Client::new();
@@ -1841,7 +1878,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
         let client = reqwest::Client::new();
@@ -1915,7 +1951,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
 
@@ -1964,7 +1999,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
 
@@ -2005,7 +2039,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
         let client = reqwest::Client::new();
@@ -2062,7 +2095,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
 
@@ -2098,7 +2130,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
         let client = reqwest::Client::new();
@@ -2155,7 +2186,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
 
@@ -2175,7 +2205,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
 
@@ -2202,7 +2231,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
 
@@ -2231,7 +2259,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
 
@@ -2267,7 +2294,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
 
@@ -2289,7 +2315,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
 
@@ -2328,7 +2353,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
 
@@ -2377,7 +2401,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
 
@@ -2423,7 +2446,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
 
@@ -2450,7 +2472,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
 
@@ -2476,7 +2497,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
 
@@ -2506,7 +2526,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
         let http = reqwest::Client::new();
@@ -2561,7 +2580,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
 
@@ -2591,7 +2609,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
 
@@ -2663,7 +2680,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
 
@@ -2703,7 +2719,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
 
@@ -2744,7 +2759,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
         let http = reqwest::Client::new();
@@ -2791,7 +2805,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
         let http = reqwest::Client::new();
@@ -2841,7 +2854,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
         let resp = reqwest::get(format!("{base}/api/workspaces/{}/config", id.0))
@@ -2866,7 +2878,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
         let body: serde_json::Value = reqwest::get(format!("{base}/api/workspaces/{}/tools", id.0))
@@ -2894,7 +2905,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
         let body: serde_json::Value = reqwest::get(format!("{base}/api/tools"))
@@ -2905,7 +2915,10 @@ default = "openai-main/gpt-4o"
             .unwrap();
         let tools = body["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, vec!["find", "search", "read", "write", "edit", "shell"]);
+        assert_eq!(
+            names,
+            vec!["find", "search", "read", "write", "edit", "shell"]
+        );
         // shell exposes a `command` field the UI scopes rules to.
         let shell = tools.iter().find(|t| t["name"] == "shell").unwrap();
         assert_eq!(shell["fields"][0]["key"], "command");
@@ -2932,7 +2945,6 @@ default = "openai-main/gpt-4o"
         let state = AppState {
             registry,
             api_key: None,
-            pricing: Arc::new(PricingTable::default()),
         };
         let base = serve_test(state).await;
 

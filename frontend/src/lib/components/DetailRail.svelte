@@ -2,7 +2,7 @@
 	import type { SessionMeta } from '$lib/types/SessionMeta';
 	import type { RuntimeInfo } from '$lib/types/RuntimeInfo';
 	import type { SessionSummary } from '$lib/types/SessionSummary';
-	import { num, statLabel, formatCost, cacheLabel, topTools } from '$lib/stats';
+	import { num, statLabel, cacheLabel, topTools } from '$lib/stats';
 	import { inspectDetail, type InspectRow, type RawEvent } from '$lib/inspect';
 
 	/** The right detail rail: Info (config-layer session context + live context
@@ -17,7 +17,7 @@
 		meta,
 		runtime,
 		divergent,
-		context,
+		liveContext,
 		summary,
 		onSetInspect,
 		onScrollToSeq
@@ -32,12 +32,34 @@
 		runtime: RuntimeInfo | null;
 		/** Runtime-layer models that diverge from the configured one (B4). */
 		divergent: string[];
-		context: { tokens: number; window: number; threshold: number } | null;
+		/** Live per-round occupancy from the ephemeral `context_updated` event —
+		 *  fresher than the summary mid-turn, but gone on reload. */
+		liveContext: { tokens: number; window: number; threshold: number } | null;
 		summary: SessionSummary | null;
 		onSetInspect: (on: boolean) => void;
 		/** Jump the conversation to the item at/around an event's seq. */
 		onScrollToSeq: (seq: number) => void;
 	} = $props();
+
+	/** Context-window occupancy for the gauge: the live per-round event wins
+	 *  while a turn is running; the summary's persisted `context_tokens`
+	 *  (last request's ledger estimate, plus the inherited snapshot estimate
+	 *  for a branched session) is the fallback that survives a page reload.
+	 *  Window and threshold come from whichever source supplied the tokens. */
+	const context = $derived(
+		liveContext
+			? liveContext
+			: summary && summary.context_tokens > 0
+				? {
+						tokens: summary.context_tokens,
+						window: runtime?.context_window ?? 0,
+						threshold: runtime?.compaction_threshold ?? 0.8
+					}
+				: null
+	);
+	/** A branched (fork/compaction/reconfiguration) session's cache rate only
+	 *  covers its own requests — the inherited snapshot is never re-read. */
+	const branched = $derived(meta !== null && meta.origin.kind !== 'new');
 
 	/** Expanded inspect groups, keyed by group key. */
 	let inspectExpanded = $state<Record<string, boolean>>({});
@@ -132,9 +154,9 @@
 				{/if}
 			</section>
 
-			<!-- CONTEXT: live per-round window occupancy (context_updated event). Its
-     own section (driven by live events, not the summary endpoint) so it
-     shows mid-turn even before the first summary snapshot loads. -->
+			<!-- CONTEXT: window occupancy. Live per-round events drive it mid-turn;
+     the summary's persisted `context_tokens` (+ snapshot estimate for a
+     branched session) is the fallback that survives a page reload. -->
 			{#if context}
 				{@const pct = context.window
 					? Math.min(100, (context.tokens / context.window) * 100)
@@ -190,12 +212,6 @@
 							<span class="stat-key">{statLabel.toolCalls(s.total_tool_calls)}</span>
 						</div>
 						<div class="stat">
-							<span class="stat-value cost" class:unpriced={s.cost_usd == null}
-								>{formatCost(s)}</span
-							>
-							<span class="stat-key">{statLabel.cost}</span>
-						</div>
-						<div class="stat">
 							<span class="stat-value">{num(s.total_input_tokens).toLocaleString()}</span>
 							<span class="stat-key">{statLabel.inTok}</span>
 						</div>
@@ -203,8 +219,13 @@
 							<span class="stat-value">{num(s.total_output_tokens).toLocaleString()}</span>
 							<span class="stat-key">{statLabel.outTok}</span>
 						</div>
-						<div class="stat">
-							<span class="stat-value">{cacheLabel(s)}</span>
+						<div
+							class="stat"
+							title={branched
+								? 'Covers only this session\'s requests — the inherited context (snapshot) is never re-read'
+								: `${num(s.total_cache_read_tokens).toLocaleString()} cache-read tokens`}
+						>
+							<span class="stat-value">{cacheLabel(s, branched)}</span>
 							<span class="stat-key">{statLabel.cache}</span>
 						</div>
 					</div>
@@ -381,14 +402,6 @@
 		white-space: nowrap;
 		overflow: hidden;
 		text-overflow: ellipsis;
-	}
-
-	.stat-value.cost {
-		color: var(--accent-ink);
-	}
-	.stat-value.cost.unpriced {
-		color: var(--text-tertiary);
-		font-size: 12px;
 	}
 
 	.stat-fail {

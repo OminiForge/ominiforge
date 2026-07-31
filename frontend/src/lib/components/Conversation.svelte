@@ -165,11 +165,13 @@
 	// and whenever a turn settles, so the metrics track the live conversation
 	// without rebuilding them from the event fold.
 	let summary = $state<SessionSummary | null>(null);
-	// Live context-window occupancy, from the per-round `context_updated` event.
-	// `tokens` is the running estimate; `window` the model's full context window
-	// (0 = unknown); `threshold` the compaction fraction (drawn as a gauge tick —
-	// the gauge is tokens/window, NOT tokens/effective_limit).
-	// Reset on session switch.
+	// Live context-window occupancy, from the per-round `context_updated` event
+	// (ephemeral: not replayed). The detail rail falls back to the summary's
+	// persisted `context_tokens` when this is null (page reload, idle session),
+	// so the gauge still reads after a refresh. `tokens` is the running
+	// estimate; `window` the model's full context window (0 = unknown);
+	// `threshold` the compaction fraction (drawn as a gauge tick — the gauge
+	// is tokens/window, NOT tokens/effective_limit). Reset on session switch.
 	let context = $state<{ tokens: number; window: number; threshold: number } | null>(null);
 	// Debounce handle for per-request STATS refresh (Q2): a long turn fires many
 	// RequestCompleted events; coalesce them so we don't replay the log per event.
@@ -1568,7 +1570,7 @@
 			{meta}
 			{runtime}
 			{divergent}
-			{context}
+			liveContext={context}
 			{summary}
 			onSetInspect={setInspect}
 			onScrollToSeq={scrollToSeq}

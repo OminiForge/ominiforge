@@ -271,12 +271,6 @@ async fn serve_cmd(config_dir: Option<PathBuf>, args: ServeArgs) -> Result<()> {
         );
     }
 
-    // Pricing for the monitor summary endpoint; best-effort (empty = unpriced).
-    let pricing = config_store
-        .load_providers()
-        .and_then(|providers| config_store.load_pricing(&providers))
-        .unwrap_or_default();
-
     let defaults = SessionDefaults {
         config: config_store,
         workspace,
@@ -284,7 +278,7 @@ async fn serve_cmd(config_dir: Option<PathBuf>, args: ServeArgs) -> Result<()> {
         no_dotenv: args.no_dotenv,
     };
     let registry = SessionRegistry::new(defaults, &gateway_config)?;
-    serve(registry, &gateway_config, pricing).await
+    serve(registry, &gateway_config).await
 }
 
 /// Dispatch `ominiforge eval`: no subcommand runs a suite; `diff`/`report`
@@ -365,10 +359,8 @@ async fn run_and_persist(
     use crate::eval::analysis::RunReport;
     use crate::eval::runner::RunConfig;
     use crate::eval::{
-        CostUnder, ExactMatch, FuzzyMatch, NoToolError, Scorer, TestsPass, TurnCompleted,
-        WorkspaceDiff,
+        ExactMatch, FuzzyMatch, NoToolError, Scorer, TestsPass, TurnCompleted, WorkspaceDiff,
     };
-    use crate::monitor::PricingTable;
 
     eprintln!("eval: running {} case(s) from {suite_label}", cases.len());
 
@@ -379,7 +371,6 @@ async fn run_and_persist(
         Arc::new(FuzzyMatch),
         Arc::new(TestsPass),
         Arc::new(WorkspaceDiff),
-        Arc::new(CostUnder::new(1.0, PricingTable::new())),
     ];
 
     let run_config = RunConfig {
@@ -654,28 +645,20 @@ fn persist_run(
 }
 
 /// Print a derived metrics summary for a session, computed offline by replaying
-/// its `events.jsonl` through the monitor (`doc/monitor.md` §8). Pricing comes
-/// from `providers.toml` + `pricing.toml`, so cost reflects current prices, not
-/// whatever was in effect when the session ran.
+/// its `events.jsonl` through the monitor (`doc/monitor.md` §8).
 fn inspect(config_dir: Option<&Path>, args: &InspectArgs) -> Result<()> {
     let requested = match args.workspace.clone() {
         Some(path) => path,
         None => std::env::current_dir().context("cannot determine current directory")?,
     };
     let workspace = app::resolve_workspace(&requested)?;
-    // Config (providers + pricing) comes from --config-dir / launch cwd / home,
-    // independent of the session's workspace (`doc/architecture.md` §15).
+    // Config comes from --config-dir / launch cwd / home, independent of the
+    // session's workspace (`doc/architecture.md` §15).
     let launch_cwd = std::env::current_dir().context("cannot determine current directory")?;
     let config = ConfigStore::discover_with(config_dir, &launch_cwd);
     if !args.no_dotenv {
         app::load_dotenv(config.roots(), &workspace);
     }
-
-    // Pricing is best-effort: a missing/empty table just means cost is unpriced.
-    let pricing = config
-        .load_providers()
-        .and_then(|providers| config.load_pricing(&providers))
-        .unwrap_or_default();
 
     let store = SessionStore::new(workspace.join(SESSIONS_SUBDIR));
     let sid = crate::core::SessionId(args.session_id.clone());
@@ -683,7 +666,7 @@ fn inspect(config_dir: Option<&Path>, args: &InspectArgs) -> Result<()> {
         .read_events(&sid)
         .with_context(|| format!("failed to read session `{}`", args.session_id))?;
 
-    let summary = crate::monitor::summarize(&events, pricing);
+    let summary = crate::monitor::summarize(&events);
     print_summary(&args.session_id, &summary);
     Ok(())
 }
@@ -706,10 +689,7 @@ fn print_summary(session_id: &str, s: &crate::monitor::SessionSummary) {
         s.cache_hit_rate * 100.0,
         s.total_cache_read_tokens
     );
-    match s.cost_usd {
-        Some(cost) => println!("  cost:           ${cost:.4}"),
-        None => println!("  cost:           (unpriced — no pricing for the model(s) used)"),
-    }
+    println!("  context:        {} tokens (est.)", s.context_tokens);
     if !s.tools_used.is_empty() {
         let mut tools: Vec<_> = s.tools_used.iter().collect();
         tools.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));

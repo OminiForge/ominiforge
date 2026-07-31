@@ -70,13 +70,20 @@ pub struct SessionDefaults {
 /// lifetime — not whatever a given model request happened to use
 /// (subagents/forks may differ; that divergence is a runtime-validation
 /// concern, not this display source).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct RuntimeInfo {
     /// Provider name (e.g. `openai-main`).
     pub provider: String,
     /// Model id sent to the API (e.g. `gpt-4o`).
     pub model: String,
+    /// The model's full context window in tokens (`0` when unknown). The
+    /// context gauge's denominator when only the persisted occupancy estimate
+    /// is available (page reload, idle session).
+    pub context_window: u32,
+    /// Effective compaction threshold (profile override or the default
+    /// fraction). Drawn as the gauge's tick.
+    pub compaction_threshold: f32,
     /// Environment labels detected from the activated session environment (e.g.
     /// `["dev shell: impure (nix-shell-env)"]` or `["venv: .venv"]`). Empty
     /// when no activation signal is present — the RUNTIME panel only shows the
@@ -941,6 +948,11 @@ impl SessionRegistry {
         Ok(RuntimeInfo {
             provider: resolved.provider_name,
             model: resolved.model_id,
+            context_window: resolved.context_window,
+            compaction_threshold: profile
+                .context
+                .compaction_threshold
+                .unwrap_or(crate::context::DEFAULT_COMPACTION_THRESHOLD),
             env: detect_env(&env),
         })
     }

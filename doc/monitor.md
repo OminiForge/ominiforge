@@ -1,13 +1,12 @@
 # Monitor Trace Model
 
-代码：`Monitor`、`SessionSummary`、`summarize`、`cost_of` 见 [`src/monitor.rs`](../src/monitor.rs)。
+代码：`Monitor`、`SessionSummary`、`summarize` 见 [`src/monitor.rs`](../src/monitor.rs)。
 本文讲设计意图与配置契约，聚合字段细节以代码为准。
 
 ## 1. 设计原则
 
 - Trace = event stream 本身，不引入独立 trace ID 或 span 体系。
 - Monitor 从 events.jsonl 派生聚合指标，不侵入 core 执行路径。
-- 成本实时估算（用于预算控制），后处理可重新计算。
 - Provider 差异由 provider adapter 屏蔽，monitor 层只看统一类型。
 
 ## 2. Model Request 记录
@@ -21,8 +20,6 @@
 ### 2.2 RequestCompleted
 
 收到完整 response 后写入：携带 `stop_reason`、`usage`（input/output/cache_read/cache_write tokens）、`duration_ms`、`time_to_first_token_ms`、`provider_request_id`。
-
-**`cost` 不存入 event** —— monitor 从 `usage` + pricing table 实时派生（见 §6）。这样历史可用最新 pricing 重算，不被写入时的价格锁死。
 
 ### 2.3 RequestFailed
 
@@ -50,7 +47,11 @@ Provider 映射：
 
 **Cache 命中率指标**：`cache_read_tokens / input_tokens`
 
-Monitor 按 session 和全局两个维度追踪此比率。
+Monitor 按 session 维度追踪此比率。注意 fork/compaction/reconfiguration 产生的
+分支 session：其继承的历史 context 以 `context_snapshot.json` 物化，分支后首个
+请求会把整段 snapshot 作为新前缀发送——它从未作为该 session 自己的请求存在过，
+因此不贡献 cache read。分支刚发生时命中率只反映分支后新请求的 cache 命中，
+读数偏低是结构性的，不是回归（`SessionSummary.cache_hit_rate` 的文档注释同样说明）。
 
 ## 4. Tool 监控
 
@@ -96,52 +97,12 @@ Turn N (turn_id)
 - `parent_event_id` 表达因果关系（tool execution 因 model tool_call 而起）。
 - Monitor 从 event stream 按 turn_id 分组，按 seq 排序，即可绘制 waterfall 视图。
 
-## 6. 成本估算
+## 6. 成本估算（已移除）
 
-### 6.1 实时估算
-
-每次 `ModelEvent::RequestCompleted` 后立即计算（不写回 event，仅 monitor 内存 + 聚合）：输入为
-`usage` + pricing table，按 input / output / cache_read / cache_write 四项分别折算。用于 cost
-limiter hook（检查累计 cost 是否超预算）。**不写入 event**——历史成本可用最新 pricing 从
-`usage` 重算。`cost_of` 见 `src/monitor.rs`。
-
-### 6.2 Pricing Table
-
-```toml
-# .omini/config/pricing.toml
-
-[models."gpt-4o"]
-input_per_million = 2.50
-output_per_million = 10.00
-cache_read_per_million = 1.25
-cache_write_per_million = 2.50
-
-[models."gpt-4o-mini"]
-input_per_million = 0.15
-output_per_million = 0.60
-cache_read_per_million = 0.075
-
-[models."mimo-7b"]
-input_per_million = 0.00
-output_per_million = 0.00
-```
-
-- 用户可更新 pricing（模型降价时）。
-- 未配置的 model → cost = 0（不报错，只跳过）。
-- Evolution worker 可用最新 pricing 重算历史成本。
-
-### 6.3 预算控制
-
-```toml
-# .omini/config/limits.toml
-
-[cost]
-session_max_usd = 5.00       # 单 session 上限
-daily_max_usd = 20.00        # 每日上限
-warn_at_percent = 80         # 达到 80% 时警告
-```
-
-Cost limiter 作为 built-in before hook（`model:request:before`），检查累计 cost，超限时 block。
+成本估算已从 `SessionSummary` 与 UI 中移除：读数长期停留在估算层（`unpriced` 或与
+实际账单不符），实用性不足。`usage` 四项（input/output/cache_read/cache_write）仍
+逐请求持久化在 event 中；`pricing.toml` / `providers.toml` 的 pricing 配置仍被解析，
+如需重新引入成本展示或预算控制，可从 `usage` 重算。
 
 ## 7. MCP Server 监控
 
@@ -161,8 +122,15 @@ MCP server 作为子进程，额外追踪：
 ## 8. Session 级汇总
 
 Session 结束时生成 `SessionSummary`（turns / model requests / tool calls / input+output
-tokens / cost / cache_hit_rate / duration / tools_used / errors），用于 `inspect` 离线展示、
+tokens / cache_hit_rate / context_tokens / tools_used / errors），用于 `inspect` 离线展示、
 evolution 分析、Web dashboard 报告。结构与离线入口 `summarize` 见 `src/monitor.rs`。
+
+`context_tokens` 是 context 占用量的持久化读数：monitor 取最后一个
+`RequestStarted.input_tokens_estimate`（agent ledger 在发送前持久化的 running 估计，
+最后一个请求发送的前缀最大）。这弥补了 live `context_updated` 帧不落盘的问题——
+页面刷新后 context gauge 仍能读数。gateway 的 summary 端点还会把分支 session 的
+`context_snapshot.json` 估算大小折叠进去，所以 fork/compaction 后的 context 不会从 0
+开始读。
 
 ## 9. Monitor 实现架构
 
@@ -174,10 +142,7 @@ EventBus (tokio broadcast channel)
       │
       ├── Monitor subscriber
       │     ├── 实时聚合（内存 HashMap）
-      │     ├── 成本累计
       │     └── 异常检测（连续失败、延迟飙升）
-      │
-      ├── Cost limiter（before hook 查询 monitor 累计值）
       │
       └── Evolution collector（采样、统计、写入分析数据）
 ```
@@ -187,6 +152,6 @@ Monitor 是 EventBus 的一个 subscriber，纯 observe，不修改任何 event�
 ## 10. 待后续完善
 
 - Trace 可视化格式（导出为 Chrome Trace JSON 或其他格式）。
-- 告警规则配置（连续 N 次失败、cost 超限、latency 超阈值）。
+- 告警规则配置（连续 N 次失败、latency 超阈值）。
 - 历史数据保留和清理策略。
 - 跨 session 聚合报告（周报、月报）。

@@ -22,5 +22,5 @@ pub use error::{EvalError, Result};
 pub use runner::{CaseResult, RunConfig, run_case};
 pub use score::{EvalContext, Score, ScoreValue};
 pub use scorer::{
-    CostUnder, ExactMatch, FuzzyMatch, NoToolError, Scorer, TestsPass, TurnCompleted, WorkspaceDiff,
+    ExactMatch, FuzzyMatch, NoToolError, Scorer, TestsPass, TurnCompleted, WorkspaceDiff,
 };

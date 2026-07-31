@@ -16,12 +16,12 @@
 ```
 events.jsonl (source of truth)
 │
-├── Monitor     fold → SessionSummary   描述性：token/cost/tool 调用数/失败率
+├── Monitor     fold → SessionSummary   描述性：token/tool 调用数/失败率
 │                                        单 session，无期望，永远不说"对不对"
 │
 └── Eval Scorer fold + case + 可选 workspace → Score
                                          规范性：需要 EvalCase 作为对照
-                                         可复用 Monitor 的聚合数值（如 cost_usd）
+                                         可复用 Monitor 的聚合数值
                                          但绝大多数 scorer 要原始事件里的细节
                                          （tool input JSON、model 文本、world state）
 ```
@@ -108,7 +108,6 @@ scorer 与 metric 分离：scorer 出**每样本**的分，metric 做**跨样本
 | `TurnCompleted` | `TurnEvent` | Turn 以 Completed 结束（非 Failed/Stalled） |
 | `TestsPass` | shell 执行 checker.command | 测试命令退出码 + pass_patterns |
 | `WorkspaceDiff` | workspace before/after | 预期文件存在/内容匹配/无副作用 |
-| `CostUnder` | `Monitor::summarize` | `cost_usd < threshold` |
 
 **Tool 失败的两种形态**（scorer 必须同时检查）：
 - `ToolOutput.is_error = true`：业务失败（协议成功，但 tool 报错）

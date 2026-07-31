@@ -21,22 +21,17 @@ export const statLabel = {
 	turns: (n: number) => plural(n, 'turn'),
 	reqs: (n: number) => plural(n, 'req'),
 	toolCalls: (n: number) => plural(n, 'tool call'),
-	cost: 'cost',
 	inTok: 'in tok',
 	outTok: 'out tok',
 	cache: 'cache'
 } as const;
 
-/** Display cost: `$1.23`, `$0.0042` for sub-cent, or `unpriced` when no priced
- *  model ran (so the UI never prints a misleading `$0.00`). */
-export function formatCost(s: SessionSummary): string {
-	if (s.cost_usd == null) return 'unpriced';
-	return `$${s.cost_usd.toFixed(s.cost_usd < 0.01 ? 4 : 2)}`;
-}
-
-/** Cache-hit rate as a whole-percent string. */
-export function cacheLabel(s: SessionSummary): string {
-	return `${(s.cache_hit_rate * 100).toFixed(0)}%`;
+/** Cache-hit rate as a whole-percent string. Branched sessions carry an
+ *  inherited snapshot their own requests never re-read, so their rate
+ *  reflects only this session's requests (reads low right after a branch) —
+ *  the `*` marks that caveat (details on hover). */
+export function cacheLabel(s: SessionSummary, branched: boolean): string {
+	return `${(s.cache_hit_rate * 100).toFixed(0)}%${branched ? '*' : ''}`;
 }
 
 /** Top tools by call count, capped. Bar width is relative to this set's own max,

@@ -23,7 +23,7 @@ use std::path::Path;
 
 use ominiforge::core::SessionId;
 use ominiforge::core::payload::{EventPayload, SessionEvent, ToolEvent, TurnEvent};
-use ominiforge::monitor::{PricingTable, summarize};
+use ominiforge::monitor::summarize;
 use ominiforge::session::SessionStore;
 
 const SESSION_ID: &str = "01SYNTHETICGOLDEN0000000TST";
@@ -128,7 +128,7 @@ fn golden_two_tool_calls_both_completed_no_failures() {
 fn golden_monitor_summary_aggregates_correctly() {
     let (store, id) = fixture_store();
     let events = store.read_events(&id).unwrap();
-    let summary = summarize(&events, PricingTable::new());
+    let summary = summarize(&events);
 
     assert_eq!(summary.total_turns, 1);
     assert_eq!(summary.total_model_requests, 2);
@@ -137,8 +137,6 @@ fn golden_monitor_summary_aggregates_correctly() {
     assert_eq!(summary.total_input_tokens, 300);
     assert_eq!(summary.total_output_tokens, 60);
     assert_eq!(summary.total_cache_read_tokens, 128);
-    // synthetic/test-model is not in the empty pricing table → no cost
-    assert_eq!(summary.cost_usd, None);
 }
 
 /// The opening turn's user input is captured as the session title.
@@ -147,7 +145,7 @@ fn golden_monitor_summary_aggregates_correctly() {
 fn golden_first_user_input_captured() {
     let (store, id) = fixture_store();
     let events = store.read_events(&id).unwrap();
-    let summary = summarize(&events, PricingTable::new());
+    let summary = summarize(&events);
 
     assert_eq!(
         summary.first_user_input.as_deref(),

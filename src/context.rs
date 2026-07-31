@@ -114,7 +114,7 @@ pub fn estimate_tokens(text: &str) -> u32 {
 /// Byte footprint of a message for the heuristic tail. Counts every part the
 /// wire format will carry: text content plus, for an assistant turn, each tool
 /// call's name and argument JSON.
-pub(crate) fn message_bytes(message: &Message) -> usize {
+pub fn message_bytes(message: &Message) -> usize {
     match message {
         Message::System { content } | Message::User { content } | Message::Tool { content, .. } => {
             content.len()
@@ -134,7 +134,8 @@ pub(crate) fn message_bytes(message: &Message) -> usize {
 }
 
 /// Convert a byte count to an estimated token count (saturating).
-fn bytes_to_tokens(bytes: usize) -> u32 {
+#[must_use]
+pub fn bytes_to_tokens(bytes: usize) -> u32 {
     u32::try_from(bytes / BYTES_PER_TOKEN).unwrap_or(u32::MAX)
 }
 

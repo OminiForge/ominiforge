@@ -1,33 +1,22 @@
-//! Monitor: derives traces, token/cost usage, cache-hit rate, and per-tool
-//! metrics from the event stream without touching the core execution path.
+//! Monitor: derives traces, token usage, cache-hit rate, and per-tool metrics
+//! from the event stream without touching the core execution path.
 //!
 //! The monitor is a pure fold over [`CoreEvent`]s (`doc/monitor.md`): the same
 //! [`Monitor::observe`] drives both consumption paths — an offline
 //! `inspect <session>` that replays `events.jsonl`, and an online subscriber
-//! draining an [`EventBus`](crate::session::EventBus). Cost is derived from
-//! `usage` + a pricing table at read time, never written back to the log, so
-//! history can be recomputed with current prices (`doc/monitor.md` §6).
+//! draining an [`EventBus`](crate::session::EventBus).
 
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::config::Pricing;
 use crate::core::CoreEvent;
 use crate::core::payload::{ErrorEvent, EventPayload, ModelEvent, ToolEvent, TurnEvent, Usage};
 
-/// Maps a model id to its pricing, for cost derivation.
-///
-/// Built from `pricing.toml` (or the inline pricing in `providers.toml`); an
-/// unlisted model contributes zero cost rather than erroring
-/// (`doc/monitor.md` §6.2).
-pub type PricingTable = HashMap<String, Pricing>;
-
 /// Aggregated, derived view of one session, produced by folding its events.
 ///
-/// All counts are saturating; `cost_usd` is `None` when no priced model ran
-/// (so the UI can say "unpriced" rather than print a misleading `$0.00`).
+/// All counts are saturating.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct SessionSummary {
@@ -39,9 +28,19 @@ pub struct SessionSummary {
     pub total_output_tokens: u64,
     pub total_cache_read_tokens: u64,
     /// `cache_read / input`, in `[0, 1]`. `0.0` when no input tokens were seen.
+    ///
+    /// For a forked/compacted/reconfigured session the inherited context is
+    /// materialized as `context_snapshot.json` and never re-requested through
+    /// this session, so it contributes no cache reads — this rate reflects
+    /// only the session's own requests and reads low right after a branch.
     pub cache_hit_rate: f64,
-    /// Derived USD cost, or `None` if no model with pricing ran.
-    pub cost_usd: Option<f64>,
+    /// Best current estimate of the context-window occupancy in tokens: the
+    /// agent ledger's `running()` count persisted on each
+    /// `RequestStarted::input_tokens_estimate` (the last one wins — that
+    /// request sent the largest prefix). `0` before the first request. The
+    /// gateway folds the inherited snapshot's estimate into this for branched
+    /// sessions, so a fork does not read as an empty context.
+    pub context_tokens: u32,
     /// The first turn's user input, if any — a human-readable title for the
     /// session list (`doc/frontend.md`). `None` for sessions with no user turn
     /// (e.g. an empty draft that was never sent). Not truncated server-side; the
@@ -63,29 +62,16 @@ pub struct SessionSummary {
 
 /// Folds an event stream into a [`SessionSummary`]. Drive it with
 /// [`observe`](Self::observe) per event, then read [`summary`](Self::summary).
-///
-/// A `RequestStarted` records its `request_id → model` so the matching
-/// `RequestCompleted` (which carries `usage` but not the model) can be priced.
 #[derive(Debug, Default)]
 pub struct Monitor {
-    pricing: PricingTable,
-    /// `request_id` → model id, to price a completion against its model.
-    request_models: HashMap<String, String>,
     summary: SessionSummary,
-    /// Accumulated cost; folded into `summary.cost_usd` lazily so an all-unpriced
-    /// run reports `None`.
-    cost_acc: f64,
-    saw_priced_model: bool,
 }
 
 impl Monitor {
-    /// A monitor that prices completions against `pricing`.
+    /// An empty monitor.
     #[must_use]
-    pub fn new(pricing: PricingTable) -> Self {
-        Self {
-            pricing,
-            ..Self::default()
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Fold one event into the running aggregates.
@@ -108,14 +94,17 @@ impl Monitor {
                 }
             }
             EventPayload::Model(ModelEvent::RequestStarted {
-                request_id, model, ..
+                input_tokens_estimate,
+                ..
             }) => {
-                self.request_models
-                    .insert(request_id.clone(), model.clone());
+                // Last-write-wins: the most recent request sent the largest
+                // prefix, so its pre-send ledger estimate is the best persisted
+                // picture of the current context size.
+                self.summary.context_tokens = *input_tokens_estimate;
             }
-            EventPayload::Model(ModelEvent::RequestCompleted {
-                request_id, usage, ..
-            }) => self.observe_completion(request_id, usage),
+            EventPayload::Model(ModelEvent::RequestCompleted { usage, .. }) => {
+                self.observe_completion(usage);
+            }
             EventPayload::Tool(ToolEvent::Started { tool_name, .. }) => {
                 self.summary.total_tool_calls = self.summary.total_tool_calls.saturating_add(1);
                 *self
@@ -136,8 +125,8 @@ impl Monitor {
         }
     }
 
-    /// Account for a completed model request: tally tokens and derive cost.
-    fn observe_completion(&mut self, request_id: &str, usage: &Usage) {
+    /// Account for a completed model request: tally its token usage.
+    fn observe_completion(&mut self, usage: &Usage) {
         self.summary.total_model_requests = self.summary.total_model_requests.saturating_add(1);
         self.summary.total_input_tokens = self
             .summary
@@ -151,17 +140,9 @@ impl Monitor {
             .summary
             .total_cache_read_tokens
             .saturating_add(u64::from(usage.cache_read_tokens));
-
-        // Price against the model that started this request, if known + listed.
-        if let Some(model) = self.request_models.get(request_id)
-            && let Some(pricing) = self.pricing.get(model)
-        {
-            self.cost_acc += cost_of(usage, pricing);
-            self.saw_priced_model = true;
-        }
     }
 
-    /// Finalize and return the summary. Computes the derived ratios/cost from the
+    /// Finalize and return the summary. Computes the derived ratio from the
     /// accumulated tallies.
     #[must_use]
     pub fn summary(&self) -> SessionSummary {
@@ -175,31 +156,16 @@ impl Monitor {
                 summary.total_cache_read_tokens as f64 / summary.total_input_tokens as f64
             }
         };
-        summary.cost_usd = self.saw_priced_model.then_some(self.cost_acc);
         summary
     }
-}
-
-/// Derive the USD cost of one request from its `usage` and a model's `pricing`.
-/// Cache read/write rates default to the input rate / zero when unset.
-fn cost_of(usage: &Usage, pricing: &Pricing) -> f64 {
-    let per = |tokens: u32, rate: f64| f64::from(tokens) * rate / 1_000_000.0;
-    let cache_read_rate = pricing
-        .cache_read_per_million
-        .unwrap_or(pricing.input_per_million);
-    let cache_write_rate = pricing.cache_write_per_million.unwrap_or(0.0);
-    per(usage.input_tokens, pricing.input_per_million)
-        + per(usage.output_tokens, pricing.output_per_million)
-        + per(usage.cache_read_tokens, cache_read_rate)
-        + per(usage.cache_write_tokens, cache_write_rate)
 }
 
 /// Replay a full event stream into a [`SessionSummary`] offline (the
 /// `inspect <session>` path). Equivalent to `observe`-ing each event then
 /// reading `summary`.
 #[must_use]
-pub fn summarize(events: &[CoreEvent], pricing: PricingTable) -> SessionSummary {
-    let mut monitor = Monitor::new(pricing);
+pub fn summarize(events: &[CoreEvent]) -> SessionSummary {
+    let mut monitor = Monitor::new();
     for event in events {
         monitor.observe(event);
     }
@@ -263,6 +229,14 @@ mod tests {
     }
 
     fn request_started(request_id: &str, model: &str) -> EventPayload {
+        request_started_with_estimate(request_id, model, 0)
+    }
+
+    fn request_started_with_estimate(
+        request_id: &str,
+        model: &str,
+        input_tokens_estimate: u32,
+    ) -> EventPayload {
         EventPayload::Model(ModelEvent::RequestStarted {
             request_id: request_id.to_owned(),
             provider: "test".to_owned(),
@@ -270,7 +244,7 @@ mod tests {
             temperature: 0.0,
             max_tokens: None,
             tool_schemas_count: 0,
-            input_tokens_estimate: 0,
+            input_tokens_estimate,
         })
     }
 
@@ -333,20 +307,6 @@ mod tests {
         })
     }
 
-    fn pricing(input: f64, output: f64) -> PricingTable {
-        let mut table = PricingTable::new();
-        table.insert(
-            "gpt-4o".to_owned(),
-            Pricing {
-                input_per_million: input,
-                output_per_million: output,
-                cache_read_per_million: None,
-                cache_write_per_million: None,
-            },
-        );
-        table
-    }
-
     /// The first turn's user input becomes the session title and later turns
     /// don't overwrite it — the opening message is the recognizable label, so a
     /// long multi-turn session still lists under what it started as. An
@@ -358,7 +318,7 @@ mod tests {
             ev(1, model_src(), request_started("r1", "gpt-4o")),
             ev(2, runtime_src(), started("now add a test")),
         ];
-        let summary = summarize(&events, PricingTable::new());
+        let summary = summarize(&events);
         assert_eq!(summary.total_turns, 2);
         assert_eq!(
             summary.first_user_input.as_deref(),
@@ -375,7 +335,7 @@ mod tests {
             input: Some("   ".to_owned()),
         });
         let events = vec![ev(0, runtime_src(), blank)];
-        let summary = summarize(&events, PricingTable::new());
+        let summary = summarize(&events);
         assert_eq!(summary.total_turns, 1);
         assert_eq!(summary.first_user_input, None);
     }
@@ -398,7 +358,7 @@ mod tests {
             at(1, t0, request_started("r1", "gpt-4o")),
             at(2, t2, started("now add a test")),
         ];
-        let summary = summarize(&events, PricingTable::new());
+        let summary = summarize(&events);
         // Title stays the opening message; activity time is the latest user turn.
         assert_eq!(
             summary.first_user_input.as_deref(),
@@ -423,15 +383,14 @@ mod tests {
             ..ev(seq, runtime_src(), payload)
         };
         let events = vec![at(0, t0, started("real message")), at(1, t1, blank)];
-        let summary = summarize(&events, PricingTable::new());
+        let summary = summarize(&events);
         assert_eq!(summary.last_user_message_at, Some(t0));
     }
 
-    /// A representative two-turn stream aggregates into the expected counts, and
-    /// cost is derived from usage × pricing for the model that ran. This pins the
-    /// numbers the `inspect` view prints (`doc/monitor.md` §8).
+    /// A representative two-turn stream aggregates into the expected counts.
+    /// This pins the numbers the `inspect` view prints (`doc/monitor.md` §8).
     #[test]
-    fn aggregates_turns_requests_tokens_and_cost() {
+    fn aggregates_turns_requests_and_tokens() {
         let events = vec![
             ev(0, runtime_src(), started("hi")),
             ev(1, model_src(), request_started("r1", "gpt-4o")),
@@ -467,8 +426,7 @@ mod tests {
             ),
         ];
 
-        // gpt-4o at $2.50/M input, $10/M output.
-        let summary = summarize(&events, pricing(2.50, 10.00));
+        let summary = summarize(&events);
 
         assert_eq!(summary.total_turns, 2);
         assert_eq!(summary.total_model_requests, 2);
@@ -480,38 +438,43 @@ mod tests {
         // cache_hit_rate = 250 / 2000.
         assert_eq!(summary.cache_hit_rate, 0.125);
         assert_eq!(*summary.tools_used.get("read").unwrap(), 1);
-
-        // cost = 2000/M × 2.50 + 300/M × 10 + 250/M × 2.50 (cache read defaults
-        // to input rate) = 0.005 + 0.003 + 0.000625 = 0.008625.
-        let cost = summary.cost_usd.unwrap();
-        assert!((cost - 0.008_625).abs() < 1e-9, "got {cost}");
     }
 
-    /// A model with no pricing entry contributes zero cost and the summary
-    /// reports `None` (not a misleading `$0.00`) — the unpriced fallback
-    /// (`doc/monitor.md` §6.2).
+    /// `context_tokens` tracks the LAST `RequestStarted`'s ledger estimate —
+    /// the largest prefix the session sent — not a sum and not the completed
+    /// request's usage, so the persisted number answers "how full is the
+    /// context now", which is what survives a page reload (the live
+    /// `context_updated` frame does not).
     #[test]
-    fn unpriced_model_yields_none_cost_not_zero() {
+    fn context_tokens_tracks_last_request_estimate() {
         let events = vec![
-            ev(0, model_src(), request_started("r1", "local-llama")),
+            ev(
+                0,
+                model_src(),
+                request_started_with_estimate("r1", "gpt-4o", 1200),
+            ),
             ev(
                 1,
                 model_src(),
                 request_completed(
                     "r1",
                     Usage {
-                        input_tokens: 500,
-                        output_tokens: 50,
+                        input_tokens: 1500,
+                        output_tokens: 100,
                         cache_read_tokens: 0,
                         cache_write_tokens: 0,
                     },
                 ),
             ),
+            ev(
+                2,
+                model_src(),
+                request_started_with_estimate("r2", "gpt-4o", 2400),
+            ),
         ];
-        // Pricing table knows gpt-4o, not local-llama.
-        let summary = summarize(&events, pricing(2.50, 10.00));
-        assert_eq!(summary.total_input_tokens, 500);
-        assert_eq!(summary.cost_usd, None);
+        let summary = summarize(&events);
+        // r2's estimate, not r1's, and not the completed request's 1500.
+        assert_eq!(summary.context_tokens, 2400);
     }
 
     /// Tool failures and raised errors both tally under their error code, and
@@ -534,20 +497,20 @@ mod tests {
                 })),
             ),
         ];
-        let summary = summarize(&events, PricingTable::new());
+        let summary = summarize(&events);
         assert_eq!(summary.total_tool_calls, 1);
         assert_eq!(summary.total_tool_failures, 1);
         assert_eq!(*summary.errors.get("execution_failed").unwrap(), 1);
         assert_eq!(*summary.errors.get("model_transport").unwrap(), 1);
     }
 
-    /// An empty stream yields the zero summary with no cost and a 0.0 hit rate
-    /// (no division by zero).
+    /// An empty stream yields the zero summary with a 0.0 hit rate (no
+    /// division by zero) and no context estimate.
     #[test]
     fn empty_stream_is_zero_summary() {
-        let summary = summarize(&[], PricingTable::new());
+        let summary = summarize(&[]);
         assert_eq!(summary, SessionSummary::default());
         assert_eq!(summary.cache_hit_rate, 0.0);
-        assert_eq!(summary.cost_usd, None);
+        assert_eq!(summary.context_tokens, 0);
     }
 }

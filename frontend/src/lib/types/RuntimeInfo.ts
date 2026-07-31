@@ -19,6 +19,17 @@ provider: string,
  */
 model: string, 
 /**
+ * The model's full context window in tokens (`0` when unknown). The
+ * context gauge's denominator when only the persisted occupancy estimate
+ * is available (page reload, idle session).
+ */
+context_window: number, 
+/**
+ * Effective compaction threshold (profile override or the default
+ * fraction). Drawn as the gauge's tick.
+ */
+compaction_threshold: number, 
+/**
  * Environment labels detected from the activated session environment (e.g.
  * `["dev shell: impure (nix-shell-env)"]` or `["venv: .venv"]`). Empty
  * when no activation signal is present — the RUNTIME panel only shows the

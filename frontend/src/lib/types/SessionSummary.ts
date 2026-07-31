@@ -3,18 +3,27 @@
 /**
  * Aggregated, derived view of one session, produced by folding its events.
  *
- * All counts are saturating; `cost_usd` is `None` when no priced model ran
- * (so the UI can say "unpriced" rather than print a misleading `$0.00`).
+ * All counts are saturating.
  */
 export type SessionSummary = { total_turns: number, total_model_requests: number, total_tool_calls: number, total_tool_failures: number, total_input_tokens: bigint, total_output_tokens: bigint, total_cache_read_tokens: bigint, 
 /**
  * `cache_read / input`, in `[0, 1]`. `0.0` when no input tokens were seen.
+ *
+ * For a forked/compacted/reconfigured session the inherited context is
+ * materialized as `context_snapshot.json` and never re-requested through
+ * this session, so it contributes no cache reads — this rate reflects
+ * only the session's own requests and reads low right after a branch.
  */
 cache_hit_rate: number, 
 /**
- * Derived USD cost, or `None` if no model with pricing ran.
+ * Best current estimate of the context-window occupancy in tokens: the
+ * agent ledger's `running()` count persisted on each
+ * `RequestStarted::input_tokens_estimate` (the last one wins — that
+ * request sent the largest prefix). `0` before the first request. The
+ * gateway folds the inherited snapshot's estimate into this for branched
+ * sessions, so a fork does not read as an empty context.
  */
-cost_usd: number | null, 
+context_tokens: number, 
 /**
  * The first turn's user input, if any — a human-readable title for the
  * session list (`doc/frontend.md`). `None` for sessions with no user turn

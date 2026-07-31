@@ -187,11 +187,7 @@ pub enum StopReason {
     StopSequence,
 }
 
-/// Token accounting reported by the provider.
-///
-/// Cost is *not* stored: the monitor derives it from `usage` plus a
-/// configurable pricing table, so history can be recomputed with current
-/// prices. See `doc/monitor.md` §3, §6.
+/// Token accounting reported by the provider. See `doc/monitor.md` §3.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct Usage {
@@ -529,8 +525,8 @@ mod tests {
         assert_eq!(event, decoded);
     }
 
-    /// `Usage` is stored; cost is derived elsewhere. Guard the field names that
-    /// the monitor's pricing math depends on.
+    /// Guard the `Usage` field names — the monitor's token accounting folds
+    /// these by name.
     #[test]
     fn usage_serializes_token_fields() {
         let usage = Usage {

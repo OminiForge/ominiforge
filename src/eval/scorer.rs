@@ -219,44 +219,6 @@ impl Scorer for TurnCompleted {
     }
 }
 
-// ── CostUnder ──────────────────────────────────────────────────────────────────
-
-/// Passes when the run's derived USD cost is under `max_usd`.
-///
-/// Cost is folded from the same event stream via [`crate::monitor::summarize`]
-/// (`doc/eval.md` §3.3). When no priced model ran, `cost_usd` is `None` and this
-/// skips rather than passes — a missing price is unknown cost, not zero cost.
-pub struct CostUnder {
-    max_usd: f64,
-    pricing: crate::monitor::PricingTable,
-}
-
-impl CostUnder {
-    /// Threshold in USD, with the pricing table used to derive cost from usage.
-    #[must_use]
-    pub const fn new(max_usd: f64, pricing: crate::monitor::PricingTable) -> Self {
-        Self { max_usd, pricing }
-    }
-}
-
-#[async_trait]
-impl Scorer for CostUnder {
-    fn name(&self) -> &'static str {
-        "CostUnder"
-    }
-
-    async fn score(&self, ctx: &EvalContext<'_>) -> Score {
-        let summary = crate::monitor::summarize(ctx.events, self.pricing.clone());
-        match summary.cost_usd {
-            None => Score::skip("no priced model ran; cost unknown"),
-            Some(cost) if cost < self.max_usd => {
-                Score::pass(format!("cost ${cost:.4} < ${:.4}", self.max_usd))
-            }
-            Some(cost) => Score::fail(format!("cost ${cost:.4} >= ${:.4}", self.max_usd)),
-        }
-    }
-}
-
 // ── TestsPass ──────────────────────────────────────────────────────────────────
 
 /// Passes when the scratch workspace's test command exits 0 and every
@@ -409,9 +371,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::float_cmp)]
 
     use super::*;
-    use crate::core::payload::{
-        BlockContent, ErrorDetail, ErrorSeverity, ModelEvent, StopReason, Usage,
-    };
+    use crate::core::payload::{BlockContent, ErrorDetail, ErrorSeverity, ModelEvent};
     use crate::core::payload::{EventPayload, ToolEvent, ToolOutput, TurnEvent};
     use crate::core::{
         CoreEvent, EventId, EventSource, SCHEMA_VERSION, SessionId, SourceKind, TurnId,
@@ -497,22 +457,6 @@ mod tests {
                 source_event_id: None,
                 provider_raw: None,
             },
-        })
-    }
-
-    fn request_completed(_model: &str, input: u32, output: u32) -> EventPayload {
-        EventPayload::Model(ModelEvent::RequestCompleted {
-            request_id: "r1".to_owned(),
-            stop_reason: StopReason::EndTurn,
-            usage: Usage {
-                input_tokens: input,
-                output_tokens: output,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-            },
-            duration_ms: 1,
-            time_to_first_token_ms: None,
-            provider_request_id: None,
         })
     }
 
@@ -677,23 +621,6 @@ mod tests {
         let case = case_with(Checker::Exact, Some("x"));
         let events = vec![ev(0, SourceKind::Model, "m", text_block("hi"))];
         let score = TurnCompleted.score(&ctx(&events, &case)).await;
-        assert!(score.value.is_skip());
-    }
-
-    // ── CostUnder ─────────────────────────────────────────────────────────────
-
-    /// With no priced model, cost is unknown → skip, never a silent pass.
-    #[tokio::test]
-    async fn cost_under_skips_when_no_pricing() {
-        let case = case_with(Checker::Exact, Some("x"));
-        let events = vec![ev(
-            0,
-            SourceKind::Model,
-            "unpriced/model",
-            request_completed("unpriced/model", 1000, 1000),
-        )];
-        let scorer = CostUnder::new(1.0, crate::monitor::PricingTable::new());
-        let score = scorer.score(&ctx(&events, &case)).await;
         assert!(score.value.is_skip());
     }
 }
