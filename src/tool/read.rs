@@ -1,11 +1,16 @@
 //! The `read` built-in tool: read a UTF-8 file or list a directory within the
 //! workspace.
 //!
-//! A bare path reads the whole file. Optional `start` (default 1) / `end`
-//! (default: last line) scope the read to an inclusive 1-based line range.
+//! A bare path reads from the top of the file, capped at `MAX_BARE_LINES`
+//! lines. Optional `start` (default 1) / `end` (default: last line) scope the
+//! read to an inclusive 1-based line range.
 //!
-//! Output is a `[path]` header and every line prefixed `N:`. Line numbers are
-//! *absolute* even for a range, for orientation — they are not an anchor
+//! Output is a `[path] (N lines)` header — the total count lets the caller
+//! scope a follow-up range without a separate `wc -l` — and every line
+//! prefixed `N:`, capped at `MAX_LINE_CHARS` characters unless `verbatim:
+//! true` is passed (a clipped line cannot be quoted in `edit`, so the cap
+//! must be liftable; `verbatim` never widens the line window). Line numbers
+//! are *absolute* even for a range, for orientation — they are not an anchor
 //! [`edit`](super::EditTool) needs: `edit` locates the exact text you quote,
 //! not a line number, so there is no snapshot/tag to go stale.
 //!
@@ -36,6 +41,8 @@ struct ReadArgs {
     start: Option<usize>,
     /// Last line to read, 1-based inclusive; default: the file's last line.
     end: Option<usize>,
+    /// Return each line in full, disabling the per-line character cap.
+    verbatim: Option<bool>,
 }
 
 /// A `path` argument plus the flat line window (`end: None` = to EOF).
@@ -45,6 +52,8 @@ struct ParsedArg {
     path: String,
     start: Option<usize>,
     end: Option<usize>,
+    /// Disable the per-line character cap (default false).
+    verbatim: bool,
 }
 
 impl ReadTool {
@@ -61,13 +70,18 @@ impl Tool for ReadTool {
         ToolDescriptor {
             name: "read".to_owned(),
             description: "Read a UTF-8 text file or list a directory, relative to the \
-                          workspace root. A bare file path numbers every line (`N:text`) \
-                          under a `[path]` header. Line numbers are for orientation only \
-                          — `edit` locates the exact lines you quote, not a line number, \
-                          so don't cite them there. A bare path reads the whole file; \
-                          `start` (default 1) / `end` (default: last line) scope the \
-                          read to an inclusive 1-based range whose numbers stay \
-                          absolute. A directory path lists its entries."
+                          workspace root. The `[path] (N lines)` header reports the \
+                          file's total line count, so you can scope a follow-up range \
+                          without guessing; each line is numbered `N:text` and capped \
+                          at 500 characters — pass `verbatim: true` to read clipped \
+                          lines in full (required before quoting them in `edit`; the \
+                          line-window caps still apply). Line numbers are for \
+                          orientation only — `edit` locates the exact lines you quote, \
+                          not a line number, so don't cite them there. A bare path \
+                          reads from the top, capped at 500 lines — for larger files \
+                          use `start` (default 1) / `end` (default: last line) to read \
+                          an inclusive 1-based range whose numbers stay absolute. \
+                          A directory path lists its entries."
                 .to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -90,6 +104,15 @@ impl Tool for ReadTool {
                         "description": "Last line to read, 1-based and inclusive \
                                         (default: the file's last line; values past \
                                         EOF clamp to it)."
+                    },
+                    "verbatim": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Return each line in full, disabling the \
+                                        per-line 500-character cap — quote these \
+                                        lines verbatim in `edit`. The line-window \
+                                        caps still apply; use start/end to move \
+                                        the window."
                     }
                 },
                 "required": ["path"],
@@ -105,6 +128,7 @@ impl Tool for ReadTool {
             path: args.path,
             start: args.start,
             end: args.end,
+            verbatim: args.verbatim.unwrap_or(false),
         };
         let path = resolve_in_workspace(&self.workspace, &parsed.path)?;
 
@@ -132,37 +156,28 @@ impl Tool for ReadTool {
                     // UI view: structured code content for the front-end to
                     // highlight (tree-sitter). The model-facing `Text` keeps the
                     // `[path]` + `N:line` anchor format the model needs for edit.
-                    // A ranged read shows ONLY the slice — with absolute line
-                    // numbers and the requested (pre-clamp) range, so the
-                    // gutter matches the model-facing text and the view doesn't
-                    // store the whole file when the call asked for a window.
-                    let view = match (parsed.start, parsed.end) {
-                        (None, None) => serde_json::json!({
-                            "kind": "code",
-                            "path": parsed.path,
-                            "content": content,
-                        }),
+                    // The view always carries the WHOLE file plus the window the
+                    // model actually saw — a bare read's text is capped at
+                    // MAX_BARE_LINES, and the front-end highlights the full
+                    // document (a slice breaks multi-line constructs) while
+                    // showing just the window, numbered by its absolute lines.
+                    let n = content.lines().count();
+                    let (lo, hi) = match (parsed.start, parsed.end) {
+                        (None, None) => (1, n.min(MAX_BARE_LINES)),
                         (start, end) => {
-                            // The view carries the WHOLE file plus the
-                            // RESOLVED window (start defaults to 1, end to
-                            // the last line): the front-end highlights the
-                            // full document (a slice breaks multi-line
-                            // constructs) and shows the slice, numbered by
-                            // the window's absolute lines.
-                            let n = content.lines().count();
                             // render() bounds-checked this same window.
-                            let (lo, hi) = clamp_range(start.unwrap_or(1), end.unwrap_or(n), n)
-                                .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
-                            serde_json::json!({
-                                "kind": "code",
-                                "path": parsed.path,
-                                "content": content,
-                                "numbered": true,
-                                "start": lo,
-                                "end": hi,
-                            })
+                            clamp_range(start.unwrap_or(1), end.unwrap_or(n), n)
+                                .map_err(|e| ToolError::InvalidInput(e.to_string()))?
                         }
-                    }
+                    };
+                    let view = serde_json::json!({
+                        "kind": "code",
+                        "path": parsed.path,
+                        "content": content,
+                        "numbered": true,
+                        "start": lo,
+                        "end": hi,
+                    })
                     .to_string();
                     let mut output = ToolOutput {
                         content: vec![Content::Text(text)],
@@ -229,29 +244,71 @@ impl ReadTool {
     }
 }
 
-/// Render file content per the optional start/end window.
+/// Lines shown by a bare (unranged) read before truncation kicks in — a bare
+/// read must never dump an unbounded file into context.
+const MAX_BARE_LINES: usize = 500;
+
+/// Characters shown per line before the line is truncated — one minified line
+/// must not blow the token budget.
+const MAX_LINE_CHARS: usize = 500;
+
+/// Render file content per the optional start/end window. The header always
+/// carries the file's total line count so the caller can scope a follow-up
+/// ranged read without a separate `wc -l` round-trip.
 ///
-/// - start/end set: `[path]` header then absolute `N:text` lines for the slice.
-/// - neither set: `[path]` header then every line numbered.
+/// - start/end set: `[path] (N lines)` header then absolute `N:text` lines
+///   for the slice — no notice: the caller chose that window and the header
+///   already tells them the total.
+/// - neither set: the same header then every line numbered, capped at
+///   [`MAX_BARE_LINES`] with a truncation notice telling the caller exactly
+///   which range to ask for next.
+///
+/// Every line is capped at [`MAX_LINE_CHARS`] unless `verbatim` is set — a
+/// clipped line cannot be quoted in `edit`, so `verbatim` exists to fetch it
+/// in full. It does NOT widen the line window.
 fn render(parsed: &ParsedArg, content: &str) -> Result<String, String> {
-    match (parsed.start, parsed.end) {
-        (None, None) => Ok(numbered(&parsed.path, content)),
-        (start, end) => {
-            let lines: Vec<&str> = content.lines().collect();
-            let n = lines.len();
-            let (lo, hi) = clamp_range(start.unwrap_or(1), end.unwrap_or(n), n)?;
-            // lo/hi are 1-based inclusive; slice is 0-based half-open.
-            let slice = &lines[lo - 1..hi];
-            let mut parts = vec![format!("[{}]", parsed.path)];
-            parts.extend(
-                slice
-                    .iter()
-                    .enumerate()
-                    .map(|(i, l)| format!("{}:{l}", lo + i)),
-            );
-            Ok(parts.join("\n"))
+    let lines: Vec<&str> = content.lines().collect();
+    let n = lines.len();
+    let header = format!("[{}] ({n} lines)", parsed.path);
+    let (lo, hi) = match (parsed.start, parsed.end) {
+        (None, None) => (1, n.min(MAX_BARE_LINES)),
+        (start, end) => clamp_range(start.unwrap_or(1), end.unwrap_or(n), n)?,
+    };
+    // lo/hi are 1-based inclusive; slice is 0-based half-open.
+    let slice = &lines[lo - 1..hi];
+    let mut parts = vec![header];
+    parts.extend(slice.iter().enumerate().map(|(i, l)| {
+        if parsed.verbatim {
+            format!("{}:{l}", lo + i)
+        } else {
+            format!("{}:{}", lo + i, clip_line(l))
         }
+    }));
+    // The notice exists only for a TOOL-imposed cap (bare read); a caller who
+    // asked for a window that ends before EOF did so on purpose.
+    if parsed.start.is_none() && parsed.end.is_none() && hi < n {
+        parts.push(format!(
+            "... (showing {lo}-{hi} of {n}; use start/end to read more)"
+        ));
     }
+    Ok(parts.join("\n"))
+}
+
+/// Cap one line at [`MAX_LINE_CHARS`], appending a notice that names the
+/// escape hatch (`verbatim: true`) alongside the original length.
+fn clip_line(line: &str) -> String {
+    if line.len() <= MAX_LINE_CHARS {
+        return line.to_owned();
+    }
+    let cut = line
+        .char_indices()
+        .nth(MAX_LINE_CHARS)
+        .map_or(line.len(), |(i, _)| i);
+    format!(
+        "{}... ({} chars total; pass verbatim: true for the full line)",
+        &line[..cut],
+        line.len()
+    )
 }
 
 /// Bounds-check a 1-based inclusive range against a file of `n` lines. `end` is
@@ -270,18 +327,6 @@ fn clamp_range(start: usize, end: usize, n: usize) -> Result<(usize, usize), Str
     Ok((start, end.min(n)))
 }
 
-/// Render the original whole-file form: `[path]` header then 1-based
-/// `N:text` lines. An empty file yields just the header.
-fn numbered(path: &str, content: &str) -> String {
-    let mut parts = vec![format!("[{path}]")];
-    parts.extend(
-        content
-            .lines()
-            .enumerate()
-            .map(|(i, l)| format!("{}:{l}", i + 1)),
-    );
-    parts.join("\n")
-}
 
 fn business_error(code: &str, message: &str) -> ToolOutput {
     ToolOutput {
@@ -360,7 +405,7 @@ mod tests {
 
         let out = t.invoke(input("a.txt")).await.unwrap();
         assert!(!out.is_error);
-        assert_eq!(text(&out), "[a.txt]\n1:hello\n2:world");
+        assert_eq!(text(&out), "[a.txt] (2 lines)\n1:hello\n2:world");
     }
 
     #[tokio::test]
@@ -396,7 +441,7 @@ mod tests {
 
         let out = t.invoke(range_input("a.txt", 2, 4)).await.unwrap();
         assert!(!out.is_error, "{:?}", out.content);
-        assert_eq!(text(&out), "[a.txt]\n2:l2\n3:l3\n4:l4");
+        assert_eq!(text(&out), "[a.txt] (5 lines)\n2:l2\n3:l3\n4:l4");
     }
 
     /// `end` past EOF clamps to the last line; this is a friendly "to the end".
@@ -407,7 +452,7 @@ mod tests {
         let t = tool(dir.path().to_path_buf());
 
         let out = t.invoke(range_input("a.txt", 1, 99)).await.unwrap();
-        assert_eq!(text(&out), "[a.txt]\n1:a\n2:b");
+        assert_eq!(text(&out), "[a.txt] (2 lines)\n1:a\n2:b");
     }
 
     /// `start` past EOF fails loud rather than returning an empty slice.
@@ -435,7 +480,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!out.is_error, "{:?}", out.content);
-        assert_eq!(text(&out), "[a.txt]\n2:l2\n3:l3");
+        assert_eq!(text(&out), "[a.txt] (3 lines)\n2:l2\n3:l3");
     }
 
     /// `end` alone defaults `start` to 1 — "read the first N lines". The view
@@ -450,7 +495,7 @@ mod tests {
             .invoke(window_input("a.txt", None, Some(2)))
             .await
             .unwrap();
-        assert_eq!(text(&out), "[a.txt]\n1:l1\n2:l2");
+        assert_eq!(text(&out), "[a.txt] (3 lines)\n1:l1\n2:l2");
         let view = view(&out);
         assert_eq!(view["numbered"], true);
         assert_eq!(view["start"], 1);
@@ -501,10 +546,11 @@ mod tests {
         assert_eq!(nums, (start..=end).collect::<Vec<_>>());
     }
 
-    /// A whole-file read keeps the legacy view shape: raw content, numbered
-    /// 1..N by the front-end, no `numbered`/`start`/`end` fields.
+    /// A bare read's view carries the whole file plus the resolved window —
+    /// the same shape as a ranged read — so a truncated bare read still
+    /// highlights correctly and shows exactly what the model saw.
     #[tokio::test]
-    async fn whole_file_view_is_unnumbered_full_content() {
+    async fn bare_read_view_is_full_content_with_window() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "l1\nl2\n").unwrap();
         let t = tool(dir.path().to_path_buf());
@@ -512,9 +558,9 @@ mod tests {
         let out = t.invoke(input("a.txt")).await.unwrap();
         let view = view(&out);
         assert_eq!(view["content"], "l1\nl2\n");
-        assert!(view.get("numbered").is_none());
-        assert!(view.get("start").is_none());
-        assert!(view.get("end").is_none());
+        assert_eq!(view["numbered"], true);
+        assert_eq!(view["start"], 1);
+        assert_eq!(view["end"], 2);
     }
 
     #[tokio::test]
@@ -526,6 +572,176 @@ mod tests {
         let out = t.invoke(range_input("a.txt", 3, 1)).await.unwrap();
         assert!(out.is_error);
         assert_eq!(out.error_code.as_deref(), Some("bad_range"));
+    }
+
+    // --- header line count, bare-read cap, long-line cap ---------------------
+
+    /// A bare read of a file over `MAX_BARE_LINES` returns only the head of
+    /// the file — the header plus the truncation notice tell the model the
+    /// total and the exact next range to ask for, replacing the `wc -l` +
+    /// `sed -n` two-call idiom.
+    #[tokio::test]
+    async fn bare_read_of_large_file_is_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (1..=600u32).fold(String::new(), |mut s, i| {
+            use std::fmt::Write as _;
+            let _ = writeln!(s, "line{i}");
+            s
+        });
+        std::fs::write(dir.path().join("big.txt"), body).unwrap();
+        let t = tool(dir.path().to_path_buf());
+
+        let out = t.invoke(input("big.txt")).await.unwrap();
+        assert!(!out.is_error, "{:?}", out.content);
+        let text = text(&out);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "[big.txt] (600 lines)");
+        assert_eq!(lines[1], "1:line1");
+        assert_eq!(lines[500], "500:line500");
+        assert_eq!(
+            lines[501],
+            "... (showing 1-500 of 600; use start/end to read more)"
+        );
+        assert_eq!(lines.len(), 502);
+    }
+
+    /// A small file below the cap shows every line with no truncation notice.
+    #[tokio::test]
+    async fn bare_read_under_cap_shows_all_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (1..=3u32).fold(String::new(), |mut s, i| {
+            use std::fmt::Write as _;
+            let _ = writeln!(s, "line{i}");
+            s
+        });
+        std::fs::write(dir.path().join("small.txt"), body).unwrap();
+        let t = tool(dir.path().to_path_buf());
+
+        let out = t.invoke(input("small.txt")).await.unwrap();
+        assert_eq!(
+            text(&out),
+            "[small.txt] (3 lines)\n1:line1\n2:line2\n3:line3"
+        );
+    }
+
+    /// One pathological line (minified code, generated JSON) must not blow
+    /// the token budget: it is cut at the cap and annotated with its true
+    /// length. Lines under the cap pass through unchanged.
+    #[tokio::test]
+    async fn overlong_line_is_clipped_with_length_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = "x".repeat(1200);
+        std::fs::write(dir.path().join("long.txt"), format!("short\n{long}")).unwrap();
+        let t = tool(dir.path().to_path_buf());
+
+        let out = t.invoke(input("long.txt")).await.unwrap();
+        assert!(!out.is_error, "{:?}", out.content);
+        let text = text(&out);
+        let mut lines = text.lines();
+        assert_eq!(lines.next().unwrap(), "[long.txt] (2 lines)");
+        assert_eq!(lines.next().unwrap(), "1:short");
+        let clipped = lines.next().unwrap();
+        assert!(clipped.starts_with(&format!("2:{}", "x".repeat(500))));
+        assert!(
+            clipped.ends_with("... (1200 chars total; pass verbatim: true for the full line)")
+        );
+        assert_eq!(lines.next(), None);
+    }
+
+    /// `verbatim: true` returns the line in full: a clipped line cannot be
+    /// quoted in `edit` (the anchor would never match), so the cap must be
+    /// liftable on demand. The word mirrors `edit`'s "quote verbatim"
+    /// contract so the fetch-then-quote chain reads consistently.
+    #[tokio::test]
+    async fn verbatim_returns_clipped_line_in_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = "x".repeat(1200);
+        std::fs::write(dir.path().join("long.txt"), format!("short\n{long}")).unwrap();
+        let t = tool(dir.path().to_path_buf());
+
+        let out = t
+            .invoke(ToolInput {
+                call_id: "c1".to_owned(),
+                input: serde_json::json!({ "path": "long.txt", "verbatim": true }),
+                timeout: Duration::from_secs(5),
+                progress: None,
+            })
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{:?}", out.content);
+        assert_eq!(
+            text(&out),
+            format!("[long.txt] (2 lines)\n1:short\n2:{long}")
+        );
+    }
+
+    /// `verbatim` composes with a range: the window selects the lines,
+    /// verbatim widens the columns. Combined, they fetch exactly the slice
+    /// to be edited, in quotable form, in one call.
+    #[tokio::test]
+    async fn verbatim_composes_with_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = "y".repeat(800);
+        std::fs::write(
+            dir.path().join("mixed.txt"),
+            format!("a\n{long}\nb\nc\n"),
+        )
+        .unwrap();
+        let t = tool(dir.path().to_path_buf());
+
+        let out = t
+            .invoke(ToolInput {
+                call_id: "c1".to_owned(),
+                input: serde_json::json!({
+                    "path": "mixed.txt",
+                    "start": 2,
+                    "end": 3,
+                    "verbatim": true,
+                }),
+                timeout: Duration::from_secs(5),
+                progress: None,
+            })
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{:?}", out.content);
+        assert_eq!(
+            text(&out),
+            format!("[mixed.txt] (4 lines)\n2:{long}\n3:b")
+        );
+    }
+
+    /// `verbatim` lifts the COLUMN cap only — the bare-read line-window cap
+    /// still applies. A caller who reads `verbatim: true` expecting the whole
+    /// raw file must still see the truncation notice pointing at start/end.
+    #[tokio::test]
+    async fn verbatim_does_not_widen_the_line_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (1..=600u32).fold(String::new(), |mut s, i| {
+            use std::fmt::Write as _;
+            let _ = writeln!(s, "line{i}");
+            s
+        });
+        std::fs::write(dir.path().join("big.txt"), body).unwrap();
+        let t = tool(dir.path().to_path_buf());
+
+        let out = t
+            .invoke(ToolInput {
+                call_id: "c1".to_owned(),
+                input: serde_json::json!({ "path": "big.txt", "verbatim": true }),
+                timeout: Duration::from_secs(5),
+                progress: None,
+            })
+            .await
+            .unwrap();
+        let body_text = text(&out);
+        let lines: Vec<&str> = body_text.lines().collect();
+        assert_eq!(lines[0], "[big.txt] (600 lines)");
+        assert_eq!(lines[500], "500:line500");
+        assert_eq!(
+            lines[501],
+            "... (showing 1-500 of 600; use start/end to read more)"
+        );
+        assert_eq!(lines.len(), 502);
     }
 
     // --- directory listing --------------------------------------------------
