@@ -11,10 +11,10 @@
 	let { state }: { state: ViewState } = $props();
 
 	const label: Record<ViewState, string> = {
-		running: '运行中',
-		awaiting: '待审批',
-		unseen: '已完成未查看',
-		seen: '已完成'
+		running: 'Running',
+		awaiting: 'Awaiting approval',
+		unseen: 'Completed, unseen',
+		seen: 'Completed'
 	};
 </script>
 

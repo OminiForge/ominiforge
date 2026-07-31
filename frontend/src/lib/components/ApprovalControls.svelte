@@ -32,13 +32,13 @@
 	let menuPos = $state<{ bottom: number; right: number } | null>(null);
 
 	const SCOPES: { value: ApprovalScope; label: string }[] = [
-		{ value: 'once', label: '仅此次' },
-		{ value: 'session', label: '本次会话' },
-		{ value: 'profile', label: '当前 profile' },
-		{ value: 'gateway', label: '所有会话' }
+		{ value: 'once', label: 'Just once' },
+		{ value: 'session', label: 'This session' },
+		{ value: 'profile', label: 'Current profile' },
+		{ value: 'gateway', label: 'All sessions' }
 	];
 
-	const scopeLabel = $derived(SCOPES.find((s) => s.value === scope)?.label ?? '仅此次');
+	const scopeLabel = $derived(SCOPES.find((s) => s.value === scope)?.label ?? 'Just once');
 
 	async function decide(decision: 'approve' | 'reject') {
 		if (busy) return;
@@ -95,7 +95,7 @@
 			disabled={busy}
 			aria-haspopup="menu"
 			aria-expanded={menuOpen}
-			title="作用域：决定的有效范围"
+			title="Scope: how long the decision stays valid"
 			onclick={toggleMenu}
 		>
 			{scopeLabel}
@@ -128,15 +128,15 @@
 						onclick={() => pickScope(s.value)}
 					>
 						{s.label}
-						{#if s.value === 'session'}<span class="menu-hint">重连/重启后失效</span>{/if}
+						{#if s.value === 'session'}<span class="menu-hint">Lost on reconnect/restart</span>{/if}
 					</button>
 				{/each}
 			</div>
 		{/if}
 	</div>
 
-	<button class="btn reject" disabled={busy} onclick={() => decide('reject')}>拒绝</button>
-	<button class="btn approve" disabled={busy} onclick={() => decide('approve')}>批准</button>
+	<button class="btn reject" disabled={busy} onclick={() => decide('reject')}>Reject</button>
+	<button class="btn approve" disabled={busy} onclick={() => decide('approve')}>Approve</button>
 </div>
 
 <style>

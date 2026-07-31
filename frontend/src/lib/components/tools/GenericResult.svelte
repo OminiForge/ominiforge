@@ -22,7 +22,7 @@
 	{#if result}
 		<pre class="out">{result}</pre>
 	{:else if status === 'error'}
-		<div class="empty">无输出 · <span class="code">{error_code ?? 'error'}</span></div>
+		<div class="empty">No output · <span class="code">{error_code ?? 'error'}</span></div>
 	{/if}
 </div>
 <RawArgs {args} />

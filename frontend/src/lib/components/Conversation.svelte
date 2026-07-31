@@ -1062,8 +1062,10 @@
 
 	function isCollapsed(item: Item, i: number): boolean {
 		if (i in collapsed) return collapsed[i];
-		// Auto-collapse finished reasoning (tools stay open per user preference)
-		if (item.kind === 'reasoning') return !item.streaming;
+		// Reasoning is collapsed by default in every state: streaming shows a
+		// one-line ticker of the latest line, finished shows a first-line
+		// preview. The user expands on demand (tools stay open per preference).
+		if (item.kind === 'reasoning') return true;
 		// Auto-collapse a todo list once every step is terminal (the work is done);
 		// keep an active todo list open so the running task stays visible.
 		if (item.kind === 'todo') return item.steps.length > 0 && todoDone(item.steps);
@@ -1093,6 +1095,16 @@
 	function shortPreview(text: string): string {
 		const first = text.split('\n')[0].slice(0, 60);
 		return first.length < text.split('\n')[0].length ? first + '…' : first;
+	}
+	/** Latest non-empty line of a streaming reasoning block — the collapsed
+	 *  ticker line the user watches roll by while the model thinks. */
+	function lastLine(text: string): string {
+		const lines = text.split('\n');
+		for (let i = lines.length - 1; i >= 0; i--) {
+			const line = lines[i].trim();
+			if (line) return line;
+		}
+		return '';
 	}
 
 	/** Short session label for the topbar: prefer the latest user message would
@@ -1494,7 +1506,7 @@
 	<div class="conv-page">
 		<!-- TOPBAR -->
 		<div class="topbar">
-			<a href="/" class="topbar-back" title="返回首页" aria-label="Back to home">
+			<a href="/" class="topbar-back" title="Back to home" aria-label="Back to home">
 				<svg
 					width="14"
 					height="14"
@@ -1512,9 +1524,9 @@
 			<div class="topbar-sep"></div>
 			<div class="topbar-meta">
 				{#if isDraft}
-					<span class="mono draft-hint">draft · 发送后创建</span>
+					<span class="mono draft-hint">draft · created on first send</span>
 				{:else}
-					<button class="session-id-btn" onclick={copyId} title={copied ? '已复制!' : sessionId}>
+					<button class="session-id-btn" onclick={copyId} title={copied ? 'Copied!' : sessionId}>
 						{shortId(sessionId)}
 						{#if copied}<span class="copy-toast" transition:fade={fadeIn()}>Copied!</span>{/if}
 					</button>
@@ -1528,7 +1540,7 @@
 					class="detail-toggle"
 					class:on={detailOpen}
 					onclick={toggleDetail}
-					title={detailOpen ? '收起信息栏' : '展开信息栏'}
+					title={detailOpen ? 'Collapse detail panel' : 'Expand detail panel'}
 					aria-label="Toggle detail panel"
 					aria-pressed={detailOpen}
 				>
@@ -1557,7 +1569,7 @@
 			     initial connect is covered by the loading skeleton, and showing
 			     "reconnecting" before anything ever connected would be wrong. -->
 			<div class="reconnect-bar" role="status">
-				<span class="reconnect-dot" aria-hidden="true"></span>连接断开，正在重连…
+				<span class="reconnect-dot" aria-hidden="true"></span>Connection lost, reconnecting…
 			</div>
 		{/if}
 
@@ -1569,7 +1581,7 @@
 				     invisible too). Shows while the view loads; the conversation
 				     below it appears already positioned at the tail. -->
 				{#if (loading || !convo.ready) && !isDraft}
-					<div class="loading-skeleton" role="status" aria-label="加载历史">
+					<div class="loading-skeleton" role="status" aria-label="Loading history">
 						<div class="sk-row sk-user">
 							<Skeleton width="42%" height="38px" radius="var(--radius-lg)" />
 						</div>
@@ -1591,7 +1603,7 @@
 				     seeded with (fork/compaction/reconfiguration), rendered dimmed above the
 				     live turns so the branch shows what came before. See DESIGN.md §4.8. -->
 					{#if inherited.length > 0}
-						<div class="inherited" aria-label="继承的上下文">
+						<div class="inherited" aria-label="Inherited context">
 							{#each inherited as it, k (k)}
 								{#if it.kind === 'user'}
 									<div class="item item-user">
@@ -1622,7 +1634,9 @@
 									</div>
 								{/if}
 							{/each}
-							<div class="inherited-sep"><span>分支自此处 · inherited context above</span></div>
+							<div class="inherited-sep">
+								<span>Branched from here · inherited context above</span>
+							</div>
 						</div>
 					{/if}
 					{#each convo.items as item, i (item.id)}
@@ -1648,7 +1662,7 @@
 										<button
 											class="turn-action-btn"
 											onclick={() => fork(item.seq!, item.text)}
-											title="从这条消息处分支（继承之前的对话，另开一个会话）"
+											title="Fork from this message (inherits the prior conversation into a new session)"
 											aria-label="Fork a new session from this message"
 										>
 											<!-- Original divergence glyph: a single stem splitting into
@@ -1684,7 +1698,7 @@
 									<!-- Optimistic echo awaiting its committed Turn::Started.
 									     A healthy stream replaces it in a blink; this hint only
 									     lingers when the stream is dead (reconnect underway). -->
-									<span class="pending-hint">已发送 · 同步中…</span>
+									<span class="pending-hint">Sent · syncing…</span>
 								{/if}
 							</div>
 						{:else if item.kind === 'text'}
@@ -1707,26 +1721,41 @@
 							{#if item.text.trim()}
 								<div
 									class="item item-reasoning"
+									class:streaming={item.streaming}
 									class:expanded={!isCollapsed(item, i)}
 									data-item-anchor={i}
 									in:fly|local={enterAnim}
 								>
 									{#if item.streaming}
-										<!-- Streaming: quiet inline label + the live text, so the
-										     user sees what it's thinking as it thinks — no card
-										     chrome, but content visible. -->
-										<div class="reasoning-inline">
-											<span class="reasoning-inline-label">思考中</span>
-											<span class="streaming-dot"></span>
-										</div>
-										<div class="reasoning-stream">
-											{#if browser}
-												<!-- eslint-disable-next-line svelte/no-at-html-tags -->
-												{@html renderMarkdown(item.text)}
+										<!-- Streaming: collapsed by default — a one-line ticker
+										     showing the latest reasoning line (the roll of lines
+										     is the liveness cue). Click to expand the full stream;
+										     click again to fold back. -->
+										<button
+											class="reasoning-preview"
+											onclick={() => toggleCollapse(item, i)}
+											aria-expanded={!isCollapsed(item, i)}
+										>
+											{#if isCollapsed(item, i)}
+												<span class="reasoning-inline-label">Thinking</span>
+												<span class="streaming-dot"></span>
+												<span class="reasoning-ticker">{lastLine(item.text)}</span>
 											{:else}
-												{item.text}
+												<span class="reasoning-inline-label">Thinking</span>
+												<span class="streaming-dot"></span>
+												Collapse
 											{/if}
-										</div>
+										</button>
+										{#if !isCollapsed(item, i)}
+											<div class="reasoning-stream">
+												{#if browser}
+													<!-- eslint-disable-next-line svelte/no-at-html-tags -->
+													{@html renderMarkdown(item.text)}
+												{:else}
+													{item.text}
+												{/if}
+											</div>
+										{/if}
 									{:else}
 										<!-- Done: single-line muted preview, click to expand. -->
 										<button
@@ -1737,7 +1766,7 @@
 											{#if isCollapsed(item, i)}
 												{shortPreview(item.text)}
 											{:else}
-												收起思考
+												Collapse thinking
 											{/if}
 										</button>
 										{#if !isCollapsed(item, i)}
@@ -1965,7 +1994,11 @@
 					{/each}
 
 					{#if convo.items.length === 0 && !loading && convo.ready}
-						<p class="empty">{isDraft ? '输入消息，开始一段新对话' : '发送消息开始对话'}</p>
+						<p class="empty">
+							{isDraft
+								? 'Type a message to start a new conversation'
+								: 'Send a message to start the conversation'}
+						</p>
 					{/if}
 				</div>
 			</div>
@@ -1996,7 +2029,7 @@
 				<button
 					class="to-bottom"
 					onclick={scrollToBottom}
-					title="回到底部"
+					title="Back to bottom"
 					aria-label="Scroll to latest"
 					transition:fly={rise(8, 120)}
 				>
@@ -2133,7 +2166,7 @@
 					<!-- Pending queue: messages the user sent while a turn was running.
 					     They flush one-at-a-time on each settle; until then each is a
 					     cancellable chip (× drops it back into the input to edit/resend). -->
-					<div class="queue" aria-label="待发送消息">
+					<div class="queue" aria-label="Queued messages">
 						{#each queued as item (item.id)}
 							<div class="queue-chip" transition:scale={pop(120)}>
 								<span class="queue-dot" aria-hidden="true"></span>
@@ -2141,7 +2174,7 @@
 								<button
 									class="queue-cancel"
 									onclick={() => cancelQueued(item)}
-									title="取消并放回输入框"
+									title="Cancel and move back to the input"
 									aria-label="Cancel queued message"
 								>
 									<svg
@@ -2168,8 +2201,8 @@
 						onkeydown={onKeydown}
 						disabled={isArchived}
 						placeholder={isArchived
-							? '会话已归档，仅供查看'
-							: '输入消息… Enter 发送，Shift+Enter 换行'}
+							? 'Session archived, read-only'
+							: 'Type a message… Enter to send, Shift+Enter for newline'}
 						rows="2"
 					></textarea>
 					<div class="input-actions">
@@ -2179,7 +2212,7 @@
 								     surfaced in the conversation itself (the session-list
 								     icon is per-row; this is the in-context signal). -->
 								<span class="status-running">
-									<span class="status-running-dot"></span>运行中
+									<span class="status-running-dot"></span>Running
 								</span>
 							{:else if incomplete}
 								<span class="status-warn">Turn incomplete</span>
@@ -2191,8 +2224,8 @@
 								class:on={cfgOpen}
 								onclick={() => (cfgOpen = !cfgOpen)}
 								title={isDraft
-									? '选择 profile / 模型 / 工作区（仅本次会话）'
-									: '查看 / 切换 profile / 模型（切换会基于当前对话开启一个新会话）'}
+									? 'Choose profile / model / workspace (this session only)'
+									: 'View / switch profile / model (switching opens a new session seeded with this conversation)'}
 								aria-expanded={cfgOpen}
 							>
 								<svg
@@ -2217,7 +2250,7 @@
 									<label class="cfg-field">
 										<span class="cfg-key">Profile</span>
 										<select class="cfg-select" bind:value={selProfile}>
-											<option value="">默认</option>
+											<option value="">Default</option>
 											{#each profiles as p (p.name)}
 												<option value={p.name}
 													>{p.name}{p.description ? ` — ${p.description}` : ''}</option
@@ -2228,7 +2261,7 @@
 									<label class="cfg-field">
 										<span class="cfg-key">Model</span>
 										<select class="cfg-select" bind:value={selModel}>
-											<option value="">默认（按 profile）</option>
+											<option value="">Default (per profile)</option>
 											{#each models as m (`${m.provider}/${m.model_id}`)}
 												<option value={`${m.provider}/${m.model_id}`}
 													>{m.model_id} · {m.provider}</option
@@ -2240,13 +2273,15 @@
 										<!-- Live session: a profile/model change can't edit in place; it
 									     opens a new session seeded with this conversation. -->
 										<div class="cfg-foot">
-											<span class="cfg-hint">切换将基于当前对话开启新会话</span>
+											<span class="cfg-hint"
+												>Switching opens a new session seeded with this conversation</span
+											>
 											<button
 												class="input-btn primary cfg-apply"
 												disabled={!cfgDirty || reconfiguring}
 												onclick={applyReconfigure}
 											>
-												{reconfiguring ? '切换中…' : '切换'}
+												{reconfiguring ? 'Switching…' : 'Switch'}
 											</button>
 										</div>
 									{/if}
@@ -2275,10 +2310,10 @@
 							disabled={isArchived || sending || !input.trim()}
 							onclick={send}
 							title={isArchived
-								? '会话已归档，仅供查看'
+								? 'Session archived, read-only'
 								: !isDraft && turnRunning
-									? '排队发送（当前回合结束后自动发出）· Enter'
-									: '发送 · Enter'}
+									? 'Queue message (sent when the current turn ends) · Enter'
+									: 'Send · Enter'}
 							aria-label="Send message"
 						>
 							{#if sending}
@@ -2340,11 +2375,13 @@
 					<button
 						class="inspect-order"
 						onclick={() => (inspectReversed = !inspectReversed)}
-						title={inspectReversed ? '最新在前，点击切换为正序' : '正序，点击切换为最新在前'}
+						title={inspectReversed
+							? 'Newest first, click for chronological'
+							: 'Chronological, click for newest first'}
 						aria-label="Toggle timeline order"
 						aria-pressed={inspectReversed}
 					>
-						{#if inspectReversed}↓ 最新{:else}↑ 最早{/if}
+						{#if inspectReversed}↓ Newest{:else}↑ Oldest{/if}
 					</button>
 				{/if}
 			</div>
@@ -2501,7 +2538,7 @@
 							<button
 								class="inspect-event"
 								onclick={() => scrollToSeq(Number(row.ev.seq))}
-								title="跳转到对话中的对应位置"
+								title="Jump to the matching position in the conversation"
 							>
 								<span class="inspect-seq">#{row.ev.seq}</span>
 								<span class="inspect-type">{info.variant}</span>
@@ -2518,7 +2555,7 @@
 									onclick={() =>
 										(inspectExpanded = { ...inspectExpanded, [g.key]: !inspectExpanded[g.key] })}
 									aria-expanded={!!inspectExpanded[g.key]}
-									title="展开/收起各阶段"
+									title="Expand/collapse phases"
 								>
 									<span class="inspect-seq">#{g.seq}</span>
 									<span class="inspect-caret" class:open={!!inspectExpanded[g.key]}>▸</span>
@@ -2529,8 +2566,8 @@
 								<button
 									class="inspect-jump"
 									onclick={() => scrollToSeq(g.seq)}
-									title="跳转到对话中的对应位置"
-									aria-label="跳转到对话中的对应位置"
+									title="Jump to the matching position in the conversation"
+									aria-label="Jump to the matching position in the conversation"
 								>
 									⧉
 								</button>
@@ -2540,7 +2577,7 @@
 										<button
 											class="inspect-event inspect-phase"
 											onclick={() => scrollToSeq(Number(ev.seq))}
-											title="跳转到对话中的对应位置"
+											title="Jump to the matching position in the conversation"
 										>
 											<span class="inspect-seq">#{ev.seq}</span>
 											<span class="inspect-type">{info.variant}</span>
@@ -3532,19 +3569,21 @@
 	}
 
 	/* ---- REASONING (inline, non-card) ---- */
-	/* Streaming: one quiet inline line, no card chrome. */
-	.reasoning-inline {
-		display: flex;
-		align-items: center;
-		gap: var(--space-2);
-		padding: var(--space-1) 0;
-		font-family: var(--font-chinese);
-	}
-
 	.reasoning-inline-label {
 		font-size: 12px;
 		color: var(--text-tertiary);
 		font-style: italic;
+	}
+
+	/* The collapsed streaming line: the latest reasoning line rolling by is
+	 *  the liveness cue. Flex item so it ellipsizes instead of pushing the
+	 *  label/dot off the row. */
+	.reasoning-ticker {
+		flex: 1;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 
 	/* Streaming body: the live reasoning text, quiet (muted + smaller) but
@@ -3578,7 +3617,8 @@
 		border-radius: 3px;
 	}
 
-	/* Done: single-line muted preview, click to expand. */
+	/* Single-line muted preview, click to expand. Streaming renders as flex
+	 *  (label + dot + ticker line); done renders as a plain text block. */
 	.reasoning-preview {
 		display: block;
 		width: 100%;
@@ -3600,6 +3640,12 @@
 
 	.reasoning-preview:hover {
 		opacity: 1;
+	}
+
+	.item-reasoning.streaming .reasoning-preview {
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
 	}
 
 	.reasoning-body {

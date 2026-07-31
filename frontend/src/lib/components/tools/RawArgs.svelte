@@ -70,7 +70,7 @@
 				{/if}
 				{#if diagnostics}
 					<div class="section-label">
-						diagnostics <span class="cn">· 已发送给模型（上方未显示）</span>
+						diagnostics <span class="cn">· sent to the model (not shown above)</span>
 					</div>
 					<pre class="pre">{diagnostics}</pre>
 				{/if}

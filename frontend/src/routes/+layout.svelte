@@ -55,7 +55,7 @@
 			<button
 				class="collapse-btn"
 				onclick={toggleCollapsed}
-				title={collapsed ? '展开侧栏' : '收起侧栏'}
+				title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
 				aria-label="Toggle sidebar"
 				aria-pressed={collapsed}
 			>
@@ -137,7 +137,7 @@
 				href="/settings"
 				class="nav-item"
 				class:active={active('/settings')}
-				title={collapsed ? 'Settings' : '设置'}
+				title="Settings"
 				aria-label="Settings"
 			>
 				<span class="nav-icon" aria-hidden="true">
@@ -151,7 +151,7 @@
 			<button
 				class="nav-item theme-btn"
 				onclick={toggleTheme}
-				title={collapsed ? (theme === 'dark' ? 'Light' : 'Dark') : '切换主题'}
+				title={collapsed ? (theme === 'dark' ? 'Light' : 'Dark') : 'Toggle theme'}
 			>
 				<span class="nav-icon" aria-hidden="true">
 					{#if theme === 'dark'}

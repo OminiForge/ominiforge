@@ -72,7 +72,7 @@
 				<span class="tool-spinner"></span>
 			{/if}
 			<span class="tool-name">{item.name}</span>
-			<span class="tool-status-badge">{awaiting ? '等待批准' : item.status}</span>
+			<span class="tool-status-badge">{awaiting ? 'awaiting approval' : item.status}</span>
 			{#if summary}
 				<span class="tool-preview">{summary}</span>
 			{/if}
@@ -107,7 +107,7 @@
 			{#if item.status === 'running' && !awaiting}
 				<div class="running-indicator">
 					<span class="tool-spinner"></span>
-					<span>正在执行…</span>
+					<span>Running…</span>
 				</div>
 			{/if}
 		</div>

@@ -22,10 +22,10 @@
 	// Network policy is a small enum; `null` = inherit profile/gateway. The
 	// allowlist hosts are edited only when the policy is `allowlist`.
 	const NETWORK_POLICIES = [
-		{ value: '', label: '继承（profile / gateway）' },
-		{ value: 'isolated', label: 'isolated（无网络）' },
-		{ value: 'allowlist', label: 'allowlist（仅允许列表）' },
-		{ value: 'open', label: 'open（不限制）' }
+		{ value: '', label: 'Inherit (profile / gateway)' },
+		{ value: 'isolated', label: 'isolated (no network)' },
+		{ value: 'allowlist', label: 'allowlist (listed hosts only)' },
+		{ value: 'open', label: 'open (unrestricted)' }
 	];
 
 	let panelEl = $state<HTMLDivElement | null>(null);
@@ -139,20 +139,21 @@
 		class="panel"
 		role="dialog"
 		aria-modal="true"
-		aria-label="工作区配置"
+		aria-label="Workspace configuration"
 		tabindex="-1"
 		onclick={(e) => e.stopPropagation()}
 		transition:scale={pop()}
 	>
-		<h2 class="title">工作区配置</h2>
+		<h2 class="title">Workspace configuration</h2>
 		<p class="sub">
-			门控最高层（deny 与 profile / gateway 并集，只增不减）+ 网络覆盖。存于网关可信目录。
+			The top gating tier (deny unions with profile / gateway, never shrinks) + network overrides.
+			Stored in the gateway’s trusted directory.
 		</p>
 
 		{#if config}
 			<div class="body">
 				<div class="net">
-					<span class="key">网络策略</span>
+					<span class="key">Network policy</span>
 					<select
 						class="in sel"
 						value={networkPolicy()}
@@ -164,7 +165,7 @@
 					</select>
 					{#if networkPolicy() === 'allowlist'}
 						<label class="net-allow">
-							<span class="key">允许的主机（每行一个）</span>
+							<span class="key">Allowed hosts (one per line)</span>
 							<textarea
 								class="in ta"
 								rows="2"
@@ -179,7 +180,7 @@
 
 				{#if config.permission}
 					<div class="perm-block">
-						<span class="key">Permission 门控</span>
+						<span class="key">Permission gating</span>
 						<PermissionRulesEditor bind:policy={config.permission} tools={toolCatalog} />
 					</div>
 				{/if}
@@ -203,17 +204,19 @@
 		{/if}
 
 		{#if confirmingClose}
-			<p class="warn" role="alert">有未保存的修改，再次点击「放弃」将丢弃。</p>
+			<p class="warn" role="alert">
+				There are unsaved changes; clicking “Discard” again will drop them.
+			</p>
 		{/if}
 		<div class="actions">
 			{#if confirmingClose}
-				<Button variant="danger" onclick={onclose}>放弃修改</Button>
-				<Button variant="ghost" onclick={() => (confirmingClose = false)}>继续编辑</Button>
+				<Button variant="danger" onclick={onclose}>Discard changes</Button>
+				<Button variant="ghost" onclick={() => (confirmingClose = false)}>Keep editing</Button>
 			{:else}
-				<Button variant="ghost" onclick={attemptClose}>取消</Button>
+				<Button variant="ghost" onclick={attemptClose}>Cancel</Button>
 			{/if}
 			<Button variant="accent" onclick={save} disabled={saving || !config}>
-				{saving ? '保存中…' : '保存'}
+				{saving ? 'Saving…' : 'Save'}
 			</Button>
 		</div>
 	</div>

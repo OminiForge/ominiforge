@@ -200,11 +200,11 @@
 		const mins = Math.floor(diff / 60000);
 		const hours = Math.floor(diff / 3600000);
 		const days = Math.floor(diff / 86400000);
-		if (mins < 1) return '刚刚';
-		if (mins < 60) return `${mins}分钟前`;
-		if (hours < 24) return `${hours}小时前`;
-		if (days < 7) return `${days}天前`;
-		return date.toLocaleDateString('zh-CN');
+		if (mins < 1) return 'just now';
+		if (mins < 60) return `${mins}m ago`;
+		if (hours < 24) return `${hours}h ago`;
+		if (days < 7) return `${days}d ago`;
+		return date.toLocaleDateString();
 	}
 
 	function originBadge(meta: SessionMeta): string | null {
@@ -333,7 +333,7 @@
 <div class="panel">
 	<aside class="ws-sidebar">
 		<div class="ws-head">
-			<a href="/" class="ws-back" title="返回工作区列表" aria-label="Back to workspaces">
+			<a href="/" class="ws-back" title="Back to workspaces" aria-label="Back to workspaces">
 				<svg
 					width="14"
 					height="14"
@@ -348,13 +348,13 @@
 				</svg>
 			</a>
 			<div class="ws-title" title={workspacePath ?? workspaceId}>
-				{workspacePath ? wsLabel(workspacePath) : '工作区'}
+				{workspacePath ? wsLabel(workspacePath) : 'Workspace'}
 			</div>
 			<button
 				class="ws-config"
 				onclick={() => (showConfig = true)}
-				title="工作区配置（门控 / 网络）"
-				aria-label="工作区配置"
+				title="Workspace configuration (gating / network)"
+				aria-label="Workspace configuration"
 			>
 				<svg
 					width="15"
@@ -403,7 +403,7 @@
 			{:else if error}
 				<p class="list-error">{error}</p>
 			{:else if rows.length === 0}
-				<p class="list-muted">还没有会话</p>
+				<p class="list-muted">No sessions yet</p>
 			{:else}
 				{#if actionError}
 					<p class="list-error">{actionError}</p>
@@ -431,8 +431,8 @@
 						</div>
 						<button
 							class="row-action"
-							title="归档会话"
-							aria-label="归档会话"
+							title="Archive session"
+							aria-label="Archive session"
 							onclick={(e) => archive(row.meta.id, e)}
 						>
 							<svg
@@ -476,7 +476,7 @@
 				>
 					<polyline points="9 18 15 12 9 6" />
 				</svg>
-				已归档{#if archivedLoaded && archivedRows.length > 0}<span class="archived-count"
+				Archived{#if archivedLoaded && archivedRows.length > 0}<span class="archived-count"
 						>{archivedRows.length}</span
 					>{/if}
 			</button>
@@ -494,7 +494,7 @@
 					{:else if archivedError}
 						<p class="list-error">{archivedError}</p>
 					{:else if archivedRows.length === 0}
-						<p class="list-muted archived-empty">没有已归档的会话</p>
+						<p class="list-muted archived-empty">No archived sessions</p>
 					{:else}
 						{#each archivedRows as row (row.meta.id)}
 							<!-- An archived session is read-only browsable: the row links
@@ -517,8 +517,8 @@
 								</div>
 								<button
 									class="row-action danger"
-									title="永久删除"
-									aria-label="永久删除"
+									title="Delete permanently"
+									aria-label="Delete permanently"
 									onclick={(e) => {
 										// The row is an `<a>`; keep deleting from navigating.
 										e.preventDefault();
@@ -558,14 +558,15 @@
 
 {#if pendingDelete}
 	<ConfirmDialog
-		title="永久删除此会话？"
-		confirmLabel={deleting ? '删除中…' : '永久删除'}
+		title="Permanently delete this session?"
+		confirmLabel={deleting ? 'Deleting…' : 'Delete permanently'}
 		error={deleteError}
 		danger
 		onconfirm={confirmDelete}
 		oncancel={closeDeleteDialog}
 	>
-		此操作不可恢复：会话的全部文件（记录、事件、快照）将被彻底删除。
+		This cannot be undone: all session files (transcript, events, snapshots) will be permanently
+		deleted.
 	</ConfirmDialog>
 {/if}
 

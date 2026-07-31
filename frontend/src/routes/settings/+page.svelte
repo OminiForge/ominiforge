@@ -349,7 +349,7 @@
 			if (profileDirty && !(await saveProfile())) return;
 			if (gatewayDirty && !(await saveGateway())) return;
 			if (wsDirty && !(await saveWorkspace())) return;
-			flash('已保存');
+			flash('Saved');
 		} finally {
 			saving = false;
 		}
@@ -396,9 +396,9 @@
 	});
 
 	const TIER_LABEL: Record<Tier, string> = {
-		gateway: '网关基线',
+		gateway: 'Gateway baseline',
 		profile: 'Profile',
-		workspace: '工作区'
+		workspace: 'Workspace'
 	};
 
 	// Bridge a nullable-number model field to a text input (empty = null).
@@ -432,7 +432,7 @@
 					class:active={tab === 'permissions'}
 					onclick={() => (tab = 'permissions')}
 				>
-					门控
+					Permissions
 				</button>
 			</div>
 		</header>
@@ -441,7 +441,7 @@
 		{#if error}<p class="error">{error}</p>{/if}
 
 		{#if loading}
-			<p class="muted">加载中…</p>
+			<p class="muted">Loading…</p>
 		{:else if tab === 'providers'}
 			<!-- PROVIDERS-SECTION -->
 			<section class="stack">
@@ -450,11 +450,11 @@
 						<div class="panel-head">
 							<input
 								class="in title-in"
-								placeholder="provider 名称"
+								placeholder="Provider name"
 								bind:value={p.name}
 								spellcheck="false"
 							/>
-							<button class="btn-ghost danger" onclick={() => removeProvider(pi)}>删除</button>
+							<button class="btn-ghost danger" onclick={() => removeProvider(pi)}>Delete</button>
 						</div>
 
 						<div class="grid2">
@@ -474,7 +474,7 @@
 								/>
 							</label>
 							<label class="field">
-								<span class="key">api_key_env（回退）</span>
+								<span class="key">api_key_env (fallback)</span>
 								<input
 									class="in"
 									bind:value={p.api_key_env}
@@ -485,8 +485,8 @@
 							<label class="field">
 								<span class="key">
 									API Key
-									{#if configured.has(p.name)}<span class="badge ok">已配置</span>{:else}<span
-											class="badge">未配置</span
+									{#if configured.has(p.name)}<span class="badge ok">Configured</span>{:else}<span
+											class="badge">Not configured</span
 										>{/if}
 								</span>
 								<div class="key-row">
@@ -494,15 +494,15 @@
 										class="in"
 										type="password"
 										placeholder={configured.has(p.name)
-											? '••••••（保存后更新）'
-											: '输入 key（保存到 DB）'}
+											? '•••••• (updates on save)'
+											: 'Enter key (saved to DB)'}
 										bind:value={keyInput[p.name]}
 										spellcheck="false"
 										autocomplete="off"
 									/>
 									{#if configured.has(p.name)}
 										<button class="btn-ghost danger" onclick={() => clearSecret(p.name)}
-											>清除</button
+											>Clear</button
 										>
 									{/if}
 								</div>
@@ -521,7 +521,7 @@
 										<input class="in" placeholder="gpt-4o" bind:value={m.id} spellcheck="false" />
 									</label>
 									<label class="mfield">
-										<span class="mkey">上下文窗口</span>
+										<span class="mkey">Context window</span>
 										<input
 											class="in num"
 											type="number"
@@ -530,7 +530,7 @@
 										/>
 									</label>
 									<label class="mfield">
-										<span class="mkey">最大输出</span>
+										<span class="mkey">Max output</span>
 										<input
 											class="in num"
 											type="number"
@@ -539,7 +539,7 @@
 										/>
 									</label>
 									<label class="mfield">
-										<span class="mkey">默认温度</span>
+										<span class="mkey">Default temperature</span>
 										<input
 											class="in num"
 											type="number"
@@ -551,12 +551,12 @@
 									<button
 										class="btn-ghost danger mrm"
 										onclick={() => removeModel(pi, mi)}
-										aria-label="删除 model">×</button
+										aria-label="Remove model">×</button
 									>
 								</div>
 							{/each}
 							{#if p.models.length === 0}
-								<p class="hint">还没有 model，点 “+ model” 添加。</p>
+								<p class="hint">No models yet — click “+ model” to add one.</p>
 							{/if}
 						</div>
 					</div>
@@ -570,7 +570,7 @@
 			<!-- PROFILES-SECTION -->
 			<section class="two-col">
 				<aside class="list">
-					<button class="btn-ghost full" onclick={newProfile}>+ 新 profile</button>
+					<button class="btn-ghost full" onclick={newProfile}>+ New profile</button>
 					{#each profileList as p (p.name)}
 						<div class="list-row" class:active={selectedName === p.name}>
 							<button class="list-btn" onclick={() => selectProfile(p.name)}>
@@ -596,7 +596,7 @@
 									class="in"
 									value={pf.profile.extends ?? ''}
 									oninput={(e) => (pf.profile.extends = e.currentTarget.value || null)}
-									placeholder="父 profile"
+									placeholder="Parent profile"
 									spellcheck="false"
 								/>
 							</label>
@@ -637,7 +637,7 @@
 									class="in"
 									value={pf.model.temperature ?? ''}
 									oninput={(e) => (pf.model.temperature = numOrNull(e.currentTarget.value))}
-									placeholder="模型默认"
+									placeholder="Model default"
 								/>
 							</label>
 							<label class="field">
@@ -646,7 +646,7 @@
 									class="in"
 									value={pf.model.max_output_tokens ?? ''}
 									oninput={(e) => (pf.model.max_output_tokens = numOrNull(e.currentTarget.value))}
-									placeholder="模型默认"
+									placeholder="Model default"
 								/>
 							</label>
 							<label class="field">
@@ -661,7 +661,7 @@
 							</label>
 						</div>
 					{:else}
-						<p class="muted">选择左侧 profile 编辑，或新建一个。</p>
+						<p class="muted">Select a profile on the left to edit, or create a new one.</p>
 					{/if}
 				</div>
 			</section>
@@ -670,9 +670,10 @@
 			<section class="stack">
 				<div class="tier">
 					<div class="tier-head">
-						<h2>Gateway 基线</h2>
+						<h2>Gateway baseline</h2>
 						<p class="tier-desc">
-							三层解析的最低层。这里的 deny 是整个网关的安全底线，任何 profile / 工作区都无法放开。
+							The lowest tier of the three-level resolution. Deny rules here are the gateway's
+							security floor — no profile or workspace can loosen them.
 						</p>
 					</div>
 					{#if gatewayPolicy}
@@ -680,7 +681,7 @@
 							bind:policy={gatewayPolicy}
 							tools={toolCatalog}
 							showDefaults
-							emptyHint="无规则 —— 未命中即允许"
+							emptyHint="No rules — unmatched means allow"
 						/>
 					{:else}
 						<!-- Mirror the loaded layout (defaults table + rule rows) so
@@ -696,14 +697,17 @@
 				<div class="tier">
 					<div class="tier-head">
 						<h2>Profile</h2>
-						<p class="tier-desc">中间层。只列本层添加的规则；空的 profile 不施加任何门控。</p>
+						<p class="tier-desc">
+							The middle tier. Only rules added at this tier are listed; an empty profile applies no
+							gating.
+						</p>
 					</div>
 					<select
 						class="in sel tier-picker"
 						value={selectedName}
 						onchange={(e) => selectProfile(e.currentTarget.value)}
 					>
-						<option value="">选择 profile…</option>
+						<option value="">Select profile…</option>
 						{#each profileList as p (p.name)}
 							<option value={p.name}>{p.name}</option>
 						{/each}
@@ -723,9 +727,10 @@
 
 				<div class="tier">
 					<div class="tier-head">
-						<h2>工作区</h2>
+						<h2>Workspace</h2>
 						<p class="tier-desc">
-							最高层，存于网关可信目录。deny 与下层并集（只增不减），ask 设了则整体替换下层。
+							The highest tier, stored in the gateway’s trusted directory. Deny unions with lower
+							tiers (never shrinks); a set ask list wholesale replaces the tiers below.
 						</p>
 					</div>
 					<select
@@ -733,7 +738,7 @@
 						value={selectedWs}
 						onchange={(e) => selectWorkspace(e.currentTarget.value)}
 					>
-						<option value="">选择工作区…</option>
+						<option value="">Select workspace…</option>
 						{#each wsList as w (w.id)}
 							<option value={w.id}>{w.path ?? w.id}</option>
 						{/each}
@@ -766,20 +771,21 @@
 							>
 								<polyline points="5,3 9,7 5,11" />
 							</svg>
-							生效结果
+							Effective result
 							<span class="eff-count">
-								{effective.length > 0 ? `${effective.length} 条生效规则` : '全部允许'}
+								{effective.length > 0 ? `${effective.length} rules in effect` : 'All allowed'}
 							</span>
 						</button>
 					</h2>
 					{#if effOpen}
 						<div class="eff-body">
 							<p class="tier-desc">
-								按当前选中的 profile 与工作区计算：deny 三层并集，ask 取最高设置层，allow
-								三层并集且命中时豁免 ask。
+								Computed from the currently selected profile and workspace: deny unions across the
+								three tiers, ask comes from the highest tier that sets one, allow unions across the
+								three tiers and exempts from ask on a match.
 							</p>
 							{#if effective.length === 0}
-								<p class="muted">三层都没有规则 —— 所有工具直接允许。</p>
+								<p class="muted">No rules on any tier — every tool is allowed outright.</p>
 							{:else}
 								{#each effective as eff, i (i)}
 									{@const row = ruleToRow(eff.rule, eff.list)}
@@ -790,7 +796,7 @@
 											class:ask={eff.list === 'ask'}
 											class:allow={eff.list === 'allow'}
 										>
-											{eff.list === 'deny' ? '拒绝' : eff.list === 'allow' ? '允许' : '询问'}
+											{eff.list === 'deny' ? 'Deny' : eff.list === 'allow' ? 'Allow' : 'Ask'}
 										</span>
 										<span class="eff-summary">
 											{row ? summaryOf(row, effCatalog) : JSON.stringify(eff.rule)}
@@ -801,11 +807,11 @@
 							{/if}
 							{#if shadowedAsks.shadowed.length > 0}
 								<p class="eff-note">
-									{TIER_LABEL[shadowedAsks.winner ?? 'gateway']} 层设了询问规则，
+									The {TIER_LABEL[shadowedAsks.winner ?? 'gateway']} tier sets ask rules, so the
 									{shadowedAsks.shadowed
-										.map((s) => `${TIER_LABEL[s.tier]} 层的 ${s.count} 条`)
-										.join('、')}
-									询问规则被整表替换，不生效。
+										.map((s) => `${s.count} ask rule(s) on the ${TIER_LABEL[s.tier]} tier`)
+										.join(' and ')}
+									are wholesale replaced and never take effect.
 								</p>
 							{/if}
 						</div>

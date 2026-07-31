@@ -18,11 +18,11 @@
 
 {#if dirtyCount > 0}
 	<div class="savebar" role="status">
-		<span class="msg">{dirtyCount} 处未保存的修改</span>
+		<span class="msg">{dirtyCount} unsaved change(s)</span>
 		<div class="actions">
-			<button class="btn ghost" onclick={ondiscard} disabled={saving}>放弃</button>
+			<button class="btn ghost" onclick={ondiscard} disabled={saving}>Discard</button>
 			<button class="btn primary" onclick={onsave} disabled={saving}>
-				{saving ? '保存中…' : '全部保存'}
+				{saving ? 'Saving…' : 'Save all'}
 			</button>
 		</div>
 	</div>

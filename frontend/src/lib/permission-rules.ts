@@ -151,23 +151,21 @@ export function fromRows(model: RowModel): PermissionPolicy {
  *  as a colored badge next to the summary, and saying it twice reads stuttered. */
 export function summaryOf(row: RuleRow, catalog: ToolInfo[]): string {
 	const info = catalog.find((t) => t.name === row.tool);
-	const toolLabel = row.tool === '*' ? '任意工具' : (info?.label ?? row.tool);
+	const toolLabel = row.tool === '*' ? 'Any tool' : (info?.label ?? row.tool);
 
 	if (row.values.length === 0 && !row.negate) {
-		return `${toolLabel}（整个工具）`;
+		return `${toolLabel} (whole tool)`;
 	}
 	const fieldLabel = row.field
 		? (info?.fields?.find((f) => f.key === row.field)?.label ?? row.field)
-		: '输入';
-	const vals = row.values.length ? row.values.join('、') : '（未填）';
+		: 'input';
+	const vals = row.values.length ? row.values.join(', ') : '(empty)';
 	if (row.negate) {
-		const rel = row.mode === 'prefix' ? '不以' : '不包含';
-		const suffix = row.mode === 'prefix' ? ' 开头' : '';
-		return `${toolLabel}：当 ${fieldLabel} ${rel} ${vals}${suffix}（仅允许这些）`;
+		const rel = row.mode === 'prefix' ? 'does not start with' : 'does not contain';
+		return `${toolLabel}: when ${fieldLabel} ${rel} ${vals} (only these are allowed)`;
 	}
-	const rel = row.mode === 'prefix' ? '以' : '包含';
-	const suffix = row.mode === 'prefix' ? ' 开头' : '';
-	return `${toolLabel}：当 ${fieldLabel} ${rel} ${vals}${suffix}`;
+	const rel = row.mode === 'prefix' ? 'starts with' : 'contains';
+	return `${toolLabel}: when ${fieldLabel} ${rel} ${vals}`;
 }
 
 /** The tier a rule comes from, for the effective view's source badges. */

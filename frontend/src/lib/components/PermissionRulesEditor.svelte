@@ -19,7 +19,7 @@
 		policy = $bindable(),
 		tools = [],
 		showDefaults = false,
-		emptyHint = '无规则 —— 继承下层，未命中即允许'
+		emptyHint = 'No rules — inherits lower tiers; unmatched means allow'
 	}: {
 		policy: PermissionPolicy;
 		tools?: ToolInfo[];
@@ -183,9 +183,9 @@
 	const defaultsSetCount = $derived(tools.filter((t) => defaultOf(t.name) !== 'allow').length);
 
 	const DEFAULTS: { value: DefaultVerdict; label: string }[] = [
-		{ value: 'allow', label: '允许' },
-		{ value: 'ask', label: '询问' },
-		{ value: 'deny', label: '拒绝' }
+		{ value: 'allow', label: 'Allow' },
+		{ value: 'ask', label: 'Ask' },
+		{ value: 'deny', label: 'Deny' }
 	];
 </script>
 
@@ -209,9 +209,9 @@
 				>
 					<polyline points="5,3 9,7 5,11" />
 				</svg>
-				<span>工具默认</span>
+				<span>Tool defaults</span>
 				<span class="defaults-count">
-					{defaultsSetCount > 0 ? `${defaultsSetCount} 项已设置` : '全部允许'}
+					{defaultsSetCount > 0 ? `${defaultsSetCount} configured` : 'All allowed'}
 				</span>
 			</button>
 			{#if defaultsOpen}
@@ -222,7 +222,7 @@
 							<span class="defaults-name">
 								{t.label ?? t.name}<span class="defaults-id">{t.name}</span>
 							</span>
-							<div class="segset" role="radiogroup" aria-label="{t.name} 默认">
+							<div class="segset" role="radiogroup" aria-label="{t.name} default">
 								{#each DEFAULTS as d (d.value)}
 									<button
 										class="seg"
@@ -258,17 +258,18 @@
 								class:ask={row.list === 'ask'}
 								class:allow={row.list === 'allow'}
 							>
-								{row.list === 'deny' ? '拒绝' : row.list === 'allow' ? '允许' : '询问'}
+								{row.list === 'deny' ? 'Deny' : row.list === 'allow' ? 'Allow' : 'Ask'}
 							</span>
 							<span class="row-summary">{summaryOf(row, tools)}</span>
 						</button>
-						<button class="row-rm" aria-label="删除规则" onclick={() => removeRow(row)}>×</button>
+						<button class="row-rm" aria-label="Remove rule" onclick={() => removeRow(row)}>×</button
+						>
 					</div>
 
 					{#if row.open}
 						<div class="row-body">
 							<div class="ctl-line">
-								<div class="segset" role="radiogroup" aria-label="决策">
+								<div class="segset" role="radiogroup" aria-label="Decision">
 									{#each DEFAULTS as d (d.value)}
 										<button
 											class="seg"
@@ -293,19 +294,19 @@
 									onchange={(e) => onToolChange(row, e.currentTarget.value)}
 								>
 									{#each tools as t (t.name)}
-										<option value={t.name}>{t.label ?? t.name}（{t.name}）</option>
+										<option value={t.name}>{t.label ?? t.name} ({t.name})</option>
 									{/each}
 									{#if row.tool !== '*' && !tools.some((t) => t.name === row.tool)}
 										<option value={row.tool}>{row.tool}</option>
 									{/if}
-									<option value="*">任意工具（*）</option>
+									<option value="*">Any tool (*)</option>
 								</select>
 							</div>
 
 							{#if row.cond}
 								<div class="cond">
 									<div class="ctl-line">
-										<span class="when">当</span>
+										<span class="when">When</span>
 										{#if fieldsOf(row.tool).length > 0}
 											<select
 												class="in sel"
@@ -315,10 +316,10 @@
 												{#each fieldsOf(row.tool) as f (f.key)}
 													<option value={f.key}>{f.label}</option>
 												{/each}
-												<option value="">任意字段</option>
+												<option value="">Any field</option>
 											</select>
 										{:else}
-											<span class="when">输入</span>
+											<span class="when">Input</span>
 										{/if}
 										<select
 											class="in sel"
@@ -328,8 +329,8 @@
 												commit();
 											}}
 										>
-											<option value="substring">包含</option>
-											<option value="prefix">以…开头</option>
+											<option value="substring">contains</option>
+											<option value="prefix">starts with</option>
 										</select>
 										<label class="negate-toggle">
 											<input
@@ -340,7 +341,7 @@
 													commit();
 												}}
 											/>
-											白名单（仅允许列出的值）
+											Allowlist (only the listed values)
 										</label>
 									</div>
 									<textarea
@@ -354,11 +355,13 @@
 										placeholder={row.mode === 'prefix' ? 'src/\ntmp/' : 'rm -rf\nsudo'}
 										spellcheck="false"
 									></textarea>
-									<button class="btn-ghost sm" onclick={() => closeCondition(row)}>移除条件</button>
+									<button class="btn-ghost sm" onclick={() => closeCondition(row)}
+										>Remove condition</button
+									>
 								</div>
 							{:else}
 								<button class="btn-ghost sm add-cond" onclick={() => openCondition(row)}>
-									+ 添加条件（默认对整个工具生效）
+									+ Add condition (applies to the whole tool by default)
 								</button>
 							{/if}
 						</div>
@@ -368,13 +371,14 @@
 		</div>
 	{/if}
 
-	<button class="btn-ghost sm add" onclick={addRow}>+ 添加规则</button>
+	<button class="btn-ghost sm add" onclick={addRow}>+ Add rule</button>
 
 	{#if advanced.length > 0}
 		<div class="advanced">
-			<span class="key">高级规则（{advanced.length}）</span>
+			<span class="key">Advanced rules ({advanced.length})</span>
 			<p class="hint">
-				以下规则用本界面无法表达的形式手写，已原样保留、不会被改动。如需编辑请直接改配置文件。
+				These rules were hand-written in a form this UI cannot express; they are kept verbatim and
+				will not be modified. Edit the config file directly to change them.
 			</p>
 			{#each advanced as a, i (i)}
 				<code class="adv-rule">[{a.list}] {JSON.stringify(a.rule)}</code>

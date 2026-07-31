@@ -34,7 +34,9 @@
 	{#if output}
 		<pre class="out">{output}</pre>
 	{:else if status === 'error'}
-		<div class="empty">无输出 · <span class="code">{error_code ?? exitCode ?? 'error'}</span></div>
+		<div class="empty">
+			No output · <span class="code">{error_code ?? exitCode ?? 'error'}</span>
+		</div>
 	{/if}
 </div>
 <RawArgs {args} />

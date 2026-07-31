@@ -72,17 +72,17 @@
 		const mins = Math.floor(diff / 60000);
 		const hours = Math.floor(diff / 3600000);
 		const days = Math.floor(diff / 86400000);
-		if (mins < 1) return '刚刚';
-		if (mins < 60) return `${mins}分钟前`;
-		if (hours < 24) return `${hours}小时前`;
-		if (days < 7) return `${days}天前`;
-		return date.toLocaleDateString('zh-CN');
+		if (mins < 1) return 'just now';
+		if (mins < 60) return `${mins}m ago`;
+		if (hours < 24) return `${hours}h ago`;
+		if (days < 7) return `${days}d ago`;
+		return date.toLocaleDateString();
 	}
 
-	/** Workspace display name: the last path segment, or "无工作区" for the
+	/** Workspace display name: the last path segment, or "No workspace" for the
 	 *  no-workspace group (path is null there). */
 	function wsName(ws: WorkspaceSummary): string {
-		if (!ws.path) return '无工作区';
+		if (!ws.path) return 'No workspace';
 		return ws.path.split('/').filter(Boolean).pop() ?? ws.path;
 	}
 
@@ -93,7 +93,7 @@
 	}
 
 	function sessionCountLabel(n: number): string {
-		return n === 1 ? '1 个会话' : `${n} 个会话`;
+		return n === 1 ? '1 session' : `${n} sessions`;
 	}
 
 	onMount(() => {
@@ -136,7 +136,7 @@
 							disabled={!newPath.trim() || creating}
 							onclick={createWorkspace}
 						>
-							{creating ? '创建中…' : '打开工作区'}
+							{creating ? 'Creating…' : 'Open workspace'}
 						</button>
 					</div>
 				{/if}
@@ -179,9 +179,9 @@
 					<line x1="19" y1="17" x2="19" y2="23" />
 					<line x1="16" y1="20" x2="22" y2="20" />
 				</svg>
-				<p class="empty-title">还没有工作区</p>
-				<p class="empty-sub">工作区是一个项目目录，会话都在其中运行。</p>
-				<button class="empty-cta" onclick={() => (cfgOpen = true)}>新建工作区</button>
+				<p class="empty-title">No workspaces yet</p>
+				<p class="empty-sub">A workspace is a project directory your sessions run in.</p>
+				<button class="empty-cta" onclick={() => (cfgOpen = true)}>New workspace</button>
 			</div>
 		{:else}
 			<ul class="grid">

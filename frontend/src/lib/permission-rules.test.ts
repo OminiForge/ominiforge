@@ -4,9 +4,13 @@ import type { PermissionPolicy } from '$lib/types/PermissionPolicy';
 import type { ToolInfo } from '$lib/types/ToolInfo';
 
 const CATALOG: ToolInfo[] = [
-	{ name: 'read', label: '读文件', fields: [{ key: 'path', label: '路径', is_path: true }] },
-	{ name: 'write', label: '写文件', fields: [{ key: 'path', label: '路径', is_path: true }] },
-	{ name: 'shell', label: '运行命令', fields: [{ key: 'command', label: '命令', is_path: false }] }
+	{ name: 'read', label: 'Read file', fields: [{ key: 'path', label: 'path', is_path: true }] },
+	{ name: 'write', label: 'Write file', fields: [{ key: 'path', label: 'path', is_path: true }] },
+	{
+		name: 'shell',
+		label: 'Run command',
+		fields: [{ key: 'command', label: 'command', is_path: false }]
+	}
 ];
 
 describe('toRows', () => {
@@ -225,15 +229,15 @@ describe('summaryOf', () => {
 			{ list: 'deny', tool: 'shell', field: null, mode: 'substring', negate: false, values: [] },
 			CATALOG
 		);
-		expect(s).toBe('运行命令（整个工具）');
+		expect(s).toBe('Run command (whole tool)');
 	});
 
-	it('reads a wildcard tool as 任意工具', () => {
+	it('reads a wildcard tool as Any tool', () => {
 		const s = summaryOf(
 			{ list: 'deny', tool: '*', field: null, mode: 'substring', negate: false, values: ['/etc/'] },
 			CATALOG
 		);
-		expect(s).toBe('任意工具：当 输入 包含 /etc/');
+		expect(s).toBe('Any tool: when input contains /etc/');
 	});
 
 	it('reads a negated prefix rule as an allow-list', () => {
@@ -248,7 +252,7 @@ describe('summaryOf', () => {
 			},
 			CATALOG
 		);
-		expect(s).toBe('写文件：当 路径 不以 src/、tmp/ 开头（仅允许这些）');
+		expect(s).toBe('Write file: when path does not start with src/, tmp/ (only these are allowed)');
 	});
 });
 
