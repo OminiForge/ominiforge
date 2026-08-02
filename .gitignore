@@ -25,6 +25,8 @@
 .claude
 
 .omini
+# web_fetch page cache (fetched web content, per-workspace, not source)
+.ominiforge/
 
 # UI design exploration scratch (HTML mockups, screenshots, node_modules symlink)
 design-demos/

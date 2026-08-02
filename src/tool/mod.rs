@@ -17,6 +17,8 @@ mod search;
 mod shell;
 pub mod stream_args;
 mod terminal;
+pub mod web;
+mod web_fetch;
 mod write;
 mod write_stream;
 
@@ -26,6 +28,8 @@ pub use find::FindTool;
 pub use read::ReadTool;
 pub use search::SearchTool;
 pub use shell::ShellTool;
+pub use web::WebFetchPolicy;
+pub use web_fetch::WebFetchTool;
 pub use write::WriteTool;
 
 use std::collections::{BTreeMap, HashMap};
@@ -170,6 +174,11 @@ pub fn summarize_by_name(name: &str, input: &serde_json::Value) -> String {
                     .join(", ")
             })
             .unwrap_or_default(),
+        "web_fetch" => input
+            .get("url")
+            .and_then(|u| u.as_str())
+            .unwrap_or("")
+            .to_owned(),
         _ => {
             let s = input.to_string();
             if s.len() > 80 {
@@ -316,6 +325,18 @@ pub fn builtin_catalog() -> Vec<ToolInfo> {
                 is_path: false,
             }],
         },
+        ToolInfo {
+            name: "web_fetch".to_owned(),
+            label: Some("抓网页".to_owned()),
+            description: Some(
+                "抓取 URL 并提取正文为 markdown（出网访问，SSRF 防护内置）".to_owned(),
+            ),
+            fields: vec![ToolField {
+                key: "url".to_owned(),
+                label: "URL".to_owned(),
+                is_path: false,
+            }],
+        },
     ]
 }
 
@@ -456,8 +477,8 @@ pub(crate) fn resolve_in_workspace(
     Ok(normalized)
 }
 
-/// Register the built-in tools (find, search, read, write, edit, shell), all
-/// scoped to `workspace`.
+/// Register the built-in tools (find, search, read, write, edit, shell,
+/// `web_fetch`), all scoped to `workspace`.
 pub fn register_builtin(registry: &mut ToolRegistry, workspace: PathBuf) {
     registry.register(Arc::new(FindTool::new(workspace.clone())));
     registry.register(Arc::new(SearchTool::new(workspace.clone())));
@@ -465,8 +486,9 @@ pub fn register_builtin(registry: &mut ToolRegistry, workspace: PathBuf) {
     registry.register(Arc::new(WriteTool::new(workspace.clone())));
     registry.register(Arc::new(EditTool::new(workspace.clone())));
     registry.register(Arc::new(ShellTool::new(Arc::new(
-        crate::sandbox::passthrough::PassthroughSandbox::new(workspace, BTreeMap::new()),
+        crate::sandbox::passthrough::PassthroughSandbox::new(workspace.clone(), BTreeMap::new()),
     ))));
+    registry.register(Arc::new(WebFetchTool::new(workspace)));
 }
 
 #[cfg(test)]
@@ -482,7 +504,15 @@ mod tests {
         let names: Vec<String> = reg.descriptors().into_iter().map(|d| d.name).collect();
         assert_eq!(
             names,
-            vec!["edit", "find", "read", "search", "shell", "write"]
+            vec![
+                "edit",
+                "find",
+                "read",
+                "search",
+                "shell",
+                "web_fetch",
+                "write"
+            ]
         );
     }
 

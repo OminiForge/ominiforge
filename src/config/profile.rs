@@ -104,6 +104,42 @@ pub struct ToolsSection {
     /// Tools to disable even if otherwise enabled.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled: Vec<String>,
+    /// `[tools.web_fetch]`: the network-egress policy for the `web_fetch`
+    /// tool (`src/tool/web.rs`). Absent = the tool's built-in defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_fetch: Option<WebFetchSection>,
+}
+
+/// `[tools.web_fetch]`: hard network constraints for `web_fetch`, enforced by
+/// the tool itself — unlike `[permission]` rules, these never ask a human.
+///
+/// The link-local block (cloud metadata, `169.254.0.0/16` / `fe80::/10`) is
+/// NOT configurable: it is applied on top of whatever this section says.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
+pub struct WebFetchSection {
+    /// Accept plain `http://` URLs (default true; `https://` always works).
+    #[serde(default = "default_true")]
+    pub allow_http: bool,
+    /// Non-default ports a URL may target; empty = 80/443 only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_ports: Vec<u16>,
+    /// CIDRs whose addresses are refused. When set, REPLACES the default
+    /// private/loopback list (e.g. to unblock Tailscale's CGNAT range) — the
+    /// hardcoded link-local floor always applies on top.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_cidrs: Option<Vec<String>>,
+    /// When non-empty, only matching hosts are fetched (`*.example.com`
+    /// matches the apex and every subdomain; `*` matches all).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_domains: Vec<String>,
+    /// Matching hosts are always refused, even if `allowed_domains` hits.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_domains: Vec<String>,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 impl ToolsSection {
@@ -284,6 +320,7 @@ fn overlay_tools(child: ToolsSection, parent: ToolsSection) -> ToolsSection {
         } else {
             child.disabled
         },
+        web_fetch: child.web_fetch.or(parent.web_fetch),
     }
 }
 
@@ -543,6 +580,7 @@ whatever = true
             builtin: Some(vec!["read".to_owned(), "shell".to_owned()]),
             mcp_servers: vec![],
             disabled: vec!["shell".to_owned()],
+            web_fetch: None,
         };
         assert!(tools.allows("read"));
         assert!(!tools.allows("shell")); // disabled wins

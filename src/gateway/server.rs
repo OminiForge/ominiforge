@@ -2917,11 +2917,22 @@ default = "openai-main/gpt-4o"
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(
             names,
-            vec!["find", "search", "read", "write", "edit", "shell"]
+            vec![
+                "find",
+                "search",
+                "read",
+                "write",
+                "edit",
+                "shell",
+                "web_fetch"
+            ]
         );
         // shell exposes a `command` field the UI scopes rules to.
         let shell = tools.iter().find(|t| t["name"] == "shell").unwrap();
         assert_eq!(shell["fields"][0]["key"], "command");
+        // web_fetch exposes a `url` field the UI scopes rules to.
+        let web_fetch = tools.iter().find(|t| t["name"] == "web_fetch").unwrap();
+        assert_eq!(web_fetch["fields"][0]["key"], "url");
         // write's path field is flagged is_path so the UI offers prefix controls.
         let write = tools.iter().find(|t| t["name"] == "write").unwrap();
         let path_field = write["fields"]

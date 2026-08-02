@@ -386,10 +386,19 @@ fn register_profile_tools(
         ));
     }
     if profile.tools.allows("edit") {
-        registry.register(Arc::new(EditTool::new(workspace).with_lsp(lsp)));
+        registry.register(Arc::new(EditTool::new(workspace.clone()).with_lsp(lsp)));
     }
     if profile.tools.allows("shell") {
         registry.register(Arc::new(ShellTool::new(sandbox)));
+    }
+    if profile.tools.allows("web_fetch") {
+        let policy = profile.tools.web_fetch.as_ref().map_or_else(
+            crate::tool::WebFetchPolicy::default,
+            crate::tool::WebFetchPolicy::from_config,
+        );
+        registry.register(Arc::new(
+            crate::tool::WebFetchTool::new(workspace).with_policy(policy),
+        ));
     }
 }
 
@@ -495,7 +504,15 @@ mod tests {
         let names: Vec<String> = reg.descriptors().into_iter().map(|d| d.name).collect();
         assert_eq!(
             names,
-            vec!["edit", "find", "read", "search", "shell", "write"]
+            vec![
+                "edit",
+                "find",
+                "read",
+                "search",
+                "shell",
+                "web_fetch",
+                "write"
+            ]
         );
     }
 
