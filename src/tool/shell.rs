@@ -54,7 +54,9 @@ impl OutputStream {
         let mut this = self;
         Box::new(move |bytes: &[u8]| {
             this.terminal.feed(bytes);
-            let due = this.last_emit.is_none_or(|t| t.elapsed() >= OUTPUT_MIN_INTERVAL);
+            let due = this
+                .last_emit
+                .is_none_or(|t| t.elapsed() >= OUTPUT_MIN_INTERVAL);
             if due {
                 this.last_emit = Some(Instant::now());
                 (this.render)(terminal_view(&this.command, &this.terminal.screen(), None));

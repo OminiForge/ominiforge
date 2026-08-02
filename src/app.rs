@@ -493,7 +493,10 @@ mod tests {
             None,
         );
         let names: Vec<String> = reg.descriptors().into_iter().map(|d| d.name).collect();
-        assert_eq!(names, vec!["edit", "find", "read", "search", "shell", "write"]);
+        assert_eq!(
+            names,
+            vec!["edit", "find", "read", "search", "shell", "write"]
+        );
     }
 
     /// An explicit `builtin` list that omits `edit` must not register it — the

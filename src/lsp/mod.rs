@@ -509,8 +509,7 @@ while True:
     async fn diagnostics_round_trip_through_mock_server() {
         let dir = tempfile::tempdir().unwrap();
         let config = mock_lsp_config(dir.path());
-        let manager =
-            LspManager::new(&config, dir.path().to_path_buf(), BTreeMap::new()).unwrap();
+        let manager = LspManager::new(&config, dir.path().to_path_buf(), BTreeMap::new()).unwrap();
 
         let file = dir.path().join("lib.rs");
         let diags = manager
@@ -529,8 +528,7 @@ while True:
     async fn warm_reuse_returns_fresh_diagnostics() {
         let dir = tempfile::tempdir().unwrap();
         let config = mock_lsp_config(dir.path());
-        let manager =
-            LspManager::new(&config, dir.path().to_path_buf(), BTreeMap::new()).unwrap();
+        let manager = LspManager::new(&config, dir.path().to_path_buf(), BTreeMap::new()).unwrap();
         let file = dir.path().join("lib.rs");
 
         let first = manager.diagnostics(&file, "first version\n").await.unwrap();
@@ -560,8 +558,7 @@ while True:
             }],
         };
         let dir = tempfile::tempdir().unwrap();
-        let manager =
-            LspManager::new(&config, dir.path().to_path_buf(), BTreeMap::new()).unwrap();
+        let manager = LspManager::new(&config, dir.path().to_path_buf(), BTreeMap::new()).unwrap();
         let file = dir.path().join("lib.rs");
         assert!(manager.diagnostics(&file, "x\n").await.is_none());
     }
@@ -578,8 +575,7 @@ while True:
 
         let dir = tempfile::tempdir().unwrap();
         let config = mock_lsp_config(dir.path());
-        let manager =
-            LspManager::new(&config, dir.path().to_path_buf(), BTreeMap::new()).unwrap();
+        let manager = LspManager::new(&config, dir.path().to_path_buf(), BTreeMap::new()).unwrap();
 
         let input = || ToolInput {
             call_id: "c1".to_owned(),
@@ -614,5 +610,4 @@ while True:
         let out = without.invoke(input()).await.unwrap();
         assert!(!text(&out).contains("[diagnostics:"));
     }
-
 }

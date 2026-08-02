@@ -1836,9 +1836,8 @@ impl TurnState<'_> {
                     timeout: self.agent.config.tool_timeout,
                     progress: progress_sink(&call.id, progress_tx, block_index),
                 };
-                let handle = tokio::spawn(async move {
-                    run_chain_tool(tool, &tool_name, input).await
-                });
+                let handle =
+                    tokio::spawn(async move { run_chain_tool(tool, &tool_name, input).await });
                 let abort = handle.abort_handle();
                 (PhaseBOutcome::Chained { parent, handle }, Some(abort))
             }
@@ -4663,8 +4662,7 @@ mod tests {
             "shell output streams live progress frames"
         );
         assert!(sink.frames.iter().all(|(idx, _)| *idx == 0));
-        let last: serde_json::Value =
-            serde_json::from_str(&sink.frames.last().unwrap().1).unwrap();
+        let last: serde_json::Value = serde_json::from_str(&sink.frames.last().unwrap().1).unwrap();
         assert_eq!(last["kind"], "terminal");
         let output = last["output"].as_str().unwrap();
         assert!(output.contains("one"), "frame carries the screen: {output}");

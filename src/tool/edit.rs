@@ -248,7 +248,6 @@ impl Tool for EditTool {
         }
         Ok(output)
     }
-
 }
 
 /// Render the planned files' diff views into a JSON envelope

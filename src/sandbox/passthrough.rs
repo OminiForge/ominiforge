@@ -97,8 +97,11 @@ impl PassthroughSandbox {
 
 /// Spawn a task forwarding each chunk read from `pipe` as `(is_err, chunk)`.
 /// The task ends on EOF, error, or a closed receiver.
-fn spawn_pipe_reader<R>(mut pipe: R, is_err: bool, tx: tokio::sync::mpsc::UnboundedSender<(bool, Vec<u8>)>)
-where
+fn spawn_pipe_reader<R>(
+    mut pipe: R,
+    is_err: bool,
+    tx: tokio::sync::mpsc::UnboundedSender<(bool, Vec<u8>)>,
+) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
     use tokio::io::AsyncReadExt;
@@ -122,7 +125,8 @@ where
 impl Sandbox for PassthroughSandbox {
     async fn exec(&self, command: &str, timeout: Duration) -> Result<ExecOutput, SandboxError> {
         // Non-streaming is streaming with the chunks dropped.
-        self.exec_streaming(command, timeout, Box::new(|_| {})).await
+        self.exec_streaming(command, timeout, Box::new(|_| {}))
+            .await
     }
 
     async fn exec_streaming(
@@ -144,7 +148,9 @@ impl Sandbox for PassthroughSandbox {
 
         // Both pipes were set to `piped()` above, so they are always present.
         let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
-            return Err(SandboxError::Exec("failed to capture shell pipes".to_owned()));
+            return Err(SandboxError::Exec(
+                "failed to capture shell pipes".to_owned(),
+            ));
         };
 
         // Read both pipes concurrently, forwarding each chunk live and
@@ -287,7 +293,12 @@ mod tests {
             .exec_streaming(
                 "printf one; sleep 0.05; printf two",
                 Duration::from_secs(5),
-                Box::new(move |c| chunks2.lock().unwrap().push(String::from_utf8_lossy(c).into_owned())),
+                Box::new(move |c| {
+                    chunks2
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(c).into_owned())
+                }),
             )
             .await
             .unwrap();

@@ -359,10 +359,7 @@ fn fold_permission(
                     *approval_pending = true;
                 }
             } else {
-                pending_asks.insert(
-                    call_id.clone(),
-                    (seq, tool_name.clone(), input.clone()),
-                );
+                pending_asks.insert(call_id.clone(), (seq, tool_name.clone(), input.clone()));
             }
         }
         PermissionEvent::Decided { call_id, .. } => {

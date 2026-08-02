@@ -184,10 +184,11 @@ impl Tool for SearchTool {
         let workspace = self.workspace.clone();
         // `grep_searcher` is synchronous and does blocking I/O; keep it off the
         // async runtime's worker threads.
-        let outcome =
-            tokio::task::spawn_blocking(move || walk(&workspace, &root, &matcher, include.as_ref()))
-                .await
-                .map_err(|e| ToolError::Execution(e.to_string()))?;
+        let outcome = tokio::task::spawn_blocking(move || {
+            walk(&workspace, &root, &matcher, include.as_ref())
+        })
+        .await
+        .map_err(|e| ToolError::Execution(e.to_string()))?;
 
         Ok(render(&outcome))
     }
@@ -388,11 +389,18 @@ mod tests {
     #[tokio::test]
     async fn multiple_patterns_match_union() {
         let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), "a.rs", "let foo = 1;\nlet bar = 2;\nlet baz = 3;\n");
+        write(
+            dir.path(),
+            "a.rs",
+            "let foo = 1;\nlet bar = 2;\nlet baz = 3;\n",
+        );
         let t = SearchTool::new(dir.path().to_path_buf());
 
         let out = t.invoke(inputs(&["foo", "bar"])).await.unwrap();
-        assert_eq!(matches(&out), vec!["a.rs:1:let foo = 1;", "a.rs:2:let bar = 2;"]);
+        assert_eq!(
+            matches(&out),
+            vec!["a.rs:1:let foo = 1;", "a.rs:2:let bar = 2;"]
+        );
     }
 
     /// `|` inside one pattern must NOT leak into the others: each pattern is

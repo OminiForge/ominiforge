@@ -119,10 +119,7 @@ impl Terminal {
         let Some(params) = seq.strip_prefix('[') else {
             return;
         };
-        let nums: Vec<usize> = params
-            .split(';')
-            .map(|p| p.parse().unwrap_or(0))
-            .collect();
+        let nums: Vec<usize> = params.split(';').map(|p| p.parse().unwrap_or(0)).collect();
         // A missing or zero count defaults to 1 (`ESC[A` = up one row).
         let n = |i: usize| nums.get(i).copied().unwrap_or(0).max(1);
         match final_byte {

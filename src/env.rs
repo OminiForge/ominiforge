@@ -415,7 +415,6 @@ exit 1
         ws.canonicalize().unwrap()
     }
 
-
     /// direnv's JSON export becomes a per-workspace overlay; non-string values
     /// are ignored, and `DIRENV_*` bookkeeping never reaches a child env.
     #[test]

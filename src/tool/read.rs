@@ -327,7 +327,6 @@ fn clamp_range(start: usize, end: usize, n: usize) -> Result<(usize, usize), Str
     Ok((start, end.min(n)))
 }
 
-
 fn business_error(code: &str, message: &str) -> ToolOutput {
     ToolOutput {
         content: vec![Content::Text(message.to_owned())],
@@ -642,9 +641,7 @@ mod tests {
         assert_eq!(lines.next().unwrap(), "1:short");
         let clipped = lines.next().unwrap();
         assert!(clipped.starts_with(&format!("2:{}", "x".repeat(500))));
-        assert!(
-            clipped.ends_with("... (1200 chars total; pass verbatim: true for the full line)")
-        );
+        assert!(clipped.ends_with("... (1200 chars total; pass verbatim: true for the full line)"));
         assert_eq!(lines.next(), None);
     }
 
@@ -682,11 +679,7 @@ mod tests {
     async fn verbatim_composes_with_range() {
         let dir = tempfile::tempdir().unwrap();
         let long = "y".repeat(800);
-        std::fs::write(
-            dir.path().join("mixed.txt"),
-            format!("a\n{long}\nb\nc\n"),
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("mixed.txt"), format!("a\n{long}\nb\nc\n")).unwrap();
         let t = tool(dir.path().to_path_buf());
 
         let out = t
@@ -704,10 +697,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!out.is_error, "{:?}", out.content);
-        assert_eq!(
-            text(&out),
-            format!("[mixed.txt] (4 lines)\n2:{long}\n3:b")
-        );
+        assert_eq!(text(&out), format!("[mixed.txt] (4 lines)\n2:{long}\n3:b"));
     }
 
     /// `verbatim` lifts the COLUMN cap only — the bare-read line-window cap

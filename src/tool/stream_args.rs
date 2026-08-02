@@ -397,7 +397,10 @@ mod tests {
     #[test]
     fn streaming_string_gives_prefix_while_open() {
         let p = PartialArgs::new(r#"{"content": "line1\nline2"#);
-        assert_eq!(p.streaming_string("content"), Some("line1\nline2".to_owned()));
+        assert_eq!(
+            p.streaming_string("content"),
+            Some("line1\nline2".to_owned())
+        );
         // Closed → same.
         let p = PartialArgs::new(r#"{"content": "line1\n"}"#);
         assert_eq!(p.streaming_string("content"), Some("line1\n".to_owned()));
@@ -470,9 +473,7 @@ mod tests {
 
     #[test]
     fn edit_entries_all_closed() {
-        let p = PartialArgs::new(
-            r#"{"edits": [{"path":"a","old":["x"],"new":["y"]}]}"#,
-        );
+        let p = PartialArgs::new(r#"{"edits": [{"path":"a","old":["x"],"new":["y"]}]}"#);
         let (closed, open) = p.edit_entries().unwrap();
         assert_eq!(closed.len(), 1);
         assert!(open.is_none());
@@ -481,9 +482,7 @@ mod tests {
     #[test]
     fn edit_entries_braces_inside_strings_dont_confuse_the_scan() {
         // A `}` inside a string literal must not close the object early.
-        let p = PartialArgs::new(
-            r#"{"edits": [{"path":"a","old":["}"],"new":["y"]}, {"path":"b"#,
-        );
+        let p = PartialArgs::new(r#"{"edits": [{"path":"a","old":["}"],"new":["y"]}, {"path":"b"#);
         let (closed, open) = p.edit_entries().unwrap();
         assert_eq!(closed.len(), 1, "the string `}}` stays inside the entry");
         assert!(open.is_some());
@@ -501,7 +500,8 @@ mod tests {
             Some(vec!["l1".to_owned(), "l2".to_owned()])
         );
         // Single-string form: complete once the string closes.
-        let p = PartialArgs::new(r#"{"old":"l1\nl2"}
+        let p = PartialArgs::new(
+            r#"{"old":"l1\nl2"}
 #);
         assert_eq!(
             p.complete_lines("old"),
@@ -512,7 +512,8 @@ mod tests {
     #[test]
     fn streaming_lines_reads_array_and_single_string_forms() {
         // Array form.
-        let p = PartialArgs::new(r#"{"old":["l1","l2"]}"#);
+        let p = PartialArgs::new(r#"{"old":["l1","l2"]}"#,
+        );
         assert_eq!(
             p.streaming_lines("old"),
             Some(vec!["l1".to_owned(), "l2".to_owned()])

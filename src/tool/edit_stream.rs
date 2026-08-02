@@ -94,18 +94,17 @@ impl EditStreamPresenter {
     /// Locate one entry's `old` against a group's lines and append its
     /// splices. `replace_all` mirrors the execute's matching; ambiguous
     /// without it renders the first match (optimistic — see module docs).
-    fn add_splices(
-        group: &mut FileGroup,
-        old: &[String],
-        new: &[String],
-        replace_all: bool,
-    ) {
+    fn add_splices(group: &mut FileGroup, old: &[String], new: &[String], replace_all: bool) {
         if old.is_empty() {
             return;
         }
         let haystack: Vec<&str> = group.lines.iter().map(String::as_str).collect();
         let matches = super::edit::find_matches(&haystack, old);
-        let starts: &[usize] = if replace_all { &matches } else { &matches[..1.min(matches.len())] };
+        let starts: &[usize] = if replace_all {
+            &matches
+        } else {
+            &matches[..1.min(matches.len())]
+        };
         for &start in starts {
             group.splices.push((start, start + old.len(), new.to_vec()));
         }
@@ -189,7 +188,9 @@ impl EditStreamPresenter {
             return None;
         }
         let haystack: Vec<&str> = group.lines.iter().map(String::as_str).collect();
-        let start = super::edit::find_matches(&haystack, &old).into_iter().next()?;
+        let start = super::edit::find_matches(&haystack, &old)
+            .into_iter()
+            .next()?;
         let new = entry.streaming_lines("new").unwrap_or_default();
         Some((idx, (start, start + old.len(), new)))
     }
@@ -263,7 +264,10 @@ mod tests {
         assert_eq!(files[0]["path"], "a.txt");
         assert_eq!(files[1]["path"], "b.txt");
         let a_patch = files[0]["patch"].as_str().unwrap();
-        assert!(a_patch.contains("+A1") && a_patch.contains("+A2"), "{a_patch}");
+        assert!(
+            a_patch.contains("+A1") && a_patch.contains("+A2"),
+            "{a_patch}"
+        );
     }
 
     #[tokio::test]

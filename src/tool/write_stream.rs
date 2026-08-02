@@ -153,7 +153,10 @@ mod tests {
         // Path closed, content not started → None.
         assert!(p.render(r#"{"path": "new.txt""#).await.is_none());
         // Content streaming → a growing code view.
-        let v = p.render(r#"{"path": "new.txt", "content": "hello"#).await.unwrap();
+        let v = p
+            .render(r#"{"path": "new.txt", "content": "hello"#)
+            .await
+            .unwrap();
         let v = env(&v);
         assert_eq!(v["kind"], "code");
         assert_eq!(v["path"], "new.txt");
@@ -202,7 +205,11 @@ mod tests {
         let mut p = WriteStreamPresenter::new(dir.path().to_path_buf());
         // Received prefix still matches the old file (and ends mid-line, so
         // only the one complete line "a" is diffed) → no diff yet → None.
-        assert!(p.render(r#"{"path": "f.txt", "content": "a\nb"#).await.is_none());
+        assert!(
+            p.render(r#"{"path": "f.txt", "content": "a\nb"#)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -219,6 +226,9 @@ mod tests {
             .await
             .unwrap();
         let patch = env(&v)["files"][0]["patch"].as_str().unwrap().to_owned();
-        assert!(patch.contains("+new"), "diff vs cached old, not the live file");
+        assert!(
+            patch.contains("+new"),
+            "diff vs cached old, not the live file"
+        );
     }
 }

@@ -661,8 +661,7 @@ mod tests {
             "expected the throttled frame + the BlockStop flush, got {:?}",
             sink.progress
         );
-        let last: serde_json::Value =
-            serde_json::from_str(sink.progress.last().unwrap()).unwrap();
+        let last: serde_json::Value = serde_json::from_str(sink.progress.last().unwrap()).unwrap();
         assert_eq!(last["kind"], "code");
         assert_eq!(last["path"], "n.txt");
         assert!(last["content"].as_str().unwrap().ends_with("tail"));
@@ -724,8 +723,7 @@ mod tests {
         drop(writer);
 
         assert!(!sink.progress.is_empty(), "edit streams a diff snapshot");
-        let last: serde_json::Value =
-            serde_json::from_str(sink.progress.last().unwrap()).unwrap();
+        let last: serde_json::Value = serde_json::from_str(sink.progress.last().unwrap()).unwrap();
         assert_eq!(last["kind"], "diff");
         assert_eq!(last["files"][0]["path"], "f.txt");
         let patch = last["files"][0]["patch"].as_str().unwrap();

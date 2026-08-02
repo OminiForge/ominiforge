@@ -269,7 +269,9 @@ pub fn builtin_catalog() -> Vec<ToolInfo> {
         ToolInfo {
             name: "search".to_owned(),
             label: Some("搜内容".to_owned()),
-            description: Some("按正则搜索工作区内文件的文本内容（遵循 .gitignore，跳过二进制）".to_owned()),
+            description: Some(
+                "按正则搜索工作区内文件的文本内容（遵循 .gitignore，跳过二进制）".to_owned(),
+            ),
             fields: vec![
                 ToolField {
                     key: "patterns".to_owned(),
@@ -427,7 +429,10 @@ impl std::fmt::Debug for ToolRegistry {
 /// guard rail for the file tools: components are normalized without touching
 /// the filesystem (so it works for not-yet-created files), and any `..` that
 /// would climb above the workspace root is rejected.
-pub(crate) fn resolve_in_workspace(workspace: &Path, requested: &str) -> Result<PathBuf, ToolError> {
+pub(crate) fn resolve_in_workspace(
+    workspace: &Path,
+    requested: &str,
+) -> Result<PathBuf, ToolError> {
     let joined = workspace.join(requested);
     let mut normalized = PathBuf::new();
     for component in joined.components() {
