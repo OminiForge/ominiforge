@@ -21,8 +21,10 @@ use serde::Deserialize;
 use super::{Tool, ToolDescriptor, ToolError, ToolInput, ToolResult};
 use crate::core::payload::{Content, ToolOutput};
 
-/// Maximum number of paths returned. A larger match set is truncated to this
-/// many, with the true total reported so the caller knows to refine the pattern.
+/// Hard ceiling on paths returned, and the default when the caller passes no
+/// `max_results`. A larger match set is truncated to the effective limit, with
+/// the true total reported so the caller knows to refine the pattern. The cap
+/// is a context-protection ceiling: `max_results` may LOWER it, never raise it.
 const RESULT_CAP: usize = 200;
 
 /// Finds files under the workspace whose path matches any of a set of globs.
@@ -34,6 +36,7 @@ pub struct FindTool {
 #[derive(Deserialize)]
 struct FindArgs {
     patterns: Vec<String>,
+    max_results: Option<usize>,
 }
 
 impl FindTool {
@@ -62,8 +65,11 @@ impl Tool for FindTool {
                           the top level of `src/`, and `src/**/*.rs` any depth under \
                           it). Pass several patterns to match any of them in one call \
                           (union) — a file matching more than one is listed once. \
-                          Returns workspace-relative paths, one per line, sorted; at \
-                          most 200, with the total reported when truncated."
+                          `max_results` (optional) caps how many paths are \
+                          returned; it defaults to 200 and may lower but never \
+                          raise the built-in 200 ceiling. Returns \
+                          workspace-relative paths, one per line, sorted; the \
+                          true total is reported when truncated."
                 .to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -75,6 +81,14 @@ impl Tool for FindTool {
                         "description": "One or more glob patterns to match file paths \
                                         against, relative to the workspace root. A file \
                                         matching any pattern is returned."
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Optional cap on returned paths. Defaults to \
+                                        200; values above 200 are clamped to 200. Use a \
+                                        small value when a broad pattern only needs a \
+                                        few examples."
                     }
                 },
                 "required": ["patterns"],
@@ -120,12 +134,18 @@ impl Tool for FindTool {
             Err(e) => return Ok(business_error("bad_pattern", &e.to_string())),
         };
 
+        // The effective limit: the caller's `max_results` (defaulting to the
+        // built-in cap) may tighten but never widen the RESULT_CAP ceiling — a
+        // model asking for 10_000 paths still gets at most RESULT_CAP.
+        let limit = args.max_results.map_or(RESULT_CAP, |n| n.clamp(1, RESULT_CAP));
+
         let workspace = self.workspace.clone();
         // `ignore::Walk` is synchronous and does blocking I/O; keep it off the
         // async runtime's worker threads.
-        let outcome = tokio::task::spawn_blocking(move || walk(&workspace, &globset))
-            .await
-            .map_err(|e| ToolError::Execution(e.to_string()))?;
+        let outcome =
+            tokio::task::spawn_blocking(move || walk(&workspace, &globset, limit))
+                .await
+                .map_err(|e| ToolError::Execution(e.to_string()))?;
 
         Ok(render(&outcome))
     }
@@ -159,9 +179,9 @@ fn normalize_pattern(pattern: &str) -> String {
 /// Paths are `/`-separated regardless of platform (so a pattern written with `/`
 /// matches on Windows too), collected then sorted for stable output. Each file
 /// is visited once, so a file matching several globs appears once. The full
-/// match count is kept even past [`RESULT_CAP`]; only the returned vector is
+/// match count is kept even past `limit`; only the returned vector is
 /// truncated.
-fn walk(workspace: &std::path::Path, globset: &globset::GlobSet) -> Outcome {
+fn walk(workspace: &std::path::Path, globset: &globset::GlobSet, limit: usize) -> Outcome {
     let mut matches: Vec<String> = Vec::new();
     // `ignore::WalkBuilder` defaults: standard-filters ON (.gitignore, hidden,
     // .git/ excluded) — exactly the "like git" behavior we document.
@@ -190,7 +210,7 @@ fn walk(workspace: &std::path::Path, globset: &globset::GlobSet) -> Outcome {
     }
     matches.sort();
     let total = matches.len();
-    matches.truncate(RESULT_CAP);
+    matches.truncate(limit);
     Outcome { matches, total }
 }
 
@@ -208,7 +228,11 @@ fn rel_to_slash(rel: &std::path::Path) -> String {
 /// view is a `listing` envelope so the front-end renders the match list
 /// directly, without parsing the header line.
 fn render(outcome: &Outcome) -> ToolOutput {
-    let header = if outcome.total > outcome.matches.len() {
+    let header = if outcome.total == 0 {
+        // Never answer a 0-hit query with bare emptiness: name the miss and the
+        // way out, so the model's next step is actionable.
+        "0 matches — no files matched; broaden the pattern or check the path scope".to_owned()
+    } else if outcome.total > outcome.matches.len() {
         format!(
             "{} matches (showing first {})",
             outcome.total,
@@ -388,8 +412,49 @@ mod tests {
         assert_eq!(paths(&out).len(), RESULT_CAP);
     }
 
+    // --- caller-set limit ----------------------------------------------------
+
+    /// `max_results` lets the model tighten the cap when a broad pattern only
+    /// needs a few examples — a small ask must not return the full 200.
+    #[tokio::test]
+    async fn max_results_tightens_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..10 {
+            write(dir.path(), &format!("f{i}.rs"), "");
+        }
+        let t = FindTool::new(dir.path().to_path_buf());
+
+        let mut i = input("*.rs");
+        i.input["max_results"] = serde_json::json!(3);
+        let out = t.invoke(i).await.unwrap();
+        assert_eq!(paths(&out).len(), 3);
+        assert_eq!(
+            text(&out).lines().next().unwrap(),
+            "10 matches (showing first 3)"
+        );
+    }
+
+    /// A `max_results` above the built-in ceiling is clamped DOWN to it — the
+    /// model may tighten the context guard, never widen it.
+    #[tokio::test]
+    async fn max_results_above_cap_is_clamped() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..(RESULT_CAP + 5) {
+            write(dir.path(), &format!("f{i:04}.rs"), "");
+        }
+        let t = FindTool::new(dir.path().to_path_buf());
+
+        let mut i = input("*.rs");
+        i.input["max_results"] = serde_json::json!(10_000);
+        let out = t.invoke(i).await.unwrap();
+        assert_eq!(paths(&out).len(), RESULT_CAP);
+    }
+
     // --- no matches / bad pattern --------------------------------------------
 
+    /// A 0-hit query must not read as an empty output: the message names the
+    /// miss and the way out (broaden the pattern), so the model has an
+    /// actionable next step rather than a bare "0 matches".
     #[tokio::test]
     async fn no_matches_reports_zero() {
         let dir = tempfile::tempdir().unwrap();
@@ -398,7 +463,8 @@ mod tests {
 
         let out = t.invoke(input("*.rs")).await.unwrap();
         assert!(!out.is_error);
-        assert_eq!(text(&out), "0 matches");
+        assert!(text(&out).starts_with("0 matches"));
+        assert!(text(&out).contains("broaden"));
     }
 
     /// A syntactically invalid glob is a business error the model can correct,

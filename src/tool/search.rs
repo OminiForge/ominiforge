@@ -26,9 +26,11 @@ use serde::Deserialize;
 use super::{Tool, ToolDescriptor, ToolError, ToolInput, ToolResult, resolve_in_workspace};
 use crate::core::payload::{Content, ToolOutput};
 
-/// Maximum number of match lines returned. A larger match set is truncated to
-/// this many, with the true total reported so the caller knows to refine the
-/// pattern.
+/// Hard ceiling on match lines returned, and the default when the caller
+/// passes no `max_results`. A larger match set is truncated to the effective
+/// limit, with the true total reported so the caller knows to refine the
+/// pattern. The cap is a context-protection ceiling: `max_results` may LOWER
+/// it, never raise it.
 const RESULT_CAP: usize = 200;
 
 /// Searches file contents under the workspace for lines matching a regex.
@@ -42,6 +44,7 @@ struct SearchArgs {
     patterns: Vec<String>,
     path: Option<String>,
     include: Option<Vec<String>>,
+    max_results: Option<usize>,
 }
 
 /// One matching line.
@@ -81,11 +84,13 @@ impl Tool for SearchTool {
                           (omit for the whole workspace). `include` (optional) is \
                           one or more globs (e.g. [\"*.rs\", \"*.toml\"]); a file \
                           matching ANY is searched (union), and a glob with no `/` \
-                          matches at any depth. OUTPUT: one `path:line:content` line \
-                          per match (like `grep -rn`), sorted by path then line; at \
-                          most 200, with the true total reported when truncated \
-                          (refine with path/include/a tighter pattern). No matches \
-                          returns `0 matches`."
+                          matches at any depth. `max_results` (optional) caps \
+                          returned lines; it defaults to 200 and may lower but \
+                          never raise the built-in 200 ceiling. OUTPUT: one \
+                          `path:line:content` line per match (like `grep -rn`), \
+                          sorted by path then line; the true total is reported \
+                          when truncated (refine with path/include/a tighter \
+                          pattern)."
                 .to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -110,6 +115,14 @@ impl Tool for SearchTool {
                                         files are searched; a file matching ANY is \
                                         searched (union). A glob with no `/` matches \
                                         at any depth."
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Optional cap on returned match lines. \
+                                        Defaults to 200; values above 200 are \
+                                        clamped to 200. Use a small value when a \
+                                        broad pattern only needs a few examples."
                     }
                 },
                 "required": ["patterns"],
@@ -181,11 +194,16 @@ impl Tool for SearchTool {
             }
         };
 
+        // The effective limit: the caller's `max_results` (defaulting to the
+        // built-in cap) may tighten but never widen the RESULT_CAP ceiling — a
+        // model asking for 10_000 lines still gets at most RESULT_CAP.
+        let limit = args.max_results.map_or(RESULT_CAP, |n| n.clamp(1, RESULT_CAP));
+
         let workspace = self.workspace.clone();
         // `grep_searcher` is synchronous and does blocking I/O; keep it off the
         // async runtime's worker threads.
         let outcome = tokio::task::spawn_blocking(move || {
-            walk(&workspace, &root, &matcher, include.as_ref())
+            walk(&workspace, &root, &matcher, include.as_ref(), limit)
         })
         .await
         .map_err(|e| ToolError::Execution(e.to_string()))?;
@@ -206,12 +224,13 @@ struct Outcome {
 ///
 /// Paths are `/`-separated regardless of platform; hits are collected then
 /// sorted by path then line for stable output. The full match count is kept
-/// even past [`RESULT_CAP`]; only the returned vector is truncated.
+/// even past `limit`; only the returned vector is truncated.
 fn walk(
     workspace: &Path,
     root: &Path,
     matcher: &RegexMatcher,
     include: Option<&globset::GlobSet>,
+    limit: usize,
 ) -> Outcome {
     let mut hits: Vec<Hit> = Vec::new();
 
@@ -260,7 +279,7 @@ fn walk(
 
     hits.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
     let total = hits.len();
-    hits.truncate(RESULT_CAP);
+    hits.truncate(limit);
     Outcome { hits, total }
 }
 
@@ -278,7 +297,11 @@ fn rel_to_slash(rel: &Path) -> String {
 /// total and how many are shown.
 fn render(outcome: &Outcome) -> ToolOutput {
     use std::fmt::Write as _;
-    let header = if outcome.total > outcome.hits.len() {
+    let header = if outcome.total == 0 {
+        // Never answer a 0-hit query with bare emptiness: name the miss and the
+        // way out, so the model's next step is actionable.
+        "0 matches — no lines matched; broaden the pattern or widen the path/include scope".to_owned()
+    } else if outcome.total > outcome.hits.len() {
         format!(
             "{} matches (showing first {})",
             outcome.total,
@@ -524,6 +547,9 @@ mod tests {
         assert_eq!(out.error_code.as_deref(), Some("bad_pattern"));
     }
 
+    /// A 0-hit query must not read as an empty output: the message names the
+    /// miss and the way out (broaden the pattern / widen the scope), so the
+    /// model has an actionable next step rather than a bare "0 matches".
     #[tokio::test]
     async fn no_matches_reports_zero() {
         let dir = tempfile::tempdir().unwrap();
@@ -532,7 +558,43 @@ mod tests {
 
         let out = t.invoke(input("zzz")).await.unwrap();
         assert!(!out.is_error);
-        assert_eq!(text(&out), "0 matches");
+        assert!(text(&out).starts_with("0 matches"));
+        assert!(text(&out).contains("broaden"));
+    }
+
+    // --- caller-set limit ----------------------------------------------------
+
+    /// `max_results` lets the model tighten the cap when a broad pattern only
+    /// needs a few examples — a small ask must not return the full 200.
+    #[tokio::test]
+    async fn max_results_tightens_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.rs", "hit\nhit\nhit\nhit\nhit\n");
+        let t = SearchTool::new(dir.path().to_path_buf());
+
+        let mut i = input("hit");
+        i.input["max_results"] = serde_json::json!(2);
+        let out = t.invoke(i).await.unwrap();
+        assert_eq!(matches(&out).len(), 2);
+        assert_eq!(
+            text(&out).lines().next().unwrap(),
+            "5 matches (showing first 2)"
+        );
+    }
+
+    /// A `max_results` above the built-in ceiling is clamped DOWN to it — the
+    /// model may tighten the context guard, never widen it.
+    #[tokio::test]
+    async fn max_results_above_cap_is_clamped() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = "hit\n".repeat(RESULT_CAP + 5);
+        write(dir.path(), "a.rs", &body);
+        let t = SearchTool::new(dir.path().to_path_buf());
+
+        let mut i = input("hit");
+        i.input["max_results"] = serde_json::json!(10_000);
+        let out = t.invoke(i).await.unwrap();
+        assert_eq!(matches(&out).len(), RESULT_CAP);
     }
 
     /// Multiple matches across files are sorted by path then line, so output
