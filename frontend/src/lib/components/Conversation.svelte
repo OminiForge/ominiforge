@@ -836,13 +836,15 @@
 				// Lazily create the real session on first send. A pending fork branches
 				// from its parent at the recorded seq (inheriting that context); an
 				// ordinary draft creates a fresh session. Either way the workspace is
-				// fixed by `workspaceId` (path resolved server-side, never sent), so
-				// only the picker's profile/model ride along on the plain path.
+				// fixed by `workspaceId` (path resolved server-side, never sent). The
+				// picker's effective profile/model ride along verbatim — WYSIWYG: the
+				// session is created with exactly what the picker shows, so the UI can
+				// never display one model while the session silently uses another.
 				const realId = forkIntent
 					? await client.forkSession(forkIntent.parentId, forkIntent.atSeq)
 					: await client.createWorkspaceSession(workspaceId, {
-							profile: selProfile || undefined,
-							model: selModel || undefined
+							profile: effProfile || undefined,
+							model: effModel || undefined
 						});
 				// The fork is materialized; drop the intent so a later send can't reuse
 				// it (defensive — we navigate away immediately after).
