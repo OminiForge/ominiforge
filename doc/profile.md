@@ -3,7 +3,7 @@
 ## 1. 设计原则
 
 - Profile 定义 agent 身份和能力组合，不涉及连接/计费细节。
-- Provider 定义连接信息、model 元数据和 pricing。
+- Provider 定义连接信息和 model 元数据。
 - Profile 引用 provider/model，可 override 参数。
 - 单继承，字段级覆盖。
 - Session 绑定 profile，运行中切换 = 创建新 session。
@@ -24,14 +24,12 @@ id = "gpt-4o"
 context_window = 128000
 max_output_tokens = 16384
 default_temperature = 0.0
-pricing = { input_per_million = 2.50, output_per_million = 10.00, cache_read_per_million = 1.25 }
 
 [[providers.models]]
 id = "gpt-4o-mini"
 context_window = 128000
 max_output_tokens = 16384
 default_temperature = 0.0
-pricing = { input_per_million = 0.15, output_per_million = 0.60 }
 
 
 [[providers]]
@@ -45,7 +43,6 @@ id = "mimo-7b"
 context_window = 32000
 max_output_tokens = 8192
 default_temperature = 0.7
-pricing = { input_per_million = 0.0, output_per_million = 0.0 }
 
 
 [[providers]]
@@ -59,7 +56,6 @@ id = "claude-sonnet-4-6"
 context_window = 200000
 max_output_tokens = 16000
 default_temperature = 0.0
-pricing = { input_per_million = 3.00, output_per_million = 15.00, cache_read_per_million = 0.30, cache_write_per_million = 3.75 }
 ```
 
 ### 2.1 Provider type
@@ -89,7 +85,25 @@ pricing = { input_per_million = 3.00, output_per_million = 15.00, cache_read_per
 | context_window | ✓ | 最大 context tokens |
 | max_output_tokens | ✓ | 最大输出 tokens |
 | default_temperature | ✗ | 默认温度，默认 0.0 |
-| pricing | ✗ | 计费信息（用于成本估算） |
+
+### 2.4 内置 Provider（catalog）
+
+除用户 `providers.toml` 外，二进制内置一份 provider 目录（`src/config/catalog.toml`，
+编译期内嵌），加载时**追加**在用户条目之后。设计要点：
+
+- **只读**：内置条目不写入用户文件；设置页对它们渲染为「连接卡片」（名称 +
+  model 列表 + API key 输入），不提供字段编辑；`PUT /providers` 携带内置名称时
+  返回 400，而不是静默写入。
+- **认证**：卡片里粘贴的 key 存入 secret store（`PUT /secrets/{provider}`），resolve
+  时优先于 `api_key_env` 环境变量。连接成功后该 provider 的全部 model 立即可在
+  profile / `--model` 中以 `provider/model_id` 引用。
+- **覆盖**：用户在 `providers.toml` 中定义同名 provider 会 shadow 内置条目（同名
+  合并去重，用户条目排序在前，`find_model` 取第一个匹配）。这是逃生通道，不是
+  推荐路径。
+- **扩展方式**：新增内置 provider 必须只是数据变更（改 `catalog.toml`）；需要新
+  协议时先实现 adapter（`src/provider/`）。model 清单按官方文档刷新，随发版更新。
+
+当前内置：`kimi-code`（Kimi / Moonshot，OpenAI 兼容端点，`MOONSHOT_API_KEY`）。
 
 ## 3. Profile 配置
 
@@ -240,7 +254,6 @@ session_max_usd = 10.00  # 覆盖
 |------|------|------|
 | API endpoint / protocol | Provider | 连接属性 |
 | context_window | Provider (model) | model 固有属性 |
-| pricing | Provider (model) | 计费属性 |
 | default_temperature | Provider (model) | model 推荐默认值 |
 | temperature override | Profile | agent 行为偏好 |
 | max_output_tokens override | Profile | agent 行为偏好 |

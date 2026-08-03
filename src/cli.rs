@@ -770,7 +770,6 @@ id = "gpt-4o"
 context_window = 128000
 max_output_tokens = 16384
 default_temperature = 0.0
-pricing = { input_per_million = 2.50, output_per_million = 10.00, cache_read_per_million = 1.25 }
 
 # Any OpenAI-compatible endpoint works (local servers, third parties, Xiaomi
 # MiMo via an OpenAI-shaped gateway, ...). Example:

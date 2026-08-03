@@ -1,7 +1,7 @@
 //! The profile data model: agent identity and capability composition.
 //!
 //! Mirrors `doc/profile.md` §3. A profile names a system prompt, a model
-//! reference (`provider_name/model_id`), and a tool set. Connection and pricing
+//! reference (`provider_name/model_id`), and a tool set. Connection info
 //! details belong to [`super::providers`], not here.
 //!
 //! Phase 1 wires `[prompt]`, `[model]`, and `[tools]`. The `[context]`,

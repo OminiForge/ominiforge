@@ -64,6 +64,13 @@ pub enum ConfigError {
     #[error("provider type `{0}` is not supported yet (only `openai-chat` is wired in Phase 1)")]
     UnsupportedProviderType(String),
 
+    /// A write tried to save a provider under a name reserved by the built-in
+    /// catalog.
+    #[error(
+        "provider `{0}` is built in and read-only; choose a different name for a custom provider"
+    )]
+    BuiltinProviderConflict(String),
+
     /// A profile's `extends` chain is longer than the allowed depth.
     #[error("profile inheritance chain for `{0}` exceeds the maximum depth of {1}")]
     InheritanceTooDeep(String, usize),

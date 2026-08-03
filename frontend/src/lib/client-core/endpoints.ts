@@ -35,6 +35,8 @@ export const endpoints = {
 	/** Built-in tool catalog for the permission-config UI (labels + fields). */
 	tools: () => `${API}/tools`,
 	providers: () => `${API}/providers`,
+	/** Probe a provider's connectivity + credentials (settings UI test button). */
+	providerTest: (name: string) => `${API}/providers/${encodeURIComponent(name)}/test`,
 	/** Per-workspace config (network + mounts + permission); top tier of the gate. */
 	workspaceConfig: (id: string) => `${API}/workspaces/${encodeURIComponent(id)}/config`,
 	/** Per-workspace tool catalog (built-ins + this workspace's MCP tools). */

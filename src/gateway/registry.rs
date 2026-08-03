@@ -1543,11 +1543,126 @@ impl SessionRegistry {
             .context("failed to write the secret store")
     }
 
+    /// Probe a provider's connectivity + credentials with a minimal request,
+    /// using the caller's unsaved profile edits and/or unsaved key when given
+    /// (so the settings UI can test before persisting). Returns the model id
+    /// that answered on success.
+    ///
+    /// The base provider definition comes from the merged catalog; `edit`, when
+    /// present, overlays connection fields (a draft custom provider the UI is
+    /// editing), and `key` overrides the stored/env key. A minimal
+    /// `builtin_default` profile carries no model, so the probe model is the
+    /// provider's first catalog entry.
+    ///
+    /// # Errors
+    /// [`anyhow::Error`] naming the failing stage: unknown provider, no model,
+    /// no credentials, no adapter, transport, or a provider-side rejection.
+    pub async fn test_provider(
+        &self,
+        name: &str,
+        edit: Option<crate::config::ProviderConfig>,
+        key: Option<String>,
+    ) -> Result<String> {
+        let store = &self.inner.defaults.config;
+        let catalog = store.load_providers()?;
+        let mut provider = catalog
+            .providers
+            .into_iter()
+            .find(|p| p.name == name)
+            .with_context(|| format!("unknown provider `{name}`"))?;
+        if let Some(e) = edit {
+            provider.provider_type = e.provider_type;
+            provider.base_url = e.base_url;
+            provider.api_key_env = e.api_key_env;
+            if !e.models.is_empty() {
+                provider.models = e.models;
+            }
+        }
+        let model_id = provider
+            .models
+            .first()
+            .map(|m| m.id.clone())
+            .with_context(|| format!("provider `{name}` has no models"))?;
+
+        // Key precedence mirrors resolve(): unsaved test key → secret store →
+        // the provider's api_key_env. Read only here, never exported.
+        let api_key = match key {
+            Some(k) => k,
+            None => match store
+                .secret_store()
+                .and_then(|s| s.get(name).transpose())
+            {
+                Some(result) => result?,
+                None => std::env::var(&provider.api_key_env).with_context(|| {
+                    format!(
+                        "no API key for `{name}`: none stored and {} is not set",
+                        provider.api_key_env
+                    )
+                })?,
+            },
+        };
+
+        let resolved = crate::config::ResolvedModel {
+            provider_name: provider.name.clone(),
+            provider_type: provider.provider_type,
+            base_url: provider.base_url.clone(),
+            api_key,
+            model_id: model_id.clone(),
+            temperature: provider.models[0].default_temperature,
+            max_output_tokens: provider.models[0].max_output_tokens,
+            context_window: provider.models[0].context_window,
+        };
+        let handle = crate::provider::build(&resolved)
+            .with_context(|| format!("provider `{name}` has no adapter"))?;
+
+        use futures_util::StreamExt;
+        let request = crate::llm::ModelRequest {
+            model: model_id.clone(),
+            messages: vec![Message::User {
+                content: "ping".to_owned(),
+            }],
+            tools: Vec::new(),
+            temperature: resolved.temperature,
+            max_tokens: Some(1),
+        };
+        let mut stream = handle
+            .stream(request)
+            .await
+            .map_err(|e| anyhow!(friendly_probe_error(&e)))?;
+        // Drain until the first terminal event; per-chunk errors surface here.
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(crate::llm::StreamEvent::Completed { .. }) => break,
+                Ok(_) => {}
+                Err(e) => return Err(anyhow!(friendly_probe_error(&e))),
+            }
+        }
+        Ok(model_id)
+    }
+
     /// The system-prompt seed for a session built from `assembled`.
     fn system_seed(assembled: &Assembled) -> Vec<Message> {
         vec![Message::System {
             content: assembled.system_prompt.clone(),
         }]
+    }
+}
+
+/// Turn an [`crate::llm::LlmError`] into a short, human-readable probe failure
+/// for the settings UI's Test action. The raw `Display` of an `LlmError`
+/// embeds the provider's JSON error body (`provider auth error:
+/// {"error":{...}}`), which is noise next to a key input; map each variant to a
+/// plain phrase. The original body is dropped on purpose — the gateway log
+/// still carries it if an operator needs it.
+fn friendly_probe_error(e: &crate::llm::LlmError) -> String {
+    use crate::llm::LlmError;
+    match e {
+        LlmError::Auth(_) => "API key invalid or expired".to_owned(),
+        LlmError::Status { status, .. } => {
+            format!("provider rejected the request (HTTP {status})")
+        }
+        LlmError::Transport(_) => "cannot reach the provider (network/endpoint)".to_owned(),
+        LlmError::Decode(_) => "provider returned an unreadable response".to_owned(),
     }
 }
 

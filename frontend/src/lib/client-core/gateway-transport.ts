@@ -22,6 +22,7 @@ import type { RuntimeInfo } from '$lib/types/RuntimeInfo';
 import type { ProfileSummary } from '$lib/types/ProfileSummary';
 import type { ModelSummary } from '$lib/types/ModelSummary';
 import type { ProvidersFile } from '$lib/types/ProvidersFile';
+import type { ProviderConfig } from '$lib/types/ProviderConfig';
 import type { Profile } from '$lib/types/Profile';
 import type { WorkspaceSummary } from '$lib/types/WorkspaceSummary';
 import type { SessionStatus } from '$lib/types/SessionStatus';
@@ -34,6 +35,7 @@ import type {
 	CreateSessionOptions,
 	EventHandlers,
 	EventSubscription,
+	ProviderTestResult,
 	ProvidersView,
 	ReconfigureOptions,
 	SessionClient,
@@ -256,6 +258,16 @@ export class GatewayTransport implements SessionClient {
 		return this.#send(endpoints.providers(), {
 			method: 'PUT',
 			body: JSON.stringify(providers)
+		});
+	}
+
+	testProvider(name: string, edit?: ProviderConfig, key?: string): Promise<ProviderTestResult> {
+		// `#json` adds Content-Type from the presence of a body; passing it here
+		// too produced `application/json, application/json`, which axum rejects
+		// with 415.
+		return this.#json<ProviderTestResult>(endpoints.providerTest(name), {
+			method: 'POST',
+			body: JSON.stringify({ edit: edit ?? null, key: key ?? null })
 		});
 	}
 

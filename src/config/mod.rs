@@ -25,18 +25,19 @@ pub use profile::{
     DEFAULT_SYSTEM_PROMPT, NetworkSection, Profile, ProfileMeta, PromptSection, ToolsSection,
     WebFetchSection,
 };
-pub use providers::{ModelConfig, Pricing, ProviderConfig, ProviderType, ProvidersFile};
+pub use providers::{ModelConfig, ProviderConfig, ProviderType, ProvidersFile, Thinking};
 
 use crate::secrets::SecretStore;
 use serde::Serialize;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 const CONFIG_SUBDIR: &str = "config";
 const PROFILES_SUBDIR: &str = "profiles";
 const PROVIDERS_FILE: &str = "providers.toml";
-const PRICING_FILE: &str = "pricing.toml";
 const OMINI_DIR: &str = ".omini";
+
+/// The embedded built-in provider catalog (`catalog.toml`, this directory).
+const CATALOG_TOML: &str = include_str!("catalog.toml");
 const MAX_INHERITANCE_DEPTH: usize = 5;
 
 /// A fully-resolved model selection: everything needed to construct a provider
@@ -59,8 +60,6 @@ pub struct ResolvedModel {
     pub max_output_tokens: u32,
     /// The model's context window (for later compaction logic).
     pub context_window: u32,
-    /// Pricing, if configured (for the monitor).
-    pub pricing: Option<Pricing>,
 }
 
 /// A profile's listable identity: its name and human-readable description.
@@ -165,8 +164,13 @@ impl ConfigStore {
         self.roots.first().map(|root| SecretStore::at_root(root))
     }
 
-    /// Load and merge every root's `config/providers.toml`. A provider defined
-    /// in a higher-priority root shadows a same-named one in a lower root.
+    /// Load and merge every root's `config/providers.toml`, then append the
+    /// built-in catalog ([`builtin_providers`]). A provider defined in a
+    /// higher-priority root shadows a same-named one in a lower root; a
+    /// same-named user entry likewise shadows a built-in one (it sorts earlier
+    /// in the merged list, and [`find_model`] takes the first match), while
+    /// [`save_providers`](Self::save_providers) refuses to *write* a built-in
+    /// name so the settings UI cannot silently fork the catalog.
     ///
     /// # Errors
     /// [`ConfigError::Parse`] / [`ConfigError::Io`] on a malformed or unreadable
@@ -189,50 +193,13 @@ impl ConfigStore {
                 }
             }
         }
+        for provider in &builtin_providers().providers {
+            if !merged.iter().any(|p| p.name == provider.name) {
+                merged.push(provider.clone());
+            }
+        }
         Ok(ProvidersFile { providers: merged })
     }
-
-    /// Build the model→pricing table the monitor uses to derive cost
-    /// (`doc/monitor.md` §6.2). Pricing comes from two sources, merged with
-    /// `pricing.toml` winning: the inline `pricing` on each model in
-    /// `providers.toml` (a sensible default shipped with the model), overridden
-    /// by an explicit `.omini/config/pricing.toml` (so a user can update prices
-    /// without touching provider definitions). A missing `pricing.toml` is fine.
-    ///
-    /// # Errors
-    /// [`ConfigError::Parse`] / [`ConfigError::Io`] on a malformed or unreadable
-    /// `pricing.toml`.
-    pub fn load_pricing(&self, providers: &ProvidersFile) -> Result<HashMap<String, Pricing>> {
-        let mut table: HashMap<String, Pricing> = HashMap::new();
-
-        // Base layer: inline pricing from providers.toml.
-        for provider in &providers.providers {
-            for model in &provider.models {
-                if let Some(pricing) = model.pricing {
-                    table.entry(model.id.clone()).or_insert(pricing);
-                }
-            }
-        }
-
-        // Override layer: pricing.toml (highest-priority root wins per id).
-        for root in &self.roots {
-            let path = root.join(CONFIG_SUBDIR).join(PRICING_FILE);
-            let Some(text) = read_optional(&path)? else {
-                continue;
-            };
-            let file: PricingFile = toml::from_str(&text).map_err(|source| ConfigError::Parse {
-                path: path.clone(),
-                source,
-            })?;
-            for (id, pricing) in file.models {
-                table.insert(id, pricing);
-            }
-        }
-
-        Ok(table)
-    }
-
-    // __APPEND_MARKER__
 
     /// Load a profile by name, resolving its `extends` chain and reading any
     /// `system_file`. Returns the [`Profile::builtin_default`] if `name` is
@@ -392,10 +359,23 @@ impl ConfigStore {
     /// state, so this is a full overwrite (not a merge). Written atomically
     /// (temp file + rename) so a crash mid-write never leaves a truncated file.
     ///
+    /// Built-in catalog entries are read-only: posting one back under its
+    /// reserved name is rejected rather than silently persisted or dropped.
+    ///
     /// # Errors
-    /// [`ConfigError::NoRoot`] if the store has no config root; serialize or io
-    /// failure otherwise.
+    /// [`ConfigError::BuiltinProviderConflict`] if any entry uses a built-in
+    /// provider name; [`ConfigError::NoRoot`] if the store has no config root;
+    /// serialize or io failure otherwise.
     pub fn save_providers(&self, providers: &ProvidersFile) -> Result<()> {
+        for provider in &providers.providers {
+            if builtin_providers()
+                .providers
+                .iter()
+                .any(|b| b.name == provider.name)
+            {
+                return Err(ConfigError::BuiltinProviderConflict(provider.name.clone()));
+            }
+        }
         let root = self.primary_root()?;
         let path = root.join(CONFIG_SUBDIR).join(PROVIDERS_FILE);
         let text = toml::to_string_pretty(providers).map_err(|source| ConfigError::Serialize {
@@ -528,7 +508,6 @@ impl ConfigStore {
             temperature,
             max_output_tokens,
             context_window: model.context_window,
-            pricing: model.pricing,
         })
     }
 
@@ -623,17 +602,32 @@ fn read_optional(path: &Path) -> Result<Option<String>> {
     }
 }
 
-/// The on-disk shape of `.omini/config/pricing.toml`: a `[models."<id>"]` table
-/// per model. Used only by [`ConfigStore::load_pricing`] (`doc/monitor.md` §6.2).
-#[derive(Debug, Default, serde::Deserialize)]
-struct PricingFile {
-    #[serde(default)]
-    models: HashMap<String, Pricing>,
-}
-
 /// The user's home directory from `HOME`, if set.
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// The built-in provider catalog, parsed once from the embedded TOML.
+///
+/// The file is compile-time data we control, so a malformed catalog is a build
+/// bug, not a runtime condition — this panics rather than threading a
+/// `Result` through every read.
+fn builtin_providers() -> &'static ProvidersFile {
+    use std::sync::OnceLock;
+    static CATALOG: OnceLock<ProvidersFile> = OnceLock::new();
+    CATALOG
+        .get_or_init(|| toml::from_str(CATALOG_TOML).expect("embedded provider catalog must parse"))
+}
+
+/// The provider names reserved by the built-in catalog (for the settings UI
+/// to render them as connect cards rather than editable forms).
+#[must_use]
+pub fn builtin_provider_names() -> Vec<String> {
+    builtin_providers()
+        .providers
+        .iter()
+        .map(|p| p.name.clone())
+        .collect()
 }
 
 #[cfg(test)]
@@ -909,75 +903,72 @@ temperature = 0.7
             user.path().join(".omini"),
         ]);
         let providers = store.load_providers().unwrap();
-        assert_eq!(providers.providers.len(), 1);
+        let names: Vec<&str> = providers
+            .providers
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        // The user-defined `shared` shadows across roots; built-ins follow.
+        assert_eq!(names[0], "shared");
         assert_eq!(providers.providers[0].base_url, "https://project");
+        assert!(names[1..].iter().all(|n| *n != "shared"));
+        assert_eq!(names.len(), 1 + builtin_provider_names().len());
     }
 
-    /// `load_pricing` seeds from inline `providers.toml` pricing, then lets an
-    /// explicit `pricing.toml` override a model's price — the monitor's cost
-    /// source (`doc/monitor.md` §6.2).
+    /// The embedded catalog parses and every entry is complete enough to be
+    /// usable: a name, an endpoint, an env-var name, and at least one model.
+    /// This guards the data file against half-finished edits.
     #[test]
-    fn load_pricing_merges_inline_then_override() {
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = dir.path().join(".omini").join(CONFIG_SUBDIR);
-        std::fs::create_dir_all(&cfg).unwrap();
-        // providers.toml: gpt-4o has inline pricing; gpt-4o-mini does not.
-        std::fs::write(
-            cfg.join(PROVIDERS_FILE),
-            r#"
-[[providers]]
-name = "openai-main"
-type = "openai-chat"
-base_url = "https://api.openai.com/v1"
-api_key_env = "HOME"
-
-[[providers.models]]
-id = "gpt-4o"
-context_window = 128000
-max_output_tokens = 16384
-pricing = { input_per_million = 2.50, output_per_million = 10.00 }
-
-[[providers.models]]
-id = "gpt-4o-mini"
-context_window = 128000
-max_output_tokens = 16384
-"#,
-        )
-        .unwrap();
-        // pricing.toml overrides gpt-4o and adds gpt-4o-mini.
-        std::fs::write(
-            cfg.join(PRICING_FILE),
-            r#"
-[models."gpt-4o"]
-input_per_million = 3.00
-output_per_million = 12.00
-
-[models."gpt-4o-mini"]
-input_per_million = 0.15
-output_per_million = 0.60
-"#,
-        )
-        .unwrap();
-
-        let store = ConfigStore::from_roots(vec![dir.path().join(".omini")]);
-        let providers = store.load_providers().unwrap();
-        let pricing = store.load_pricing(&providers).unwrap();
-
-        // gpt-4o: pricing.toml wins over the inline 2.50.
-        assert_eq!(pricing["gpt-4o"].input_per_million, 3.00);
-        // gpt-4o-mini: only in pricing.toml.
-        assert_eq!(pricing["gpt-4o-mini"].output_per_million, 0.60);
+    fn builtin_catalog_is_well_formed() {
+        let catalog = builtin_providers();
+        assert!(!catalog.providers.is_empty());
+        let mut names = std::collections::HashSet::new();
+        for p in &catalog.providers {
+            assert!(!p.name.is_empty());
+            assert!(p.base_url.starts_with("https://"), "{}", p.name);
+            assert!(!p.api_key_env.is_empty(), "{}", p.name);
+            assert!(!p.models.is_empty(), "{}", p.name);
+            assert!(names.insert(p.name.as_str()), "duplicate {}", p.name);
+        }
     }
 
-    /// A missing `pricing.toml` is not an error: the table is just the inline
-    /// pricing from `providers.toml`.
+    /// `load_providers` exposes built-ins after user entries, and a same-named
+    /// user provider shadows the built-in (it sorts first, so `find_model`
+    /// picks it).
     #[test]
-    fn load_pricing_without_pricing_toml_uses_inline_only() {
+    fn builtin_providers_are_appended_and_shadowable() {
+        let builtin = &builtin_provider_names()[0];
         let (_d, store) = store_with(PROVIDERS, &[]);
         let providers = store.load_providers().unwrap();
-        // PROVIDERS has no inline pricing → empty table, not an error.
-        let pricing = store.load_pricing(&providers).unwrap();
-        assert!(pricing.is_empty());
+        assert!(providers.providers.iter().any(|p| p.name == *builtin));
+        assert_eq!(providers.providers[0].name, "openai-main");
+
+        // A user entry reusing the built-in name shadows it.
+        let shadow = PROVIDERS.replace("openai-main", builtin);
+        let (_d2, store2) = store_with(&shadow, &[]);
+        let providers2 = store2.load_providers().unwrap();
+        let matches: Vec<_> = providers2
+            .providers
+            .iter()
+            .filter(|p| p.name == *builtin)
+            .collect();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].base_url, "https://api.openai.com/v1");
+    }
+
+    /// `save_providers` refuses to persist a provider under a built-in name —
+    /// the settings UI posts full state, and silently writing the catalog back
+    /// would fork it.
+    #[test]
+    fn save_providers_rejects_builtin_names() {
+        let (_d, store) = store_with(PROVIDERS, &[]);
+        let builtin = builtin_providers().providers[0].clone();
+        let err = store
+            .save_providers(&ProvidersFile {
+                providers: vec![builtin],
+            })
+            .unwrap_err();
+        assert!(matches!(err, ConfigError::BuiltinProviderConflict(_)));
     }
 
     /// `discover_with` orders roots `--config-dir` → launch cwd → home, each as a

@@ -1,4 +1,4 @@
-//! The `providers.toml` data model: connection info, model metadata, pricing.
+//! The `providers.toml` data model: connection info and model metadata.
 //!
 //! Mirrors `doc/profile.md` §2. A provider owns connection details (endpoint,
 //! protocol, the *name* of the env var holding its API key) and a list of
@@ -99,25 +99,33 @@ pub struct ModelConfig {
     #[serde(default)]
     pub default_temperature: f32,
 
-    /// Cost metadata for the monitor's estimation (optional).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pricing: Option<Pricing>,
+    /// Whether / how the model reasons before answering. Display-only metadata
+    /// for the settings UI; it does not change how requests are built.
+    #[serde(default)]
+    pub thinking: Thinking,
+
+    /// Input modalities beyond text the model accepts (e.g. `["image", "video"]`).
+    /// Empty = text only. Display-only metadata.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modalities: Vec<String>,
 }
 
-/// Per-million-token pricing, used by the monitor to estimate cost. Stored in
-/// config (not in the event stream) so history can be recomputed with current
-/// prices. See `doc/monitor.md` §6.
-#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+/// A model's reasoning behaviour, shown in the settings UI's model table.
+///
+/// This is richer than a boolean because providers distinguish "always thinks"
+/// from "can think if asked": Kimi's `kimi-k2.7-code` always reasons (it cannot
+/// be disabled) while `kimi-k2.6` reasons only by default/optionally.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
-pub struct Pricing {
-    #[serde(default)]
-    pub input_per_million: f64,
-    #[serde(default)]
-    pub output_per_million: f64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_read_per_million: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_write_per_million: Option<f64>,
+#[serde(rename_all = "kebab-case")]
+pub enum Thinking {
+    /// No reasoning mode (the default when unspecified).
+    #[default]
+    None,
+    /// Reasoning is available (on by default, or can be enabled).
+    Optional,
+    /// The model always reasons; it cannot be turned off.
+    Always,
 }
 
 #[cfg(test)]
@@ -126,8 +134,8 @@ mod tests {
 
     use super::*;
 
-    /// The full example from `doc/profile.md` §2 must parse, including inline
-    /// pricing tables and the array-of-tables `[[providers.models]]` shape.
+    /// The full example from `doc/profile.md` §2 must parse, including the
+    /// array-of-tables `[[providers.models]]` shape.
     #[test]
     fn parses_doc_example() {
         let toml_src = r#"
@@ -142,13 +150,11 @@ id = "gpt-4o"
 context_window = 128000
 max_output_tokens = 16384
 default_temperature = 0.0
-pricing = { input_per_million = 2.50, output_per_million = 10.00, cache_read_per_million = 1.25 }
 
 [[providers.models]]
 id = "gpt-4o-mini"
 context_window = 128000
 max_output_tokens = 16384
-pricing = { input_per_million = 0.15, output_per_million = 0.60 }
 
 [[providers]]
 name = "anthropic"
@@ -171,14 +177,10 @@ max_output_tokens = 16000
 
         let gpt4o = openai.model("gpt-4o").unwrap();
         assert_eq!(gpt4o.context_window, 128_000);
-        let pricing = gpt4o.pricing.unwrap();
-        assert_eq!(pricing.input_per_million, 2.50);
-        assert_eq!(pricing.cache_read_per_million, Some(1.25));
 
-        // gpt-4o-mini omits default_temperature and cache pricing → defaults.
+        // gpt-4o-mini omits default_temperature → default.
         let mini = openai.model("gpt-4o-mini").unwrap();
         assert_eq!(mini.default_temperature, 0.0);
-        assert_eq!(mini.pricing.unwrap().cache_read_per_million, None);
 
         assert_eq!(parsed.providers[1].provider_type, ProviderType::Anthropic);
     }

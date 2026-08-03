@@ -1,0 +1,142 @@
+# Built-in provider catalog, embedded into the binary via `include_str!` and
+# merged into the configured providers by `ConfigStore::load_providers`.
+#
+# These entries are read-only: they are never written to a user's
+# `providers.toml`, `save_providers` rejects entries colliding with a built-in
+# name, and the settings UI renders them as "connect with an API key" cards
+# instead of editable forms. A same-named user entry takes precedence at
+# resolve time (it sorts earlier in the merged list).
+#
+# Adding a provider here must be a pure data change — new wire protocols need
+# an adapter first (`src/provider/`). Model metadata follows the provider's
+# official docs; refresh it when upstream model lists change.
+
+# Kimi for Coding (Moonshot AI subscription) — OpenAI-compatible Chat
+# Completions endpoint. NOTE: the subscription API is a separate product from
+# the pay-as-you-go platform (api.moonshot.cn / api.moonshot.ai) — keys are
+# not interchangeable. Models per https://platform.kimi.com/docs/models
+# (kimi-k2 series removed upstream 2026-05-25).
+# NOTE: this endpoint pins temperature to 1 for every model (any other value
+# is rejected with `invalid temperature`), so each model sets its default to
+# 1.0 — overriding it in a profile will break requests.
+[[providers]]
+name = "kimi-code"
+type = "openai-chat"
+base_url = "https://api.kimi.com/coding/v1"
+api_key_env = "KIMI_CODE_API_KEY"
+
+[[providers.models]]
+id = "kimi-k3"
+context_window = 1048576
+# Official: `max_completion_tokens` defaults to 131072 (K3 quickstart,
+# "重要限制"); the request can raise it up to the 1M context.
+max_output_tokens = 131072
+default_temperature = 1.0
+thinking = "always"
+modalities = ["image", "video"]
+
+# NOTE: Kimi does not publish an output-token cap for the K2.x models below.
+# max_output_tokens is a conservative estimate, not an official figure —
+# update it if the docs start specifying one.
+[[providers.models]]
+id = "kimi-k2.7-code"
+context_window = 262144
+max_output_tokens = 32768
+default_temperature = 1.0
+thinking = "always"
+modalities = ["image", "video"]
+
+[[providers.models]]
+id = "kimi-k2.7-code-highspeed"
+context_window = 262144
+max_output_tokens = 32768
+default_temperature = 1.0
+thinking = "always"
+modalities = ["image", "video"]
+
+[[providers.models]]
+id = "kimi-k2.6"
+context_window = 262144
+max_output_tokens = 32768
+default_temperature = 1.0
+thinking = "optional"
+modalities = ["image", "video"]
+
+# Kimi open platform (pay-as-you-go) — the standard OpenAI-compatible API.
+# Separate product from the subscription above; a platform API key will NOT
+# work on the subscription endpoint and vice versa. Same model ids (the
+# endpoints map them); the platform does NOT pin temperature to 1.
+[[providers]]
+name = "kimi-platform"
+type = "openai-chat"
+base_url = "https://api.moonshot.cn/v1"
+api_key_env = "MOONSHOT_API_KEY"
+
+[[providers.models]]
+id = "kimi-k3"
+context_window = 1048576
+max_output_tokens = 131072
+default_temperature = 1.0
+thinking = "always"
+modalities = ["image", "video"]
+
+[[providers.models]]
+id = "kimi-k2.7-code"
+context_window = 262144
+max_output_tokens = 32768
+default_temperature = 1.0
+thinking = "always"
+modalities = ["image", "video"]
+
+[[providers.models]]
+id = "kimi-k2.6"
+context_window = 262144
+max_output_tokens = 32768
+default_temperature = 0.6
+thinking = "optional"
+modalities = ["image", "video"]
+
+# Xiaomi MiMo Token Plan (subscription) — OpenAI-compatible. Text models per
+# https://mimo.mi.com/docs/zh-CN/quick-start/summary/model (v2.5 series:
+# 1M context / 128K max output). ASR/TTS models are not chat models, so only
+# the text ones are listed.
+[[providers]]
+name = "mimo-token"
+type = "openai-chat"
+base_url = "https://token-plan-cn.xiaomimimo.com/v1"
+api_key_env = "XIAOMI_MIMO_TOKEN_KEY"
+
+[[providers.models]]
+id = "mimo-v2.5-pro"
+context_window = 1048576
+max_output_tokens = 131072
+thinking = "optional"
+modalities = []
+
+[[providers.models]]
+id = "mimo-v2.5"
+context_window = 1048576
+max_output_tokens = 131072
+thinking = "optional"
+modalities = ["image", "video", "audio"]
+
+# Xiaomi MiMo open platform (pay-as-you-go) — same models, standard API key.
+[[providers]]
+name = "mimo-api"
+type = "openai-chat"
+base_url = "https://api.xiaomimimo.com/v1"
+api_key_env = "XIAOMI_MIMO_API_KEY"
+
+[[providers.models]]
+id = "mimo-v2.5-pro"
+context_window = 1048576
+max_output_tokens = 131072
+thinking = "optional"
+modalities = []
+
+[[providers.models]]
+id = "mimo-v2.5"
+context_window = 1048576
+max_output_tokens = 131072
+thinking = "optional"
+modalities = ["image", "video", "audio"]

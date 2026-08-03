@@ -56,7 +56,7 @@ pub struct Assembled {
     /// The sandbox's persisted descriptor (backend + durable id), stamped on the
     /// session's meta so its environment can be re-attached after a restart.
     pub sandbox_descriptor: crate::session::SandboxDescriptor,
-    /// The resolved model (provider/model/window/pricing) for display + config.
+    /// The resolved model (provider/model/window) for display + config.
     pub resolved: ResolvedModel,
     /// Live MCP subprocess clients; hold these for the session's lifetime.
     pub mcp_clients: Vec<Arc<crate::mcp::McpClient>>,

@@ -101,8 +101,7 @@ Turn N (turn_id)
 
 成本估算已从 `SessionSummary` 与 UI 中移除：读数长期停留在估算层（`unpriced` 或与
 实际账单不符），实用性不足。`usage` 四项（input/output/cache_read/cache_write）仍
-逐请求持久化在 event 中；`pricing.toml` / `providers.toml` 的 pricing 配置仍被解析，
-如需重新引入成本展示或预算控制，可从 `usage` 重算。
+逐请求持久化在 event 中；如需重新引入成本展示或预算控制，可从 `usage` 重算。
 
 ## 7. MCP Server 监控
 

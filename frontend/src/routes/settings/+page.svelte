@@ -1,14 +1,14 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { client } from '$lib/client';
-	import Notice from '$lib/components/Notice.svelte';
 	import PermissionRulesEditor from '$lib/components/PermissionRulesEditor.svelte';
+	import ProviderRow from '$lib/components/ProviderRow.svelte';
 	import SaveBar from '$lib/components/SaveBar.svelte';
 	import Skeleton from '$lib/components/Skeleton.svelte';
+	import Toasts from '$lib/components/Toasts.svelte';
+	import { pushToast } from '$lib/toast';
 	import { resolveEffective, ruleToRow, summaryOf, type Tier } from '$lib/permission-rules';
 	import type { ProviderConfig } from '$lib/types/ProviderConfig';
-	import type { ProviderType } from '$lib/types/ProviderType';
-	import type { ModelConfig } from '$lib/types/ModelConfig';
 	import type { Profile } from '$lib/types/Profile';
 	import type { ProfileSummary } from '$lib/types/ProfileSummary';
 	import type { PermissionPolicy } from '$lib/types/PermissionPolicy';
@@ -20,12 +20,14 @@
 	let tab = $state<Tab>('providers');
 
 	// ---- Providers state ----
+	// Each provider is a self-contained card that saves itself; this page only
+	// holds the list. Custom providers are editable, built-ins render as
+	// read-only connect cards. None of this feeds the SaveBar.
 	let providers = $state<ProviderConfig[]>([]);
+	// Built-in catalog entries (read-only), in catalog order.
+	let builtins = $state<ProviderConfig[]>([]);
 	// Provider names that already have a stored key (from the secret store).
 	let configured = $state<Set<string>>(new Set());
-	// Per-provider pending key input; only non-empty entries are written on save.
-	let keyInput = $state<Record<string, string>>({});
-	let providersSnapshot = $state('');
 
 	// ---- Profiles state ----
 	let profileList = $state<ProfileSummary[]>([]);
@@ -55,7 +57,6 @@
 	let loading = $state(true);
 	let saving = $state(false);
 	let error = $state<string | null>(null);
-	let notice = $state<string | null>(null);
 
 	// Sliding pill behind the active tab: measured from the real button so it
 	// tracks text width/font loading instead of hardcoded geometry.
@@ -67,19 +68,8 @@
 		if (active) pill = { x: active.offsetLeft, w: active.offsetWidth };
 	});
 
-	const PROVIDER_TYPES: ProviderType[] = [
-		'openai-chat',
-		'openai-completion',
-		'anthropic',
-		'custom'
-	];
-
-	// ---- Dirty tracking: one JSON snapshot per independently-savable unit ----
-	const providersDirty = $derived(
-		!loading &&
-			(JSON.stringify(providers) !== providersSnapshot ||
-				Object.values(keyInput).some((k) => k.trim().length > 0))
-	);
+	// ---- Dirty tracking (SaveBar units: profiles + the two permission tiers).
+	// Providers are intentionally absent — each card saves itself. ----
 	// New-profile state has no snapshot (nothing on disk to differ from) — an
 	// unsaved draft is dirty by definition, or the SaveBar would never offer
 	// to save it.
@@ -94,9 +84,7 @@
 	const wsDirty = $derived(
 		wsConfig !== null && wsSnapshot !== null && JSON.stringify(wsConfig) !== wsSnapshot
 	);
-	const dirtyCount = $derived(
-		[providersDirty, profileDirty, gatewayDirty, wsDirty].filter(Boolean).length
-	);
+	const dirtyCount = $derived([profileDirty, gatewayDirty, wsDirty].filter(Boolean).length);
 
 	// Intercept page leave with unsaved edits — the SaveBar is always visible,
 	// but a route change / tab close is not.
@@ -109,10 +97,14 @@
 
 	async function loadProviders() {
 		const view = await client.getProviders();
-		providers = view.providers;
+		const builtinNames = new Set(view.builtin_names);
+		// User-defined entries keep server order; built-ins follow the catalog
+		// order given by `builtin_names`, so the card row is stable.
+		providers = view.providers.filter((p) => !builtinNames.has(p.name));
+		builtins = view.builtin_names
+			.map((name) => view.providers.find((p) => p.name === name))
+			.filter((p): p is ProviderConfig => p !== undefined);
 		configured = new Set(view.secret_names);
-		keyInput = {};
-		providersSnapshot = JSON.stringify(providers);
 	}
 
 	async function loadProfiles() {
@@ -152,11 +144,11 @@
 	});
 
 	function flash(msg: string) {
-		notice = msg;
-		setTimeout(() => (notice = null), 2500);
+		pushToast(msg, 'success');
 	}
 
-	// ---- Provider editing ----
+	// ---- Provider cards (each saves itself; these manage only the list) ----
+	// A new custom provider exists only as a local draft until its card saves.
 	function addProvider() {
 		providers = [
 			...providers,
@@ -164,55 +156,21 @@
 		];
 	}
 
-	function removeProvider(i: number) {
+	// Delete persists immediately for an already-saved provider (removes it from
+	// providers.toml); a never-saved draft is just dropped from the list. A
+	// stored key is left in place (harmless; the provider name may be reused).
+	async function removeProvider(i: number) {
+		const target = providers[i];
+		const wasSaved = target.name !== '';
 		providers = providers.filter((_, idx) => idx !== i);
-	}
-
-	function addModel(pi: number) {
-		const m: ModelConfig = {
-			id: '',
-			context_window: 128000,
-			max_output_tokens: 16384,
-			default_temperature: 0,
-			pricing: null
-		};
-		providers[pi].models = [...providers[pi].models, m];
-	}
-
-	function removeModel(pi: number, mi: number) {
-		providers[pi].models = providers[pi].models.filter((_, idx) => idx !== mi);
-	}
-
-	// Each save returns success so saveAll can stop at the first failure.
-	async function saveProviders(): Promise<boolean> {
-		try {
-			await client.saveProviders({ providers });
-			// Persist any newly-entered API keys, then clear the inputs.
-			for (const [name, key] of Object.entries(keyInput)) {
-				if (key.trim()) {
-					await client.setSecret(name, key.trim());
-					configured = new Set([...configured, name]);
-				}
+		if (wasSaved) {
+			try {
+				await client.saveProviders({ providers });
+				pushToast(`${target.name} removed`, 'info');
+			} catch (e) {
+				error = e instanceof Error ? e.message : String(e);
+				await loadProviders().catch(() => {});
 			}
-			keyInput = {};
-			providersSnapshot = JSON.stringify(providers);
-			return true;
-		} catch (e) {
-			error = e instanceof Error ? e.message : String(e);
-			return false;
-		}
-	}
-
-	async function clearSecret(name: string) {
-		error = null;
-		try {
-			await client.deleteSecret(name);
-			const next = new Set(configured);
-			next.delete(name);
-			configured = next;
-			flash(`Key for ${name} removed`);
-		} catch (e) {
-			error = e instanceof Error ? e.message : String(e);
 		}
 	}
 
@@ -345,7 +303,6 @@
 		saving = true;
 		try {
 			// Stop at the first failure; already-saved units stay saved.
-			if (providersDirty && !(await saveProviders())) return;
 			if (profileDirty && !(await saveProfile())) return;
 			if (gatewayDirty && !(await saveGateway())) return;
 			if (wsDirty && !(await saveWorkspace())) return;
@@ -357,7 +314,6 @@
 
 	async function discardAll() {
 		error = null;
-		if (providersDirty) await loadProviders().catch(() => {});
 		// An existing profile reloads from disk; a never-saved draft has nothing
 		// to reload — discarding abandons it.
 		if (profileDirty && selectedName) await selectProfile(selectedName);
@@ -437,130 +393,37 @@
 			</div>
 		</header>
 
-		{#if notice}<Notice message={notice} />{/if}
 		{#if error}<p class="error">{error}</p>{/if}
 
 		{#if loading}
 			<p class="muted">Loading…</p>
 		{:else if tab === 'providers'}
-			<!-- PROVIDERS-SECTION -->
+			<!-- PROVIDERS-SECTION: each card is self-contained and saves itself. -->
 			<section class="stack">
+				{#if builtins.length > 0}
+					<span class="key sect">Built-in services</span>
+					{#each builtins as p (p.name)}
+						<ProviderRow
+							provider={p}
+							builtin
+							hasKey={configured.has(p.name)}
+							onsaved={() => loadProviders().catch(() => {})}
+						/>
+					{/each}
+
+					<span class="key sect">Custom providers</span>
+				{/if}
 				{#each providers as p, pi (pi)}
-					<div class="panel">
-						<div class="panel-head">
-							<input
-								class="in title-in"
-								placeholder="Provider name"
-								bind:value={p.name}
-								spellcheck="false"
-							/>
-							<button class="btn-ghost danger" onclick={() => removeProvider(pi)}>Delete</button>
-						</div>
-
-						<div class="grid2">
-							<label class="field">
-								<span class="key">Type</span>
-								<select class="in" bind:value={p.type}>
-									{#each PROVIDER_TYPES as t (t)}<option value={t}>{t}</option>{/each}
-								</select>
-							</label>
-							<label class="field">
-								<span class="key">Base URL</span>
-								<input
-									class="in"
-									bind:value={p.base_url}
-									placeholder="https://api…/v1"
-									spellcheck="false"
-								/>
-							</label>
-							<label class="field">
-								<span class="key">api_key_env (fallback)</span>
-								<input
-									class="in"
-									bind:value={p.api_key_env}
-									placeholder="OPENAI_API_KEY"
-									spellcheck="false"
-								/>
-							</label>
-							<label class="field">
-								<span class="key">
-									API Key
-									{#if configured.has(p.name)}<span class="badge ok">Configured</span>{:else}<span
-											class="badge">Not configured</span
-										>{/if}
-								</span>
-								<div class="key-row">
-									<input
-										class="in"
-										type="password"
-										placeholder={configured.has(p.name)
-											? '•••••• (updates on save)'
-											: 'Enter key (saved to DB)'}
-										bind:value={keyInput[p.name]}
-										spellcheck="false"
-										autocomplete="off"
-									/>
-									{#if configured.has(p.name)}
-										<button class="btn-ghost danger" onclick={() => clearSecret(p.name)}
-											>Clear</button
-										>
-									{/if}
-								</div>
-							</label>
-						</div>
-
-						<div class="models">
-							<div class="models-head">
-								<span class="key">Models</span>
-								<button class="btn-ghost" onclick={() => addModel(pi)}>+ model</button>
-							</div>
-							{#each p.models as m, mi (mi)}
-								<div class="model-row">
-									<label class="mfield grow">
-										<span class="mkey">Model ID</span>
-										<input class="in" placeholder="gpt-4o" bind:value={m.id} spellcheck="false" />
-									</label>
-									<label class="mfield">
-										<span class="mkey">Context window</span>
-										<input
-											class="in num"
-											type="number"
-											placeholder="128000"
-											bind:value={m.context_window}
-										/>
-									</label>
-									<label class="mfield">
-										<span class="mkey">Max output</span>
-										<input
-											class="in num"
-											type="number"
-											placeholder="16384"
-											bind:value={m.max_output_tokens}
-										/>
-									</label>
-									<label class="mfield">
-										<span class="mkey">Default temperature</span>
-										<input
-											class="in num"
-											type="number"
-											step="0.1"
-											placeholder="0.0"
-											bind:value={m.default_temperature}
-										/>
-									</label>
-									<button
-										class="btn-ghost danger mrm"
-										onclick={() => removeModel(pi, mi)}
-										aria-label="Remove model">×</button
-									>
-								</div>
-							{/each}
-							{#if p.models.length === 0}
-								<p class="hint">No models yet — click “+ model” to add one.</p>
-							{/if}
-						</div>
-					</div>
+					<ProviderRow
+						provider={p}
+						hasKey={configured.has(p.name)}
+						onsaved={() => loadProviders().catch(() => {})}
+						ondeleted={() => removeProvider(pi)}
+					/>
 				{/each}
+				{#if providers.length === 0 && builtins.length > 0}
+					<p class="hint">No custom providers yet.</p>
+				{/if}
 
 				<div class="actions">
 					<button class="btn-ghost" onclick={addProvider}>+ provider</button>
@@ -824,6 +687,8 @@
 	</div>
 </div>
 
+<Toasts />
+
 <style>
 	.page {
 		height: 100%;
@@ -911,20 +776,8 @@
 		gap: var(--space-4);
 	}
 
-	.panel {
-		border: 1px solid var(--border-subtle);
-		border-radius: var(--radius-md);
-		background: var(--canvas-raised);
-		padding: var(--space-4);
-		display: flex;
-		flex-direction: column;
-		gap: var(--space-3);
-	}
-
-	.panel-head {
-		display: flex;
-		align-items: center;
-		gap: var(--space-2);
+	.sect {
+		margin-top: var(--space-2);
 	}
 
 	.grid2 {
@@ -973,85 +826,9 @@
 		box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 10%, transparent);
 	}
 
-	.title-in {
-		flex: 1;
-		font-weight: 600;
-		font-size: 13px;
-	}
-
 	.ta {
 		resize: vertical;
 		line-height: 1.5;
-	}
-
-	.num {
-		max-width: 90px;
-	}
-
-	.key-row {
-		display: flex;
-		gap: var(--space-2);
-		align-items: center;
-	}
-
-	.badge {
-		font-family: var(--font-mono);
-		font-size: 9px;
-		padding: 1px 5px;
-		border-radius: 3px;
-		background: var(--canvas-float);
-		color: var(--text-tertiary);
-		text-transform: none;
-		letter-spacing: 0;
-	}
-
-	.badge.ok {
-		color: var(--state-done-text);
-		background: var(--state-done-bg);
-	}
-
-	.models {
-		border-top: 1px solid var(--border-subtle);
-		padding-top: var(--space-3);
-		display: flex;
-		flex-direction: column;
-		gap: var(--space-2);
-	}
-
-	.models-head {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-	}
-
-	.model-row {
-		display: flex;
-		gap: var(--space-2);
-		align-items: flex-end;
-	}
-
-	.mfield {
-		display: flex;
-		flex-direction: column;
-		gap: 3px;
-		min-width: 0;
-	}
-
-	.mfield.grow {
-		flex: 1;
-	}
-
-	.mkey {
-		font-family: var(--font-mono);
-		font-size: 9px;
-		font-weight: 510;
-		color: var(--text-tertiary);
-		letter-spacing: 0.06em;
-		text-transform: uppercase;
-	}
-
-	.mrm {
-		margin-bottom: 1px;
 	}
 
 	.hint {

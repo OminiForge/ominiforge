@@ -127,6 +127,7 @@ fn router(state: AppState) -> Router {
         .route("/models", get(list_models))
         .route("/tools", get(list_tools))
         .route("/providers", get(get_providers).put(put_providers))
+        .route("/providers/{name}/test", post(test_provider))
         .route(
             "/gateway/permission",
             get(get_gateway_permission).put(put_gateway_permission),
@@ -539,9 +540,11 @@ async fn list_tools() -> Response {
     Json(json!({ "tools": crate::tool::builtin_catalog() })).into_response()
 }
 
-/// `GET /providers` — the full `providers.toml` for the settings UI, plus the
-/// set of provider names that have an API key in the secret store. Keys
-/// themselves are never returned; the UI shows only whether one is configured.
+/// `GET /providers` — the merged provider set (user config plus the built-in
+/// catalog) for the settings UI, the set of provider names that have an API
+/// key in the secret store, and the names reserved by the built-in catalog
+/// (rendered as connect cards, not editable forms). Keys themselves are never
+/// returned; the UI shows only whether one is configured.
 async fn get_providers(State(state): State<AppState>) -> Response {
     let providers = match state.registry.load_providers() {
         Ok(p) => p,
@@ -551,18 +554,65 @@ async fn get_providers(State(state): State<AppState>) -> Response {
         Ok(n) => n,
         Err(e) => return internal_error(&e),
     };
-    Json(json!({ "providers": providers.providers, "secret_names": secret_names })).into_response()
+    Json(json!({
+        "providers": providers.providers,
+        "secret_names": secret_names,
+        "builtin_names": crate::config::builtin_provider_names(),
+    }))
+    .into_response()
 }
 
 /// `PUT /providers` — overwrite `providers.toml` with the posted provider set
-/// (full desired state). A malformed body is a client error (400).
+/// (full desired state). A malformed body or an entry reusing a built-in
+/// catalog name is a client error (400).
 async fn put_providers(
     State(state): State<AppState>,
     Json(providers): Json<crate::config::ProvidersFile>,
 ) -> Response {
     match state.registry.save_providers(&providers) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => internal_error(&e),
+        Err(e) => {
+            if e.chain().any(|cause| {
+                cause
+                    .downcast_ref::<ConfigError>()
+                    .is_some_and(|cfg| matches!(cfg, ConfigError::BuiltinProviderConflict(_)))
+            }) {
+                bad_request(&e)
+            } else {
+                internal_error(&e)
+            }
+        }
+    }
+}
+
+/// The optional body of `POST /providers/{name}/test`: unsaved edits and/or an
+/// unsaved key, so the settings UI can probe before persisting.
+#[derive(Debug, Default, serde::Deserialize)]
+struct TestProviderBody {
+    /// Draft connection fields (a custom provider being edited).
+    edit: Option<crate::config::ProviderConfig>,
+    /// A key the user just typed but has not saved.
+    key: Option<String>,
+}
+
+/// `POST /providers/{name}/test` — probe the provider with a minimal request.
+/// Always 200 with `{ ok, model?, error? }`: the point is to report *why* a
+/// connection fails (auth, transport, no model), which is data, not an HTTP
+/// fault. An unknown provider name is a real 404.
+async fn test_provider(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    body: Option<Json<TestProviderBody>>,
+) -> Response {
+    let Json(body) = body.unwrap_or_default();
+    match state
+        .registry
+        .test_provider(&name, body.edit, body.key)
+        .await
+    {
+        Ok(model) => Json(json!({ "ok": true, "model": model })).into_response(),
+        Err(e) if e.to_string().contains("unknown provider") => not_found(&e),
+        Err(e) => Json(json!({ "ok": false, "error": e.to_string() })).into_response(),
     }
 }
 
@@ -1763,6 +1813,100 @@ default = "openai-main/gpt-4o"
             .unwrap();
         assert_eq!(got["providers"][0]["name"], "anthropic-main");
         assert_eq!(got["providers"][0]["models"][0]["id"], "claude-sonnet-4-6");
+    }
+
+    /// The providers API marks built-in catalog entries and refuses to persist
+    /// them: `GET` reports them under `builtin_names`, and a `PUT` reusing a
+    /// built-in name is a 400, not a silent fork of the catalog.
+    #[tokio::test]
+    async fn builtin_providers_are_marked_and_write_protected() {
+        let (registry, _dir) = test_registry_with_config();
+        let state = AppState {
+            registry,
+            api_key: None,
+        };
+        let base = serve_test(state).await;
+
+        let body: serde_json::Value = reqwest::get(format!("{base}/api/providers"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let builtins = body["builtin_names"].as_array().unwrap();
+        assert!(!builtins.is_empty());
+        let builtin = builtins[0].as_str().unwrap();
+        // Built-ins are present in the merged list, after user entries.
+        assert!(
+            body["providers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["name"] == builtin)
+        );
+
+        let put = json!({
+            "providers": [{
+                "name": builtin,
+                "type": "openai-chat",
+                "base_url": "https://example.com/v1",
+                "api_key_env": "HOME",
+                "models": []
+            }]
+        });
+        let resp = reqwest::Client::new()
+            .put(format!("{base}/api/providers"))
+            .json(&put)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    /// `POST /providers/{name}/test` never 5xx's a *connection* failure: an
+    /// unknown provider is a 404, but a known provider that cannot authenticate
+    /// (no key anywhere) returns 200 with `ok: false` and the reason — the
+    /// failure is the probe's result, not a server fault.
+    #[tokio::test]
+    async fn test_provider_reports_failure_without_crashing() {
+        let (registry, _dir) = test_registry_with_config();
+        let state = AppState {
+            registry,
+            api_key: None,
+        };
+        let base = serve_test(state).await;
+        let client = reqwest::Client::new();
+
+        // Unknown provider → 404.
+        let resp = client
+            .post(format!("{base}/api/providers/ghost/test"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+
+        // A built-in provider with no key stored and no usable env fallback →
+        // 200 with ok:false. We force the no-credential path by passing an
+        // `edit` whose api_key_env names a var that cannot exist in any env
+        // (the catalog's real env var might be set on a developer machine).
+        let builtin = crate::config::builtin_provider_names().remove(0);
+        let edit = serde_json::json!({
+            "name": builtin,
+            "type": "openai-chat",
+            "base_url": "https://api.kimi.com/coding/v1",
+            "api_key_env": "OMINI_DEFINITELY_UNSET_VAR_XYZ",
+            "models": []
+        });
+        let resp = client
+            .post(format!("{base}/api/providers/{builtin}/test"))
+            .json(&serde_json::json!({ "edit": edit, "key": null }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], false);
+        assert!(body["error"].as_str().unwrap().contains("API key"));
     }
 
     /// Profile CRUD round-trip: PUT creates a file, GET reads it back raw, DELETE

@@ -18,6 +18,7 @@ import type { PermissionPolicy } from '$lib/types/PermissionPolicy';
 import type { WorkspaceConfig } from '$lib/types/WorkspaceConfig';
 import type { ToolInfo } from '$lib/types/ToolInfo';
 import type { ApprovalScope } from '$lib/types/ApprovalScope';
+import type { ProviderConfig } from '$lib/types/ProviderConfig';
 
 /** The settings view of `providers.toml`: the raw provider set plus which
  *  providers have an API key in the secret store. Key values are never sent —
@@ -26,6 +27,18 @@ export interface ProvidersView {
 	providers: ProvidersFile['providers'];
 	/** Provider names that have a stored API key. */
 	secret_names: string[];
+	/** Names reserved by the built-in catalog (connect cards, not editable). */
+	builtin_names: string[];
+}
+
+/** The result of a provider connectivity probe. Always resolvable; `ok`
+ *  distinguishes success from a reported failure (auth, transport, no model). */
+export interface ProviderTestResult {
+	ok: boolean;
+	/** The model that answered, on success. */
+	model?: string;
+	/** Why the probe failed, on failure. */
+	error?: string;
 }
 
 /** Handle to a live event subscription; call `close()` to detach. */
@@ -173,6 +186,8 @@ export interface SessionClient {
 	getProviders(): Promise<ProvidersView>;
 	/** Overwrite `providers.toml` with the given provider set (full desired state). */
 	saveProviders(providers: ProvidersFile): Promise<void>;
+	/** Probe a provider's connectivity + credentials (optional unsaved edits/key). */
+	testProvider(name: string, edit?: ProviderConfig, key?: string): Promise<ProviderTestResult>;
 	/** The raw (unresolved) profile file `name`, for editing in the settings UI. */
 	getProfile(name: string): Promise<Profile>;
 	/** Overwrite (or create) profile `name`'s file. */
