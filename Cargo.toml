@@ -70,7 +70,7 @@ toml = "0.8"
 # unless RUST_LOG asks for more; default level is set in cli::run.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-ulid = "1"
+ulid = "3"
 
 # Sandbox backend (feature `sandbox-boxlite`, doc/sandbox.md §4): libkrun microVM
 # runtime for isolated per-session execution. Optional and OFF by default —
