@@ -27,6 +27,12 @@ default_temperature: number,
  */
 thinking: Thinking, 
 /**
+ * The reasoning-effort tiers this model accepts, as raw provider strings
+ * (e.g. `["low", "medium", "high"]` or `["high", "max"]`). Kept verbatim
+ * because providers name tiers differently; empty = no selectable tiers.
+ */
+think_efforts?: Array<string>, 
+/**
  * Input modalities beyond text the model accepts (e.g. `["image", "video"]`).
  * Empty = text only. Display-only metadata.
  */

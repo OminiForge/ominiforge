@@ -85,6 +85,17 @@ default_temperature = 0.0
 | context_window | ✓ | 最大 context tokens |
 | max_output_tokens | ✓ | 最大输出 tokens |
 | default_temperature | ✗ | 默认温度，默认 0.0 |
+| thinking | ✗ | 推理行为：`none`（默认）/`optional`/`always` |
+| think_efforts | ✗ | 可选推理强度档位，**原始 provider 字符串**（如 `["low","high","max"]` 或 `["low","medium","high"]`）；空 = 无可选档位，不显示强度选择器 |
+| modalities | ✗ | 文本以外的输入模态（如 `["image","video"]`） |
+
+> **推理强度档位为何存原始字符串**：各家对「推理强度」的命名与可选集合不一致
+> （Kimi K3 用 `low/high/max`，MiMo 用 `low/medium/high`），前端选择器直接展示模型
+> 声明的档位名，请求时按 OpenAI 兼容的 `reasoning_effort` 字段原样透传。Profile 的
+> `model.think_effort` 与会话的每轮 effort 覆盖都只是**引用**这里声明的档位；
+> 引用了一个模型未声明的档位时会被丢弃（不会把一个模型的档位发给另一个模型）。
+> **只声明官方文档确认或实测接受的档位**——不接受 `reasoning_effort` 的模型
+> （如 Kimi K2.x，用 `thinking` 参数开关思考）留空。
 
 ### 2.4 内置 Provider（catalog）
 
@@ -103,7 +114,7 @@ default_temperature = 0.0
 - **扩展方式**：新增内置 provider 必须只是数据变更（改 `catalog.toml`）；需要新
   协议时先实现 adapter（`src/provider/`）。model 清单按官方文档刷新，随发版更新。
 
-当前内置：`kimi-code`（Kimi / Moonshot，OpenAI 兼容端点，`MOONSHOT_API_KEY`）。
+当前内置：`kimi-code`、`kimi-platform`（Kimi / Moonshot）、`mimo-token`、`mimo-api`（Xiaomi MiMo）。
 
 ## 3. Profile 配置
 
@@ -123,11 +134,11 @@ You are a software engineering assistant. You write clean, tested code.
 # system_file = "prompts/coding.md"
 
 [model]
-default = "openai-main/gpt-4o"      # provider_name/model_id
+default = "openai-main/gpt-4o"      # provider_name/model_id（设置页从可用模型下选）
 fallback = "openai-main/gpt-4o-mini" # 降级模型
-# 可选 override（覆盖 provider 默认值）
-temperature = 0.0
-max_output_tokens = 16384
+think_effort = "high"               # 默认推理强度档位（须为所选模型声明的档位）
+# temperature / max_output_tokens 不再由 profile 覆盖：它们是模型自身的元数据
+# （providers.toml 的 ModelConfig），profile 只引用模型。
 
 [context]
 compaction_threshold = 0.8           # 何时触发压缩（% of context window）
@@ -233,9 +244,10 @@ session_max_usd = 10.00  # 覆盖
 
 - Session 启动时绑定一个 profile，`session.toml` 记录 `profile_id`。
 - 首条 event（SessionEvent::Created）记录 profile 配置快照。
-- 运行中切换 profile → 创建新 session（origin.kind = "reconfiguration"），自动带 context_snapshot。
+- 运行中切换 profile → 创建新 session（origin.kind = "reconfiguration"），自动带 context_snapshot。**惰性执行**：选取只是记下意图，下一次发送消息时才 reconfigure + 发送——误操作选取不产生任何会话。
+- 运行中切换 **model / 推理强度** → **不**创建新 session：它们是每轮可改的运行参数，随下一次 `POST /sessions/{id}/message`（`model` / `think_effort`）生效，只影响那一轮。
 - 用户命令：`/profile coding` → 切换并创建新 session。
-- 同一 session 内 profile 不可变（历史不可变原则）。
+- 同一 session 内 profile 不可变（历史不可变原则）；model/effort 是每轮参数，不属于这条。
 
 ## 6. Profile 变更对 Cache 的影响
 
@@ -255,8 +267,9 @@ session_max_usd = 10.00  # 覆盖
 | API endpoint / protocol | Provider | 连接属性 |
 | context_window | Provider (model) | model 固有属性 |
 | default_temperature | Provider (model) | model 推荐默认值 |
-| temperature override | Profile | agent 行为偏好 |
-| max_output_tokens override | Profile | agent 行为偏好 |
+| think_efforts（可选档位） | Provider (model) | model 支持的推理强度集合 |
+| think_effort 默认档 | Profile | agent 行为偏好（引用模型的档位），会话内可每轮覆盖 |
+| temperature / max_output_tokens | Provider (model) | model 固有元数据，profile 不再覆盖 |
 | compaction_threshold | Profile | 用户偏好 |
 | injection_max_tokens | Profile | 用户偏好 |
 | budget limit | Profile | 不同 agent 角色预算不同 |

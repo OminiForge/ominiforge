@@ -295,10 +295,22 @@ ominiforge Web 控制台是**开发者每天盯 8 小时的 agent 生产工具**
 - 控件密度参考 Linear 的紧凑原则：按钮约 `8px 14px`，输入约 `8px 12px`；触屏断点下可放大点击面积，但不要默认做巨大 CTA。
 - 下方 `Type / for commands` 提示（`--text-disabled`，mono）。
 - 状态行：turn incomplete 时显示 `Turn incomplete`（`--state-running-text`）。
-- **Config Picker**：在输入区 actions 行，点击配置按钮弹出 popover（向上弹出），可选择 Profile 和 Model。
-  - 格式：`{profile} · {model}`，默认显示 `default · default model`。
-  - popover 使用 `--canvas-overlay` 背景、`--border-default` 边框、`--radius-lg` 圆角、`--shadow-md` 阴影。
-  - draft 时用于配置新会话；live session 时用于查看/切换配置（切换会基于当前对话开启新会话）。
+- **Config Pickers**：输入区 actions 行，**profile / model / effort 是三个独立触发器**，点一下直接展开选项列表选取（`ModelSelect` 的 `listOnly` 模式，无中间下拉层）。触发器形式：`KEY value`（mono uppercase 类别 key + 值），值永远是**具体生效值**（draft 显示将要使用的解析默认，如 `model kimi-k3`；不显示裸 `default` 占位）。
+  - **Profile**（配置级）：draft 时用于新会话；live session 里选了不同的 profile **不立即 reconfig**——惰性切换（与 fork 同源）：选取只是记下意图，输入区下方提示行换成琥珀色「Profile → X · sending switches」，下一次发送才 reconfigure（新会话继承本对话）+ 发送 + 跳转。误操作不产生任何会话。
+  - **Model + Effort**（每轮参数）：**不触发 reconfig**，随下一次 send 生效一轮（`POST /message` 带 `model` / `think_effort`）。模型声明了 `think_efforts` 时才出现 effort 触发器，档位名按模型/provider 原样展示（`low/high/max`、`low/medium/high`…）。effort 触发器永远显示**具体档位**（选中档 > profile 配置档 > 该模型声明的最后一档作为官方默认，如 K3 的 `max`），不显示裸 `default`；切换模型时 effort 自动采用新模型的默认档。
+  - **列表无「Default」合成行**：只列真实可选项；draft 未选时触发器显示解析后的默认（profile 首个 / profile 配置的 model，未配置则回退第一个可用模型）。
+  - 列表 popover **向上弹出**（输入区在屏幕底部），right 对齐触发器；选项列表限高 ~5 行滚动（`ModelSelect`），绝不超出屏幕。
+  - 所有下拉用共享的 **`ModelSelect`** 组件（§4.11），不是原生 `<select>`。
+
+### 4.11 ModelSelect（主题化下拉）
+
+原生 `<select>` 的选项列表用 OS 配色渲染——暗色主题下会弹出白底列表，与近黑控制台严重违和。所有需要下拉的地方（session config picker、settings profile 编辑器）统一用 `lib/components/ModelSelect.svelte`：
+
+- **纯 token 渲染**：trigger `--canvas-base` + `--border-default`（hover/focus `--border-strong` + accent 淡发光 focus ring）；选项列表 `--canvas-float`（比它所在的 overlay popover 高一层，符合 surface ladder）+ `--border-default` hairline + `--shadow-md`。
+- **选项行**：label（mono）+ 可选 muted detail（provider/描述）；hover 升一层到 `--canvas-overlay`；选中行 `--accent-dim` 底 + `--accent-ink` 对勾（选中态只用极少量 accent，不铺）。
+- **行为**：`listOnly` 模式（session picker）下点**任何地方**（列表外任意元素、或再点一次触发器）都关闭——list 监听 window `click`，触发器 click `stopPropagation` 避免被当成「外部点击」；普通模式下点外部 / Escape 关闭；`up` 时向上弹（输入区底部场景）；进出过渡走 `lib/motion.ts` 的 `rise`，禁用态降透明。
+- **两种模式**：默认 = trigger + 下拉列表（settings 等表单）；`listOnly` = 只渲染选项列表（session picker，宿主自备触发器）。
+- 双向绑定 `value`，可选 `onselect`（值变化后回调，供宿主把空串还原成 `null`）与 `onclose`（选中/外部点击后通知宿主卸载列表）。
 
 ### 4.3 侧栏 + Detail Rail（`+layout.svelte` + `Conversation.svelte`）
 

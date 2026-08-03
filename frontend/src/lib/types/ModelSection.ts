@@ -19,4 +19,10 @@ temperature?: number | null,
 /**
  * Overrides the model's `max_output_tokens`.
  */
-max_output_tokens?: number | null, };
+max_output_tokens?: number | null, 
+/**
+ * Default reasoning-effort tier for sessions on this profile, as a raw
+ * tier name the chosen model declares (`low`/`high`/`max`). Resolved
+ * against the model's `think_efforts`; per-turn picks override it.
+ */
+think_effort?: string | null, };

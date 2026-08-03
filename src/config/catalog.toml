@@ -10,6 +10,13 @@
 # Adding a provider here must be a pure data change — new wire protocols need
 # an adapter first (`src/provider/`). Model metadata follows the provider's
 # official docs; refresh it when upstream model lists change.
+#
+# `think_efforts` tiers are the raw strings the endpoint accepts on the
+# OpenAI-compatible `reasoning_effort` field, verified against the upstream
+# docs / live API: Kimi K3 documents `low`/`high`/`max` (default `max`);
+# MiMo v2.5 rejects anything but `low`/`medium`/`high` (400 otherwise).
+# The K2.x Kimi models control thinking on/off via a `thinking` param, not
+# `reasoning_effort`, so they declare no tiers.
 
 # Kimi for Coding (Moonshot AI subscription) — OpenAI-compatible Chat
 # Completions endpoint. NOTE: the subscription API is a separate product from
@@ -33,6 +40,7 @@ context_window = 1048576
 max_output_tokens = 131072
 default_temperature = 1.0
 thinking = "always"
+think_efforts = ["low", "high", "max"]
 modalities = ["image", "video"]
 
 # NOTE: Kimi does not publish an output-token cap for the K2.x models below.
@@ -78,6 +86,7 @@ context_window = 1048576
 max_output_tokens = 131072
 default_temperature = 1.0
 thinking = "always"
+think_efforts = ["low", "high", "max"]
 modalities = ["image", "video"]
 
 [[providers.models]]
@@ -111,6 +120,9 @@ id = "mimo-v2.5-pro"
 context_window = 1048576
 max_output_tokens = 131072
 thinking = "optional"
+# OpenAI-compatible reasoning tiers; the request passes the pick through as
+# `reasoning_effort` (doc/profile.md §2.3).
+think_efforts = ["low", "medium", "high"]
 modalities = []
 
 [[providers.models]]
@@ -118,6 +130,9 @@ id = "mimo-v2.5"
 context_window = 1048576
 max_output_tokens = 131072
 thinking = "optional"
+# OpenAI-compatible reasoning tiers; the request passes the pick through as
+# `reasoning_effort` (doc/profile.md §2.3).
+think_efforts = ["low", "medium", "high"]
 modalities = ["image", "video", "audio"]
 
 # Xiaomi MiMo open platform (pay-as-you-go) — same models, standard API key.
@@ -132,6 +147,9 @@ id = "mimo-v2.5-pro"
 context_window = 1048576
 max_output_tokens = 131072
 thinking = "optional"
+# OpenAI-compatible reasoning tiers; the request passes the pick through as
+# `reasoning_effort` (doc/profile.md §2.3).
+think_efforts = ["low", "medium", "high"]
 modalities = []
 
 [[providers.models]]
@@ -139,4 +157,7 @@ id = "mimo-v2.5"
 context_window = 1048576
 max_output_tokens = 131072
 thinking = "optional"
+# OpenAI-compatible reasoning tiers; the request passes the pick through as
+# `reasoning_effort` (doc/profile.md §2.3).
+think_efforts = ["low", "medium", "high"]
 modalities = ["image", "video", "audio"]

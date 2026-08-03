@@ -763,6 +763,14 @@ async fn reconfigure_session(
 struct MessageBody {
     /// The user input to send to the agent.
     text: String,
+    /// Optional per-turn model override (`provider/model_id`). Resolves against
+    /// the configured providers; `None` keeps the session's model.
+    #[serde(default)]
+    model: Option<String>,
+    /// Optional per-turn reasoning-effort tier (a raw string the session's
+    /// model declares). `None` keeps the session's configured effort.
+    #[serde(default)]
+    think_effort: Option<String>,
 }
 
 /// `POST /sessions/{id}/message` — enqueue a turn. Returns `202 Accepted`
@@ -778,7 +786,14 @@ async fn post_message(
         Ok(h) => h,
         Err(e) => return conflict_or_not_found(&e),
     };
-    match handle.send(Command::Send { text: body.text }).await {
+    match handle
+        .send(Command::Send {
+            text: body.text,
+            model: body.model,
+            think_effort: body.think_effort,
+        })
+        .await
+    {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
         Err(_) => internal_error(&anyhow::anyhow!("session actor is unavailable")),
     }

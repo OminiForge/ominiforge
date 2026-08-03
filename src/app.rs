@@ -291,6 +291,7 @@ pub async fn assemble(
             model: resolved.model_id.clone(),
             temperature: resolved.temperature,
             max_tokens: Some(resolved.max_output_tokens),
+            think_effort: resolved.think_effort.clone(),
             tool_timeout: Duration::from_secs(120),
             context_window: resolved.context_window,
             compaction_threshold: profile

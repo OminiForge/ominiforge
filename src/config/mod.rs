@@ -60,6 +60,11 @@ pub struct ResolvedModel {
     pub max_output_tokens: u32,
     /// The model's context window (for later compaction logic).
     pub context_window: u32,
+    /// Reasoning-effort tiers the model accepts (raw provider strings).
+    pub think_efforts: Vec<String>,
+    /// The profile's default effort tier, resolved to a valid tier for this
+    /// model; `None` when the profile/model names no tier.
+    pub think_effort: Option<String>,
 }
 
 /// A profile's listable identity: its name and human-readable description.
@@ -89,6 +94,10 @@ pub struct ModelSummary {
     pub model_id: String,
     /// Maximum context window in tokens (shown alongside the model).
     pub context_window: u32,
+    /// Whether / how the model reasons (drives the effort picker's visibility).
+    pub thinking: crate::config::Thinking,
+    /// Selectable reasoning-effort tiers (raw provider strings; empty = none).
+    pub think_efforts: Vec<String>,
 }
 
 /// Loads and resolves configuration from one or more `.omini` roots.
@@ -329,9 +338,13 @@ impl ConfigStore {
         summaries
     }
 
-    /// Flatten every configured provider's models into a selectable list for a
-    /// per-session model override. Order follows `providers.toml` (provider, then
-    /// model order within it), stable across calls so a front-end never reorders.
+    /// Flatten every *usable* provider's models into a selectable list for a
+    /// per-session model override. A provider is usable when credentials would
+    /// resolve — a key in the secret store or its `api_key_env` set (the same
+    /// rule [`resolve`](Self::resolve) applies) — so a provider the user has
+    /// not configured never offers models that would only fail at resolve time.
+    /// Order follows `providers.toml` (provider, then model order within it),
+    /// stable across calls so a front-end never reorders.
     ///
     /// # Errors
     /// Propagates [`load_providers`](Self::load_providers) failures (malformed
@@ -341,15 +354,37 @@ impl ConfigStore {
         let models = providers
             .providers
             .iter()
+            .filter(|p| self.provider_has_credentials(p))
             .flat_map(|p| {
                 p.models.iter().map(move |m| ModelSummary {
                     provider: p.name.clone(),
                     model_id: m.id.clone(),
                     context_window: m.context_window,
+                    thinking: m.thinking,
+                    think_efforts: m.think_efforts.clone(),
                 })
             })
             .collect();
         Ok(models)
+    }
+
+    /// Whether a provider would resolve credentials. Built-in catalog entries
+    /// are configured through the settings UI's connect cards (a key in the
+    /// secret store) — their `api_key_env` is documentation, so an env var
+    /// happening to share the name must NOT make an unconfigured built-in look
+    /// usable. User-defined providers keep the resolve precedence: secret
+    /// store first, then their `api_key_env`.
+    fn provider_has_credentials(&self, provider: &ProviderConfig) -> bool {
+        if let Some(store) = self.secret_store()
+            && let Ok(Some(_)) = store.get(&provider.name)
+        {
+            return true;
+        }
+        let is_builtin = builtin_providers()
+            .providers
+            .iter()
+            .any(|b| b.name == provider.name);
+        !is_builtin && std::env::var_os(&provider.api_key_env).is_some()
     }
 
     // __APPEND_MARKER2__
@@ -499,6 +534,16 @@ impl ConfigStore {
             .max_output_tokens
             .unwrap_or(model.max_output_tokens);
 
+        // A profile effort tier that the resolved model does not declare is
+        // dropped (a stale tier from another model must not leak into a
+        // request that would reject it).
+        let think_effort = profile
+            .model
+            .think_effort
+            .as_ref()
+            .filter(|tier| model.think_efforts.contains(tier))
+            .cloned();
+
         Ok(ResolvedModel {
             provider_name: provider.name.clone(),
             provider_type: provider.provider_type,
@@ -508,6 +553,8 @@ impl ConfigStore {
             temperature,
             max_output_tokens,
             context_window: model.context_window,
+            think_efforts: model.think_efforts.clone(),
+            think_effort,
         })
     }
 
@@ -670,6 +717,56 @@ context_window = 128000
 max_output_tokens = 16384
 default_temperature = 0.3
 "#;
+
+    #[test]
+    fn list_models_skips_providers_without_credentials() {
+        // `HOME` is always set (a usable custom provider); the second provider
+        // names an env var that never is — its models must not be offered,
+        // since picking one could only fail at resolve time. `kimi-code` is a
+        // built-in: its `api_key_env` being set must NOT list it (built-ins
+        // are configured via the secret store).
+        let (_dir, store) = store_with(
+            r#"
+[[providers]]
+name = "usable"
+type = "openai-chat"
+base_url = "https://a.test/v1"
+api_key_env = "HOME"
+
+[[providers.models]]
+id = "m1"
+context_window = 1000
+max_output_tokens = 100
+
+[[providers]]
+name = "unconfigured"
+type = "openai-chat"
+base_url = "https://b.test/v1"
+api_key_env = "OMINI_TEST_NEVER_SET_KEY_ENV"
+
+[[providers.models]]
+id = "m2"
+context_window = 1000
+max_output_tokens = 100
+"#,
+            &[],
+        );
+        let models = store.list_models().unwrap();
+        assert!(
+            models
+                .iter()
+                .any(|m| m.provider == "usable" && m.model_id == "m1"),
+            "a credentialed provider's model must be listed, got {models:?}"
+        );
+        assert!(
+            !models.iter().any(|m| m.provider == "unconfigured"),
+            "a provider without credentials must not offer models, got {models:?}"
+        );
+        assert!(
+            !models.iter().any(|m| m.provider == "kimi-code"),
+            "a built-in without a stored key must not offer models (env is not its config), got {models:?}"
+        );
+    }
 
     #[test]
     fn resolves_full_model_ref_with_overrides() {

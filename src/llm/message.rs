@@ -60,4 +60,10 @@ pub struct ModelRequest {
     pub temperature: f32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// Reasoning-effort tier as the model declares it (e.g. `low`/`high`/`max`).
+    /// Passed through verbatim to providers that support it; `None` leaves the
+    /// provider default untouched. The raw string (not an enum) because
+    /// providers name tiers differently (`doc/profile.md` §2.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub think_effort: Option<String>,
 }

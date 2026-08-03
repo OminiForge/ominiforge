@@ -200,10 +200,14 @@ export class GatewayTransport implements SessionClient {
 		return body.session_id;
 	}
 
-	sendMessage(id: string, text: string): Promise<void> {
+	sendMessage(
+		id: string,
+		text: string,
+		opts?: { model?: string; thinkEffort?: string }
+	): Promise<void> {
 		return this.#send(endpoints.message(id), {
 			method: 'POST',
-			body: JSON.stringify({ text })
+			body: JSON.stringify({ text, model: opts?.model, think_effort: opts?.thinkEffort })
 		});
 	}
 

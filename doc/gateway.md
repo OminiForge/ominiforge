@@ -94,12 +94,14 @@ session API 统一挂在 `/api/*` 下，避免与前端 SPA 自身的 client-sid
 | POST | `/api/sessions` | 新建 session → `201 {session_id}` |
 | GET  | `/api/sessions/{id}` | session 元数据 |
 | POST | `/api/sessions/{id}/fork` | body `{at_seq}` → 在该 seq 分叉，`201 {session_id}` |
-| POST | `/api/sessions/{id}/message` | body `{text}` → 入队一个 turn，`202 Accepted`（不阻塞） |
+| POST | `/api/sessions/{id}/message` | body `{text, model?, think_effort?}` → 入队一个 turn，`202 Accepted`（不阻塞） |
 | POST | `/api/sessions/{id}/cancel` | abort 正在跑的 turn |
 | POST | `/api/sessions/{id}/compact` | body 可选 `{keep_last}` → 摘要并切换 compaction session |
 | GET  | `/api/sessions/{id}/events` | SSE event 流（见 §4） |
 
 `message` 立即返回 202；turn 在 actor 内跑，输出走 event 流。这把“提交”与“观察”解耦。
+
+模型与推理强度是**每轮参数**而非重配置项：`model`（`provider/model_id`）/ `think_effort` 随单条 message 生效一轮，不写回会话配置；无法解析的 model、未声明的档位被丢弃并降级到会话配置（跨 provider 的覆盖由 actor 现 resolve 一个一轮性 provider；同 provider 复用连接只换模型 id）。只有 **profile** 切换才走 `POST /sessions/{id}/reconfigure`（换 system prompt / 工具集，必须开新 session）。`GET /api/models` 只返回**已配置凭证**的 provider 的模型：内置 catalog provider 需要 secret store 里有 key（即设置页粘贴配置），自定义 provider 则是 secret store 或其 `api_key_env` 已设置；未配置的不提供会在 resolve 时才失败的选项。
 
 ## 4. 重连 / 续传
 

@@ -191,6 +191,7 @@ mod tests {
             tools: vec![],
             temperature: 0.0,
             max_tokens: None,
+            think_effort: None,
         }
     }
 

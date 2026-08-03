@@ -81,6 +81,9 @@ pub struct AgentConfig {
     pub temperature: f32,
     /// Output token cap, if any.
     pub max_tokens: Option<u32>,
+    /// Reasoning-effort tier for this session's model rounds (raw provider
+    /// string from the model's declared tiers). `None` = provider default.
+    pub think_effort: Option<String>,
     /// Per-tool-invocation time budget.
     pub tool_timeout: Duration,
     /// Absolute safety net on model rounds in one turn. This is *not* the
@@ -110,6 +113,7 @@ impl Default for AgentConfig {
             temperature: 0.0,
             retry: crate::llm::RetryConfig::default(),
             max_tokens: None,
+            think_effort: None,
             tool_timeout: Duration::from_secs(120),
             max_rounds: 100,
             context_window: 0,
@@ -271,6 +275,43 @@ impl Agent {
         self
     }
 
+    /// A copy of this agent on a different provider, sharing the tool registry
+    /// and the LIVE permission/approval handles (scoped approvals pinned
+    /// mid-turn must keep working on the override turn). Hooks are dropped —
+    /// the registry is not clonable and a one-turn override agent is a narrow
+    /// escape hatch, not a full second agent. Used by the gateway actor for a
+    /// cross-provider per-turn model pick.
+    #[must_use]
+    pub fn clone_for_provider(&self, provider: Arc<dyn Provider>) -> Self {
+        Self {
+            provider,
+            tools: self.tools.clone(),
+            config: self.config.clone(),
+            compaction: None,
+            hooks: HookRegistry::new(),
+            permission: Arc::clone(&self.permission),
+            approval: std::sync::Arc::clone(&self.approval),
+        }
+    }
+
+    /// Override the model id / effort in this agent's config (a per-turn model
+    /// pick on a freshly built override agent). `None` keeps the profile
+    /// default already in the config.
+    #[must_use]
+    pub fn with_config_model(
+        mut self,
+        model: Option<String>,
+        think_effort: Option<String>,
+    ) -> Self {
+        if let Some(model) = model {
+            self.config.model = model;
+        }
+        if let Some(tier) = think_effort {
+            self.config.think_effort = Some(tier);
+        }
+        self
+    }
+
     /// Run one turn: append `input` to the runtime context, drive model rounds
     /// and tool calls to completion, and persist every event through `writer`.
     ///
@@ -296,6 +337,28 @@ impl Agent {
             .await
     }
 
+    /// Like [`run_turn`](Self::run_turn), with optional per-turn generation
+    /// overrides: `model` switches the model id sent to the provider (the same
+    /// provider connection is reused — cross-provider switches need a
+    /// reconfigured/new session), and `think_effort` replaces the config's
+    /// effort. Both apply to this turn's model rounds only; the session's
+    /// configured values are untouched.
+    ///
+    /// # Errors
+    /// Same as [`run_turn`](Self::run_turn).
+    pub async fn run_turn_with_overrides(
+        &self,
+        writer: &mut SessionWriter,
+        runtime: &mut SessionRuntime,
+        input: String,
+        model: Option<String>,
+        think_effort: Option<String>,
+        sink: &mut dyn StreamSink,
+    ) -> Result<TurnOutcome, AgentError> {
+        self.run_turn_inner(writer, runtime, input, model, think_effort, sink)
+            .await
+    }
+
     /// Like [`run_turn`](Self::run_turn), but forwards every streamed delta to
     /// `sink` in real time so a front-end can render the turn as it unfolds.
     /// `sink.on_turn_end()` is called once the turn settles (on success).
@@ -307,6 +370,19 @@ impl Agent {
         writer: &mut SessionWriter,
         runtime: &mut SessionRuntime,
         input: String,
+        sink: &mut dyn StreamSink,
+    ) -> Result<TurnOutcome, AgentError> {
+        self.run_turn_inner(writer, runtime, input, None, None, sink)
+            .await
+    }
+
+    async fn run_turn_inner(
+        &self,
+        writer: &mut SessionWriter,
+        runtime: &mut SessionRuntime,
+        input: String,
+        model: Option<String>,
+        think_effort: Option<String>,
         sink: &mut dyn StreamSink,
     ) -> Result<TurnOutcome, AgentError> {
         let turn_id = TurnId(ulid::Ulid::new().to_string());
@@ -322,6 +398,8 @@ impl Agent {
             accumulated_usage: Usage::default(),
             gate_count: 0,
             step_stuck_rounds: HashMap::new(),
+            model,
+            think_effort,
         };
         turn.run(input).await
     }
@@ -343,13 +421,6 @@ impl Agent {
         schemas.push(todo::descriptor());
         schemas.sort_by(|a, b| a.name.cmp(&b.name));
         schemas
-    }
-
-    fn model_source(&self) -> EventSource {
-        EventSource {
-            kind: SourceKind::Model,
-            id: format!("{}/{}", self.provider.name(), self.config.model),
-        }
     }
 
     /// Generate a compaction summary of the current context. Calls the model with
@@ -393,6 +464,8 @@ impl Agent {
             tools: Vec::new(),
             temperature: 0.3,
             max_tokens: Some(1000),
+            // Compaction summarizes; a thinking effort would only add latency.
+            think_effort: None,
         };
 
         let mut stream = provider.stream(request).await?;
@@ -454,6 +527,10 @@ struct TurnState<'a> {
     // turn-scoped todo control counters, reset every turn
     gate_count: u8,
     step_stuck_rounds: HashMap<String, u32>,
+    /// Per-turn model id override; `None` uses the session's configured model.
+    model: Option<String>,
+    /// Per-turn reasoning-effort override; `None` uses the config's effort.
+    think_effort: Option<String>,
 }
 
 /// What the completion gate decided when the model stopped calling tools.
@@ -1276,15 +1353,27 @@ impl TurnState<'_> {
     /// assistant message; they abort the round as before.
     async fn run_model_round(&mut self) -> Result<collector::RoundOutcome, AgentError> {
         let tools = self.agent.tool_schemas();
-        let source = self.agent.model_source();
         let config = &self.agent.config;
+        // A per-turn model override switches the id sent to the provider (the
+        // same connection is reused); the event source must name what the
+        // request actually uses, not the session's configured model.
+        let model = self.model.clone().unwrap_or_else(|| config.model.clone());
+        let source = EventSource {
+            kind: SourceKind::Model,
+            id: format!("{}/{model}", self.agent.provider.name()),
+        };
 
         let request = ModelRequest {
-            model: config.model.clone(),
+            model,
             messages: self.runtime.context.clone(),
             tools: tools.clone(),
             temperature: config.temperature,
             max_tokens: config.max_tokens,
+            // A per-turn override wins over the session's configured effort.
+            think_effort: self
+                .think_effort
+                .clone()
+                .or_else(|| config.think_effort.clone()),
         };
 
         // Best pre-request estimate of the prefix we're about to send: the

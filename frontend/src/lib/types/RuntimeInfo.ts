@@ -35,4 +35,15 @@ compaction_threshold: number,
  * when no activation signal is present — the RUNTIME panel only shows the
  * row when non-empty ("detected, therefore shown"; `doc/frontend.md`, B2).
  */
-env: Array<string>, };
+env: Array<string>, 
+/**
+ * Reasoning-effort tiers the session's model declares (raw provider
+ * strings). Drives the per-turn effort picker; empty = the model offers
+ * no selectable tiers.
+ */
+think_efforts: Array<string>, 
+/**
+ * The session's default effort tier (from the profile, resolved against
+ * the model's tiers). `None` = provider default.
+ */
+think_effort: string | null, };

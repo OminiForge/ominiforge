@@ -22,6 +22,7 @@
 	} from '$lib/conversation';
 	import type { GatewayEvent } from '$lib/types/GatewayEvent';
 	import Skeleton from '$lib/components/Skeleton.svelte';
+	import ModelSelect, { type SelectOption } from '$lib/components/ModelSelect.svelte';
 	import ConversationItem from '$lib/components/ConversationItem.svelte';
 	import TodoCard from '$lib/components/TodoCard.svelte';
 	import DetailRail from '$lib/components/DetailRail.svelte';
@@ -136,7 +137,11 @@
 	let selProfile = $state('');
 	// Model override as `provider/model_id`; empty = use the profile default.
 	let selModel = $state('');
-	let cfgOpen = $state(false);
+	// Per-turn reasoning-effort tier (a raw string the current model declares);
+	// empty = the session's configured default. Applies to the next send only.
+	let selEffort = $state('');
+	// Which picker popover is open (only one at a time); `null` = all closed.
+	let openPicker = $state<'profile' | 'model' | 'effort' | null>(null);
 	// The active session id is exactly the route param: the draft (`'new'`), or a
 	// real id under `.../sessions/[id]`. Every transition — draft first-send,
 	// reconfigure, compaction, sidebar click, back/forward — is a real navigation
@@ -501,6 +506,8 @@
 		curModel = runtime ? `${runtime.provider}/${runtime.model}` : '';
 		selProfile = curProfile;
 		selModel = curModel;
+		// Sync the per-turn effort picker to the session's effective tier.
+		syncEffortFromRuntime();
 		await refreshSummary(id);
 		await loadInherited(id);
 	}
@@ -777,6 +784,13 @@
 		if (profiles.length > 0 || models.length > 0) return;
 		try {
 			[profiles, models] = await Promise.all([client.listProfiles(), client.listModels()]);
+			// Resolve the default profile's configured model so a draft's model
+			// picker can show what the session will run on (not a bare "default").
+			const defName = profiles[0]?.name;
+			if (defName) {
+				const def = await client.getProfile(defName).catch(() => null);
+				profileDefaultModel = def?.model?.default ?? null;
+			}
 		} catch {
 			/* leave lists empty */
 		}
@@ -840,17 +854,36 @@
 				// the sidebar wouldn't see the new id. A real goto mounts the session
 				// page (which replays the just-committed turn over SSE) and updates
 				// page.params.id so the sidebar highlights + inserts the new row.
-				await client.sendMessage(realId, text);
+				await client.sendMessage(realId, text, { thinkEffort: effortForSend() });
 				input = '';
 				// Same optimistic echo on the draft view: the goto below re-subscribes
 				// and replays, but the bubble makes the accepted send visible in the
 				// gap (and the draft view resets on navigation anyway).
 				convo = pushOptimisticUser(convo, text);
 				await goto(`/workspaces/${workspaceId}/sessions/${realId}`);
+			} else if (profileDirty) {
+				// Lazy profile switch (like fork): picking a new profile does NOT
+				// reconfigure on its own — only sending materializes the switch, so a
+				// misclick never spawns a reconfiguration session. The new session is
+				// seeded with this conversation, then the message goes out on it.
+				const newId = await client.reconfigure(sessionId, {
+					profile: selProfile || undefined
+				});
+				await client.sendMessage(newId, text, {
+					model: modelForSend(),
+					thinkEffort: effortForSend()
+				});
+				input = '';
+				await goto(`/workspaces/${workspaceId}/sessions/${newId}`);
 			} else {
 				const id = sessionId;
 				const seqBefore = convo.lastSeq;
-				await client.sendMessage(id, text);
+				// Model + effort are per-turn picks: they ride along on this message
+				// only, never reconfiguring the session.
+				await client.sendMessage(id, text, {
+					model: modelForSend(),
+					thinkEffort: effortForSend()
+				});
 				input = '';
 				// Optimistic echo: the send was ACCEPTED (202) — show the bubble now
 				// instead of waiting for Turn::Started to fold back. Normally a blink;
@@ -1074,52 +1107,138 @@
 	// the inline-item `collapsed` map (keyed by item index).
 	let pinnedTodoCollapsed = $state(true);
 
-	/** One-line label for the config trigger: the chosen profile (or "default")
-	 *  and the chosen model's bare id (or "default model"). On a draft this is
-	 *  what the session will be created on; on a live session it's what it runs on
-	 *  now (and what a reconfiguration would change). */
-	const cfgLabel = $derived.by(() => {
-		const p = selProfile || 'default';
-		const m = selModel ? selModel.split('/').pop() : 'default model';
-		return `${p} · ${m}`;
+	/** The default profile's configured model (`provider/model_id`), loaded
+	 *  once for a draft so the model picker can show what the session WILL run
+	 *  on when nothing is picked. Best-effort: a failure leaves it null and the
+	 *  trigger just shows the generic fallback. */
+	let profileDefaultModel = $state<string | null>(null);
+
+	/** The effective profile: the pick, or the gateway default profile (first
+	 *  in the list) when unpicked — a draft always shows what it WILL use. */
+	const effProfile = $derived(selProfile || (profiles[0]?.name ?? ''));
+	/** The effective model (`provider/model_id`): the pick, else the profile
+	 *  default's qualified form when it appears in the usable list, else the
+	 *  first usable model (a configured default that no longer resolves — e.g.
+	 *  its provider lost credentials — must not leave the picker blank). */
+	const effModel = $derived.by(() => {
+		if (selModel) return selModel;
+		const def = profileDefaultModel;
+		if (def && models.some((m) => `${m.provider}/${m.model_id}` === def)) return def;
+		const first = models[0];
+		return first ? `${first.provider}/${first.model_id}` : '';
 	});
 
-	// Reconfiguration (live sessions only): changing profile/model on an existing
-	// session can't edit it in place (history is immutable), so it mints a new
-	// reconfiguration session seeded with this conversation. We track the live
-	// session's *current* profile/model to detect a pending change and whether a
-	// reconfigure request is in flight.
+	// A live session syncs from its runtime (loadMeta): the configured default
+	// effort when the model declares it, else the model's official default (the
+	// last declared tier), so the picker always shows a concrete tier.
+	function syncEffortFromRuntime() {
+		const tiers = runtime?.think_efforts ?? [];
+		if (tiers.length === 0) {
+			selEffort = '';
+			return;
+		}
+		const cfg = runtime?.think_effort;
+		selEffort = cfg && tiers.includes(cfg) ? cfg : (tiers.at(-1) ?? '');
+	}
+
+	// A draft has no runtime; once its effective model resolves, adopt that
+	// model's default tier (its last declared one) so the effort picker shows a
+	// concrete tier from the start. Guarded to run once per model resolution —
+	// a manual pick or a model change owns the value from there.
+	$effect(() => {
+		if (!isDraft) return;
+		const entry = models.find((m) => `${m.provider}/${m.model_id}` === effModel);
+		if (entry && !selEffort) selEffort = entry.think_efforts.at(-1) ?? '';
+	});
+
+	/** Short labels for the three pickers (profile / model / effort): always
+	 *  the concrete value in effect — on a draft what the session will be
+	 *  created on, on a live session what it runs on (a differing profile pick
+	 *  = pending lazy switch; model/effort = per-turn picks for the next send). */
+	const profileLabel = $derived(effProfile || 'default');
+	const modelLabel = $derived.by(() => {
+		if (effModel) return effModel.split('/').pop() ?? effModel;
+		return 'no model configured';
+	});
+
+	// Picker option lists (shared `ModelSelect` rows). The model list is the
+	// usable models (credentials-resolved server-side). No synthetic "Default"
+	// row — the pickers always show a concrete current value; on a draft the
+	// gateway/profile default applies when nothing was picked (the trigger
+	// still shows what WILL be used, resolved below).
+	const profileOptions = $derived<SelectOption[]>(
+		profiles.map((p) => ({
+			value: p.name,
+			label: p.name,
+			detail: p.description ?? undefined
+		}))
+	);
+	const modelOptions = $derived<SelectOption[]>(
+		models.map((m) => ({
+			value: `${m.provider}/${m.model_id}`,
+			label: m.model_id,
+			detail: m.provider
+		}))
+	);
+	// The effort tiers of the model the picker currently points at. On a live
+	// session the runtime info is authoritative; a draft (or a pending model
+	// change) falls back to the catalog entry for the selected model.
+	const curModelEfforts = $derived.by<string[]>(() => {
+		const fromRuntime = !isDraft && effModel === curModel ? (runtime?.think_efforts ?? []) : [];
+		if (fromRuntime.length > 0) return fromRuntime;
+		return models.find((m) => `${m.provider}/${m.model_id}` === effModel)?.think_efforts ?? [];
+	});
+	const effortOptions = $derived<SelectOption[]>(
+		curModelEfforts.map((t) => ({ value: t, label: t }))
+	);
+	// The model's official default tier: the profile's configured tier when the
+	// model declares it, else the LAST declared tier (provider catalogs list
+	// tiers ascending, so the last is the strongest/default — Kimi K3 defaults
+	// to `max`). Effort has no separate "off" state here: a model with tiers
+	// always reasons at one of them, so the picker shows that tier.
+	const effortDefault = $derived.by(() => {
+		const rt = !isDraft && effModel === curModel ? runtime?.think_effort : null;
+		if (rt && curModelEfforts.includes(rt)) return rt;
+		return curModelEfforts.at(-1) ?? '';
+	});
+	const effortLabel = $derived(
+		selEffort && curModelEfforts.includes(selEffort) ? selEffort : effortDefault
+	);
+
+	/** A model switch adopts the new model's default tier (its last declared
+	 *  one) so the picker never shows a tier the model doesn't declare. */
+	function onModelPick(v: string) {
+		selModel = v;
+		const entry = models.find((m) => `${m.provider}/${m.model_id}` === v);
+		selEffort = entry?.think_efforts.at(-1) ?? '';
+	}
+
+	/** The effort tier to attach to the next send: the picker's pick when it is
+	 *  a tier the current model declares, else undefined (the session's
+	 *  configured default applies). A stale pick from a previous model is never
+	 *  sent to a model that would reject it. */
+	function effortForSend(): string | undefined {
+		return selEffort && curModelEfforts.includes(selEffort) ? selEffort : undefined;
+	}
+
+	/** The per-turn model override to attach to the next send on a live session:
+	 *  the pick only when it differs from what the session runs on (empty /
+	 *  unchanged = no override, the session's configured model applies). */
+	function modelForSend(): string | undefined {
+		return !isDraft && selModel && selModel !== curModel ? selModel : undefined;
+	}
+
+	// Profile switching (live sessions only): picking a different profile does
+	// NOT reconfigure on its own — the change is materialized lazily by the next
+	// send (reconfigure → send → navigate), like fork's lazy semantics, so a
+	// misclick never spawns a reconfiguration session. Until then the input
+	// shows a quiet banner that sending will switch.
 	let curProfile = $state('');
 	let curModel = $state('');
-	let reconfiguring = $state(false);
 
-	/** A live session has a pending config change when the picker's profile/model
-	 *  differs from what the session currently runs on. Drives the Apply button. */
-	const cfgDirty = $derived(!isDraft && (selProfile !== curProfile || selModel !== curModel));
-
-	/** Apply a live config change by reconfiguring into a new session, then adopt
-	 *  its id (same swap the compaction path uses). No-op on a draft (there the
-	 *  choice is applied at first send instead). */
-	async function applyReconfigure() {
-		if (isDraft || !cfgDirty || reconfiguring) return;
-		reconfiguring = true;
-		error = null;
-		try {
-			const newId = await client.reconfigure(sessionId, {
-				profile: selProfile || undefined,
-				model: selModel || undefined
-			});
-			cfgOpen = false;
-			// Navigate to the reconfigured session's route (a real goto, not a
-			// shallow replaceState) so page.params.id updates — the sync $effect then
-			// re-subscribes + reloads meta, and the sidebar highlights the new row.
-			await goto(`/workspaces/${workspaceId}/sessions/${newId}`);
-		} catch (e) {
-			error = e instanceof Error ? e.message : String(e);
-		} finally {
-			reconfiguring = false;
-		}
-	}
+	/** A live session has a pending lazy profile switch when the picker's
+	 *  profile differs from what the session currently runs on. */
+	const profileDirty = $derived(!isDraft && selProfile !== curProfile);
 
 	// Fork: branch a new session from a chosen user turn. Like "new session", the
 	// branch is created LAZILY — clicking fork navigates to the workspace draft
@@ -1432,71 +1551,79 @@
 								<span class="status-warn">Turn incomplete</span>
 							{/if}
 						</span>
-						<div class="cfg">
-							<button
-								class="input-btn cfg-trigger"
-								class:on={cfgOpen}
-								onclick={() => (cfgOpen = !cfgOpen)}
-								title={isDraft
-									? 'Choose profile / model / workspace (this session only)'
-									: 'View / switch profile / model (switching opens a new session seeded with this conversation)'}
-								aria-expanded={cfgOpen}
-							>
-								<svg
-									width="12"
-									height="12"
-									viewBox="0 0 14 14"
-									fill="none"
-									stroke="currentColor"
-									stroke-width="1.4"
-									stroke-linecap="round"
-									stroke-linejoin="round"
+						<div class="pickers">
+							<!-- Profile: a config-level pick. On a live session a change
+							     is LAZY — it reconfigures (new session seeded with this
+							     conversation) only when the next message sends. -->
+							<div class="picker">
+								<button
+									class="input-btn picker-trigger"
+									class:on={openPicker === 'profile'}
+									onclick={(e) => { e.stopPropagation(); openPicker = openPicker === 'profile' ? null : 'profile'; }}
+									title="Profile (agent identity: prompt + tools){isDraft ? '' : ' — switching reconfigures on the next send'}"
+									aria-expanded={openPicker === 'profile'}
 								>
-									<circle cx="7" cy="7" r="2.2" />
-									<path
-										d="M7 1.2v1.6M7 11.2v1.6M1.2 7h1.6M11.2 7h1.6M2.9 2.9l1.1 1.1M10 10l1.1 1.1M11.1 2.9 10 4M4 10l-1.1 1.1"
-									/>
-								</svg>
-								<span class="cfg-label">{cfgLabel}</span>
-							</button>
-							{#if cfgOpen}
-								<div class="cfg-popover" transition:fly={rise(6)}>
-									<label class="cfg-field">
-										<span class="cfg-key">Profile</span>
-										<select class="cfg-select" bind:value={selProfile}>
-											<option value="">Default</option>
-											{#each profiles as p (p.name)}
-												<option value={p.name}
-													>{p.name}{p.description ? ` — ${p.description}` : ''}</option
-												>
-											{/each}
-										</select>
-									</label>
-									<label class="cfg-field">
-										<span class="cfg-key">Model</span>
-										<select class="cfg-select" bind:value={selModel}>
-											<option value="">Default (per profile)</option>
-											{#each models as m (`${m.provider}/${m.model_id}`)}
-												<option value={`${m.provider}/${m.model_id}`}
-													>{m.model_id} · {m.provider}</option
-												>
-											{/each}
-										</select>
-									</label>
-									{#if !isDraft}
-										<!-- Live session: a profile/model change can't edit in place; it
-								     opens a new session seeded with this conversation. -->
-										<div class="cfg-foot">
-											<span class="cfg-hint"
-												>Switching opens a new session seeded with this conversation</span
-											>
-											<button
-												class="input-btn primary cfg-apply"
-												disabled={!cfgDirty || reconfiguring}
-												onclick={applyReconfigure}
-											>
-												{reconfiguring ? 'Switching…' : 'Switch'}
-											</button>
+									<span class="picker-key">profile</span>
+									<span class="picker-label">{profileLabel}</span>
+								</button>
+								{#if openPicker === 'profile'}
+									<div class="picker-popover" transition:fly={rise(6)}>
+										<ModelSelect
+											options={profileOptions}
+											bind:value={selProfile}
+											listOnly
+											onclose={() => (openPicker = null)}
+										/>
+									</div>
+								{/if}
+							</div>
+
+							<!-- Model + effort: per-turn picks, riding along on the next
+							     send — never a reconfiguration. -->
+							<div class="picker">
+								<button
+									class="input-btn picker-trigger"
+									class:on={openPicker === 'model'}
+									onclick={(e) => { e.stopPropagation(); openPicker = openPicker === 'model' ? null : 'model'; }}
+									title="Model for the next turn (per-turn, no reconfiguration)"
+									aria-expanded={openPicker === 'model'}
+								>
+									<span class="picker-key">model</span>
+									<span class="picker-label">{modelLabel}</span>
+								</button>
+								{#if openPicker === 'model'}
+									<div class="picker-popover" transition:fly={rise(6)}>
+										<ModelSelect
+											options={modelOptions}
+											value={selModel}
+											onselect={onModelPick}
+											listOnly
+											onclose={() => (openPicker = null)}
+										/>
+									</div>
+								{/if}
+							</div>
+
+							{#if curModelEfforts.length > 0}
+								<div class="picker">
+									<button
+										class="input-btn picker-trigger"
+										class:on={openPicker === 'effort'}
+										onclick={(e) => { e.stopPropagation(); openPicker = openPicker === 'effort' ? null : 'effort'; }}
+										title="Reasoning effort for the next turn"
+										aria-expanded={openPicker === 'effort'}
+									>
+										<span class="picker-key">effort</span>
+										<span class="picker-label">{effortLabel}</span>
+									</button>
+									{#if openPicker === 'effort'}
+										<div class="picker-popover" transition:fly={rise(6)}>
+											<ModelSelect
+											options={effortOptions}
+											bind:value={selEffort}
+											listOnly
+											onclose={() => (openPicker = null)}
+										/>
 										</div>
 									{/if}
 								</div>
@@ -1556,7 +1683,19 @@
 						</button>
 					</div>
 				</div>
-				<div class="input-hint">Type / for commands</div>
+				<div class="input-hint">
+					{#if profileDirty}
+						<!-- Lazy profile switch: the pick alone changes nothing; sending
+						     materializes it (reconfigure → new session seeded with this
+						     conversation). Quiet warning, not an accent action. -->
+						<span class="profile-note"
+							>Profile → <strong>{selProfile || 'default'}</strong> · sending switches (new session
+							seeded with this conversation)</span
+						>
+					{:else}
+						Type / for commands
+					{/if}
+				</div>
 			</div>
 		</div>
 	</div>
@@ -2237,23 +2376,6 @@
 		transform: translateY(1px);
 	}
 
-	.input-btn.primary {
-		background: var(--accent);
-		color: var(--accent-fg);
-		border-color: transparent;
-		font-weight: 590;
-	}
-
-	.input-btn.primary:hover {
-		background: var(--accent-hover);
-		color: var(--accent-fg);
-	}
-
-	.input-btn.primary:disabled {
-		opacity: 0.55;
-		cursor: not-allowed;
-	}
-
 	/* ---- SEND BUTTON (accent circular icon) ---- */
 	.send-btn {
 		display: flex;
@@ -2314,26 +2436,47 @@
 	}
 
 	/* ---- DRAFT CONFIG PICKER (profile / model / workspace) ---- */
-	/* Anchors the popover; lives in the input-actions row just left of Send so the
-	   pre-send config sits in the composer cluster (the space above the input is
-	   taken by the todo dock). Draft-only — gone once the session is real. */
-	.cfg {
+	/* The config pickers cluster: profile (config-level, lazy switch) and
+	   model/effort (per-turn) as separate one-click triggers in the input
+	   actions row (DESIGN.md §4.2). */
+	.pickers {
+		display: flex;
+		align-items: center;
+		gap: var(--space-1);
+		flex-shrink: 1;
+		min-width: 0;
+	}
+
+	.picker {
 		position: relative;
 		display: flex;
-		flex-shrink: 0;
+		flex-shrink: 1;
+		min-width: 0;
 	}
 
-	.cfg-trigger {
-		max-width: 220px;
+	.picker-trigger {
+		max-width: 190px;
+		gap: 6px;
 	}
 
-	.cfg-trigger.on {
+	.picker-trigger.on {
 		background: var(--surface-hover);
 		color: var(--text-primary);
 		border-color: var(--border-strong);
 	}
 
-	.cfg-label {
+	/* mono lowercase category key (profile / model / effort): quiet label, the
+	   value is the readable part. */
+	.picker-key {
+		flex-shrink: 0;
+		font-family: var(--font-mono);
+		font-size: 9.5px;
+		letter-spacing: 0.08em;
+		text-transform: uppercase;
+		color: var(--text-tertiary);
+	}
+
+	.picker-label {
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
@@ -2341,77 +2484,17 @@
 		font-size: 11px;
 	}
 
-	/* Opens upward (the input sits at the screen bottom). Right-aligned to the
-	   trigger so it stays within the composer width. */
-	.cfg-popover {
+	/* Opens upward (the input sits at the screen bottom), right-aligned to the
+	   trigger so the list stays within the composer width. The option list
+	   itself caps at ~5 rows and scrolls (`ModelSelect`), never running off
+	   the screen. */
+	.picker-popover {
 		position: absolute;
 		bottom: calc(100% + 6px);
 		right: 0;
-		z-index: 20;
+		z-index: var(--z-popover);
 		width: 300px;
 		max-width: min(300px, 80vw);
-		display: flex;
-		flex-direction: column;
-		gap: var(--space-3);
-		padding: var(--space-3) var(--space-4);
-		background: var(--canvas-overlay);
-		border: 1px solid var(--border-default);
-		border-radius: var(--radius-lg);
-		box-shadow: var(--shadow-md, 0 8px 24px rgba(0, 0, 0, 0.18));
-	}
-
-	.cfg-field {
-		display: flex;
-		flex-direction: column;
-		gap: 3px;
-	}
-
-	.cfg-key {
-		font-family: var(--font-mono);
-		font-size: 9.5px;
-		font-weight: 510;
-		color: var(--text-tertiary);
-		letter-spacing: 0.09em;
-		text-transform: uppercase;
-	}
-
-	.cfg-select {
-		width: 100%;
-		padding: 5px 8px;
-		background: var(--canvas-base);
-		border: 1px solid var(--border-default);
-		border-radius: var(--radius-sm);
-		color: var(--text-primary);
-		font-family: var(--font-mono);
-		font-size: 12px;
-		outline: none;
-	}
-
-	.cfg-select:focus {
-		border-color: var(--border-strong);
-		box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 10%, transparent);
-	}
-
-	/* Live-session footer: hint + the "switch" (reconfigure) action. */
-	.cfg-foot {
-		display: flex;
-		align-items: center;
-		gap: var(--space-2);
-		padding-top: var(--space-1);
-		border-top: 1px solid var(--border-subtle);
-	}
-
-	.cfg-hint {
-		flex: 1;
-		font-size: 10.5px;
-		color: var(--text-tertiary);
-		font-family: var(--font-chinese);
-		line-height: 1.3;
-	}
-
-	.cfg-apply {
-		flex-shrink: 0;
-		padding: 4px 10px;
 	}
 
 	.input-hint {
@@ -2420,6 +2503,17 @@
 		font-family: var(--font-mono);
 		margin-top: 5px;
 		padding-left: 2px;
+	}
+
+	/* Pending lazy profile switch: amber (a state, not an action — no accent),
+	   same quiet line as the hint it replaces. */
+	.profile-note {
+		color: var(--state-running-text);
+		font-family: var(--font-chinese);
+	}
+
+	.profile-note strong {
+		font-weight: 590;
 	}
 
 	/* Shared keyframes (pulse/spin) used by the queue dot, status dot and

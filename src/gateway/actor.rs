@@ -141,8 +141,14 @@ pub enum Delta {
 #[derive(Debug)]
 pub enum Command {
     /// Run a turn with `text` as the user input. Enqueued if a turn is already
-    /// running (turns never overlap on one session).
-    Send { text: String },
+    /// running (turns never overlap on one session). `model` / `think_effort`
+    /// are optional per-turn overrides (a `provider/model_id` and a raw effort
+    /// tier the model declares); `None` keeps the session's configured values.
+    Send {
+        text: String,
+        model: Option<String>,
+        think_effort: Option<String>,
+    },
     /// Abort the running turn (if any). The partial work already persisted
     /// stands; the runtime is rebuilt from the log.
     Cancel,
@@ -250,6 +256,45 @@ pub struct SessionActor {
     /// MCP tools dispatch through them. Per-session isolation means each actor
     /// owns its own set (user's choice; `doc/gateway.md`).
     _mcp_clients: Vec<Arc<crate::mcp::McpClient>>,
+    /// Reasoning-effort tiers the session's model declares (from its resolved
+    /// config). Guards per-turn effort overrides: only a listed tier is applied.
+    model_efforts: Vec<String>,
+    /// The session's resolved model selection (provider identity + config), the
+    /// baseline a per-turn model override is compared against / built from.
+    resolved: crate::config::ResolvedModel,
+    /// The profile the session runs on; per-turn model overrides resolve
+    /// against it (its parameter overrides apply to the override model too).
+    profile_name: String,
+    /// Resolves per-session model references (provider + credentials) for
+    /// cross-provider per-turn overrides. Injected by the registry, which owns
+    /// the config roots; tests leave it `None` (cross-provider picks degrade
+    /// to the session model).
+    model_resolver: Option<Arc<dyn ModelResolver>>,
+}
+
+/// The generation settings one turn runs with, after applying per-turn
+/// overrides on top of the session's configured model.
+struct TurnSpec {
+    /// Model id to send; `None` = the session's configured model.
+    model_id: Option<String>,
+    /// Effort tier; `None` = the session's configured effort.
+    think_effort: Option<String>,
+    /// A different provider when the override crosses providers (the turn
+    /// builds a one-off agent on it); `None` reuses the session's provider.
+    provider: Option<Arc<dyn crate::llm::Provider>>,
+}
+
+/// Resolves a `provider/model_id` reference into a buildable
+/// [`crate::config::ResolvedModel`] for a per-turn override. Implemented by the
+/// gateway registry (it owns the config roots); the actor calls it without
+/// knowing where config lives.
+#[cfg_attr(test, allow(dead_code))]
+pub trait ModelResolver: Send + Sync {
+    fn resolve_turn_model(
+        &self,
+        model_ref: &str,
+        profile_name: &str,
+    ) -> anyhow::Result<crate::config::ResolvedModel>;
 }
 
 impl SessionActor {
@@ -274,6 +319,9 @@ impl SessionActor {
         mcp_clients: Vec<Arc<crate::mcp::McpClient>>,
         status: StatusHub,
         on_scoped: Option<Arc<dyn Fn(ScopedDecision) + Send + Sync>>,
+        resolved: crate::config::ResolvedModel,
+        profile_name: String,
+        model_resolver: Option<Arc<dyn ModelResolver>>,
     ) -> ActorHandle {
         let (inbox_tx, inbox_rx) = mpsc::channel(INBOX_CAPACITY);
         let (outbound, _) = broadcast::channel(OUTBOUND_CAPACITY);
@@ -330,6 +378,10 @@ impl SessionActor {
             idle_timeout,
             deferred: VecDeque::new(),
             _mcp_clients: mcp_clients,
+            model_efforts: resolved.think_efforts.clone(),
+            resolved,
+            profile_name,
+            model_resolver,
         };
 
         // Forward committed events from the session bus onto the outbound stream,
@@ -361,6 +413,73 @@ impl SessionActor {
             status,
             latest_seq: self.tail_seq(),
         });
+    }
+
+    /// Resolve a turn's per-message `model`/`think_effort` overrides into the
+    /// generation settings the turn runs with. Both are validated and degrade
+    /// to the session's configured values: an unresolvable model and an effort
+    /// tier the effective model does not declare are dropped with a warning
+    /// (the send still runs — silently failing the whole turn over a stale UI
+    /// pick would be worse than running on the session's model).
+    fn resolve_turn_overrides(&self, model: Option<&str>, think_effort: Option<&str>) -> TurnSpec {
+        let mut spec = TurnSpec {
+            model_id: None,
+            think_effort: None,
+            provider: None,
+        };
+
+        if let Some(model_ref) = model
+            && model_ref != self.session_model_ref()
+            && let Some(resolver) = &self.model_resolver
+        {
+            match resolver.resolve_turn_model(model_ref, &self.profile_name) {
+                Ok(resolved) => {
+                    if resolved.provider_name == self.resolved.provider_name {
+                        // Same provider connection: just swap the model id.
+                        spec.model_id = Some(resolved.model_id.clone());
+                    } else {
+                        match crate::provider::build(&resolved) {
+                            Some(provider) => {
+                                spec.provider = Some(provider);
+                                spec.model_id = Some(resolved.model_id.clone());
+                            }
+                            None => {
+                                tracing::warn!(
+                                    model = model_ref,
+                                    "per-turn model override has no adapter; using session model"
+                                );
+                            }
+                        }
+                    }
+                    // Only the override model's tiers validate the effort pick
+                    // when the override resolved; a dropped pick keeps the
+                    // session model's tiers (below).
+                    if spec.model_id.is_some() {
+                        spec.think_effort = think_effort
+                            .filter(|tier| resolved.think_efforts.iter().any(|t| t == tier))
+                            .map(str::to_owned);
+                        return spec;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        model = model_ref,
+                        error = %e,
+                        "per-turn model override failed to resolve; using session model"
+                    );
+                }
+            }
+        }
+
+        spec.think_effort = think_effort
+            .filter(|tier| self.model_efforts.iter().any(|t| t == tier))
+            .map(str::to_owned);
+        spec
+    }
+
+    /// The session's configured model as a qualified `provider/model_id`.
+    fn session_model_ref(&self) -> String {
+        format!("{}/{}", self.resolved.provider_name, self.resolved.model_id)
     }
 
     /// Route a human decision to the tool call parked awaiting it. Removing the
@@ -418,8 +537,15 @@ impl SessionActor {
             };
 
             match cmd {
-                Command::Send { text } => {
-                    let Some(next) = self.run_turn_phase(session, text).await else {
+                Command::Send {
+                    text,
+                    model,
+                    think_effort,
+                } => {
+                    let Some(next) = self
+                        .run_turn_phase(session, text, model.as_deref(), think_effort.as_deref())
+                        .await
+                    else {
                         return; // Shutdown requested mid-turn.
                     };
                     session = next;
@@ -442,8 +568,19 @@ impl SessionActor {
     /// Returns `Some(session)` to resume with (possibly a fresh compaction
     /// session, or a rebuilt one after a cancel), or `None` if the actor was
     /// told to shut down (the loop should exit).
-    async fn run_turn_phase(&mut self, session: Session, text: String) -> Option<Session> {
+    async fn run_turn_phase(
+        &mut self,
+        session: Session,
+        text: String,
+        model: Option<&str>,
+        think_effort: Option<&str>,
+    ) -> Option<Session> {
         let (writer, runtime) = session;
+        // Resolve the turn's generation settings: a per-turn model/effort
+        // override wins over the session's configured values, but only when it
+        // is usable (an unknown model / undeclared effort tier is dropped,
+        // never sent to a provider that would reject it).
+        let turn = self.resolve_turn_overrides(model, think_effort);
         let agent = Arc::clone(&self.agent);
         let outbound = self.outbound.clone();
 
@@ -455,9 +592,32 @@ impl SessionActor {
             let mut writer = writer;
             let mut runtime = runtime;
             let mut sink = BroadcastSink { tx: outbound };
-            let result = agent
-                .run_turn_with_sink(&mut writer, &mut runtime, text, &mut sink)
-                .await;
+            let result = match turn.provider {
+                // Same provider as the session: reuse the agent, just override
+                // the model id / effort for this turn's requests.
+                None => {
+                    agent
+                        .run_turn_with_overrides(
+                            &mut writer,
+                            &mut runtime,
+                            text,
+                            turn.model_id,
+                            turn.think_effort,
+                            &mut sink,
+                        )
+                        .await
+                }
+                // A different provider: build a one-turn agent sharing the
+                // session's tool registry and live permission/approval handles.
+                Some(provider) => {
+                    let turn_agent = agent
+                        .clone_for_provider(provider)
+                        .with_config_model(turn.model_id, turn.think_effort);
+                    turn_agent
+                        .run_turn_with_sink(&mut writer, &mut runtime, text, &mut sink)
+                        .await
+                }
+            };
             (writer, runtime, result)
         });
 
@@ -983,6 +1143,50 @@ mod tests {
         }
     }
 
+    /// Like [`ScriptedProvider`] but records the `model` / `think_effort` of
+    /// every request, so a test can assert what a per-turn override sent.
+    struct RecordingProvider {
+        rounds: Mutex<VecDeque<Vec<StreamEvent>>>,
+        seen: Mutex<Vec<(String, Option<String>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for RecordingProvider {
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn name(&self) -> &str {
+            "scripted"
+        }
+
+        async fn stream(&self, request: ModelRequest) -> Result<EventStream, LlmError> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((request.model.clone(), request.think_effort.clone()));
+            let batch = self
+                .rounds
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("provider called more times than scripted");
+            let items: Vec<Result<StreamEvent, LlmError>> = batch.into_iter().map(Ok).collect();
+            Ok(Box::pin(stream::iter(items)))
+        }
+    }
+
+    /// A resolver that maps every model ref onto one fixed [`ResolvedModel`]
+    /// (the test's "other" model on the same provider).
+    struct StaticResolver(crate::config::ResolvedModel);
+
+    impl ModelResolver for StaticResolver {
+        fn resolve_turn_model(
+            &self,
+            _model_ref: &str,
+            _profile_name: &str,
+        ) -> anyhow::Result<crate::config::ResolvedModel> {
+            Ok(self.0.clone())
+        }
+    }
+
     /// One model round that answers with `text` and ends the turn cleanly.
     fn answer(text: &str) -> Vec<StreamEvent> {
         vec![
@@ -1005,6 +1209,23 @@ mod tests {
     /// Build an actor over a fresh session in a temp store, scripted to produce
     /// `rounds` (one batch per turn). Returns the handle and the temp dir (kept
     /// alive so the store outlives the test).
+    /// A minimal resolved model for test actors: no effort tiers, no resolver —
+    /// per-turn overrides degrade to the session model.
+    fn test_resolved_model() -> crate::config::ResolvedModel {
+        crate::config::ResolvedModel {
+            provider_name: "test".to_owned(),
+            provider_type: crate::config::ProviderType::OpenaiChat,
+            base_url: "http://localhost".to_owned(),
+            api_key: String::new(),
+            model_id: "mock".to_owned(),
+            temperature: 0.0,
+            max_output_tokens: 0,
+            context_window: 0,
+            think_efforts: Vec::new(),
+            think_effort: None,
+        }
+    }
+
     fn spawn_test_actor(rounds: Vec<Vec<StreamEvent>>) -> (ActorHandle, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::new(dir.path());
@@ -1032,6 +1253,9 @@ mod tests {
             std::time::Duration::from_secs(3600),
             Vec::new(),
             StatusHub::new(),
+            None,
+            test_resolved_model(),
+            "default".to_owned(),
             None,
         );
         (handle, dir)
@@ -1072,8 +1296,83 @@ mod tests {
             Vec::new(),
             status,
             None,
+            test_resolved_model(),
+            "default".to_owned(),
+            None,
         );
         (handle, dir)
+    }
+
+    /// A per-turn model override on the SAME provider swaps the model id sent
+    /// on the wire (and validates the effort tier against the override model),
+    /// without touching the session's configured model — the whole point of the
+    /// per-turn pick is that the next send can run on a different model without
+    /// a reconfiguration session.
+    #[tokio::test]
+    async fn per_turn_model_override_reaches_the_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let provider = Arc::new(RecordingProvider {
+            rounds: Mutex::new(vec![answer("hi")].into()),
+            seen: Mutex::new(Vec::new()),
+        });
+        let seen = Arc::clone(&provider);
+        let agent = Agent::new(
+            provider,
+            ToolRegistry::new(),
+            AgentConfig {
+                model: "mock".to_owned(),
+                ..AgentConfig::default()
+            },
+        );
+        let system = vec![Message::System {
+            content: "sys".to_owned(),
+        }];
+        let writer = store.create_new(None, None, vec![]).unwrap();
+        let runtime = SessionRuntime::new(system.clone());
+        // The session runs on test/mock; the override model lives on the same
+        // provider and declares a `high` tier.
+        let mut session_model = test_resolved_model();
+        let mut override_model = test_resolved_model();
+        override_model.model_id = "mock-pro".to_owned();
+        override_model.think_efforts = vec!["high".to_owned()];
+        session_model.think_efforts = Vec::new();
+        let handle = SessionActor::spawn(
+            agent,
+            store,
+            system,
+            (writer, runtime),
+            std::time::Duration::from_secs(3600),
+            Vec::new(),
+            StatusHub::new(),
+            None,
+            session_model,
+            "default".to_owned(),
+            Some(Arc::new(StaticResolver(override_model))),
+        );
+        handle
+            .send(Command::Send {
+                text: "hi".to_owned(),
+                model: Some("test/mock-pro".to_owned()),
+                think_effort: Some("high".to_owned()),
+            })
+            .await
+            .unwrap();
+
+        // Wait for the turn to settle, then inspect what the wire saw.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            if !seen.seen.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let seen = seen.seen.lock().unwrap();
+        assert_eq!(
+            seen.first().map(|(m, e)| (m.as_str(), e.as_deref())),
+            Some(("mock-pro", Some("high"))),
+            "the override model + effort must reach the request, got {seen:?}"
+        );
     }
 
     /// A turn publishes `Running` then `Idle` to the status hub, and the `Idle`
@@ -1092,6 +1391,8 @@ mod tests {
         handle
             .send(Command::Send {
                 text: "hi".to_owned(),
+                model: None,
+                think_effort: None,
             })
             .await
             .unwrap();
@@ -1131,6 +1432,8 @@ mod tests {
             handle
                 .send(Command::Send {
                     text: "hi".to_owned(),
+                    model: None,
+                    think_effort: None,
                 })
                 .await
                 .unwrap();
@@ -1166,6 +1469,8 @@ mod tests {
         handle
             .send(Command::Send {
                 text: "hi".to_owned(),
+                model: None,
+                think_effort: None,
             })
             .await
             .unwrap();
@@ -1201,12 +1506,16 @@ mod tests {
         handle
             .send(Command::Send {
                 text: "first".to_owned(),
+                model: None,
+                think_effort: None,
             })
             .await
             .unwrap();
         handle
             .send(Command::Send {
                 text: "second".to_owned(),
+                model: None,
+                think_effort: None,
             })
             .await
             .unwrap();
@@ -1285,12 +1594,17 @@ mod tests {
             Vec::new(),
             StatusHub::new(),
             None,
+            test_resolved_model(),
+            "default".to_owned(),
+            None,
         );
 
         let mut rx = handle.subscribe();
         handle
             .send(Command::Send {
                 text: "hi".to_owned(),
+                model: None,
+                think_effort: None,
             })
             .await
             .unwrap();
@@ -1489,6 +1803,9 @@ mod tests {
             Vec::new(),
             StatusHub::new(),
             None,
+            test_resolved_model(),
+            "default".to_owned(),
+            None,
         );
         (handle, store_dir, ws_dir)
     }
@@ -1544,6 +1861,8 @@ mod tests {
         handle
             .send(Command::Send {
                 text: "write a file".to_owned(),
+                model: None,
+                think_effort: None,
             })
             .await
             .unwrap();
@@ -1580,6 +1899,8 @@ mod tests {
         handle
             .send(Command::Send {
                 text: "write a file".to_owned(),
+                model: None,
+                think_effort: None,
             })
             .await
             .unwrap();
@@ -1633,6 +1954,8 @@ mod tests {
         handle
             .send(Command::Send {
                 text: "write a file".to_owned(),
+                model: None,
+                think_effort: None,
             })
             .await
             .unwrap();
@@ -2035,6 +2358,8 @@ mod tests {
         handle
             .send(Command::Send {
                 text: "write a file".to_owned(),
+                model: None,
+                think_effort: None,
             })
             .await
             .unwrap();
@@ -2100,12 +2425,17 @@ mod tests {
             Vec::new(),
             StatusHub::new(),
             None,
+            test_resolved_model(),
+            "default".to_owned(),
+            None,
         );
 
         let mut rx = handle.subscribe();
         handle
             .send(Command::Send {
                 text: "run".to_owned(),
+                model: None,
+                think_effort: None,
             })
             .await
             .unwrap();
@@ -2138,6 +2468,8 @@ mod tests {
         handle
             .send(Command::Send {
                 text: "write a file".to_owned(),
+                model: None,
+                think_effort: None,
             })
             .await
             .unwrap();
@@ -2157,6 +2489,8 @@ mod tests {
         handle
             .send(Command::Send {
                 text: "write another".to_owned(),
+                model: None,
+                think_effort: None,
             })
             .await
             .unwrap();
@@ -2207,12 +2541,17 @@ mod tests {
             Vec::new(),
             StatusHub::new(),
             None,
+            test_resolved_model(),
+            "default".to_owned(),
+            None,
         );
 
         let mut rx = handle.subscribe();
         handle
             .send(Command::Send {
                 text: "hi".to_owned(),
+                model: None,
+                think_effort: None,
             })
             .await
             .unwrap();
@@ -2254,6 +2593,8 @@ mod tests {
         handle
             .send(Command::Send {
                 text: "write both".to_owned(),
+                model: None,
+                think_effort: None,
             })
             .await
             .unwrap();
@@ -2385,6 +2726,9 @@ mod tests {
             Vec::new(),
             StatusHub::new(),
             None,
+            test_resolved_model(),
+            "default".to_owned(),
+            None,
         );
         (handle, store_dir)
     }
@@ -2482,6 +2826,8 @@ mod tests {
         handle
             .send(Command::Send {
                 text: "run both".to_owned(),
+                model: None,
+                think_effort: None,
             })
             .await
             .unwrap();
@@ -2577,6 +2923,8 @@ mod tests {
         handle
             .send(Command::Send {
                 text: "run".to_owned(),
+                model: None,
+                think_effort: None,
             })
             .await
             .unwrap();
@@ -2631,6 +2979,8 @@ mod tests {
         handle
             .send(Command::Send {
                 text: "run".to_owned(),
+                model: None,
+                think_effort: None,
             })
             .await
             .unwrap();
@@ -2694,6 +3044,8 @@ mod tests {
         handle
             .send(Command::Send {
                 text: "run all three".to_owned(),
+                model: None,
+                think_effort: None,
             })
             .await
             .unwrap();

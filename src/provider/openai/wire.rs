@@ -26,6 +26,10 @@ pub struct ChatRequest {
     pub temperature: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// OpenAI-compatible reasoning-effort hint (`low`/`medium`/`high`, plus
+    /// provider-specific tiers like `max`). Sent only when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     pub stream: bool,
     pub stream_options: StreamOptions,
 }
@@ -98,6 +102,7 @@ impl ChatRequest {
             tools,
             temperature: req.temperature,
             max_tokens: req.max_tokens,
+            reasoning_effort: req.think_effort,
             stream: true,
             stream_options: StreamOptions {
                 include_usage: true,
@@ -506,6 +511,7 @@ mod tests {
             }],
             temperature: 0.0,
             max_tokens: Some(256),
+            think_effort: None,
         };
 
         let body = ChatRequest::from_request(req);

@@ -44,6 +44,32 @@ use super::approval::ScopedDecision;
 use super::config::GatewayConfig;
 use super::status::{ActivityStatus, StatusHub};
 
+/// Bridges the actor's per-turn model overrides to the config store: resolves
+/// a `provider/model_id` reference (against the session's profile, for its
+/// overrides) into a buildable [`crate::config::ResolvedModel`].
+struct TurnModelResolver {
+    config: ConfigStore,
+}
+
+impl super::actor::ModelResolver for TurnModelResolver {
+    fn resolve_turn_model(
+        &self,
+        model_ref: &str,
+        profile_name: &str,
+    ) -> Result<crate::config::ResolvedModel> {
+        let store = &self.config;
+        let providers = store
+            .load_providers()
+            .context("failed to load providers.toml")?;
+        let profile = store
+            .load_profile(profile_name)
+            .with_context(|| format!("failed to load profile `{profile_name}`"))?;
+        store
+            .resolve(&providers, &profile, Some(model_ref), None)
+            .map_err(anyhow::Error::from)
+    }
+}
+
 /// Default model/profile selection a new session is assembled with.
 ///
 /// Plus the workspace it operates in and the config store. Held by the registry
@@ -89,6 +115,13 @@ pub struct RuntimeInfo {
     /// when no activation signal is present — the RUNTIME panel only shows the
     /// row when non-empty ("detected, therefore shown"; `doc/frontend.md`, B2).
     pub env: Vec<String>,
+    /// Reasoning-effort tiers the session's model declares (raw provider
+    /// strings). Drives the per-turn effort picker; empty = the model offers
+    /// no selectable tiers.
+    pub think_efforts: Vec<String>,
+    /// The session's default effort tier (from the profile, resolved against
+    /// the model's tiers). `None` = provider default.
+    pub think_effort: Option<String>,
 }
 
 /// Detect environment labels from activated environment variables.
@@ -954,6 +987,8 @@ impl SessionRegistry {
                 .compaction_threshold
                 .unwrap_or(crate::context::DEFAULT_COMPACTION_THRESHOLD),
             env: detect_env(&env),
+            think_efforts: resolved.think_efforts,
+            think_effort: resolved.think_effort,
         })
     }
 
@@ -1037,6 +1072,9 @@ impl SessionRegistry {
             assembled.mcp_clients,
             self.inner.status_hub.clone(),
             Some(self.scoped_rule_callback(id.clone())),
+            assembled.resolved.clone(),
+            assembled.profile_name.clone(),
+            Some(self.model_resolver()),
         );
         actors.insert(id.clone(), handle.clone());
         Ok(handle)
@@ -1129,6 +1167,9 @@ impl SessionRegistry {
             assembled.mcp_clients,
             self.inner.status_hub.clone(),
             Some(self.scoped_rule_callback(id.clone())),
+            assembled.resolved.clone(),
+            assembled.profile_name.clone(),
+            Some(self.model_resolver()),
         );
         self.inner
             .actors
@@ -1222,6 +1263,9 @@ impl SessionRegistry {
             assembled.mcp_clients,
             self.inner.status_hub.clone(),
             Some(self.scoped_rule_callback(id.clone())),
+            assembled.resolved.clone(),
+            assembled.profile_name.clone(),
+            Some(self.model_resolver()),
         );
         self.inner
             .actors
@@ -1305,6 +1349,9 @@ impl SessionRegistry {
             assembled.mcp_clients,
             self.inner.status_hub.clone(),
             Some(self.scoped_rule_callback(id.clone())),
+            assembled.resolved.clone(),
+            assembled.profile_name.clone(),
+            Some(self.model_resolver()),
         );
         self.inner
             .actors
@@ -1417,6 +1464,15 @@ impl SessionRegistry {
     #[must_use]
     pub fn list_profiles(&self) -> Vec<ProfileSummary> {
         self.inner.defaults.config.list_profiles()
+    }
+
+    /// The per-turn model resolver handed to actors: shares the gateway's
+    /// config store so a cross-provider model pick resolves against the same
+    /// providers/credentials session creation uses.
+    fn model_resolver(&self) -> Arc<dyn super::actor::ModelResolver> {
+        Arc::new(TurnModelResolver {
+            config: self.inner.defaults.config.clone(),
+        })
     }
 
     /// List the models available for a per-session override, flattened from the
@@ -1588,10 +1644,7 @@ impl SessionRegistry {
         // the provider's api_key_env. Read only here, never exported.
         let api_key = match key {
             Some(k) => k,
-            None => match store
-                .secret_store()
-                .and_then(|s| s.get(name).transpose())
-            {
+            None => match store.secret_store().and_then(|s| s.get(name).transpose()) {
                 Some(result) => result?,
                 None => std::env::var(&provider.api_key_env).with_context(|| {
                     format!(
@@ -1611,6 +1664,8 @@ impl SessionRegistry {
             temperature: provider.models[0].default_temperature,
             max_output_tokens: provider.models[0].max_output_tokens,
             context_window: provider.models[0].context_window,
+            think_efforts: provider.models[0].think_efforts.clone(),
+            think_effort: None,
         };
         let handle = crate::provider::build(&resolved)
             .with_context(|| format!("provider `{name}` has no adapter"))?;
@@ -1624,6 +1679,7 @@ impl SessionRegistry {
             tools: Vec::new(),
             temperature: resolved.temperature,
             max_tokens: Some(1),
+            think_effort: None,
         };
         let mut stream = handle
             .stream(request)

@@ -144,8 +144,15 @@ export interface SessionClient {
 	 *  `id`'s full conversation (reconfiguration); resolves to the new session id.
 	 *  The session's config is immutable, so this is a new session, not an edit. */
 	reconfigure(id: string, opts: ReconfigureOptions): Promise<string>;
-	/** Enqueue a turn. Returns once accepted (202); output arrives over the stream. */
-	sendMessage(id: string, text: string): Promise<void>;
+	/** Enqueue a turn. Returns once accepted (202); output arrives over the stream.
+	 *  `opts.model` is a per-turn `provider/model_id` override; `opts.thinkEffort`
+	 *  a per-turn reasoning-effort tier (a raw string the model declares). Both
+	 *  apply to this turn only — omitted = the session's configured values. */
+	sendMessage(
+		id: string,
+		text: string,
+		opts?: { model?: string; thinkEffort?: string }
+	): Promise<void>;
 	/** Abort the running turn, if any. */
 	cancel(id: string): Promise<void>;
 	/** Answer a suspended `ask` tool call: `approve` runs it, `reject` blocks it

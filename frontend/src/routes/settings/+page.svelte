@@ -7,8 +7,10 @@
 	import Skeleton from '$lib/components/Skeleton.svelte';
 	import Toasts from '$lib/components/Toasts.svelte';
 	import { pushToast } from '$lib/toast';
+	import ModelSelect, { type SelectOption } from '$lib/components/ModelSelect.svelte';
 	import { resolveEffective, ruleToRow, summaryOf, type Tier } from '$lib/permission-rules';
 	import type { ProviderConfig } from '$lib/types/ProviderConfig';
+	import type { ModelSummary } from '$lib/types/ModelSummary';
 	import type { Profile } from '$lib/types/Profile';
 	import type { ProfileSummary } from '$lib/types/ProfileSummary';
 	import type { PermissionPolicy } from '$lib/types/PermissionPolicy';
@@ -34,6 +36,9 @@
 	let selectedName = $state<string>('');
 	let profile = $state<Profile | null>(null);
 	let profileSnapshot = $state<string | null>(null);
+	// Every usable model across providers (drives the profile's default-model
+	// dropdown and its reasoning-effort tier list).
+	let modelList = $state<ModelSummary[]>([]);
 
 	// ---- Permissions tab state ----
 	// The three gate tiers (doc/permission.md §3.1): gateway baseline (bottom),
@@ -135,7 +140,12 @@
 
 	onMount(async () => {
 		try {
-			await Promise.all([loadProviders(), loadProfiles(), loadTools()]);
+			[modelList] = await Promise.all([
+				client.listModels(),
+				loadProviders(),
+				loadProfiles(),
+				loadTools()
+			]);
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 		} finally {
@@ -199,7 +209,7 @@
 		profile = {
 			profile: { name: '', description: null, extends: null },
 			prompt: { system: null, system_file: null },
-			model: { default: null, fallback: null, temperature: null, max_output_tokens: null },
+			model: { default: null, fallback: null, think_effort: null },
 			tools: { builtin: null, mcp_servers: [], disabled: [] },
 			context: { compaction_threshold: null, compaction_model: null, injection_max_tokens: null },
 			skills: { enabled: [] },
@@ -357,6 +367,28 @@
 		workspace: 'Workspace'
 	};
 
+	// ---- Profile model picker options ----
+	// The default model is chosen from the usable models (credentials-resolved
+	// server-side), not typed by hand; temperature / max-output stay model
+	// metadata, so a profile only references a model plus its effort tier.
+	const modelOptions = $derived<SelectOption[]>([
+		{ value: '', label: 'None (gateway default)' },
+		...modelList.map((m) => ({
+			value: `${m.provider}/${m.model_id}`,
+			label: m.model_id,
+			detail: m.provider
+		}))
+	]);
+	// The model the profile editor currently references (drives which effort
+	// tiers the effort picker offers).
+	const selectedModelEntry = $derived(
+		modelList.find((m) => `${m.provider}/${m.model_id}` === (profile?.model.default ?? ''))
+	);
+	const effortOptions = $derived<SelectOption[]>([
+		{ value: '', label: 'Model default' },
+		...(selectedModelEntry?.think_efforts ?? []).map((t) => ({ value: t, label: t }))
+	]);
+
 	// Bridge a nullable-number model field to a text input (empty = null).
 	function numOrNull(v: string): number | null {
 		const t = v.trim();
@@ -485,31 +517,21 @@
 
 						<div class="grid2">
 							<label class="field">
-								<span class="key">Model default</span>
-								<input
-									class="in"
+								<span class="key">Default model</span>
+								<ModelSelect
+									options={modelOptions}
 									value={pf.model.default ?? ''}
-									oninput={(e) => (pf.model.default = e.currentTarget.value || null)}
-									placeholder="provider/model_id"
-									spellcheck="false"
+									onselect={(v) => (pf.model.default = v || null)}
 								/>
 							</label>
 							<label class="field">
-								<span class="key">Temperature</span>
-								<input
-									class="in"
-									value={pf.model.temperature ?? ''}
-									oninput={(e) => (pf.model.temperature = numOrNull(e.currentTarget.value))}
-									placeholder="Model default"
-								/>
-							</label>
-							<label class="field">
-								<span class="key">Max output tokens</span>
-								<input
-									class="in"
-									value={pf.model.max_output_tokens ?? ''}
-									oninput={(e) => (pf.model.max_output_tokens = numOrNull(e.currentTarget.value))}
-									placeholder="Model default"
+								<span class="key">Thinking effort</span>
+								<ModelSelect
+									options={effortOptions}
+									value={pf.model.think_effort ?? ''}
+									onselect={(v) => (pf.model.think_effort = v || null)}
+									disabled={!selectedModelEntry ||
+										(selectedModelEntry.think_efforts ?? []).length === 0}
 								/>
 							</label>
 							<label class="field">

@@ -89,6 +89,11 @@ pub struct ModelSection {
     /// Overrides the model's `max_output_tokens`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+    /// Default reasoning-effort tier for sessions on this profile, as a raw
+    /// tier name the chosen model declares (`low`/`high`/`max`). Resolved
+    /// against the model's `think_efforts`; per-turn picks override it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub think_effort: Option<String>,
 }
 
 /// `[tools]`: which built-in tools and MCP servers are available.
@@ -304,6 +309,7 @@ fn overlay_model(child: ModelSection, parent: ModelSection) -> ModelSection {
         fallback: child.fallback.or(parent.fallback),
         temperature: child.temperature.or(parent.temperature),
         max_output_tokens: child.max_output_tokens.or(parent.max_output_tokens),
+        think_effort: child.think_effort.or(parent.think_effort),
     }
 }
 
