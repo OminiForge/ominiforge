@@ -103,7 +103,13 @@ impl Tool for ShellTool {
         ToolDescriptor {
             name: "shell".to_owned(),
             description: "Run a shell command in the workspace directory and capture its \
-                          combined stdout and stderr."
+                          combined stdout and stderr. LAST RESORT: use a dedicated tool \
+                          instead of a shell equivalent whenever one exists — `read` (not \
+                          cat/sed/head/tail/less/awk), `search` (not grep/rg/ack), `find` \
+                          (not find/ls to locate files), `edit`/`write` (not sed/awk/\"\">\"/tee \
+                          to change files). Reserve `shell` for what no dedicated tool can \
+                          do: build/test/run commands (cargo, npm, make, just), git, \
+                          package managers, and other real executables."
                 .to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",

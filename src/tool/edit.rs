@@ -116,7 +116,9 @@ fn edit_input_schema() -> serde_json::Value {
         "properties": {
             "path": {
                 "type": "string",
-                "description": "File path relative to the workspace root."
+                "description": "File path relative to the workspace root. Emit this \
+                                field FIRST (before `old`/`new`) so streaming can \
+                                render the file immediately."
             },
             "old": {
                 "type": "array",
@@ -158,7 +160,9 @@ impl Tool for EditTool {
         ToolDescriptor {
             name: "edit".to_owned(),
             description: "Replace exact lines of text in existing files — no line numbers, \
-                          no prior-read tag. Give `edits: [{ path, old, new, replace_all? }]`: \
+                          no prior-read tag. Give `edits: [{ path, old, new, replace_all? }]`, \
+                          emitting each entry's `path` FIRST (streaming renders the file \
+                          as soon as `path` arrives): \
                           `old` is the exact current content you're replacing (quoted \
                           verbatim from a `read`/`edit`/`write` output, one file line per \
                           array item), `new` is what it becomes (empty array deletes; an \

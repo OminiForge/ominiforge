@@ -52,14 +52,18 @@ impl Tool for WriteTool {
         ToolDescriptor {
             name: "write".to_owned(),
             description: "Write a UTF-8 text file, relative to the workspace root. \
-                          Creates parent directories and overwrites existing files."
+                          Creates parent directories and overwrites existing files. \
+                          Output `path` FIRST, then `content` (streaming renders the \
+                          file as soon as `path` arrives)."
                 .to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "File path relative to the workspace root."
+                        "description": "File path relative to the workspace root. \
+                                        Emit this field FIRST (before `content`) so \
+                                        streaming can render the file immediately."
                     },
                     "content": {
                         "type": "string",
