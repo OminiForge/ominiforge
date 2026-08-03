@@ -38,11 +38,18 @@
 		/>
 	{:else if parsed?.kind === 'listing'}
 		<div class="head"><span class="path">{parsed.path}</span></div>
-		<ul class="dir">
-			{#each parsed.entries as entry (entry)}
-				<li class="entry" class:is-dir={entry.endsWith('/')}>{entry}</li>
-			{/each}
-		</ul>
+		{#if parsed.entries.length === 0}
+			<!-- A 0-hit find/search (or an empty directory) must not render as a
+			     bare blank: the card would read as broken rather than as a
+			     legitimate "nothing matched". Name the miss. -->
+			<div class="empty">No matches</div>
+		{:else}
+			<ul class="dir">
+				{#each parsed.entries as entry (entry)}
+					<li class="entry" class:is-dir={entry.endsWith('/')}>{entry}</li>
+				{/each}
+			</ul>
+		{/if}
 	{:else}
 		<pre class="plain">{result ?? ''}</pre>
 	{/if}
@@ -81,6 +88,11 @@
 	}
 	.entry.is-dir {
 		color: var(--accent-ink);
+	}
+	.empty {
+		color: var(--text-tertiary);
+		font-family: var(--font-chinese);
+		font-size: 12px;
 	}
 	.plain {
 		margin: 0;
