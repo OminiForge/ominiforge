@@ -260,6 +260,7 @@
 	<div
 		class="item item-activity"
 		class:activity-blocked={item.icon === 'hook' && !!item.detail}
+		class:activity-timer={item.icon === 'timer'}
 		in:fly|local={enterAnim}
 	>
 		<span class="activity-mark" aria-hidden="true">
@@ -287,6 +288,16 @@
 						fill="currentColor"
 						stroke="none"
 					/></svg
+				>
+			{:else if item.icon === 'timer'}
+				<svg
+					viewBox="0 0 12 12"
+					fill="none"
+					stroke="currentColor"
+					stroke-width="1.4"
+					stroke-linecap="round"
+					stroke-linejoin="round"
+					><circle cx="6" cy="6" r="4.5" /><polyline points="6,3 6,6 8.5,7.5" /></svg
 				>
 			{:else}
 				<svg
@@ -856,6 +867,19 @@
 
 	.activity-blocked .activity-detail {
 		background: color-mix(in srgb, var(--warning) 12%, transparent);
+	}
+
+	/* Turn timer: a quiet completion marker — the duration label is the only
+	   content, rendered in tabular-nums mono so it reads as a precise metric,
+	   not prose. Slightly brighter than a routine op trace to signal "done". */
+	.activity-timer {
+		color: var(--text-secondary);
+	}
+
+	.activity-timer .activity-label {
+		font-family: var(--font-mono);
+		font-variant-numeric: tabular-nums;
+		font-size: 11.5px;
 	}
 
 	.activity-spinner {

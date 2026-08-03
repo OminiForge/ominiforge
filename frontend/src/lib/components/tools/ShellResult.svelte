@@ -1,12 +1,14 @@
 <script lang="ts">
 	import RawArgs from './RawArgs.svelte';
 	import { parseView } from '$lib/tools/view';
+	import { parseAnsi } from '$lib/ansi';
 
 	/** `shell` result: rendered from the backend's structured UI view
-	 *  (`doc/tool-view.md`) — the command's combined stdout/stderr as plain
-	 *  monospace, with command + exit code from the structured envelope. An error
-	 *  with empty output (e.g. `exit 3`, no stderr) must stay visible, so it
-	 *  falls back to showing the error code instead of a blank body. */
+	 *  (`doc/tool-view.md`) — the command's combined stdout/stderr with ANSI
+	 *  colors preserved (parsed to styled segments), command + exit code from
+	 *  the structured envelope. An error with empty output (e.g. `exit 3`, no
+	 *  stderr) must stay visible, so it falls back to showing the error code
+	 *  instead of a blank body. */
 	let {
 		args,
 		result,
@@ -23,7 +25,9 @@
 
 	const parsed = $derived(view ? parseView(view) : null);
 	const command = $derived(parsed?.kind === 'terminal' ? parsed.command : null);
-	const output = $derived(parsed?.kind === 'terminal' ? parsed.output : result);
+	const rawOutput = $derived(parsed?.kind === 'terminal' ? parsed.output : result);
+	const segments = $derived(rawOutput ? parseAnsi(rawOutput) : []);
+	const hasOutput = $derived(segments.length > 0);
 	const exitCode = $derived(parsed?.kind === 'terminal' ? parsed.exit_code : undefined);
 </script>
 
@@ -31,8 +35,15 @@
 	{#if command}
 		<div class="cmd">{command}</div>
 	{/if}
-	{#if output}
-		<pre class="out">{output}</pre>
+	{#if hasOutput}
+		<pre class="out">{#each segments as seg, i (i)}<span
+					style:color={seg.fg}
+					style:background-color={seg.bg}
+					style:font-weight={seg.bold ? 600 : undefined}
+					style:opacity={seg.dim ? 0.6 : undefined}
+					style:font-style={seg.italic ? 'italic' : undefined}
+					style:text-decoration={seg.underline ? 'underline' : undefined}
+				>{seg.text}</span>{/each}</pre>
 	{:else if status === 'error'}
 		<div class="empty">
 			No output · <span class="code">{error_code ?? exitCode ?? 'error'}</span>

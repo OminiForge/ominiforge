@@ -495,7 +495,9 @@ async function* parseSse(
 	}
 }
 
-/** Build a structured error from a non-2xx gateway response. */
+/** Build a user-friendly error from a non-2xx gateway response. The raw
+ *  server message is kept as `cause` for debugging; the display message is
+ *  a plain-language Chinese summary, not a JSON blob. */
 async function gatewayError(res: Response): Promise<Error> {
 	let detail = res.statusText;
 	try {
@@ -504,7 +506,52 @@ async function gatewayError(res: Response): Promise<Error> {
 	} catch {
 		// non-JSON body; keep the status text
 	}
-	return new Error(`gateway ${res.status}: ${detail}`);
+	const friendly = friendlyGatewayMessage(res.status, detail);
+	const err = new Error(friendly);
+	(err as Error & { cause?: string }).cause = `gateway ${res.status}: ${detail}`;
+	return err;
+}
+/** Map an HTTP status + server detail to a plain-language message. The
+ *  server detail is often a JSON blob or an internal error string — the
+ *  user should see a clean summary, not raw internals. */
+function friendlyGatewayMessage(status: number, detail: string): string {
+	switch (status) {
+		case 400:
+			return `请求参数有误：${sanitizeDetail(detail)}`;
+		case 401:
+			return '认证失败，请检查网关令牌（token）是否正确。';
+		case 403:
+			return '没有权限执行此操作。';
+		case 404:
+			return `未找到请求的资源：${sanitizeDetail(detail)}`;
+		case 409:
+			return `操作冲突：${sanitizeDetail(detail)}`;
+		case 429:
+			return '请求过于频繁，请稍后再试。';
+		case 500:
+			return `服务器内部错误：${sanitizeDetail(detail)}`;
+		case 502:
+		case 503:
+			return '网关暂时不可用，请稍后重试。';
+		default:
+			return `请求失败（${status}）：${sanitizeDetail(detail)}`;
+	}
+}
+/** Trim a server error detail to a reasonable length and strip surrounding
+ *  JSON quotes/braces so the user sees plain text, not a raw payload. */
+function sanitizeDetail(detail: string): string {
+	// If the detail looks like a JSON object (starts with '{'), extract just
+	// the error message value to avoid showing raw JSON to the user.
+	let text = detail;
+	if (text.startsWith('{')) {
+		try {
+			const parsed = JSON.parse(text) as { error?: string; message?: string };
+			text = parsed.error ?? parsed.message ?? text;
+		} catch {
+			// not valid JSON; use as-is
+		}
+	}
+	return text.length > 120 ? text.slice(0, 120) + '…' : text;
 }
 
 function headerObj(init?: HeadersInit): Record<string, string> {

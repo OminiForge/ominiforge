@@ -26,12 +26,12 @@ export const statLabel = {
 	cache: 'cache'
 } as const;
 
-/** Cache-hit rate as a whole-percent string. Branched sessions carry an
+/** Cache-hit rate as a two-decimal percent string. Branched sessions carry an
  *  inherited snapshot their own requests never re-read, so their rate
  *  reflects only this session's requests (reads low right after a branch) —
  *  the `*` marks that caveat (details on hover). */
 export function cacheLabel(s: SessionSummary, branched: boolean): string {
-	return `${(s.cache_hit_rate * 100).toFixed(0)}%${branched ? '*' : ''}`;
+	return `${(s.cache_hit_rate * 100).toFixed(2)}%${branched ? '*' : ''}`;
 }
 
 /** Top tools by call count, capped. Bar width is relative to this set's own max,

@@ -97,7 +97,7 @@ export type Item =
 	| {
 			kind: 'activity';
 			id: number;
-			icon: 'hook' | 'todo' | 'runtime';
+			icon: 'hook' | 'todo' | 'runtime' | 'timer';
 			label: string;
 			detail?: string;
 			/** True while the op this row traces is still streaming/executing.
@@ -166,6 +166,11 @@ export interface ConversationState {
 	 *  task without persisting a terminator, so reloading such a session leaves
 	 *  this `true` (a stale Cancel that no-ops on click). */
 	turnRunning?: boolean;
+	/** ISO timestamp of the current turn's `Turn::Started` event, kept so the
+	 *  terminator (`Completed`/`Failed`/`Interrupted`) can compute the turn's
+	 *  wall-clock duration from the two committed timestamps. Cleared when the
+	 *  turn ends. */
+	turnStartedAt?: string;
 	/** Distinct models seen on the runtime layer: every model a `RequestStarted`
 	 *  actually used this session (deduplicated). The display source stays the
 	 *  config layer (the session page's `runtime`); this is the *validation*
@@ -267,6 +272,7 @@ export function apply(state: ConversationState, ev: GatewayEvent): ConversationS
 				...state,
 				lastSettle: ev.incomplete,
 				turnRunning: false,
+				turnStartedAt: undefined,
 				requestStart: undefined,
 				requestCommitted: undefined,
 				commitBase: undefined
@@ -320,7 +326,7 @@ function applyCommitted(
 						(it) => !(it.kind === 'user' && it.pending && it.text === t.Started.input)
 					)
 				: next.items;
-			const started = { ...next, items, turnRunning: true };
+			const started = { ...next, items, turnRunning: true, turnStartedAt: core.timestamp };
 			return t.Started.input
 				? push(started, {
 						kind: 'user',
@@ -340,11 +346,27 @@ function applyCommitted(
 			// cancel path is racy about writing Decided; this fold is the race-free
 			// guarantee).
 			const hasPending = next.items.some((it) => it.kind === 'tool' && it.approvalPending);
-			if (!hasPending) return { ...next, turnRunning: false };
-			const items = next.items.map((it) =>
-				it.kind === 'tool' && it.approvalPending ? { ...it, approvalPending: false } : it
-			);
-			return { ...next, items, turnRunning: false };
+			// Wall-clock duration from the committed Started/terminator timestamps
+			// (covers model requests AND tool execution). Only shown when the turn
+			// started cleanly — a resumed turn's Started is in the prior session.
+			const duration = next.turnStartedAt
+				? formatTurnDuration(new Date(core.timestamp).getTime() - new Date(next.turnStartedAt).getTime())
+				: undefined;
+			const base: ConversationState = { ...next, turnRunning: false, turnStartedAt: undefined };
+			if (hasPending) {
+				base.items = base.items.map((it) =>
+					it.kind === 'tool' && it.approvalPending ? { ...it, approvalPending: false } : it
+				);
+			}
+			if (duration) {
+				return push(base, {
+					kind: 'activity',
+					id: Number(core.seq),
+					icon: 'timer',
+					label: duration
+				});
+			}
+			return base;
 		}
 		return next;
 	}
@@ -832,6 +854,18 @@ type LeafOp =
 	| { op: 'block'; id: string; reason?: string }
 	| { op: 'add'; content: string; after_id?: string };
 
+/** Format a turn's wall-clock duration for the activity timeline. Rounds
+ *  to one decimal for sub-minute turns, whole minutes:seconds above that
+ *  ("3.2s", "47s", "2m 5s"). Returns undefined for negative/zero durations
+ *  (clock skew between events). */
+function formatTurnDuration(ms: number): string | undefined {
+	if (ms <= 0) return undefined;
+	const totalSec = ms / 1000;
+	if (totalSec < 60) return `${totalSec.toFixed(1)}s`;
+	const min = Math.floor(totalSec / 60);
+	const sec = Math.round(totalSec % 60);
+	return `${min}m ${sec}s`;
+}
 /** Push a transient item, allocating its negative id from the state counter
  *  (see `Item.id`). Every push site that does not carry a committed event seq
  *  (notices, errors) goes through here. */
