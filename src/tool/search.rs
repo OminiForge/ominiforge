@@ -222,6 +222,12 @@ struct Outcome {
 /// Walk `root` (honoring `.gitignore`), collecting one [`Hit`] per line whose
 /// content matches `matcher`. Binary files are skipped by the searcher.
 ///
+/// `root` may be a directory (walked recursively) or a single FILE — the
+/// walker's depth-0 entry is the root itself, which for a directory is
+/// skipped (directories carry no content) but for a file IS the one and only
+/// candidate, so the depth-0 skip must only apply when that entry is not a
+/// file.
+///
 /// Paths are `/`-separated regardless of platform; hits are collected then
 /// sorted by path then line for stable output. The full match count is kept
 /// even past `limit`; only the returned vector is truncated.
@@ -245,9 +251,9 @@ fn walk(
         .build()
         .flatten()
     {
-        if entry.depth() == 0 {
-            continue;
-        }
+        // Skip directory entries (including the root dir at depth 0); keep
+        // files — a depth-0 entry that IS a file is the caller's file-scoped
+        // `path` and must be searched, not skipped.
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
@@ -480,6 +486,38 @@ mod tests {
         i.input["path"] = serde_json::json!("src");
         let out = t.invoke(i).await.unwrap();
         assert_eq!(matches(&out), vec!["src/a.rs:1:hit"]);
+    }
+
+    /// `path` may name a single FILE, not just a directory: the walker's
+    /// root entry (depth 0) IS that file, so the depth-0 skip must not drop
+    /// it. Regression test for the bug where a file-scoped `path` always
+    /// returned 0 matches.
+    #[tokio::test]
+    async fn path_scopes_search_to_a_single_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/a.rs", "hit\n");
+        write(dir.path(), "other/b.rs", "hit\n");
+        let t = SearchTool::new(dir.path().to_path_buf());
+
+        let mut i = input("hit");
+        i.input["path"] = serde_json::json!("src/a.rs");
+        let out = t.invoke(i).await.unwrap();
+        assert_eq!(matches(&out), vec!["src/a.rs:1:hit"]);
+    }
+
+    /// A file-scoped `path` still honors `include`: a glob that doesn't match
+    /// the file yields zero hits rather than silently ignoring the filter.
+    #[tokio::test]
+    async fn file_path_still_honors_include() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/a.rs", "hit\n");
+        let t = SearchTool::new(dir.path().to_path_buf());
+
+        let mut i = input("hit");
+        i.input["path"] = serde_json::json!("src/a.rs");
+        i.input["include"] = serde_json::json!(["*.txt"]);
+        let out = t.invoke(i).await.unwrap();
+        assert!(text(&out).starts_with("0 matches"));
     }
 
     /// `path` may not escape the workspace.
