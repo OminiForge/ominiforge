@@ -248,6 +248,33 @@
 					</section>
 				{/if}
 			{/if}
+
+			<!-- LSP: live status of the language servers this session ACTIVATED
+     (`doc/lsp.md` §5.1). Only servers touched by a file op are listed —
+     a rust+ts session shows rust-analyzer / typescript-language-server,
+     never clangd/gopls. Last section: diagnostic trivia, below the
+     session's own Info/Context/Stats. Empty list (cold session / no op
+     yet) renders nothing, matching the rail's "detected, therefore
+     shown" rule. -->
+			{#if runtime && runtime.lsp.length > 0}
+				<section class="detail-section">
+					<div class="detail-label">LSP</div>
+					{#each runtime.lsp as srv (srv.name)}
+						<div class="kv">
+							<div class="kv-val lsp-name" title={`${srv.name} · .${srv.extensions.join(' .')}`}>
+								{srv.name}
+							</div>
+							<span
+								class="lsp-state"
+								class:running={srv.state === 'running'}
+								class:failed={srv.state === 'failed'}
+							>
+								{srv.state}
+							</span>
+						</div>
+					{/each}
+				</section>
+			{/if}
 		</div>
 	{:else}
 		<!-- INSPECT: raw event timeline. Read rawLog imperatively; inspectTick
@@ -368,6 +395,40 @@
 		overflow: hidden;
 		text-overflow: ellipsis;
 		max-width: 100%;
+	}
+
+	/* LSP status rows: server name + state badge on one horizontal line. */
+	.lsp-name {
+		color: var(--text-primary);
+	}
+
+	/* The badge mirrors the tool-block state language (§4.1): a pip-less
+	   mono label tinted by state. starting (amber, indexing) → running
+	   (green) / failed (red); untouched servers are omitted, not shown.
+	   The tertiary base is a defensive fallback. No accent. */
+	.kv:has(.lsp-state) {
+		flex-direction: row;
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--space-2);
+	}
+
+	.lsp-state {
+		font-family: var(--font-mono);
+		font-size: 9.5px;
+		font-weight: 510;
+		letter-spacing: 0.08em;
+		text-transform: uppercase;
+		color: var(--text-tertiary);
+		line-height: 1;
+	}
+
+	.lsp-state.running {
+		color: var(--state-done-text);
+	}
+
+	.lsp-state.failed {
+		color: var(--state-error-text);
 	}
 
 	/* Divergence marker: runtime model ≠ configured model (fail-loud, B4) */

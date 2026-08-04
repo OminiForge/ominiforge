@@ -686,6 +686,14 @@
 					// STATS snapshot so turns/cost/tokens track the live conversation.
 					if (ev.type === 'turn_settled') {
 						void refreshSummary(id);
+						// LSP servers spawn/state-change during a turn's file ops, so the
+						// INFO panel's LSP section is only fresh if runtime is refetched
+						// once the turn settles (`doc/lsp.md` §5.1). Best-effort: keep the
+						// last good value on failure rather than blanking the panel.
+						client
+							.getRuntime(id)
+							.then((rt) => (runtime = rt))
+							.catch(() => {});
 						// The turn is done: release the next queued message (if any). One
 						// per settle keeps the gateway's own defer-queue empty, so every
 						// still-pending message stays here — visible and cancellable.
@@ -774,6 +782,23 @@
 		const id = sessionId;
 		const seq = convo.lastSeq;
 		if (id !== DRAFT_ID && seq !== undefined) markSeen(id, seq);
+	});
+
+	// While any LSP server is `starting`, poll the runtime on a short cadence so
+	// the "indexing…" hint clears as soon as the server runs/fails — the mount +
+	// turn_settled refetches are too sparse for a transient that may resolve in
+	// seconds (`doc/lsp.md` §5.2). The effect re-runs when the starting set
+	// changes; the interval only lives while something is still starting.
+	$effect(() => {
+		const id = sessionId;
+		if (id === DRAFT_ID || startingServers.length === 0) return;
+		const timer = setInterval(() => {
+			client
+				.getRuntime(id)
+				.then((rt) => (runtime = rt))
+				.catch(() => {});
+		}, 2000);
+		return () => clearInterval(timer);
 	});
 
 	/** Load the profile + model lists for the config picker. Fetched once
@@ -1076,6 +1101,14 @@
 	// Cancel only makes sense while a turn is running (the backend ignores Cancel
 	// when idle), so the button is shown only then — see ConversationState.turnRunning.
 	const turnRunning = $derived(convo.turnRunning === true);
+
+	// Servers still in their `starting` transient (spawned + handshook, not yet
+	// answering — `doc/lsp.md` §5.2). The composer shows a transient "indexing…"
+	// hint for these so a slow index never reads as the app hanging. Empty when
+	// every server is running/failed — the hint disappears on its own.
+	const startingServers = $derived(
+		(runtime?.lsp ?? []).filter((s) => s.state === 'starting')
+	);
 
 	// The seq of the FIRST user message in the view. Forking before it would
 	// inherit an empty context (identical to a plain new session), so that first
@@ -1548,6 +1581,14 @@
 								     icon is per-row; this is the in-context signal). -->
 								<span class="status-running">
 									<span class="status-running-dot"></span>Running
+								</span>
+							{:else if startingServers.length > 0}
+								<!-- LSP indexing transient (`doc/lsp.md` §5.2): a server in
+								     its `starting` state is indexing, so a slow first answer
+								     never reads as the app hanging. Amber, chinese font; it
+								     disappears on its own once the server runs/fails. -->
+								<span class="status-warn lsp-starting">
+									{startingServers[0].name} 索引中…{#if startingServers.length > 1} +{startingServers.length - 1}{/if}
 								</span>
 							{:else if incomplete}
 								<span class="status-warn">Turn incomplete</span>
