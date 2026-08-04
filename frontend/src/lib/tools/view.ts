@@ -7,6 +7,13 @@
 export interface DiffFile {
 	path: string;
 	patch: string;
+	/** The auto-formatter that changed the text (`doc/format.md` §6), when the
+	 *  diff includes its reflow — the reader should know part of the change is
+	 *  not the model's edit. */
+	formatted_by?: string;
+	/** How many change regions the formatter made (its own edits only), for
+	 *  the "N 处调整" in the annotation. */
+	format_adjustments?: number;
 }
 
 /** A file's content. Whole-file reads carry raw content (numbered 1..N by
@@ -92,7 +99,10 @@ export function parseView(text: string): ToolView | null {
 					.filter((f): f is Record<string, unknown> => !!f && typeof f === 'object')
 					.map((f) => ({
 						path: String(f.path ?? ''),
-						patch: String(f.patch ?? '')
+						patch: String(f.patch ?? ''),
+						formatted_by: typeof f.formatted_by === 'string' ? f.formatted_by : undefined,
+						format_adjustments:
+							typeof f.format_adjustments === 'number' ? f.format_adjustments : undefined
 					}))
 			};
 		}

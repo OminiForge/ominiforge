@@ -244,12 +244,21 @@ pub async fn assemble(
         .context("failed to load lsp.toml")
         .map(|cfg| crate::lsp::LspManager::new(&cfg, workspace.clone(), env_overlay.clone()))?;
 
+    // Auto-format after edit/write (doc/format.md): load `format.toml`, build
+    // a stateless manager. `None` when `mode = "off"` or no formatter is
+    // configured, so edit/write pay nothing. Unlike the LSP manager this owns
+    // no subprocess — each format is a fresh stdin→stdout call.
+    let format_manager = crate::format::FormatConfig::load(store.roots())
+        .context("failed to load format.toml")
+        .map(|cfg| crate::format::FormatManager::new(cfg, env_overlay.clone()))?;
+
     register_profile_tools(
         &mut tools,
         &profile,
         workspace.clone(),
         Arc::clone(&sandbox),
         lsp_manager.clone(),
+        format_manager,
     );
 
     // Connect configured MCP servers and register their tools alongside the
@@ -371,6 +380,7 @@ fn register_profile_tools(
     workspace: PathBuf,
     sandbox: Arc<dyn crate::sandbox::Sandbox>,
     lsp: Option<Arc<crate::lsp::LspManager>>,
+    format: Option<Arc<crate::format::FormatManager>>,
 ) {
     if profile.tools.allows("find") {
         registry.register(Arc::new(FindTool::new(workspace.clone())));
@@ -383,11 +393,17 @@ fn register_profile_tools(
     }
     if profile.tools.allows("write") {
         registry.register(Arc::new(
-            WriteTool::new(workspace.clone()).with_lsp(lsp.clone()),
+            WriteTool::new(workspace.clone())
+                .with_lsp(lsp.clone())
+                .with_format(format.clone()),
         ));
     }
     if profile.tools.allows("edit") {
-        registry.register(Arc::new(EditTool::new(workspace.clone()).with_lsp(lsp)));
+        registry.register(Arc::new(
+            EditTool::new(workspace.clone())
+                .with_lsp(lsp)
+                .with_format(format),
+        ));
     }
     if profile.tools.allows("shell") {
         registry.register(Arc::new(ShellTool::new(sandbox)));
@@ -501,6 +517,7 @@ mod tests {
                 BTreeMap::new(),
             )),
             None,
+            None,
         );
         let names: Vec<String> = reg.descriptors().into_iter().map(|d| d.name).collect();
         assert_eq!(
@@ -532,6 +549,7 @@ mod tests {
                 PathBuf::from("/tmp/ws"),
                 BTreeMap::new(),
             )),
+            None,
             None,
         );
         let names: Vec<String> = reg.descriptors().into_iter().map(|d| d.name).collect();

@@ -18,6 +18,7 @@ pub mod context;
 pub mod env;
 pub mod eval;
 pub mod evolution;
+pub mod format;
 pub mod gateway;
 pub mod hook;
 pub mod llm;

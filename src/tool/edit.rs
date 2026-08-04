@@ -21,6 +21,7 @@ use super::{
     resolve_in_workspace,
 };
 use crate::core::payload::{Content, ToolOutput};
+use crate::format::FormatManager;
 use crate::lsp::LspManager;
 
 /// Applies content-anchored edits relative to the session workspace.
@@ -30,6 +31,9 @@ pub struct EditTool {
     /// Optional LSP assist: when set, a successful edit appends each written
     /// file's diagnostics to the result (`doc/lsp.md`).
     lsp: Option<Arc<LspManager>>,
+    /// Optional auto-format: when set, the written file is formatted before
+    /// the diff/diagnostics are produced (`doc/format.md`).
+    format: Option<Arc<FormatManager>>,
 }
 
 #[derive(Deserialize)]
@@ -99,6 +103,7 @@ impl EditTool {
         Self {
             workspace,
             lsp: None,
+            format: None,
         }
     }
 
@@ -106,6 +111,14 @@ impl EditTool {
     #[must_use]
     pub fn with_lsp(mut self, lsp: Option<Arc<LspManager>>) -> Self {
         self.lsp = lsp;
+        self
+    }
+
+    /// Attach a [`FormatManager`] so successful edits are formatted before
+    /// their diff/diagnostics are produced (`doc/format.md`).
+    #[must_use]
+    pub fn with_format(mut self, format: Option<Arc<FormatManager>>) -> Self {
+        self.format = format;
         self
     }
 }
@@ -202,27 +215,64 @@ impl Tool for EditTool {
             Err(PlanErr::Business(out)) => return Ok(out),
         };
 
-        let mut summaries = Vec::with_capacity(planned.len());
-        // Render the UI diff from the plan BEFORE consuming it for the writes
-        // (the plan's captured pre-edit lines + splices are the view's data).
-        let view_text = plan_view(&planned);
-        // Remember what we wrote (abs path, display name, final text) so the LSP
-        // assist can request diagnostics per file after all writes land.
-        let mut written: Vec<(PathBuf, String, String)> = Vec::with_capacity(planned.len());
+        // Auto-format each planned file BEFORE it lands (`doc/format.md` §6):
+        // the formatter consumes the model's target text in memory, the FINAL
+        // text is written once, and the diff/diagnostics below are anchored to
+        // it — so the model's next edit anchors to the real, formatted state
+        // and never hits a `not_found` from formatting drift. Fail-closed: a
+        // skip keeps the model's text. `written` remembers (abs path, display
+        // name, final text, formatter) for the view + diagnostics.
+        let mut written: Vec<WrittenFile> = Vec::with_capacity(planned.len());
         for plan in planned {
-            if let Err(e) = tokio::fs::write(&plan.abs_path, plan.new_content.as_bytes()).await {
+            let outcome = match &self.format {
+                Some(fmt) => {
+                    fmt.format(&plan.abs_path, &plan.new_content, plan.edited_lines)
+                        .await
+                }
+                None => crate::format::FormatOutcome::Skipped {
+                    text: plan.new_content.clone(),
+                },
+            };
+            // Record the formatter only when it actually changed the text —
+            // an already-formatted file carries no annotation. The adjustment
+            // count is the formatter's OWN change regions (model text →
+            // formatted text), so the annotation attributes only its edits.
+            let formatter = match &outcome {
+                crate::format::FormatOutcome::Formatted { formatter, text }
+                    if *text != plan.new_content =>
+                {
+                    Some((
+                        formatter.clone(),
+                        super::diffview::change_region_count(&plan.new_content, text),
+                    ))
+                }
+                _ => None,
+            };
+            let final_text = outcome.into_text();
+            if let Err(e) = tokio::fs::write(&plan.abs_path, final_text.as_bytes()).await {
                 return Ok(business_error(
                     "write_failed",
                     &format!("failed to write {}: {e}", plan.rel_path),
                 ));
             }
+            written.push(WrittenFile {
+                abs_path: plan.abs_path,
+                rel_path: plan.rel_path,
+                old_content: plan.old_content,
+                final_text,
+                replacement_count: plan.replacement_count,
+                formatter,
+            });
+        }
+
+        let mut summaries = Vec::with_capacity(written.len());
+        for w in &written {
             summaries.push(format!(
                 "edited {} ({} replacement{})",
-                plan.rel_path,
-                plan.replacement_count,
-                if plan.replacement_count == 1 { "" } else { "s" }
+                w.rel_path,
+                w.replacement_count,
+                if w.replacement_count == 1 { "" } else { "s" }
             ));
-            written.push((plan.abs_path, plan.rel_path, plan.new_content));
         }
 
         let mut output = ToolOutput {
@@ -233,20 +283,24 @@ impl Tool for EditTool {
         // The UI diff view rides as a `TextView` block after the model-facing
         // summary: rendered by the front-end, skipped by `render_output`, so
         // the model never pays tokens for a diff of its own arguments
-        // (`doc/tool-view.md`).
+        // (`doc/tool-view.md`). The diff is `old_content → final_text` — when
+        // a formatter ran it includes the formatter's reflow, annotated with
+        // `formatted_by` so the reader knows part of the change is not the
+        // model's (`doc/format.md` §6).
+        let view_text = written_view(&written);
         if !view_text.is_empty() {
             output.content.push(Content::TextView {
                 text: view_text,
                 audience: crate::core::payload::AUDIENCE_UI.to_owned(),
             });
         }
-        for (abs_path, rel_path, new_content) in &written {
+        for w in &written {
             append_diagnostics(
                 self.lsp.as_ref(),
                 &mut output,
-                abs_path,
-                rel_path,
-                new_content,
+                &w.abs_path,
+                &w.rel_path,
+                &w.final_text,
             )
             .await;
         }
@@ -254,29 +308,50 @@ impl Tool for EditTool {
     }
 }
 
-/// Render the planned files' diff views into a JSON envelope
-/// `{ kind: "diff", files: [{ path, patch }] }` (same shape as the executed
-/// `TextView`). Used by `invoke` (post-write view).
-fn plan_view(planned: &[PlannedWrite]) -> String {
+/// One file that landed on disk: everything the diff view and diagnostics
+/// need, anchored to the FINAL (possibly formatted) text.
+struct WrittenFile {
+    abs_path: PathBuf,
+    rel_path: String,
+    old_content: String,
+    final_text: String,
+    replacement_count: usize,
+    /// The formatter that changed the text plus how many change regions it
+    /// made (drives `formatted_by` / the "N 处调整" annotation).
+    formatter: Option<(String, usize)>,
+}
+
+/// Render the written files' diff views into a JSON envelope
+/// `{ kind: "diff", files: [{ path, patch, formatted_by? }] }`. The diff is
+/// `old_content → final_text` (`doc/format.md` §6): when a formatter changed
+/// the text, the diff includes its reflow and the file entry carries a
+/// `formatted_by` annotation so the reader knows part of the change is not
+/// the model's. `render_hunks`'s splice-anchored render can't be used here
+/// because the formatter's edits aren't among the model's splices — so this
+/// runs a real line-level diff (`similar`, same as `write`).
+fn written_view(written: &[WrittenFile]) -> String {
     let mut files: Vec<serde_json::Value> = Vec::new();
-    for plan in planned {
-        if let Some(view) = &plan.view {
-            let patch = super::diffview::render_hunks(
-                &view.lines,
-                &view
-                    .splices
-                    .iter()
-                    .map(|(s, e, p)| (*s, *e, p.as_slice()))
-                    .collect::<Vec<_>>(),
-                super::diffview::default_context(),
-            );
-            if !patch.is_empty() {
-                files.push(serde_json::json!({
-                    "path": plan.rel_path,
-                    "patch": patch,
-                }));
-            }
+    for w in written {
+        if w.old_content == w.final_text {
+            continue; // no change — no diff block
         }
+        let patch = super::diffview::write_diff(
+            &w.old_content,
+            &w.final_text,
+            super::diffview::default_context(),
+        );
+        if patch.is_empty() {
+            continue;
+        }
+        let mut entry = serde_json::json!({
+            "path": w.rel_path,
+            "patch": patch,
+        });
+        if let Some((formatter, adjustments)) = &w.formatter {
+            entry["formatted_by"] = serde_json::Value::String(formatter.clone());
+            entry["format_adjustments"] = serde_json::json!(adjustments);
+        }
+        files.push(entry);
     }
     if files.is_empty() {
         return String::new();
@@ -366,22 +441,18 @@ struct Entry {
     replace_all: bool,
 }
 
-/// The data needed to render one file's UI diff view after the write lands:
-/// pre-edit lines plus the exact resolved splices, so the view shows the
-/// tool's own matching result — not a re-match against possibly-stale
-/// content (`doc/tool-view.md` §4).
-struct ViewData {
-    lines: Vec<String>,
-    splices: Vec<(usize, usize, Vec<String>)>,
-}
-
 /// A validated path's worth of edits, ready to write.
 struct PlannedWrite {
     abs_path: PathBuf,
     rel_path: String,
+    /// The file's content before the edit — the diff's "before" side and the
+    /// base for re-rendering after auto-format (`doc/format.md` §6).
+    old_content: String,
     new_content: String,
     replacement_count: usize,
-    view: Option<ViewData>,
+    /// The 1-based inclusive line range the edits touched, for `mode = "edit"`
+    /// formatting. `None` when nothing actually changed.
+    edited_lines: Option<(u32, u32)>,
 }
 
 impl EditTool {
@@ -463,29 +534,10 @@ impl EditTool {
 
         let replacement_count = splices.len();
 
-        // Capture the UI diff view BEFORE applying: the original lines plus
-        // the resolved (start, end, new) splices. Skipped when nothing
-        // actually changes (identical old/new) — an empty diff renders no
-        // block, matching the summary-only contract.
-        let view = {
-            let owned_lines: Vec<String> = lines.iter().map(|s| (*s).to_owned()).collect();
-            let owned_splices: Vec<(usize, usize, Vec<String>)> = splices
-                .iter()
-                .map(|&(start, end, entry)| (start, end, entry.new.clone()))
-                .collect();
-            let text = super::diffview::render_hunks(
-                &owned_lines,
-                &owned_splices
-                    .iter()
-                    .map(|(s, e, p)| (*s, *e, p.as_slice()))
-                    .collect::<Vec<_>>(),
-                super::diffview::default_context(),
-            );
-            (!text.is_empty()).then_some(ViewData {
-                lines: owned_lines,
-                splices: owned_splices,
-            })
-        };
+        // The 1-based inclusive line range the edits touch, in the NEW
+        // content's coordinates (for `mode = "edit"` formatting). Computed
+        // from the splices BEFORE they are consumed below.
+        let edited_lines = edited_line_range(&splices);
 
         // Apply high-index first so earlier splices' indices stay valid.
         let mut out: Vec<String> = lines.iter().map(|s| (*s).to_owned()).collect();
@@ -498,14 +550,47 @@ impl EditTool {
             new_content.push('\n');
         }
 
+        // `edited_lines` is meaningful only when the edit actually changed
+        // something — an identical old/new leaves nothing to format locally.
+        let changed = new_content != content;
+
         Ok(PlannedWrite {
             abs_path: abs_path.to_path_buf(),
             rel_path: rel_path.to_owned(),
+            old_content: content,
             new_content,
             replacement_count,
-            view,
+            edited_lines: if changed { edited_lines } else { None },
         })
     }
+}
+
+/// The 1-based inclusive line range a set of splices touches, in the NEW
+/// content's coordinates (for `mode = "edit"` formatting, `doc/format.md`
+/// §5). Walks the sorted splices tracking the cumulative line shift from old
+/// to new coordinates. Coordinates stay in `isize` (a pure deletion can pull
+/// a later splice's new-start below its old one) and convert to `u32` once;
+/// line counts here are file lengths, far below any wrap concern.
+#[allow(clippy::cast_possible_wrap)]
+fn edited_line_range(splices: &[(usize, usize, &Entry)]) -> Option<(u32, u32)> {
+    if splices.is_empty() {
+        return None;
+    }
+    let mut first_new_start = isize::MAX;
+    let mut last_new_end = 0isize;
+    let mut shift = 0isize;
+    for (start, end, entry) in splices {
+        let new_start = *start as isize + shift;
+        first_new_start = first_new_start.min(new_start);
+        last_new_end = last_new_end.max(new_start + entry.new.len() as isize);
+        shift += entry.new.len() as isize - (*end - *start) as isize;
+    }
+    // 1-based inclusive [start, end]; a pure insertion has new.len() lines, a
+    // pure deletion touches the line it collapsed into.
+    let to_u32 = |v: isize| u32::try_from(v).unwrap_or(u32::MAX);
+    let start_line = to_u32(first_new_start + 1);
+    let end_line = to_u32(last_new_end.max(first_new_start + 1));
+    Some((start_line, end_line))
 }
 
 /// Every start index (0-based) at which `needle` occurs as a contiguous run in
@@ -841,6 +926,128 @@ b
             .unwrap();
         assert!(!out.is_error);
         assert!(view(&out).is_none());
+    }
+
+    // --- auto-format integration (`doc/format.md`) --------------------------
+
+    /// A `FormatManager` whose only formatter strips trailing whitespace via
+    /// `sed` — a deterministic *whitespace-only* change, so it passes the
+    /// fail-closed consistency check (non-whitespace content is unchanged).
+    fn fmt_manager() -> std::sync::Arc<crate::format::FormatManager> {
+        let config = crate::format::FormatConfig {
+            mode: Some(crate::format::FormatMode::File),
+            formatters: vec![crate::format::FormatterConfig {
+                name: "trim-ws".to_owned(),
+                command: "sed".to_owned(),
+                args: vec!["s/[[:space:]]*$//".to_owned()],
+                env: std::collections::HashMap::new(),
+                extensions: vec!["txt".to_owned()],
+                enabled: true,
+                supports_line_range: false,
+                format_timeout_ms: 5_000,
+            }],
+        };
+        crate::format::FormatManager::new(config, std::collections::BTreeMap::new()).unwrap()
+    }
+
+    /// When the formatter changes the text, the edit writes the FORMATTED
+    /// text and the diff view reflects it (annotated `formatted_by`), so the
+    /// model's next edit anchors to the real on-disk state (`doc/format.md`
+    /// §2/§6). The model's `new` here carries trailing whitespace; the
+    /// formatter strips it, and the diff shows the stripped line.
+    #[tokio::test]
+    async fn formatted_edit_diff_anchors_to_formatted_text() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "a\nb\nc\n").unwrap();
+        let t = EditTool::new(dir.path().to_path_buf()).with_format(Some(fmt_manager()));
+
+        let out = t
+            .invoke(call(serde_json::json!([
+                { "path": "f.txt", "old": ["b"], "new": ["B   "] }
+            ])))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{:?}", out.content);
+        // The on-disk text is formatted (trailing whitespace stripped).
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "a\nB\nc\n"
+        );
+        // The diff shows the formatted line (`+B`, not `+B   `) and names the
+        // formatter.
+        let view_json: serde_json::Value = serde_json::from_str(view(&out).unwrap()).unwrap();
+        assert_eq!(view_json["files"][0]["formatted_by"], "trim-ws");
+        // The formatter stripped trailing whitespace on one line — one change
+        // region, attributed to it (not to the model).
+        assert_eq!(view_json["files"][0]["format_adjustments"], 1);
+        let patch = view_json["files"][0]["patch"].as_str().unwrap();
+        assert!(
+            patch.contains("\n+B\n"),
+            "patch should show stripped +B: {patch}"
+        );
+        assert!(
+            !patch.contains("+B   "),
+            "patch must not show the pre-format text"
+        );
+    }
+
+    /// A file the formatter leaves unchanged carries no `formatted_by`
+    /// annotation — an already-clean file must not claim it was reformatted.
+    #[tokio::test]
+    async fn unchanged_format_has_no_annotation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "a\nb\nc\n").unwrap();
+        let t = EditTool::new(dir.path().to_path_buf()).with_format(Some(fmt_manager()));
+
+        let out = t
+            .invoke(call(serde_json::json!([
+                { "path": "f.txt", "old": ["b"], "new": ["B"] }
+            ])))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{:?}", out.content);
+        let view_json: serde_json::Value = serde_json::from_str(view(&out).unwrap()).unwrap();
+        assert!(view_json["files"][0].get("formatted_by").is_none());
+    }
+
+    /// Fail-closed end to end: a formatter whose binary is missing skips
+    /// formatting, so the edit writes the model's ORIGINAL text (trailing
+    /// whitespace and all) and no annotation appears — never a broken result.
+    #[tokio::test]
+    async fn missing_formatter_keeps_original_text() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "a\nb\nc\n").unwrap();
+        let config = crate::format::FormatConfig {
+            mode: Some(crate::format::FormatMode::File),
+            formatters: vec![crate::format::FormatterConfig {
+                name: "gone".to_owned(),
+                command: "definitely-not-a-real-formatter-xyz".to_owned(),
+                args: vec![],
+                env: std::collections::HashMap::new(),
+                extensions: vec!["txt".to_owned()],
+                enabled: true,
+                supports_line_range: false,
+                format_timeout_ms: 5_000,
+            }],
+        };
+        let fmt =
+            crate::format::FormatManager::new(config, std::collections::BTreeMap::new()).unwrap();
+        let t = EditTool::new(dir.path().to_path_buf()).with_format(Some(fmt));
+
+        let out = t
+            .invoke(call(serde_json::json!([
+                { "path": "f.txt", "old": ["b"], "new": ["B   "] }
+            ])))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{:?}", out.content);
+        // Original (unstripped) text is on disk; no annotation.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "a\nB   \nc\n"
+        );
+        let view_json: serde_json::Value = serde_json::from_str(view(&out).unwrap()).unwrap();
+        assert!(view_json["files"][0].get("formatted_by").is_none());
     }
 
     #[tokio::test]

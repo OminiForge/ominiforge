@@ -145,21 +145,59 @@ struct Flat {
 /// correspondence to the old, so this runs a real line-level diff (`similar`,
 /// Myers) and windows it into hunks.
 ///
-/// Returns `""` when the contents are identical (a no-change write renders no
-/// diff block, same as the old front-end).
-pub fn write_diff_json(path: &str, old: &str, new: &str, context: usize) -> String {
+/// `formatted` annotates the file entry when an auto-formatter changed the
+/// text (`doc/format.md` §6): the formatter's name plus how many change
+/// regions it made, so the front-end can note that part of the diff is the
+/// formatter's reflow, not the model's edit. Returns `""` when the contents
+/// are identical (a no-change write renders no diff block, same as the old
+/// front-end).
+pub fn write_diff_json(
+    path: &str,
+    old: &str,
+    new: &str,
+    context: usize,
+    formatted: Option<(&str, usize)>,
+) -> String {
     let body = write_diff(old, new, context);
     if body.is_empty() {
         return String::new();
     }
+    let mut file = serde_json::json!({
+        "path": path,
+        "patch": body,
+    });
+    if let Some((formatter, adjustments)) = formatted {
+        file["formatted_by"] = serde_json::Value::String(formatter.to_owned());
+        file["format_adjustments"] = serde_json::json!(adjustments);
+    }
     serde_json::json!({
         "kind": "diff",
-        "files": [{
-            "path": path,
-            "patch": body,
-        }],
+        "files": [file],
     })
     .to_string()
+}
+
+/// Count the number of distinct change regions (hunks) between two texts —
+/// used for the "N 处调整" in the `formatted by` annotation, where a region
+/// (not a line) is the natural unit of "the formatter touched this spot".
+/// A maximal run of non-equal lines is one region.
+#[must_use]
+pub fn change_region_count(old: &str, new: &str) -> usize {
+    let diff = similar::TextDiff::from_lines(old, new);
+    let mut regions = 0usize;
+    let mut in_change = false;
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            similar::ChangeTag::Equal => in_change = false,
+            similar::ChangeTag::Insert | similar::ChangeTag::Delete => {
+                if !in_change {
+                    regions += 1;
+                    in_change = true;
+                }
+            }
+        }
+    }
+    regions
 }
 
 /// Build a unified-diff hunk text for a `write` overwrite, given the pre-write

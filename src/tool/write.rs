@@ -10,6 +10,7 @@ use super::{
     resolve_in_workspace,
 };
 use crate::core::payload::{Content, ToolOutput};
+use crate::format::FormatManager;
 use crate::lsp::LspManager;
 
 /// Writes a text file relative to the session workspace, creating parent
@@ -20,6 +21,9 @@ pub struct WriteTool {
     /// Optional LSP assist: when set, a successful write appends the touched
     /// file's diagnostics to the result (`doc/lsp.md`).
     lsp: Option<Arc<LspManager>>,
+    /// Optional auto-format: when set, the written content is formatted before
+    /// the diff/diagnostics are produced (`doc/format.md`).
+    format: Option<Arc<FormatManager>>,
 }
 
 #[derive(Deserialize)]
@@ -35,6 +39,7 @@ impl WriteTool {
         Self {
             workspace,
             lsp: None,
+            format: None,
         }
     }
 
@@ -42,6 +47,14 @@ impl WriteTool {
     #[must_use]
     pub fn with_lsp(mut self, lsp: Option<Arc<LspManager>>) -> Self {
         self.lsp = lsp;
+        self
+    }
+
+    /// Attach a [`FormatManager`] so successful writes are formatted before
+    /// their diff/diagnostics are produced (`doc/format.md`).
+    #[must_use]
+    pub fn with_format(mut self, format: Option<Arc<FormatManager>>) -> Self {
+        self.format = format;
         self
     }
 }
@@ -85,40 +98,66 @@ impl Tool for WriteTool {
         // diff old→new. A missing/unreadable file is treated as a new file.
         let old = tokio::fs::read_to_string(&path).await.ok();
 
+        // Auto-format the content BEFORE it lands (`doc/format.md` §6): a
+        // `write` replaces the whole file, so it always formats whole-file
+        // (`edited_lines = None`). The FINAL text is written once, and the
+        // diff/diagnostics below are anchored to it. Fail-closed: a skip keeps
+        // the model's content.
+        let outcome = match &self.format {
+            Some(fmt) => fmt.format(&path, &args.content, None).await,
+            None => crate::format::FormatOutcome::Skipped {
+                text: args.content.clone(),
+            },
+        };
+        // Record the formatter only when it actually changed the content,
+        // plus how many change regions it made (model content → formatted).
+        let formatter = match &outcome {
+            crate::format::FormatOutcome::Formatted { formatter, text }
+                if *text != args.content =>
+            {
+                Some((
+                    formatter.clone(),
+                    super::diffview::change_region_count(&args.content, text),
+                ))
+            }
+            _ => None,
+        };
+        let content = outcome.into_text();
+
         if let Some(parent) = path.parent()
             && let Err(e) = tokio::fs::create_dir_all(parent).await
         {
             return Ok(business_error(&args.path, &e));
         }
-        match tokio::fs::write(&path, args.content.as_bytes()).await {
+        match tokio::fs::write(&path, content.as_bytes()).await {
             Ok(()) => {
                 let mut output = ToolOutput {
                     content: vec![Content::Text(write_summary(
                         &args.path,
                         old.as_deref(),
-                        &args.content,
+                        &content,
                     ))],
                     is_error: false,
                     error_code: None,
                 };
                 // UI view: an overwrite diffs old→new (`similar`, same engine
                 // `write_summary` counts with); a new file's view is its full
-                // content. Never model input (`doc/tool-view.md`).
-                let view = write_view(&args.path, old.as_deref(), &args.content);
+                // content. Never model input (`doc/tool-view.md`). When a
+                // formatter changed the text the diff carries `formatted_by`.
+                let view = write_view(
+                    &args.path,
+                    old.as_deref(),
+                    &content,
+                    formatter.as_ref().map(|(n, c)| (n.as_str(), *c)),
+                );
                 if let Some(text) = view {
                     output.content.push(Content::TextView {
                         text,
                         audience: crate::core::payload::AUDIENCE_UI.to_owned(),
                     });
                 }
-                append_diagnostics(
-                    self.lsp.as_ref(),
-                    &mut output,
-                    &path,
-                    &args.path,
-                    &args.content,
-                )
-                .await;
+                append_diagnostics(self.lsp.as_ref(), &mut output, &path, &args.path, &content)
+                    .await;
                 Ok(output)
             }
             Err(e) => Ok(business_error(&args.path, &e)),
@@ -140,7 +179,12 @@ impl Tool for WriteTool {
 /// no-change write (empty diff = no block) or an empty new file. Shared by
 /// `invoke` (executed `TextView`) and `preview` (approval gate), so the gate
 /// shows exactly what the executed card will.
-fn write_view(path: &str, old: Option<&str>, content: &str) -> Option<String> {
+fn write_view(
+    path: &str,
+    old: Option<&str>,
+    content: &str,
+    formatted: Option<(&str, usize)>,
+) -> Option<String> {
     match old {
         Some(old) if old != content => {
             let body = super::diffview::write_diff_json(
@@ -148,6 +192,7 @@ fn write_view(path: &str, old: Option<&str>, content: &str) -> Option<String> {
                 old,
                 content,
                 super::diffview::default_context(),
+                formatted,
             );
             (!body.is_empty()).then_some(body)
         }
@@ -327,6 +372,85 @@ e
             .unwrap();
         assert!(!out.is_error);
         assert!(view(&out).is_none());
+    }
+
+    // --- auto-format integration (`doc/format.md`) --------------------------
+
+    /// A `FormatManager` whose only formatter strips trailing whitespace via
+    /// `sed` (a whitespace-only change that passes the fail-closed check).
+    fn fmt_manager() -> std::sync::Arc<crate::format::FormatManager> {
+        let config = crate::format::FormatConfig {
+            mode: Some(crate::format::FormatMode::File),
+            formatters: vec![crate::format::FormatterConfig {
+                name: "trim-ws".to_owned(),
+                command: "sed".to_owned(),
+                args: vec!["s/[[:space:]]*$//".to_owned()],
+                env: std::collections::HashMap::new(),
+                extensions: vec!["txt".to_owned()],
+                enabled: true,
+                supports_line_range: false,
+                format_timeout_ms: 5_000,
+            }],
+        };
+        crate::format::FormatManager::new(config, std::collections::BTreeMap::new()).unwrap()
+    }
+
+    /// An overwrite whose content carries trailing whitespace is written
+    /// FORMATTED, and the diff view (old → formatted) is annotated
+    /// `formatted_by` (`doc/format.md` §6) — the model sees the real on-disk
+    /// change, part of which is the formatter's.
+    #[tokio::test]
+    async fn formatted_write_diff_is_annotated() {
+        let dir = tempfile::tempdir().unwrap();
+        // Pre-write content differs from the formatted result, so the diff is
+        // non-empty; the model's content carries trailing whitespace that the
+        // formatter strips.
+        std::fs::write(dir.path().join("f.txt"), "x\ny\n").unwrap();
+        let out = WriteTool::new(dir.path().to_path_buf())
+            .with_format(Some(fmt_manager()))
+            .invoke(input("f.txt", "a   \nb\n"))
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "a\nb\n"
+        );
+        let view_json: serde_json::Value = serde_json::from_str(view(&out).unwrap()).unwrap();
+        assert_eq!(view_json["files"][0]["formatted_by"], "trim-ws");
+    }
+
+    /// `mode = "off"` produces no `FormatManager` at all (`FormatManager::new`
+    /// returns `None`), so a write is never touched.
+    #[tokio::test]
+    async fn mode_off_writes_content_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::format::FormatConfig {
+            mode: Some(crate::format::FormatMode::Off),
+            formatters: vec![crate::format::FormatterConfig {
+                name: "trim-ws".to_owned(),
+                command: "sed".to_owned(),
+                args: vec!["s/[[:space:]]*$//".to_owned()],
+                env: std::collections::HashMap::new(),
+                extensions: vec!["txt".to_owned()],
+                enabled: true,
+                supports_line_range: false,
+                format_timeout_ms: 5_000,
+            }],
+        };
+        // `None` manager → the tool is constructed without a formatter.
+        assert!(
+            crate::format::FormatManager::new(config, std::collections::BTreeMap::new()).is_none()
+        );
+        let out = WriteTool::new(dir.path().to_path_buf())
+            .invoke(input("f.txt", "a   \n"))
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "a   \n"
+        );
     }
 
     // --- write_summary -------------------------------------------------------

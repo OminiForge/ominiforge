@@ -51,7 +51,16 @@
 	{#if errorText}<div class="err">{errorText}</div>{/if}
 	{#if files.length}
 		{#each files as f (f.path)}
-			<Diff text={f.patch} />
+			<div class="file">
+				{#if f.formatted_by}
+					<!-- Auto-format annotation (`doc/format.md` §6): part of this diff
+					     is the formatter's reflow, not the model's edit. -->
+					<div class="fmt-note">
+						formatted by <span class="fmt-name">{f.formatted_by}</span>{#if f.format_adjustments != null}<span class="fmt-count">（{f.format_adjustments} 处调整）</span>{/if}
+					</div>
+				{/if}
+				<Diff text={f.patch} />
+			</div>
 		{/each}
 	{:else if code}
 		<CodeView code={code.content} path={code.path} />
@@ -102,5 +111,21 @@
 		color: var(--state-error-text);
 		white-space: pre-wrap;
 		word-break: break-word;
+	}
+	.file {
+		display: grid;
+		gap: var(--space-1);
+	}
+	.fmt-note {
+		color: var(--text-tertiary);
+		font-size: 10.5px;
+		letter-spacing: 0.02em;
+	}
+	.fmt-name {
+		font-family: var(--font-mono);
+		color: var(--text-secondary);
+	}
+	.fmt-count {
+		font-family: var(--font-chinese);
 	}
 </style>

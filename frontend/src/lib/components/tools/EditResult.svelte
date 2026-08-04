@@ -44,6 +44,14 @@
 	{#each files as f (f.path)}
 		<div class="file">
 			<div class="path">{f.path}</div>
+			{#if f.formatted_by}
+				<!-- Auto-format annotation (`doc/format.md` §6): part of this diff is
+				     the formatter's reflow, not the model's edit. Tertiary text —
+				     informational, not a status; never accent. -->
+				<div class="fmt-note">
+					formatted by <span class="fmt-name">{f.formatted_by}</span>{#if f.format_adjustments != null}<span class="fmt-count">（{f.format_adjustments} 处调整）</span>{/if}
+				</div>
+			{/if}
 			<Diff text={f.patch} />
 		</div>
 	{/each}
@@ -96,6 +104,18 @@
 	.path {
 		color: var(--accent-ink);
 		font-weight: 500;
+	}
+	.fmt-note {
+		color: var(--text-tertiary);
+		font-size: 10.5px;
+		letter-spacing: 0.02em;
+	}
+	.fmt-name {
+		font-family: var(--font-mono);
+		color: var(--text-secondary);
+	}
+	.fmt-count {
+		font-family: var(--font-chinese);
 	}
 	.err {
 		color: var(--state-error-text);
