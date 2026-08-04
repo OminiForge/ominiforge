@@ -61,6 +61,9 @@ struct AppState {
 /// Binding the listener or a fatal serve error.
 pub async fn serve(registry: SessionRegistry, config: &GatewayConfig) -> Result<()> {
     let api_key = config.resolve_api_key().map(Arc::from);
+    // Reclaim shared language servers for roots whose sessions have all gone
+    // idle past the grace period (`doc/lsp.md` §5.2).
+    registry.start_lsp_sweeper();
     let state = AppState { registry, api_key };
 
     let app = router(state);
@@ -1036,7 +1039,15 @@ async fn session_runtime(State(state): State<AppState>, Path(id): Path<String>) 
         )
         .await
     {
-        Ok(info) => Json(info).into_response(),
+        Ok(mut info) => {
+            // Live LSP status comes from the shared service, keyed by the
+            // session's root (`doc/lsp.md` §5.2); `runtime_info` leaves it
+            // empty. A restricted session (no workspace) has no root → no LSP.
+            if let Some(workspace) = meta.workspace.as_deref() {
+                info.lsp = state.registry.lsp_status(workspace).await;
+            }
+            Json(info).into_response()
+        }
         Err(e) => internal_error(&e),
     }
 }
@@ -1617,6 +1628,50 @@ default = "openai-main/gpt-4o"
             "runtime must reflect the per-session override, not the profile default"
         );
         assert_eq!(rt["provider"], "openai-main");
+    }
+
+    /// End-to-end over HTTP: `GET /runtime`'s `lsp` field only lists servers
+    /// the session has *activated* (`doc/lsp.md` §5.1). A configured server
+    /// whose language was never touched (no file op ran) is omitted — so a
+    /// rust+ts session never shows clangd/gopls. This proves the
+    /// actor→registry→handler wiring carries the manager's status.
+    #[tokio::test]
+    async fn runtime_omits_untouched_lsp_servers() {
+        let (registry, dir) = test_registry_with_config();
+        // Route `.rs` to a (never-spawned) server so the session has a manager.
+        std::fs::write(
+            dir.path().join(".omini/config/lsp.toml"),
+            "[[servers]]\nname = \"rust-analyzer\"\ncommand = \"rust-analyzer\"\nextensions = [\"rs\"]\n",
+        )
+        .unwrap();
+        let state = AppState {
+            registry,
+            api_key: None,
+        };
+        let base = serve_test(state).await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .post(format!("{base}/api/sessions"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        let id = resp.json::<serde_json::Value>().await.unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let resp = reqwest::get(format!("{base}/api/sessions/{id}/runtime"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let rt: serde_json::Value = resp.json().await.unwrap();
+        let lsp = rt["lsp"].as_array().expect("lsp field is an array");
+        assert!(
+            !lsp.iter().any(|s| s["name"] == "rust-analyzer"),
+            "an untouched server is omitted, not listed as idle: {lsp:?}"
+        );
     }
 
     /// The complement of the override test: a session created with NO model

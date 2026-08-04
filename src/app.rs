@@ -153,6 +153,7 @@ pub async fn assemble(
     default_permission: crate::permission::PermissionPolicy,
     workspace_permission: crate::permission::PermissionPolicy,
     mounts: Vec<crate::sandbox::VolumeMount>,
+    lsp_service: Arc<crate::lsp::LspService>,
 ) -> Result<Assembled> {
     let workspace = resolve_workspace(&workspace)?;
 
@@ -242,7 +243,9 @@ pub async fn assemble(
     // start lazily on the first file of their language.
     let lsp_manager = crate::lsp::LspConfig::load(store.roots())
         .context("failed to load lsp.toml")
-        .map(|cfg| crate::lsp::LspManager::new(&cfg, workspace.clone(), env_overlay.clone()))?;
+        .map(|cfg| {
+            crate::lsp::LspManager::new(lsp_service, &cfg, workspace.clone(), env_overlay.clone())
+        })?;
 
     // Auto-format after edit/write (doc/format.md): load `format.toml`, build
     // a stateless manager. `None` when `mode = "off"` or no formatter is

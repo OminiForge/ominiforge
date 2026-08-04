@@ -119,6 +119,11 @@ pub struct LspClient {
     shared: Arc<Shared>,
     /// Per-uri document version, bumped on each `didChange` we send.
     versions: Mutex<HashMap<String, i64>>,
+    /// Per-uri last-touch time, for idle document closing (`doc/lsp.md` §5.2):
+    /// an open doc the server holds in memory is `didClose`d after it sits
+    /// untouched, freeing the server's per-doc text/syntax tree while the
+    /// workspace index (the server's real asset) stays warm.
+    doc_last_used: Mutex<HashMap<String, std::time::Instant>>,
     /// The position encoding the server negotiated (`utf-8` if it honored our
     /// request, else `utf-16`). Recorded for future position-mapping ops; the
     /// diagnostics assist renders the server's own line numbers directly, so it
@@ -171,6 +176,7 @@ impl LspClient {
             next_id: AtomicU64::new(1),
             shared,
             versions: Mutex::new(HashMap::new()),
+            doc_last_used: Mutex::new(HashMap::new()),
             position_encoding: "utf-16".to_owned(),
             _child: child,
             _reader: reader,
@@ -232,6 +238,11 @@ impl LspClient {
         *version += 1;
         let version = *version;
         drop(versions);
+        // A touch refreshes the doc's idle clock (drives idle-close, §5.2).
+        self.doc_last_used
+            .lock()
+            .await
+            .insert(uri.to_owned(), std::time::Instant::now());
 
         if already_open {
             self.notify(
@@ -257,6 +268,44 @@ impl LspClient {
             .await?;
         }
         Ok(version)
+    }
+
+    /// `didClose` every open document that has sat untouched for longer than
+    /// `max_idle`, freeing the server's per-document memory (`doc/lsp.md`
+    /// §5.2). The workspace index is untouched — only the cached open copy is
+    /// released, and the next touch re-`didOpen`s it transparently. Returns
+    /// the number of documents closed.
+    pub async fn close_idle_docs(&self, max_idle: std::time::Duration) -> usize {
+        let now = std::time::Instant::now();
+        let stale: Vec<String> = self
+            .doc_last_used
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, t)| now.duration_since(**t) > max_idle)
+            .map(|(uri, _)| uri.clone())
+            .collect();
+        let mut closed = 0usize;
+        for uri in stale {
+            // A doc that was never opened (already closed, or only ever
+            // diagnosed) has no `didClose` to send.
+            if self.versions.lock().await.remove(&uri).is_none() {
+                continue;
+            }
+            self.doc_last_used.lock().await.remove(&uri);
+            self.shared.diagnostics.lock().await.remove(&uri);
+            if self
+                .notify(
+                    "textDocument/didClose",
+                    Some(serde_json::json!({ "textDocument": { "uri": uri } })),
+                )
+                .await
+                .is_ok()
+            {
+                closed += 1;
+            }
+        }
+        closed
     }
 
     /// Wait up to `budget` for diagnostics on `uri` that are *fresh* — i.e. a

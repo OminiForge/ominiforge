@@ -21,6 +21,14 @@ const DEFAULT_BIND: &str = "127.0.0.1:7878";
 /// event-log lock so the session can be reopened on demand). 30 minutes.
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 1800;
 
+/// Default grace before an idle root's shared language servers are reclaimed
+/// (`doc/lsp.md` §5.2). 30 minutes.
+const DEFAULT_LSP_RECLAIM_GRACE_SECS: u64 = 1800;
+
+const fn default_lsp_reclaim_grace_secs() -> u64 {
+    DEFAULT_LSP_RECLAIM_GRACE_SECS
+}
+
 /// Default sandbox network policy when neither the profile nor this file names
 /// one. `open` (unrestricted egress) so a fresh boxlite session can reach the
 /// package registries / APIs an agent normally needs; a deployment that wants a
@@ -43,6 +51,13 @@ pub struct GatewayConfig {
 
     /// Idle seconds before an inactive session actor is shut down and evicted.
     pub idle_timeout_secs: u64,
+
+    /// Grace seconds before a workspace root with no active session has its
+    /// shared language servers reclaimed (`doc/lsp.md` §5.2). Long (default
+    /// 30 min) so a user who tabs away and back does not pay a full re-index;
+    /// a server in active use is never reclaimed on a timer.
+    #[serde(default = "default_lsp_reclaim_grace_secs")]
+    pub lsp_reclaim_grace_secs: u64,
 
     /// Which sandbox backend sessions run in (`doc/sandbox.md` §3.2). A
     /// host-level, OS-agnostic choice; `passthrough` (no isolation) by default so
@@ -81,6 +96,7 @@ impl Default for GatewayConfig {
             bind: DEFAULT_BIND.to_owned(),
             api_key_env: None,
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
+            lsp_reclaim_grace_secs: DEFAULT_LSP_RECLAIM_GRACE_SECS,
             sandbox_backend: crate::sandbox::manager::SandboxBackendChoice::default(),
             default_network: DEFAULT_NETWORK_POLICY.to_owned(),
             default_network_allow: Vec::new(),
@@ -133,6 +149,12 @@ impl GatewayConfig {
     #[must_use]
     pub const fn idle_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.idle_timeout_secs)
+    }
+
+    /// LSP reclaim grace as a [`std::time::Duration`] (`doc/lsp.md` §5.2).
+    #[must_use]
+    pub const fn lsp_reclaim_grace(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.lsp_reclaim_grace_secs)
     }
 
     /// Resolve the fallback network policy sessions inherit when their profile

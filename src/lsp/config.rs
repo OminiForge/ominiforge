@@ -32,9 +32,15 @@ pub struct LspServerConfig {
     pub env: HashMap<String, String>,
 
     /// File extensions this server handles, without the leading dot (e.g.
-    /// `"rs"`). A file is routed to the first server whose list contains its
-    /// extension.
+    /// `"rs"`). A file is routed to every enabled server whose list contains
+    /// its extension (a language may have several: `pyright` + `ruff`).
     pub extensions: Vec<String>,
+
+    /// Whether this server is used. A higher-precedence layer sets `false`
+    /// under a built-in's `name` to disable that default (tombstone semantics,
+    /// `doc/lsp.md` §3). Defaults to `true`.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
 
     /// Milliseconds a `read`/`edit`/`write` op waits for fresh diagnostics
     /// after syncing the doc before giving up and returning without them. Caps
@@ -51,11 +57,15 @@ pub struct LspServerConfig {
     pub init_timeout_ms: u64,
 }
 
-const fn default_diag_timeout_ms() -> u64 {
+pub const fn default_diag_timeout_ms() -> u64 {
     400
 }
 
-const fn default_init_timeout_ms() -> u64 {
+pub const fn default_enabled() -> bool {
+    true
+}
+
+pub const fn default_init_timeout_ms() -> u64 {
     2_000
 }
 
@@ -69,6 +79,8 @@ impl LspConfig {
     /// Returns the offending path and parse error if a present file is
     /// malformed.
     pub fn load(roots: &[std::path::PathBuf]) -> Result<Self, ConfigError> {
+        // Roots are highest-priority first: the FIRST same-named server wins
+        // (mirrors `McpConfig::load`), so a higher root shadows a lower one.
         let mut merged: Vec<LspServerConfig> = Vec::new();
         for root in roots {
             let path = root.join("config").join("lsp.toml");
@@ -87,7 +99,21 @@ impl LspConfig {
                 }
             }
         }
-        Ok(Self { servers: merged })
+        // The built-in registry is the lowest-precedence layer. Overlay the
+        // user's servers on it: a same-named user server REPLACES the built-in
+        // (including an `enabled = false` tombstone that disables it); a new
+        // name is appended.
+        let mut result: Vec<LspServerConfig> = super::registry::builtin_servers();
+        for server in merged {
+            if let Some(existing) = result.iter_mut().find(|s| s.name == server.name) {
+                *existing = server;
+            } else {
+                result.push(server);
+            }
+        }
+        // Tombstones applied: drop disabled entries.
+        result.retain(|s| s.enabled);
+        Ok(Self { servers: result })
     }
 }
 
@@ -149,7 +175,8 @@ init_timeout_ms = 5000
     }
 
     /// A higher-priority root shadows a same-named server in a lower root
-    /// (same precedence as `McpConfig::load`).
+    /// (same precedence as `McpConfig::load`). The custom server rides on top
+    /// of the built-in registry, which is always present as the base layer.
     #[test]
     fn higher_root_shadows_same_name() {
         let dir = tempfile::tempdir().unwrap();
@@ -167,15 +194,62 @@ init_timeout_ms = 5000
             .unwrap();
         }
         let config = LspConfig::load(&[high, low]).unwrap();
-        assert_eq!(config.servers.len(), 1);
-        assert_eq!(config.servers[0].command, "high-cmd");
+        let shared = config.servers.iter().find(|s| s.name == "shared").unwrap();
+        assert_eq!(shared.command, "high-cmd");
     }
 
-    /// No `lsp.toml` anywhere → empty config, not an error.
+    /// No `lsp.toml` anywhere → the built-in registry alone (out-of-the-box
+    /// defaults), not an empty config.
     #[test]
-    fn missing_everywhere_is_empty() {
+    fn missing_everywhere_yields_builtins() {
         let dir = tempfile::tempdir().unwrap();
         let config = LspConfig::load(&[dir.path().to_path_buf()]).unwrap();
-        assert!(config.servers.is_empty());
+        assert_eq!(
+            config.servers.len(),
+            super::super::registry::builtin_servers().len()
+        );
+        assert!(config.servers.iter().all(|s| s.enabled));
+    }
+
+    /// A higher layer disables a built-in by name via `enabled = false`
+    /// (tombstone): the entry vanishes from the merged result.
+    #[test]
+    fn enabled_false_disables_builtin() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            cfg.join("lsp.toml"),
+            "[[servers]]\nname = \"rust-analyzer\"\ncommand = \"rust-analyzer\"\nextensions = [\"rs\"]\nenabled = false\n",
+        )
+        .unwrap();
+        let config = LspConfig::load(&[dir.path().to_path_buf()]).unwrap();
+        assert!(
+            !config.servers.iter().any(|s| s.name == "rust-analyzer"),
+            "disabled builtin should be dropped"
+        );
+        // Other builtins survive.
+        assert!(config.servers.iter().any(|s| s.name == "pyright"));
+    }
+
+    /// A higher layer overrides a built-in's fields (here: the command) while
+    /// keeping it a single merged entry.
+    #[test]
+    fn higher_layer_overrides_builtin_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            cfg.join("lsp.toml"),
+            "[[servers]]\nname = \"rust-analyzer\"\ncommand = \"ra-wrapper\"\nextensions = [\"rs\"]\n",
+        )
+        .unwrap();
+        let config = LspConfig::load(&[dir.path().to_path_buf()]).unwrap();
+        let ra = config
+            .servers
+            .iter()
+            .find(|s| s.name == "rust-analyzer")
+            .unwrap();
+        assert_eq!(ra.command, "ra-wrapper");
     }
 }

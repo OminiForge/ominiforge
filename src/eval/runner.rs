@@ -76,6 +76,9 @@ pub async fn run_case(case: &EvalCase, config: &RunConfig<'_>) -> Result<CaseRes
         crate::permission::PermissionPolicy::default(),
         // Eval runs on passthrough; no auxiliary mounts.
         Vec::new(),
+        // Each eval case is its own scratch workspace, so there is nothing to
+        // share servers across: a per-run service is correct (`doc/lsp.md` §5.2).
+        std::sync::Arc::new(crate::lsp::LspService::new()),
     )
     .await
     .context("failed to assemble agent for eval case")?;

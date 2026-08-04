@@ -122,6 +122,12 @@ pub struct RuntimeInfo {
     /// The session's default effort tier (from the profile, resolved against
     /// the model's tiers). `None` = provider default.
     pub think_effort: Option<String>,
+    /// Live status of the language servers activated under this session's
+    /// root (`doc/lsp.md` §5.2). Servers are shared per `root_uri`, so every
+    /// session in the same workspace/worktree sees the same list. Empty when
+    /// no server is configured or none has been touched yet (servers spawn
+    /// lazily on the first file op of their language).
+    pub lsp: Vec<crate::lsp::ServerStatus>,
 }
 
 /// Detect environment labels from activated environment variables.
@@ -211,6 +217,38 @@ pub enum WorkspaceConfigError {
     Load(#[source] anyhow::Error),
 }
 
+/// How often the LSP sweeper runs (`doc/lsp.md` §5.2). Short relative to the
+/// 30-min grace so a gone-idle root is reclaimed promptly after the grace
+/// elapses, without the sweep itself being a measurable cost.
+const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The set of workspace roots that currently have at least one live actor
+/// (`doc/lsp.md` §5.2): the "is this root still in use" signal the LSP
+/// sweeper reclaims against. Dead handles (idle-evicted but not yet pruned)
+/// don't count — a root whose sessions all went idle is eligible for reclaim
+/// after the grace period. Free-standing so the sweeper task can call it on
+/// the shared `RegistryInner` without a `SessionRegistry` handle.
+async fn active_roots(inner: &RegistryInner) -> std::collections::HashSet<PathBuf> {
+    let store = SessionStore::new(inner.defaults.workspace.join(app::SESSIONS_SUBDIR));
+    // Snapshot the live session ids and release the actors lock before the
+    // (synchronous) meta reads, so the map isn't held across them.
+    let live: Vec<SessionId> = {
+        let actors = inner.actors.lock().await;
+        actors
+            .iter()
+            .filter(|(_, handle)| handle.is_alive())
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    let mut roots = std::collections::HashSet::new();
+    for id in live {
+        if let Some(ws) = store.read_meta(&id).ok().and_then(|m| m.workspace) {
+            roots.insert(ws);
+        }
+    }
+    roots
+}
+
 struct RegistryInner {
     defaults: SessionDefaults,
     idle_timeout: std::time::Duration,
@@ -228,6 +266,10 @@ struct RegistryInner {
     /// execution environment, decoupled from the (ephemeral) actor that drives
     /// it. Backend is chosen once here as a deployment property.
     sandbox_manager: crate::sandbox::manager::SandboxManager,
+    /// Process-level owner of shared language servers (`doc/lsp.md` §5.2):
+    /// one server per `(root_uri, language)`, shared by every session under
+    /// the root. Handed to each assembly so the tools reach shared clients.
+    lsp_service: Arc<crate::lsp::LspService>,
     /// Fallback sandbox network policy for sessions whose profile does not set
     /// one (`doc/sandbox.md` §6.2). Resolved once from `gateway.toml` at boot so
     /// a malformed default fails loud here, not per session.
@@ -387,6 +429,10 @@ impl SessionRegistry {
                 workspaces,
                 status_hub: StatusHub::new(),
                 sandbox_manager,
+                lsp_service: Arc::new(crate::lsp::LspService::new().with_periods(
+                    config.lsp_reclaim_grace(),
+                    crate::lsp::DEFAULT_DOC_IDLE_CLOSE,
+                )),
                 default_network,
                 default_permission,
                 workspace_config,
@@ -401,6 +447,39 @@ impl SessionRegistry {
     #[must_use]
     pub fn status_hub(&self) -> StatusHub {
         self.inner.status_hub.clone()
+    }
+
+    /// Spawn the background LSP sweeper (`doc/lsp.md` §5.2): every
+    /// [`SWEEP_INTERVAL`] it reclaims the shared language servers of roots
+    /// that have no active session and have been idle past the grace period.
+    /// The sweep is cheap (a map scan) and never touches an in-use server —
+    /// the grace period, not server idleness, gates reclaim.
+    ///
+    /// The task runs for the process lifetime, capturing only the shared
+    /// `RegistryInner` (so it outlives any one `SessionRegistry` handle).
+    pub fn start_lsp_sweeper(&self) {
+        let inner = Arc::clone(&self.inner);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(SWEEP_INTERVAL);
+            // The first tick fires immediately; skip it so a just-booted
+            // gateway doesn't sweep servers still within their grace.
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                let roots = active_roots(&inner).await;
+                let reclaimed = inner.lsp_service.reclaim_inactive(&roots).await;
+                if reclaimed > 0 {
+                    tracing::debug!(reclaimed, "lsp: sweeper reclaimed idle-root servers");
+                }
+                // Independent of root reclaim: close open docs that have sat
+                // idle, freeing per-document memory on LIVE servers while
+                // keeping their workspace indexes warm (`doc/lsp.md` §5.2).
+                let closed = inner.lsp_service.close_idle_documents().await;
+                if closed > 0 {
+                    tracing::debug!(closed, "lsp: sweeper closed idle open documents");
+                }
+            }
+        });
     }
 
     /// The session store rooted at the configured workspace.
@@ -989,7 +1068,19 @@ impl SessionRegistry {
             env: detect_env(&env),
             think_efforts: resolved.think_efforts,
             think_effort: resolved.think_effort,
+            // Config-layer resolution has no live session; the gateway handler
+            // fills this from the actor's LSP manager (`session_runtime`).
+            lsp: Vec::new(),
         })
+    }
+
+    /// Live LSP server status for `root`, read from the shared `LspService`
+    /// (`doc/lsp.md` §5.2). Every session under the same root sees the same
+    /// server list, because the servers themselves are shared. Empty when the
+    /// root has no activated server — servers spawn lazily, so there is
+    /// nothing to report until the first file op wakes one.
+    pub async fn lsp_status(&self, root: &Path) -> Vec<crate::lsp::ServerStatus> {
+        self.inner.lsp_service.status(root).await
     }
 
     /// Get the live actor for `id`, spawning one if the session is cold. The
@@ -1454,6 +1545,7 @@ impl SessionRegistry {
             default_permission,
             workspace_config.permission.clone(),
             mounts,
+            Arc::clone(&self.inner.lsp_service),
         )
         .await
     }
