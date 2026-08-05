@@ -829,16 +829,16 @@ impl TurnState<'_> {
             }
             self.runtime.push_message(outcome.message.clone());
 
-            // Round-budget reminder (`doc/todo.md` §7b): fired every round,
-            // before the completion gate, so a turn that is about to run out
-            // of soft budget hears about it even when the model stops calling
-            // tools on this very round.
-            self.check_round_budget()?;
-
             if tool_calls.is_empty() {
                 match self.completion_gate()? {
                     Gate::Done => return self.finish(),
-                    Gate::Continue => continue,
+                    Gate::Continue => {
+                        // No tool calls this round, so the dispatch path below
+                        // never runs — fire the budget check here so a text-only
+                        // round still counts toward the round budget.
+                        self.check_round_budget()?;
+                        continue;
+                    }
                     Gate::GiveUp => {
                         let incomplete = self.incomplete_step_count();
                         return self.fail(
@@ -1030,6 +1030,13 @@ impl TurnState<'_> {
             // (`doc/agents-md.md`).
             self.load_project_guidance(&touched)?;
             self.check_stuck(progressed)?;
+            // Round-budget reminder (`doc/todo.md` §7b): fired every round,
+            // after tool dispatch, so the injection never lands between an
+            // assistant `tool_calls` message and its `tool` results — the
+            // provider rejects that interleaving with a 400. When the model
+            // stopped calling tools this round the completion gate above
+            // already returned, so this point is only reached on tool rounds.
+            self.check_round_budget()?;
         }
 
         // The tool loop ran out of round budget. This is the absolute safety
@@ -3044,14 +3051,14 @@ mod tests {
 
         let events = store.read_events(&sid).unwrap();
         let reminders = round_budget_injections(&events);
-        // One soft warning (spent=4) + one exhausted (spent=5) + one more
-        // on the final text round (spent=6, still over budget).
-        assert_eq!(reminders.len(), 3);
+        // One soft warning (spent=4) + one exhausted (spent=5). The final text
+        // round takes the `Gate::Done` branch, which returns before the budget
+        // check — terminal rounds no longer count toward the budget.
+        assert_eq!(reminders.len(), 2);
         assert!(reminders[0].contains("4/5"));
         assert!(reminders[0].contains("without an active todo list"));
         assert!(reminders[1].contains("exhausted your round budget"));
         assert!(reminders[1].contains("no active todo list"));
-        assert!(reminders[2].contains("6/5"));
     }
 
     /// With an active todo, the reminders branch to the todo-aware text.
@@ -3147,22 +3154,24 @@ mod tests {
 
         let events = store.read_events(&sid).unwrap();
         let reminders = round_budget_injections(&events);
-        // Each round after a todo op starts a fresh window: spent climbs 1, 2,
-        // then reset, 1, 2, then reset, 1. Branches track the live todo state.
-        assert_eq!(reminders.len(), 5);
+        // A todo op resets the budget mid-dispatch, and the post-dispatch
+        // budget check then counts that same round — so each todo round still
+        // emits the spent=1 soft warning. Sequence: soft (no todo), soft
+        // (todo), exhausted (todo), soft (no todo after `complete`). The final
+        // text round takes `Gate::Done` and returns before the budget check,
+        // so it adds no fifth reminder.
+        assert_eq!(reminders.len(), 4);
         assert!(reminders[0].contains("1/2"));
         assert!(reminders[0].contains("without an active todo list"));
-        assert!(reminders[1].contains("exhausted"));
-        assert!(reminders[1].contains("no active todo list"));
         // After `init`, the step exists but is still pending — reminder
         // branches to the todo-aware text.
-        assert!(reminders[2].contains("1/2"));
+        assert!(reminders[1].contains("1/2"));
+        assert!(reminders[1].contains("current todo step"));
+        assert!(reminders[2].contains("exhausted"));
         assert!(reminders[2].contains("current todo step"));
-        assert!(reminders[3].contains("exhausted"));
-        assert!(reminders[3].contains("current todo step"));
         // After `complete`, no active todo remains — back to the no-todo branch.
-        assert!(reminders[4].contains("1/2"));
-        assert!(reminders[4].contains("without an active todo list"));
+        assert!(reminders[3].contains("1/2"));
+        assert!(reminders[3].contains("without an active todo list"));
     }
 
     /// `round_budget_threshold = 0` disables the reminder entirely.
