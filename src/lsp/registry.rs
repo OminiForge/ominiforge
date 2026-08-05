@@ -39,6 +39,9 @@ pub fn builtin_servers() -> Vec<LspServerConfig> {
             &["--stdio"],
             &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"],
         ),
+        // .svelte files only — svelteserver syntax-parses standalone .ts but
+        // does not type-check them, so TS/JS stay with typescript-language-server.
+        entry("svelte", "svelteserver", &["--stdio"], &["svelte"]),
         entry("gopls", "gopls", &[], &["go"]),
         entry(
             "clangd",

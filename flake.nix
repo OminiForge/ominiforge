@@ -59,6 +59,14 @@
         nodejs_22
         pnpm
         chromium
+        # Language servers consumed by ominiforge's own LSP integration
+        # (doc/lsp.md), which routes by file extension to a specific binary.
+        # svelteserver handles .svelte; typescript-language-server handles
+        # .ts/.js. They are independent processes — svelteserver cannot cover
+        # standalone .ts files (it only syntax-parses them, no type-checking),
+        # so both are required for frontend diagnostics.
+        svelte-language-server
+        typescript-language-server
       ];
 
       miscTools = with pkgs; [
