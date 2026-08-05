@@ -358,6 +358,10 @@ pub enum InjectionSource {
     /// stuck-step reminder pushed into the context to keep a turn on track.
     /// See `doc/todo.md` §8.
     Runtime,
+    /// The agent loop injected a round-budget reminder (soft threshold hit
+    /// or budget exhausted) to nudge the model into opening/updating its
+    /// todo list. See `doc/todo.md` §7b.
+    RoundBudget,
     /// A project guidance file (`AGENTS.md`/`CLAUDE.md`) loaded lazily when the
     /// agent first touched a file under its directory. See `doc/agents-md.md`.
     ProjectGuidance,

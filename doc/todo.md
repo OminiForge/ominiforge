@@ -114,14 +114,59 @@ cancel/block，只有客观障碍才合法**。`Blocked` 让 turn 能在"需要�
 注入一次性提醒建议取消或重构清单；step 被 complete/cancel/block 时重置其计数器。"早发现"是
 语义级别（某步推进停滞），不是 token 耗尽级别。
 
+## 7b. Round-Budget Reminder（软预算提醒）
+
+每个 turn 和每个 todo step 运行在一个**软 round 预算**下。不同于 `max_rounds` 的绝对硬顶，软
+预算只**提醒**，不强制停止——模型自己决定是收尾、拆步骤，还是继续。设计目标：让模型在
+跑飞之前自觉管理节奏，而不是等到 token 耗尽被硬砍。
+
+**配置**（`profile.toml` 的 `[budget]` 段）：
+
+- `round_budget_threshold`（默认 20，`0` = 禁用整套提醒）：每个预算窗口的 round 数。
+- `round_budget_warn_pct`（默认 0.8）：首次提醒的比例阈值。
+- `max_rounds`（默认 1000）：绝对硬顶，撞了就 `MaxRoundsExceeded` fail。
+
+**计数器生命周期**：
+
+- Turn 开始 → `spent = 0`，`warned = false`
+- 每次 model round → `spent += 1`
+- 成功的 todo op（init/add/start/complete/cancel/block）→ `spent = 0`，`warned = false`
+- 新 turn → 全重置
+
+**触发规则**（按 spent × 是否有活跃 todo 四象限）：
+
+| 状态 | 活跃 todo | 无活跃 todo |
+|---|---|---|
+| `spent == ceil(threshold * warn_pct)`（一次） | 提醒拆步骤或推进 | 提醒开 todo 或尽快收尾 |
+| `spent >= threshold`（每轮） | 提醒必须更新 todo | 提醒必须停或开 todo |
+
+"活跃 todo" = 存在至少一条 `pending` 或 `in_progress` step。全终态的清单不算活跃。
+
+**注入通道**：用 `InjectionSource::RoundBudget`（区别于 completion gate / stuck-step 的
+`Runtime`），事件流持久化，resume 可重放；前端会话流用 `timer` 图标渲染，与 `Runtime` 的
+圆圈图标区分。
+
+**提醒文案**：英文，`<reminder>` 包裹，不硬编码数字——模板用 `{spent}/{threshold}/{remaining}`
+占位，模型看到的是渲染后的具体值。
+
+**为什么不硬砍**：模型在预算耗尽时通常仍在做有效工作（验证、重构、读代码），硬砍会丢失
+上下文。软提醒让模型自己判断：
+
+- 任务接近完成 → 收尾并退出
+- 步骤确实太大 → `cancel` + `add` 拆小
+- 还需多轮 → 继续跑，但每轮都被提醒一次（"我知道我在超支"）
+
+`max_rounds` 仍在，作为最后的失控防线。
+
 ## 8. 注入与缓存纪律
 
-所有系统注入（完成度门、卡死警告）遵循 [`context-management.md`](./context-management.md) §5：
+所有系统注入（完成度门、卡死警告、round-budget 提醒）遵循 [`context-management.md`](./context-management.md) §5：
 
 - 用 `<reminder>...</reminder>` 包裹，文本英文，与用户输入区分。
 - 作为真实消息**永久留在 context 历史中不移除**（保 prefix cache）。
-- 同步写一条 `InjectionEvent`（`InjectionSource::Runtime`）到 events.jsonl，replay 可还原
-  模型每轮所见。
+- 同步写一条 `InjectionEvent` 到 events.jsonl，replay 可还原模型每轮所见。完成度门与卡死警
+  告用 `InjectionSource::Runtime`；round-budget 提醒用 `InjectionSource::RoundBudget`（§7b），
+  前端据以区分图标。
 
 ## 9. Tool Descriptor 中的使用规范
 

@@ -96,6 +96,9 @@ pub enum ViewActivityIcon {
     Hook,
     Todo,
     Runtime,
+    /// Round-budget reminder (`InjectionSource::RoundBudget`): the loop
+    /// warning the model its per-step round budget is running low or out.
+    Timer,
 }
 
 // serde's `skip_serializing_if` passes a reference; the by-value signature
@@ -399,23 +402,26 @@ fn fold_hook(seq: u64, h: &HookEvent, items: &mut Vec<ViewItem>) {
     });
 }
 
-/// Fold a context injection: only Runtime injections surface in the flow —
-/// they are the loop nudging itself mid-turn (completion gate / stuck-step
-/// reminders, not user input, so the user must see why the agent kept
-/// going). Assembly-time sources (Memory/RAG/Hook/ProjectGuidance) stay
-/// inspect-only.
+/// Fold a context injection: Runtime and RoundBudget injections surface in
+/// the flow — they are the loop nudging itself mid-turn (completion gate /
+/// stuck-step / round-budget reminders, not user input, so the user must see
+/// why the agent kept going). Assembly-time sources (Memory/RAG/Hook/
+/// ProjectGuidance) stay inspect-only.
 fn fold_injection(seq: u64, i: &InjectionEvent, items: &mut Vec<ViewItem>) {
     let InjectionEvent::ContextInjected {
         source, content, ..
     } = i;
-    if *source == InjectionSource::Runtime {
-        items.push(ViewItem::Activity {
-            id: seq,
-            icon: ViewActivityIcon::Runtime,
-            label: runtime_injection_label(content),
-            detail: Some(content.clone()),
-        });
-    }
+    let icon = match source {
+        InjectionSource::Runtime => ViewActivityIcon::Runtime,
+        InjectionSource::RoundBudget => ViewActivityIcon::Timer,
+        _ => return,
+    };
+    items.push(ViewItem::Activity {
+        id: seq,
+        icon,
+        label: runtime_injection_label(content),
+        detail: Some(content.clone()),
+    });
 }
 
 /// Fold one committed content block: text/reasoning append (empty blocks are
@@ -1054,6 +1060,32 @@ mod tests {
             "Model reminder: The following todo items are not in a terminal state. Continue working on them:"
         );
         assert_eq!(detail.as_deref(), Some(reminder));
+    }
+
+    /// A round-budget reminder folds into an activity row with the `Timer`
+    /// icon, so the user can tell a budget nudge apart from a completion-gate
+    /// nudge (`doc/todo.md` §7b).
+    #[test]
+    fn round_budget_injections_fold_into_timer_activity_rows() {
+        let inject = |seq: u64, content: &str| {
+            ev(
+                seq,
+                EventPayload::Injection(crate::core::payload::InjectionEvent::ContextInjected {
+                    source: crate::core::payload::InjectionSource::RoundBudget,
+                    content: content.into(),
+                    token_count: 10,
+                }),
+            )
+        };
+        let reminder = "<reminder>You have used 16/20 rounds this turn (4 left) without an active todo \
+             list. If this is a multi-step task, open a todo now.</reminder>";
+        let view = fold_view(&[inject(1, reminder)]);
+        assert_eq!(view.items.len(), 1);
+        let ViewItem::Activity { icon, label, .. } = &view.items[0] else {
+            panic!("activity row")
+        };
+        assert_eq!(*icon, ViewActivityIcon::Timer);
+        assert!(label.starts_with("Model reminder: You have used 16/20"));
     }
 
     /// The file tools split a trailing Text block off as diagnostics; other

@@ -318,7 +318,12 @@ must do.
 - NEVER cancel or block a step merely because it is hard or you would rather \
 not do it.
 - Every step must reach a terminal state (completed / cancelled / blocked) \
-before the task can finish.";
+before the task can finish.
+
+Round budget: each turn and each todo step runs under a soft round budget. \
+As the budget runs low — and again when it runs out — the loop will remind \
+you. Plan steps that fit a budget; split a large step into smaller ones via \
+`add` + `cancel` rather than letting one step run long.";
 
 /// JSON Schema for the `todo` tool arguments: two shapes, `oneOf`.
 ///

@@ -4,4 +4,4 @@
  * What produced an injection. Ordering is kept stable (Memory → Rag → Acp →
  * Hook → Runtime → `ProjectGuidance`) to avoid needless prefix-cache churn.
  */
-export type InjectionSource = "Memory" | "RAG" | "ACP" | "Hook" | "Runtime" | "ProjectGuidance";
+export type InjectionSource = "Memory" | "RAG" | "ACP" | "Hook" | "Runtime" | "RoundBudget" | "ProjectGuidance";

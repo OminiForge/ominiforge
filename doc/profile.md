@@ -160,6 +160,9 @@ auto_write = true                    # agent 可否自动写入 memory
 session_max_usd = 10.00
 daily_max_usd = 50.00
 warn_at_percent = 80
+max_rounds = 1000                  # 单 turn 绝对硬顶（MaxRoundsExceeded）
+round_budget_threshold = 20        # 软预算窗口；0 = 禁用提醒
+round_budget_warn_pct = 0.8        # 首次提醒比例
 
 [hooks]
 before_tool = ["security-guard"]     # 额外绑定的 hook
@@ -192,7 +195,10 @@ tool = "write"
 | tools.* | ✗ | 默认全部可用 |
 | skills.* | ✗ | 默认全部可用 |
 | memory.* | ✗ | 默认 scopes=["user","project"], auto_write=true |
-| budget.* | ✗ | 默认无限制 |
+| budget.session_max_usd | ✗ | 金钱预算；默认无限制 |
+| budget.max_rounds | ✗ | 单 turn 模型轮次绝对硬顶；默认 1000。见 `doc/todo.md` §7 |
+| budget.round_budget_threshold | ✗ | 每步软 round 预算；默认 20，`0` 禁用。见 `doc/todo.md` §7b |
+| budget.round_budget_warn_pct | ✗ | 软预算首次提醒比例；默认 0.8 |
 | hooks.* | ✗ | 默认无额外 hook |
 | network.policy | ✗ | 沙箱网络策略 `isolated`/`allowlist`/`open`；缺省继承 gateway `default_network`（兜底 = `open`）。见 `doc/sandbox.md` §6.2 |
 | network.allow | ✗ | `allowlist` 下的可达主机；其他策略忽略 |

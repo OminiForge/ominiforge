@@ -87,12 +87,20 @@ pub struct AgentConfig {
     /// Per-tool-invocation time budget.
     pub tool_timeout: Duration,
     /// Absolute safety net on model rounds in one turn. This is *not* the
-    /// primary loop control — the completion gate and stuck detection
-    /// (`doc/todo.md` §6–§7) catch a misbehaving turn far earlier and more
-    /// cheaply. `max_rounds` only backstops a runaway that slips past both, so
-    /// it is set generously: a routine multi-step task (read many files, run a
-    /// few commands, write output) legitimately needs dozens of rounds.
+    /// primary loop control — the round-budget reminder below, the completion
+    /// gate, and stuck detection (`doc/todo.md` §6–§7) catch a misbehaving
+    /// turn far earlier and more cheaply. `max_rounds` only backstops a
+    /// runaway that slips past all three; it is set generously so a legitimate
+    /// long task (many files, many verifications) never hits it.
     pub max_rounds: u32,
+    /// Soft per-step round budget. Once the model has spent this many rounds
+    /// since the last todo op (or turn start), every round injects a
+    /// round-budget reminder until the todo list moves or the turn ends.
+    /// `0` disables the reminder entirely. See `doc/todo.md` §7b.
+    pub round_budget_threshold: u32,
+    /// Fraction of `round_budget_threshold` at which a one-shot soft warning
+    /// fires (e.g. 0.8 = warn once when 80% of the budget is spent).
+    pub round_budget_warn_pct: f32,
     /// The model's context window in tokens, for the usage estimate's effective
     /// limit. `0` means "unknown" (threshold tracking is skipped).
     pub context_window: u32,
@@ -115,7 +123,9 @@ impl Default for AgentConfig {
             max_tokens: None,
             think_effort: None,
             tool_timeout: Duration::from_secs(120),
-            max_rounds: 100,
+            max_rounds: 1000,
+            round_budget_threshold: 20,
+            round_budget_warn_pct: 0.8,
             context_window: 0,
             compaction_threshold: DEFAULT_COMPACTION_THRESHOLD,
             workspace: PathBuf::new(),
@@ -400,6 +410,8 @@ impl Agent {
             step_stuck_rounds: HashMap::new(),
             model,
             think_effort,
+            round_budget_spent: 0,
+            round_budget_warned: false,
         };
         turn.run(input).await
     }
@@ -531,6 +543,14 @@ struct TurnState<'a> {
     model: Option<String>,
     /// Per-turn reasoning-effort override; `None` uses the config's effort.
     think_effort: Option<String>,
+
+    // Round-budget reminder state (doc/todo.md §7b). Reset every time the
+    // todo list moves (any successful todo op) and at turn start.
+    /// Rounds spent since the last todo op (or turn start).
+    round_budget_spent: u32,
+    /// Whether the one-shot soft warning (at `round_budget_warn_pct`) has
+    /// already fired for the current budget window.
+    round_budget_warned: bool,
 }
 
 /// What the completion gate decided when the model stopped calling tools.
@@ -808,6 +828,12 @@ impl TurnState<'_> {
                 self.answer = answer;
             }
             self.runtime.push_message(outcome.message.clone());
+
+            // Round-budget reminder (`doc/todo.md` §7b): fired every round,
+            // before the completion gate, so a turn that is about to run out
+            // of soft budget hears about it even when the model stops calling
+            // tools on this very round.
+            self.check_round_budget()?;
 
             if tool_calls.is_empty() {
                 match self.completion_gate()? {
@@ -1191,11 +1217,22 @@ impl TurnState<'_> {
     /// Push a runtime reminder into the context (kept permanently, for prefix
     /// cache) and mirror it as an `InjectionEvent` (`doc/todo.md` §8).
     fn inject_runtime(&mut self, content: String) -> Result<(), AgentError> {
+        self.inject_with_source(InjectionSource::Runtime, content)
+    }
+
+    /// Same as [`inject_runtime`](Self::inject_runtime) but with an explicit
+    /// injection source, so round-budget reminders surface distinctly in the
+    /// event log and the UI (`doc/todo.md` §7b).
+    fn inject_with_source(
+        &mut self,
+        source: InjectionSource,
+        content: String,
+    ) -> Result<(), AgentError> {
         let token_count = estimate_tokens(&content);
         self.writer.append(
             runtime_source(),
             EventPayload::Injection(InjectionEvent::ContextInjected {
-                source: InjectionSource::Runtime,
+                source,
                 content: content.clone(),
                 token_count,
             }),
@@ -1203,6 +1240,83 @@ impl TurnState<'_> {
             Some(self.turn_id.clone()),
         )?;
         self.runtime.push_message(Message::User { content });
+        Ok(())
+    }
+
+    /// Reset the round-budget window. Called when a todo op lands — the model
+    /// has declared fresh work (or restructured the list), so it gets a fresh
+    /// budget to execute it (`doc/todo.md` §7b).
+    const fn reset_round_budget(&mut self) {
+        self.round_budget_spent = 0;
+        self.round_budget_warned = false;
+    }
+
+    /// Round-budget reminder (`doc/todo.md` §7b). Called after every model
+    /// round; decides whether to inject a soft warning (once, at
+    /// `round_budget_warn_pct`) or an exhausted reminder (every round past
+    /// `round_budget_threshold`). The reminder text branches on whether an
+    /// active todo step exists, because the corrective action differs.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    fn check_round_budget(&mut self) -> Result<(), AgentError> {
+        let threshold = self.agent.config.round_budget_threshold;
+        if threshold == 0 {
+            return Ok(());
+        }
+        self.round_budget_spent += 1;
+        let spent = self.round_budget_spent;
+        let warn_at = ((threshold as f32) * self.agent.config.round_budget_warn_pct).ceil() as u32;
+        let has_active_todo = self
+            .runtime
+            .todo
+            .iter()
+            .any(|s| s.status == StepStatus::InProgress || s.status == StepStatus::Pending);
+
+        if spent == warn_at && !self.round_budget_warned {
+            self.round_budget_warned = true;
+            let remaining = threshold.saturating_sub(spent);
+            let content = if has_active_todo {
+                format!(
+                    "<reminder>You have used {spent}/{threshold} rounds on the current \
+                     todo step ({remaining} left). If the step is nearly done, complete it \
+                     and move on — the budget resets. If it is bigger than expected, split \
+                     it: cancel with a reason and `add` finer-grained sub-steps.</reminder>"
+                )
+            } else {
+                format!(
+                    "<reminder>You have used {spent}/{threshold} rounds this turn \
+                     ({remaining} left) without an active todo list. If this is a \
+                     multi-step task, open a todo now (`init`) so the budget resets with \
+                     each step. If it is short, finish soon — the budget is nearly \
+                     out.</reminder>"
+                )
+            };
+            return self.inject_with_source(InjectionSource::RoundBudget, content);
+        }
+
+        if spent >= threshold {
+            let content = if has_active_todo {
+                format!(
+                    "<reminder>You have exhausted your round budget ({spent}/{threshold}) \
+                     on the current todo step. Update the todo list now: `complete` the \
+                     step if it is done (budget resets), `cancel` + `add` finer sub-steps \
+                     if it is too big, or `block` with a reason if it needs the \
+                     user.</reminder>"
+                )
+            } else {
+                format!(
+                    "<reminder>You have exhausted your round budget ({spent}/{threshold}) \
+                     and have no active todo list. Either stop and give your final answer, \
+                     or open a todo (`init`) to declare the remaining work — the budget \
+                     resets. Continuing without choosing repeats this reminder every \
+                     round.</reminder>"
+                )
+            };
+            return self.inject_with_source(InjectionSource::RoundBudget, content);
+        }
         Ok(())
     }
 
@@ -1540,6 +1654,13 @@ impl TurnState<'_> {
                 apply_todo_op(&mut self.runtime.todo, op).map_err(|e: TodoError| e.to_string())
             })
             .map(|()| todo::render(&self.runtime.todo));
+
+        // A successful todo op resets the round-budget window: the model has
+        // declared a fresh step (or restructured the list), so it gets a fresh
+        // budget to execute it (`doc/todo.md` §7b).
+        if result.is_ok() {
+            self.reset_round_budget();
+        }
 
         let output = match &result {
             Ok(rendered) => ToolOutput {
@@ -2868,6 +2989,214 @@ mod tests {
         )));
         // No clean Completed event was written.
         assert_eq!(turn_completed_count(&events), 0);
+    }
+
+    /// Round-budget reminders (`doc/todo.md` §7b): the loop warns once when
+    /// the soft threshold's warn fraction is crossed, and reminds every round
+    /// once the budget is exhausted. Resetting via a successful todo op gives
+    /// a fresh window.
+    fn round_budget_injections(events: &[CoreEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Injection(InjectionEvent::ContextInjected {
+                    source: InjectionSource::RoundBudget,
+                    content,
+                    ..
+                }) => Some(content.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// No active todo + crossing the warn fraction: one soft reminder only.
+    #[tokio::test]
+    async fn round_budget_warns_once_at_soft_threshold_without_todo() {
+        let dir = tempfile::tempdir().unwrap();
+        // No todo calls; each round calls shell so the loop never settles.
+        // threshold=5, warn_pct=0.8 → warn at spent=4, exhaust at spent=5.
+        let rounds = (0..5)
+            .map(|i| tool_call_round(&format!("c{i}"), "shell", r#"{"command":"true"}"#))
+            .chain(std::iter::once(text_round("done")))
+            .collect();
+        let provider = Arc::new(ScriptedProvider::new(rounds));
+        let agent = Agent::new(
+            provider,
+            ToolRegistry::new(),
+            AgentConfig {
+                model: "mock".to_owned(),
+                max_rounds: 50,
+                round_budget_threshold: 5,
+                round_budget_warn_pct: 0.8,
+                ..AgentConfig::default()
+            },
+        );
+
+        let store = SessionStore::new(dir.path().join("sessions"));
+        let mut writer = store.create_new(None, None, vec![]).unwrap();
+        let sid = writer.session_id().clone();
+        let mut runtime = SessionRuntime::default();
+        agent
+            .run_turn(&mut writer, &mut runtime, "go".to_owned())
+            .await
+            .unwrap();
+        drop(writer);
+
+        let events = store.read_events(&sid).unwrap();
+        let reminders = round_budget_injections(&events);
+        // One soft warning (spent=4) + one exhausted (spent=5) + one more
+        // on the final text round (spent=6, still over budget).
+        assert_eq!(reminders.len(), 3);
+        assert!(reminders[0].contains("4/5"));
+        assert!(reminders[0].contains("without an active todo list"));
+        assert!(reminders[1].contains("exhausted your round budget"));
+        assert!(reminders[1].contains("no active todo list"));
+        assert!(reminders[2].contains("6/5"));
+    }
+
+    /// With an active todo, the reminders branch to the todo-aware text.
+    #[tokio::test]
+    async fn round_budget_with_active_todo_nudges_todo_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rounds = vec![todo_round(
+            "c0",
+            r#"{"op":"init","steps":[{"content":"long step"}]}"#,
+        )];
+        rounds.push(todo_round("c1", r#"{"ops":[{"op":"start","id":"1"}]}"#));
+        // Burn budget on the step via shell calls (each round's todo result
+        // above does NOT reset the budget for the *next* round — reset happens
+        // when the todo op lands, so the shell rounds below accumulate spent).
+        for i in 0..5 {
+            rounds.push(tool_call_round(
+                &format!("s{i}"),
+                "shell",
+                r#"{"command":"true"}"#,
+            ));
+        }
+        // Complete the step so the completion gate lets the turn end.
+        rounds.push(todo_round("c2", r#"{"ops":[{"op":"complete","id":"1"}]}"#));
+        rounds.push(text_round("wrapped"));
+        let provider = Arc::new(ScriptedProvider::new(rounds));
+        let agent = Agent::new(
+            provider,
+            ToolRegistry::new(),
+            AgentConfig {
+                model: "mock".to_owned(),
+                max_rounds: 50,
+                round_budget_threshold: 3,
+                round_budget_warn_pct: 0.5, // warn at spent=2 (after the first shell)
+                ..AgentConfig::default()
+            },
+        );
+
+        let store = SessionStore::new(dir.path().join("sessions"));
+        let mut writer = store.create_new(None, None, vec![]).unwrap();
+        let sid = writer.session_id().clone();
+        let mut runtime = SessionRuntime::default();
+        agent
+            .run_turn(&mut writer, &mut runtime, "go".to_owned())
+            .await
+            .unwrap();
+        drop(writer);
+
+        let events = store.read_events(&sid).unwrap();
+        let reminders = round_budget_injections(&events);
+        // The `start` todo op resets the budget; then 5 shell rounds run with
+        // threshold=3 → warn once at spent=2, exhaust at spent=3,4,5.
+        assert!(!reminders.is_empty());
+        assert!(reminders[0].contains("current todo step"));
+        assert!(reminders.iter().any(|r| r.contains("complete` the step")));
+    }
+
+    /// A successful todo op resets the budget window: spent returns to 0 and
+    /// the soft warning can fire again later.
+    #[tokio::test]
+    async fn todo_op_resets_round_budget_window() {
+        let dir = tempfile::tempdir().unwrap();
+        // threshold=2, warn_pct=0.5 → warn at spent=1, exhaust at spent=2.
+        let rounds = vec![
+            tool_call_round("s0", "shell", r#"{"command":"true"}"#), // spent=1 → soft warn (no todo)
+            todo_round("c0", r#"{"op":"init","steps":[{"content":"a"}]}"#), // resets
+            tool_call_round("s1", "shell", r#"{"command":"true"}"#), // spent=1 again → soft warn (has todo)
+            // Complete the step so the completion gate lets the turn end.
+            todo_round("c1", r#"{"ops":[{"op":"complete","id":"1"}]}"#),
+            text_round("done"),
+        ];
+        let provider = Arc::new(ScriptedProvider::new(rounds));
+        let agent = Agent::new(
+            provider,
+            ToolRegistry::new(),
+            AgentConfig {
+                model: "mock".to_owned(),
+                max_rounds: 50,
+                round_budget_threshold: 2,
+                round_budget_warn_pct: 0.5,
+                ..AgentConfig::default()
+            },
+        );
+
+        let store = SessionStore::new(dir.path().join("sessions"));
+        let mut writer = store.create_new(None, None, vec![]).unwrap();
+        let sid = writer.session_id().clone();
+        let mut runtime = SessionRuntime::default();
+        agent
+            .run_turn(&mut writer, &mut runtime, "go".to_owned())
+            .await
+            .unwrap();
+        drop(writer);
+
+        let events = store.read_events(&sid).unwrap();
+        let reminders = round_budget_injections(&events);
+        // Each round after a todo op starts a fresh window: spent climbs 1, 2,
+        // then reset, 1, 2, then reset, 1. Branches track the live todo state.
+        assert_eq!(reminders.len(), 5);
+        assert!(reminders[0].contains("1/2"));
+        assert!(reminders[0].contains("without an active todo list"));
+        assert!(reminders[1].contains("exhausted"));
+        assert!(reminders[1].contains("no active todo list"));
+        // After `init`, the step exists but is still pending — reminder
+        // branches to the todo-aware text.
+        assert!(reminders[2].contains("1/2"));
+        assert!(reminders[2].contains("current todo step"));
+        assert!(reminders[3].contains("exhausted"));
+        assert!(reminders[3].contains("current todo step"));
+        // After `complete`, no active todo remains — back to the no-todo branch.
+        assert!(reminders[4].contains("1/2"));
+        assert!(reminders[4].contains("without an active todo list"));
+    }
+
+    /// `round_budget_threshold = 0` disables the reminder entirely.
+    #[tokio::test]
+    async fn zero_threshold_disables_round_budget_reminder() {
+        let dir = tempfile::tempdir().unwrap();
+        let rounds = (0..10)
+            .map(|i| tool_call_round(&format!("c{i}"), "shell", r#"{"command":"true"}"#))
+            .chain(std::iter::once(text_round("done")))
+            .collect();
+        let provider = Arc::new(ScriptedProvider::new(rounds));
+        let agent = Agent::new(
+            provider,
+            ToolRegistry::new(),
+            AgentConfig {
+                model: "mock".to_owned(),
+                max_rounds: 50,
+                round_budget_threshold: 0,
+                ..AgentConfig::default()
+            },
+        );
+
+        let store = SessionStore::new(dir.path().join("sessions"));
+        let mut writer = store.create_new(None, None, vec![]).unwrap();
+        let sid = writer.session_id().clone();
+        let mut runtime = SessionRuntime::default();
+        agent
+            .run_turn(&mut writer, &mut runtime, "go".to_owned())
+            .await
+            .unwrap();
+        drop(writer);
+
+        let events = store.read_events(&sid).unwrap();
+        assert_eq!(round_budget_injections(&events).len(), 0);
     }
 
     /// A `cancel`/`block` op missing its required `reason` fails to decode and

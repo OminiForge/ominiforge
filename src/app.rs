@@ -309,6 +309,9 @@ pub async fn assemble(
             max_tokens: Some(resolved.max_output_tokens),
             think_effort: resolved.think_effort.clone(),
             tool_timeout: Duration::from_secs(120),
+            max_rounds: profile.budget.max_rounds.unwrap_or(1000),
+            round_budget_threshold: profile.budget.round_budget_threshold.unwrap_or(20),
+            round_budget_warn_pct: profile.budget.round_budget_warn_pct.unwrap_or(0.8),
             context_window: resolved.context_window,
             compaction_threshold: profile
                 .context

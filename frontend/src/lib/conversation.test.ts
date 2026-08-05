@@ -923,6 +923,33 @@ describe('activity fold', () => {
 		expect(row.kind === 'activity' && row.detail).toBe(reminder);
 	});
 
+	it('a round-budget reminder folds into an activity row with the timer icon', () => {
+		const inject = (seq: number, source: string, content: string): GatewayEvent =>
+			({
+				type: 'event',
+				schema_version: 'ominiforge.event.v1',
+				seq,
+				session_id: 's',
+				timestamp: '2026-06-24T00:00:00Z',
+				source: { kind: 'Runtime', id: 'runtime' },
+				parent_event_id: null,
+				turn_id: null,
+				payload: { Injection: { ContextInjected: { source, content, token_count: 10 } } }
+			}) as unknown as GatewayEvent;
+		const reminder =
+			'<reminder>You have used 16/20 rounds this turn (4 left) without an active todo ' +
+			'list. If this is a multi-step task, open a todo now.</reminder>';
+		const state = fold([inject(1, 'RoundBudget', reminder)]);
+		const activities = state.items.filter((i) => i.kind === 'activity');
+		expect(activities).toHaveLength(1);
+		const row = activities[0];
+		expect(row.kind === 'activity' && row.icon).toBe('timer');
+		expect(row.kind === 'activity' && row.label).toContain(
+			'Model reminder: You have used 16/20'
+		);
+		expect(row.kind === 'activity' && row.detail).toBe(reminder);
+	});
+
 	it('every hook execution folds into an activity row; block/fail carry the reason', () => {
 		const state = fold([
 			hookExecuted(1, 'Pass'),

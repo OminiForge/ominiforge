@@ -194,7 +194,14 @@ pub struct MemorySection {
     pub auto_write: Option<bool>,
 }
 
-/// `[budget]` (parsed; not yet wired).
+/// `[budget]`: per-turn round budget and the absolute hard cap.
+///
+/// `max_rounds` is the absolute safety net on model rounds in one turn
+/// (`doc/todo.md` §7). `round_budget_threshold` + `round_budget_warn_pct`
+/// drive the soft round-budget reminder: when the model has spent
+/// `warn_pct * threshold` rounds the loop injects a one-shot reminder, and
+/// once it has spent the full threshold it injects a reminder every round
+/// until the todo list moves or the turn ends.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct BudgetSection {
@@ -204,6 +211,18 @@ pub struct BudgetSection {
     pub daily_max_usd: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warn_at_percent: Option<u32>,
+    /// Absolute hard cap on model rounds in one turn (`MaxRoundsExceeded`
+    /// when hit). Default 1000 when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rounds: Option<u32>,
+    /// Soft per-step round budget. `0` disables the round-budget reminder
+    /// entirely. Default 20 when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round_budget_threshold: Option<u32>,
+    /// Fraction of `round_budget_threshold` at which a one-shot warning
+    /// fires. Default 0.8 when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round_budget_warn_pct: Option<f32>,
 }
 
 /// `[hooks]` (parsed; not yet wired).

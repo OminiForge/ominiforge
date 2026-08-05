@@ -474,13 +474,18 @@ function applyCommitted(
 	}
 	if ('Injection' in payload) {
 		const inj = payload.Injection;
-		// Only Runtime injections surface in the flow: they are the loop nudging
-		// itself mid-turn (completion gate / stuck-step reminders), invisible
-		// otherwise. Memory/RAG/Hook/ProjectGuidance injections happen at
-		// assembly time and are inspect content, not conversation activity.
-		if ('ContextInjected' in inj && inj.ContextInjected.source === 'Runtime') {
+		// Runtime + RoundBudget injections surface in the flow: they are the loop
+		// nudging itself mid-turn (completion gate / stuck-step / round-budget
+		// reminders), invisible otherwise. Memory/RAG/Hook/ProjectGuidance
+		// injections happen at assembly time and are inspect content, not
+		// conversation activity. RoundBudget gets the timer icon so the user can
+		// tell a budget nudge apart from a completion-gate nudge.
+		if ('ContextInjected' in inj) {
+			const source = inj.ContextInjected.source;
+			if (source !== 'Runtime' && source !== 'RoundBudget') return next;
 			const content = inj.ContextInjected.content;
-			const at = transientActivityIndex(next.items, 'runtime');
+			const icon = source === 'RoundBudget' ? 'timer' : 'runtime';
+			const at = transientActivityIndex(next.items, icon);
 			if (at >= 0) {
 				const items = [...next.items];
 				items[at] = { ...items[at], id: Number(core.seq), streaming: false } as Item;
@@ -489,7 +494,7 @@ function applyCommitted(
 			return push(next, {
 				kind: 'activity',
 				id: Number(core.seq),
-				icon: 'runtime',
+				icon,
 				label: runtimeInjectionLabel(content),
 				detail: content
 			});
@@ -879,7 +884,7 @@ function pushTransient(
 
 /// Find the newest transient activity row of the given icon (a row pushed at
 /// delta time for a live op). Returns its items index, or -1.
-function transientActivityIndex(items: Item[], icon: 'hook' | 'todo' | 'runtime'): number {
+function transientActivityIndex(items: Item[], icon: 'hook' | 'todo' | 'runtime' | 'timer'): number {
 	for (let i = items.length - 1; i >= 0; i--) {
 		const it = items[i];
 		if (it.kind === 'activity' && it.icon === icon && it.streaming) return i;
