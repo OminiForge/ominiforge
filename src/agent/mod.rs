@@ -137,7 +137,8 @@ impl Default for AgentConfig {
 ///
 /// Owned by the interactive loop / CLI and borrowed by each [`TurnState`].
 /// Rebuilt from `events.jsonl` when resuming a session (replay the todo ops and
-/// the conversation view; see `doc/todo.md` §10.3 — Phase 2). In the Phase 1
+/// the conversation view, folding steps orphaned by an abnormally ended turn to
+/// `Blocked`; see `doc/todo.md` §10). In the Phase 1
 /// single-turn CLI it is built fresh per `run` and discarded, the degenerate
 /// case of the same interface.
 #[derive(Debug, Clone, Default)]

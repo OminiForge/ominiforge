@@ -33,7 +33,14 @@
 //!
 //! The todo list is rebuilt separately by replaying each `todo` tool call's op, with
 //! the same error tolerance as live dispatch (a bad op was never applied, so
-//! replay skips it too).
+//! replay skips it too). One recovery semantic sits on top of plain replay: when
+//! the log's last turn ended abnormally (`Interrupted` — user cancel or a dead
+//! gateway — or `Failed`), its non-terminal steps would otherwise revive as
+//! `pending`/`in_progress` and hold the next turn's completion gate open even
+//! when the model only wants to ask the user something. [`rebuild_runtime`]
+//! therefore folds those steps to `Blocked` and injects one synthetic reminder
+//! naming them, so the model sees the collapsed state and re-plans, restarts, or
+//! cancels them itself (`doc/todo.md` §10).
 
 use std::collections::{HashMap, HashSet};
 
@@ -45,7 +52,7 @@ use crate::core::payload::{
 use crate::llm::{Message, ToolCall};
 
 use super::todo::{TODO_TOOL_NAME, TodoOp, apply_todo_op};
-use super::{SessionRuntime, TodoItem, render_output};
+use super::{SessionRuntime, StepStatus, TodoItem, render_output};
 
 /// Rebuild a [`SessionRuntime`] from `events`, seeded with `system` (the system
 /// message(s) the caller derived from the profile).
@@ -58,9 +65,68 @@ pub fn rebuild_runtime(events: &[CoreEvent], system: Vec<Message>) -> SessionRun
     // authoritative token count forward, so the first request after resume
     // recalibrates it from real usage (`doc/context-management.md`).
     let mut runtime = SessionRuntime::new(rebuild_context(events, system));
-    runtime.todo = rebuild_todo(events);
+    runtime.todo = rebuild_todo(events, log_ends_abnormal(events));
+    if let Some(reminder) = interrupted_todo_reminder(&runtime.todo) {
+        runtime.push_message(Message::User { content: reminder });
+    }
     runtime.loaded_guidance = rebuild_loaded_guidance(events);
     runtime
+}
+
+/// Whether the log's tail is an abnormally ended turn: a `Started`/`Resumed`
+/// whose terminator is `Interrupted` (user cancel, dead gateway) or `Failed`,
+/// or — a truncated/crashed log — no terminator at all. A `Completed` tail (or
+/// an empty log) is normal. The todo replay only folds on `true`.
+///
+/// The reverse scan returns on the *first* turn-lifecycle event, so only the
+/// most recent turn's ending decides — an earlier `Interrupted` that a later
+/// turn already dealt with is shadowed by that turn's terminator and never
+/// reached. Turns are bracketed by lifecycle events, so the scan is bounded by
+/// the distance to the tail (a handful of events), never the whole log; the
+/// same tail-first pattern as `open_turn_id` in the gateway actor.
+fn log_ends_abnormal(events: &[CoreEvent]) -> bool {
+    for event in events.iter().rev() {
+        match &event.payload {
+            // An open turn here means the log lost its terminator (crash
+            // mid-write): treat it as abnormal like `Interrupted`/`Failed`.
+            EventPayload::Turn(
+                TurnEvent::Started { .. }
+                | TurnEvent::Resumed { .. }
+                | TurnEvent::Failed { .. }
+                | TurnEvent::Interrupted { .. },
+            ) => return true,
+            EventPayload::Turn(TurnEvent::Completed { .. }) => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The synthetic reminder injected after an abnormal-end fold, naming every
+/// step that was collapsed to `Blocked`. `None` when nothing was folded (the
+/// model then sees no todo noise it did not write itself). The fold leaves the
+/// step in a terminal state, so nothing else re-surfaces it — without this
+/// reminder the model could miss that its todo changed; with it the model
+/// re-plans, restarts, or cancels the named steps on its own.
+fn interrupted_todo_reminder(todo: &[TodoItem]) -> Option<String> {
+    let mut names = String::new();
+    for step in todo.iter().filter(|s| {
+        s.status == super::StepStatus::Blocked && s.reason.as_deref() == Some(INTERRUPTED_REASON)
+    }) {
+        use std::fmt::Write;
+        let _ = writeln!(names, "  [{}] {}", step.id, step.content);
+    }
+    if names.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "<reminder>The previous turn was interrupted before it finished. The \
+         following todo steps were still non-terminal and have been marked \
+         `blocked` so this turn is not held open by stale work:\n{names}\
+         Review them against the current request: `start` a step to resume it, \
+         `cancel` what is obsolete, or `init` a fresh list to re-plan. Do not \
+         leave them blocked out of forgetfulness.</reminder>"
+    ))
 }
 
 /// Rebuild the conversation view: `system` followed by the messages replayed
@@ -315,7 +381,16 @@ impl ContextRebuilder {
 /// An op that fails to decode or apply is skipped — live dispatch never applied
 /// it either (a bad op yields an `is_error` result, leaving the list unchanged),
 /// so the replayed list matches the runtime list at the time the session stopped.
-fn rebuild_todo(events: &[CoreEvent]) -> Vec<TodoItem> {
+/// The `reason` stamped on steps collapsed by the abnormal-end fold. The
+/// reminder matcher keys on this exact string, so keep the two in step.
+const INTERRUPTED_REASON: &str = "the previous turn ended abnormally (cancelled, failed, or crashed); re-plan, \
+     restart, or cancel this step";
+
+/// `ends_abnormal`: see [`log_ends_abnormal`]. When set, every step the replay
+/// leaves non-terminal is folded to `Blocked` with [`INTERRUPTED_REASON`] — the
+/// turn that owned them is dead, so they must not hold the next turn's
+/// completion gate open.
+fn rebuild_todo(events: &[CoreEvent], ends_abnormal: bool) -> Vec<TodoItem> {
     let mut todo = Vec::new();
     for event in events {
         if event.source.kind != SourceKind::Tool || event.source.id != TODO_TOOL_NAME {
@@ -325,6 +400,14 @@ fn rebuild_todo(events: &[CoreEvent]) -> Vec<TodoItem> {
             && let Ok(op) = serde_json::from_value::<TodoOp>(input.clone())
         {
             let _ = apply_todo_op(&mut todo, op);
+        }
+    }
+    if ends_abnormal {
+        for step in &mut todo {
+            if !step.status.is_terminal() {
+                step.status = StepStatus::Blocked;
+                step.reason = Some(INTERRUPTED_REASON.to_owned());
+            }
         }
     }
     todo
@@ -527,6 +610,34 @@ mod tests {
             source: ToolSource::Builtin,
             input,
             working_dir: None,
+        })
+    }
+
+    fn turn_completed() -> EventPayload {
+        EventPayload::Turn(TurnEvent::Completed {
+            turn_id: TurnId("t".to_owned()),
+        })
+    }
+
+    fn turn_interrupted(at_seq: u64) -> EventPayload {
+        EventPayload::Turn(TurnEvent::Interrupted {
+            turn_id: TurnId("t".to_owned()),
+            interrupted_at_event_id: EventId {
+                session_id: sid(),
+                seq: at_seq,
+            },
+        })
+    }
+
+    fn turn_failed() -> EventPayload {
+        EventPayload::Turn(TurnEvent::Failed {
+            turn_id: TurnId("t".to_owned()),
+            failed_at_event_id: EventId {
+                session_id: sid(),
+                seq: 0,
+            },
+            retryable: false,
+            reason: None,
         })
     }
 
@@ -757,9 +868,152 @@ mod tests {
         assert_eq!(rt.todo.len(), 2);
         assert_eq!(rt.todo[0].id, "1");
         assert_eq!(rt.todo[0].status, super::super::StepStatus::Completed);
-        // Step two stayed pending: the cancel op was malformed and skipped.
+        // Step two was never touched: the cancel op was malformed and skipped.
         assert_eq!(rt.todo[1].id, "2");
-        assert_eq!(rt.todo[1].status, super::super::StepStatus::Pending);
+        // The log ends on an open turn (no terminator — a truncated log reads
+        // as abnormal), so the pending step folds to `blocked` and a reminder
+        // lands on the context tail naming it.
+        assert_eq!(rt.todo[1].status, super::super::StepStatus::Blocked);
+        assert_eq!(rt.todo[1].reason.as_deref(), Some(INTERRUPTED_REASON));
+        assert!(matches!(
+            rt.context.last(),
+            Some(Message::User { content }) if content.contains("step two")
+        ));
+    }
+
+    /// A turn that ends `Interrupted` (user cancel, dead gateway) must not
+    /// leave its non-terminal steps holding the next turn's completion gate
+    /// open — the model may simply want to ask the user something. Resume folds
+    /// them to `blocked` with a reason, and injects one reminder naming them so
+    /// the model (which is never re-shown the list otherwise) re-plans,
+    /// restarts, or cancels them (`doc/todo.md` §10).
+    #[test]
+    fn interrupted_turn_folds_non_terminal_steps_to_blocked() {
+        let events = vec![
+            ev(0, runtime_src(), started("task")),
+            ev(
+                1,
+                tool_src(TODO_TOOL_NAME),
+                todo_started(serde_json::json!({
+                    "op": "init",
+                    "steps": [{"content": "done step"}, {"content": "live step"}, {"content": "queued step"}]
+                })),
+            ),
+            ev(
+                2,
+                tool_src(TODO_TOOL_NAME),
+                todo_started(serde_json::json!({"ops": [
+                    {"op": "complete", "id": "1"},
+                    {"op": "start", "id": "2"}
+                ]})),
+            ),
+            ev(3, runtime_src(), turn_interrupted(2)),
+        ];
+
+        let rt = rebuild_runtime(&events, vec![]);
+
+        // Terminal state survives untouched; non-terminal folds with a reason.
+        assert_eq!(rt.todo[0].status, StepStatus::Completed);
+        assert_eq!(rt.todo[0].reason, None);
+        for step in &rt.todo[1..] {
+            assert_eq!(step.status, StepStatus::Blocked);
+            assert_eq!(step.reason.as_deref(), Some(INTERRUPTED_REASON));
+        }
+        // One reminder, naming exactly the folded steps, on the context tail.
+        let Some(Message::User { content }) = rt.context.last() else {
+            panic!("expected the interruption reminder as the last message");
+        };
+        assert!(content.contains("live step") && content.contains("queued step"));
+        assert!(!content.contains("done step"));
+        assert!(content.starts_with("<reminder>") && content.ends_with("</reminder>"));
+    }
+
+    /// `Failed` is an abnormal end too (provider outage mid-turn): the same
+    /// fold applies, so a retrying user is not greeted by a stale gate.
+    #[test]
+    fn failed_turn_folds_non_terminal_steps_to_blocked() {
+        let events = vec![
+            ev(0, runtime_src(), started("task")),
+            ev(
+                1,
+                tool_src(TODO_TOOL_NAME),
+                todo_started(serde_json::json!({
+                    "op": "init",
+                    "steps": [{"content": "step"}]
+                })),
+            ),
+            ev(2, runtime_src(), turn_failed()),
+        ];
+
+        let rt = rebuild_runtime(&events, vec![]);
+
+        assert_eq!(rt.todo[0].status, StepStatus::Blocked);
+        assert_eq!(rt.todo[0].reason.as_deref(), Some(INTERRUPTED_REASON));
+        assert!(
+            matches!(rt.context.last(), Some(Message::User { content }) if content.contains("step"))
+        );
+    }
+
+    /// A cleanly completed turn leaves the replayed todo exactly as the model
+    /// left it — the fold must not touch a normal end, and no synthetic
+    /// reminder appears.
+    #[test]
+    fn completed_turn_does_not_fold_todo() {
+        let events = vec![
+            ev(0, runtime_src(), started("task")),
+            ev(
+                1,
+                tool_src(TODO_TOOL_NAME),
+                todo_started(serde_json::json!({
+                    "op": "init",
+                    "steps": [{"content": "still pending"}]
+                })),
+            ),
+            ev(2, runtime_src(), turn_completed()),
+        ];
+
+        let rt = rebuild_runtime(&events, vec![]);
+
+        assert_eq!(rt.todo[0].status, StepStatus::Pending);
+        assert_eq!(rt.todo[0].reason, None);
+        assert!(!matches!(
+            rt.context.last(),
+            Some(Message::User { content }) if content.contains("<reminder>")
+        ));
+    }
+
+    /// An abnormal end with an empty (or already all-terminal) todo folds
+    /// nothing, so no reminder is injected — the resumed context carries no
+    /// todo noise the model did not write.
+    #[test]
+    fn interrupted_turn_with_terminal_todo_injects_no_reminder() {
+        let events = vec![
+            ev(0, runtime_src(), started("task")),
+            ev(
+                1,
+                tool_src(TODO_TOOL_NAME),
+                todo_started(serde_json::json!({
+                    "op": "init",
+                    "steps": [{"content": "done"}]
+                })),
+            ),
+            ev(
+                2,
+                tool_src(TODO_TOOL_NAME),
+                todo_started(serde_json::json!({"ops": [{"op": "complete", "id": "1"}]})),
+            ),
+            ev(3, runtime_src(), turn_interrupted(2)),
+        ];
+
+        let rt = rebuild_runtime(&events, vec![]);
+
+        assert_eq!(rt.todo[0].status, StepStatus::Completed);
+        assert_eq!(
+            rt.context.last(),
+            Some(&Message::User {
+                content: "task".to_owned()
+            })
+        );
     }
 
     /// A `ProjectGuidance` injection rebuilds two things on resume: its wrapped

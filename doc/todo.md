@@ -190,6 +190,15 @@ todo 与 context 留在 `SessionRuntime`。
   events.jsonl。resume 时按时间序回放 todo op 依次 `apply_todo_op`，确定性重建当前清单——
   符合"events 是 source of truth，内存结构可重建"。Phase 1 单 turn CLI 每次新建空 runtime；
   多 turn 延续与 resume 重建在 Phase 2 落地，接口现在就立好，单 turn 是其退化情形。
+- **异常结束折叠（cancel / fail / crash）**：日志尾部不是 `Completed` 时（`Interrupted`、
+  `Failed`，或日志被截断连终止符都没有），回放出的非终态步骤属于一个已死的 turn——若原样
+  复活为 pending/in_progress，下个 turn 模型哪怕只想问用户一句话，也会被完成度门当成
+  "还有未完成任务"而注入提醒强行续 round。因此 `rebuild_runtime` 在回放后把这些步骤折叠为
+  `Blocked`（reason 指明前个 turn 异常结束），并在 context 尾部注入一条合成 `<reminder>`
+  点名被折叠的步骤：blocked 是终态、不会再触发门，而 reminder 保证模型看得见 todo 变了，
+  由它决定 `start` 继续 / `cancel` 关闭 / `init` 重设计。干净 `Completed` 的 turn 不受影响，
+  无可折叠步骤时也不注入 reminder。与 dangling tool call 的 `[cancelled]` 合成结果同类：日志
+  保持不可变，恢复语义体现在重建出的内存状态上。
 
 ## 11. 不在 MVP 中
 
