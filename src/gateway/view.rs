@@ -188,6 +188,11 @@ pub fn fold_view(events: &[CoreEvent]) -> SessionView {
     let mut pending_asks: HashMap<String, (u64, String, serde_json::Value)> = HashMap::new();
     let mut last_seq: Option<u64> = None;
     let mut turn_running = false;
+    // Timestamp of the running turn's `Started` event, kept so the terminator
+    // can compute the turn's wall-clock duration from the two committed
+    // timestamps — mirroring the web fold's `turnStartedAt`. Cleared when the
+    // turn ends.
+    let mut turn_started_at: Option<chrono::DateTime<chrono::Utc>> = None;
     // Insertion order is preserved so the client's divergence display is
     // stable across identical folds.
     let mut runtime_models: Vec<String> = Vec::new();
@@ -196,7 +201,14 @@ pub fn fold_view(events: &[CoreEvent]) -> SessionView {
         let seq = ev.seq;
         last_seq = Some(seq);
         match &ev.payload {
-            EventPayload::Turn(t) => fold_turn(seq, t, &mut items, &mut turn_running),
+            EventPayload::Turn(t) => fold_turn(
+                seq,
+                ev.timestamp,
+                t,
+                &mut items,
+                &mut turn_running,
+                &mut turn_started_at,
+            ),
             EventPayload::Model(ModelEvent::RequestStarted { model, .. }) => {
                 if !runtime_models.contains(model) {
                     runtime_models.push(model.clone());
@@ -243,8 +255,17 @@ pub fn fold_view(events: &[CoreEvent]) -> SessionView {
 /// bubble; the lifecycle flips `turn_running` last-write-wins. A turn ending
 /// while an ask is pending leaves a zombie prompt (its Decided can never
 /// commit): disarm it, mirroring the web fold's Completed/Failed/Interrupted
-/// handling.
-fn fold_turn(seq: u64, t: &TurnEvent, items: &mut Vec<ViewItem>, turn_running: &mut bool) {
+/// handling. A cleanly-started turn's terminator also appends the wall-clock
+/// duration activity row, so the persisted view carries the same turn timer
+/// the live web fold shows (otherwise it vanishes on page reload).
+fn fold_turn(
+    seq: u64,
+    timestamp: chrono::DateTime<chrono::Utc>,
+    t: &TurnEvent,
+    items: &mut Vec<ViewItem>,
+    turn_running: &mut bool,
+    turn_started_at: &mut Option<chrono::DateTime<chrono::Utc>>,
+) {
     if let TurnEvent::Started {
         input: Some(text), ..
     } = t
@@ -256,7 +277,11 @@ fn fold_turn(seq: u64, t: &TurnEvent, items: &mut Vec<ViewItem>, turn_running: &
         });
     }
     match t {
-        TurnEvent::Started { .. } | TurnEvent::Resumed { .. } => *turn_running = true,
+        TurnEvent::Started { .. } => {
+            *turn_running = true;
+            *turn_started_at = Some(timestamp);
+        }
+        TurnEvent::Resumed { .. } => *turn_running = true,
         TurnEvent::Completed { .. } | TurnEvent::Failed { .. } | TurnEvent::Interrupted { .. } => {
             *turn_running = false;
             for item in items.iter_mut() {
@@ -267,8 +292,40 @@ fn fold_turn(seq: u64, t: &TurnEvent, items: &mut Vec<ViewItem>, turn_running: &
                     *approval_pending = false;
                 }
             }
+            // Wall-clock duration from the committed Started/terminator
+            // timestamps (covers model requests AND tool execution). Only
+            // shown when the turn started cleanly — a resumed turn's Started
+            // is in the prior session.
+            if let Some(label) = turn_started_at
+                .take()
+                .and_then(|started| format_turn_duration(timestamp - started))
+            {
+                items.push(ViewItem::Activity {
+                    id: seq,
+                    icon: ViewActivityIcon::Timer,
+                    label,
+                    detail: None,
+                });
+            }
         }
     }
+}
+
+/// Format a turn's wall-clock duration for the activity timeline, mirroring
+/// the web fold's `formatTurnDuration`: rounds to one decimal for sub-minute
+/// turns, whole minutes:seconds above that ("3.2s", "47s", "2m 5s").
+/// Returns `None` for negative/zero durations (clock skew between events).
+fn format_turn_duration(d: chrono::Duration) -> Option<String> {
+    let ms = d.num_milliseconds();
+    if ms <= 0 {
+        return None;
+    }
+    // Sub-minute: tenths of a second via integer math (avoids a float cast).
+    if ms < 60_000 {
+        return Some(format!("{}.{:01}s", ms / 1000, (ms % 1000) / 100));
+    }
+    let whole_secs = d.num_seconds();
+    Some(format!("{}m {}s", whole_secs / 60, whole_secs % 60))
 }
 
 /// Fold a tool event: `Completed`/`Failed` pair back to the call's card via
@@ -1275,5 +1332,82 @@ mod tests {
         ]);
         assert_eq!(view.runtime_models, ["sonnet", "haiku"]);
         assert!(fold_view(&[]).runtime_models.is_empty());
+    }
+
+    /// A turn event `secs` seconds after the shared `ev` helper's pinned
+    /// instant (which alone can't express a non-zero duration).
+    fn ev_at(seq: u64, secs: i64, payload: EventPayload) -> CoreEvent {
+        let mut e = ev(seq, payload);
+        e.timestamp += chrono::Duration::seconds(secs);
+        e
+    }
+
+    /// A cleanly-started turn's terminator appends the wall-clock duration
+    /// activity row — this is what lets the turn timer survive a page reload
+    /// (the web fold only shows it live; the persisted view must carry it).
+    /// Mirrors the web fold's `formatTurnDuration`.
+    #[test]
+    fn a_completed_turn_folds_into_a_timer_activity_row() {
+        let turn = |seq, secs, started: Option<&str>| {
+            let tid = || crate::core::TurnId("t".into());
+            let payload = started.map_or_else(
+                || EventPayload::Turn(TurnEvent::Completed { turn_id: tid() }),
+                |input| {
+                    EventPayload::Turn(TurnEvent::Started {
+                        turn_id: tid(),
+                        input: Some(input.into()),
+                    })
+                },
+            );
+            ev_at(seq, secs, payload)
+        };
+
+        // Sub-minute: one decimal.
+        let view = fold_view(&[turn(1, 0, Some("go")), turn(2, 3, None)]);
+        let last = view.items.last().unwrap();
+        let ViewItem::Activity { icon, label, .. } = last else {
+            panic!("timer activity row, got {last:?}")
+        };
+        assert_eq!(*icon, ViewActivityIcon::Timer);
+        assert_eq!(label, "3.0s");
+
+        // Over a minute: whole minutes:seconds.
+        let view = fold_view(&[turn(1, 0, Some("go")), turn(2, 125, None)]);
+        let ViewItem::Activity { label, .. } = view.items.last().unwrap() else {
+            panic!("timer activity row")
+        };
+        assert_eq!(label, "2m 5s");
+    }
+
+    /// A resumed turn's `Started` lives in the prior session, so there is no
+    /// clean start timestamp — no timer row (mirrors the web fold, which only
+    /// shows the duration "when the turn started cleanly").
+    #[test]
+    fn a_resumed_turn_yields_no_timer_row() {
+        let resumed = ev_at(
+            1,
+            0,
+            EventPayload::Turn(TurnEvent::Resumed {
+                turn_id: crate::core::TurnId("t".into()),
+                resume_from_event_id: EventId {
+                    session_id: SessionId("s".into()),
+                    seq: 0,
+                },
+            }),
+        );
+        let completed = ev_at(
+            2,
+            30,
+            EventPayload::Turn(TurnEvent::Completed {
+                turn_id: crate::core::TurnId("t".into()),
+            }),
+        );
+        let view = fold_view(&[resumed, completed]);
+        assert!(
+            !view
+                .items
+                .iter()
+                .any(|i| matches!(i, ViewItem::Activity { .. }))
+        );
     }
 }

@@ -127,14 +127,6 @@
 						<div class="kv-val" title={runtime.env.join(' · ')}>{runtime.env.join(' · ')}</div>
 					</div>
 				{/if}
-				{#if runtime}
-					<div class="kv">
-						<div class="kv-key">Model</div>
-						<div class="kv-val" title={`${runtime.provider} · ${runtime.model}`}>
-							{runtime.model}
-						</div>
-					</div>
-				{/if}
 				{#if divergent.length > 0}
 					<div class="kv warn">
 						<div class="kv-key warn-key">⚠ Runtime</div>
@@ -144,12 +136,6 @@
 						>
 							{divergent.join(' · ')} ≠ {runtime?.model}
 						</div>
-					</div>
-				{/if}
-				{#if meta?.profile_id}
-					<div class="kv">
-						<div class="kv-key">Profile</div>
-						<div class="kv-val">{meta.profile_id}</div>
 					</div>
 				{/if}
 			</section>
@@ -222,7 +208,7 @@
 						<div
 							class="stat"
 							title={branched
-								? 'Covers only this session\'s requests — the inherited context (snapshot) is never re-read'
+								? "Covers only this session's requests — the inherited context (snapshot) is never re-read"
 								: `${num(s.total_cache_read_tokens).toLocaleString()} cache-read tokens`}
 						>
 							<span class="stat-value">{cacheLabel(s, branched)}</span>

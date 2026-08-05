@@ -624,6 +624,54 @@ describe('conversation fold', () => {
 		]);
 		expect(state.turnRunning).toBe(true);
 	});
+
+	// ── Turn timer: the wall-clock duration row on turn end ────────────
+	// The committed Started/terminator timestamps give the turn's wall-clock
+	// duration, shown as a one-line `timer` activity row. The shared turn
+	// helpers all pin one timestamp, so these build events at explicit times.
+	// The server view fold (`src/gateway/view.rs`) mirrors this — that is what
+	// lets the row survive a page reload.
+	const at = (seq: number, iso: string, payload: Record<string, unknown>): GatewayEvent =>
+		({
+			type: 'event',
+			schema_version: 'ominiforge.event.v1',
+			seq,
+			session_id: 's',
+			timestamp: iso,
+			source: { kind: 'Runtime', id: 'ominiforge' },
+			parent_event_id: null,
+			turn_id: null,
+			payload: { Turn: payload }
+		}) as unknown as GatewayEvent;
+
+	it('a completed turn folds into a timer activity row (wall-clock duration)', () => {
+		const state = fold([
+			at(1, '2026-06-24T00:00:00Z', { Started: { turn_id: 't', input: 'go' } }),
+			at(2, '2026-06-24T00:00:03Z', { Completed: { turn_id: 't' } })
+		]);
+		const row = state.items[state.items.length - 1];
+		expect(row.kind === 'activity' && row.icon).toBe('timer');
+		expect(row.kind === 'activity' && row.label).toBe('3.0s');
+	});
+
+	it('turn timer formats over-a-minute durations as minutes:seconds', () => {
+		const state = fold([
+			at(1, '2026-06-24T00:00:00Z', { Started: { turn_id: 't', input: 'go' } }),
+			at(2, '2026-06-24T00:02:05Z', { Completed: { turn_id: 't' } })
+		]);
+		const row = state.items[state.items.length - 1];
+		expect(row.kind === 'activity' && row.label).toBe('2m 5s');
+	});
+
+	it('a resumed turn yields no timer row (its Started is in the prior session)', () => {
+		const state = fold([
+			at(1, '2026-06-24T00:00:00Z', {
+				Resumed: { turn_id: 't', resume_from_event_id: { session_id: 's', seq: 0 } }
+			}),
+			at(2, '2026-06-24T00:00:30Z', { Completed: { turn_id: 't' } })
+		]);
+		expect(state.items.some((i) => i.kind === 'activity')).toBe(false);
+	});
 });
 
 // ── Todo control tool: folded into structured todo cards ───────────────
@@ -944,9 +992,7 @@ describe('activity fold', () => {
 		expect(activities).toHaveLength(1);
 		const row = activities[0];
 		expect(row.kind === 'activity' && row.icon).toBe('timer');
-		expect(row.kind === 'activity' && row.label).toContain(
-			'Model reminder: You have used 16/20'
-		);
+		expect(row.kind === 'activity' && row.label).toContain('Model reminder: You have used 16/20');
 		expect(row.kind === 'activity' && row.detail).toBe(reminder);
 	});
 
