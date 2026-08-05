@@ -22,7 +22,8 @@
 	} from '$lib/conversation';
 	import type { GatewayEvent } from '$lib/types/GatewayEvent';
 	import Skeleton from '$lib/components/Skeleton.svelte';
-	import ModelSelect, { type SelectOption } from '$lib/components/ModelSelect.svelte';
+	import PickerSelect from '$lib/components/PickerSelect.svelte';
+	import { type SelectOption } from '$lib/components/ModelSelect.svelte';
 	import ConversationItem from '$lib/components/ConversationItem.svelte';
 	import TodoCard from '$lib/components/TodoCard.svelte';
 	import DetailRail from '$lib/components/DetailRail.svelte';
@@ -141,7 +142,6 @@
 	// empty = the session's configured default. Applies to the next send only.
 	let selEffort = $state('');
 	// Which picker popover is open (only one at a time); `null` = all closed.
-	let openPicker = $state<'profile' | 'model' | 'effort' | null>(null);
 	// The active session id is exactly the route param: the draft (`'new'`), or a
 	// real id under `.../sessions/[id]`. Every transition — draft first-send,
 	// reconfigure, compaction, sidebar click, back/forward — is a real navigation
@@ -1598,78 +1598,33 @@
 							<!-- Profile: a config-level pick. On a live session a change
 							     is LAZY — it reconfigures (new session seeded with this
 							     conversation) only when the next message sends. -->
-							<div class="picker">
-								<button
-									class="input-btn picker-trigger"
-									class:on={openPicker === 'profile'}
-									onclick={(e) => { e.stopPropagation(); openPicker = openPicker === 'profile' ? null : 'profile'; }}
-									title="Profile (agent identity: prompt + tools){isDraft ? '' : ' — switching reconfigures on the next send'}"
-									aria-expanded={openPicker === 'profile'}
-								>
-									<span class="picker-key">profile</span>
-									<span class="picker-label">{profileLabel}</span>
-								</button>
-								{#if openPicker === 'profile'}
-									<div class="picker-popover" transition:fly={rise(6)}>
-										<ModelSelect
-											options={profileOptions}
-											bind:value={selProfile}
-											listOnly
-											onclose={() => (openPicker = null)}
-										/>
-									</div>
-								{/if}
-							</div>
+							<PickerSelect
+								options={profileOptions}
+								bind:value={selProfile}
+								key="profile"
+								label={profileLabel}
+								title="Profile (agent identity: prompt + tools){isDraft ? '' : ' — switching reconfigures on the next send'}"
+							/>
 
 							<!-- Model + effort: per-turn picks, riding along on the next
 							     send — never a reconfiguration. -->
-							<div class="picker">
-								<button
-									class="input-btn picker-trigger"
-									class:on={openPicker === 'model'}
-									onclick={(e) => { e.stopPropagation(); openPicker = openPicker === 'model' ? null : 'model'; }}
-									title="Model for the next turn (per-turn, no reconfiguration)"
-									aria-expanded={openPicker === 'model'}
-								>
-									<span class="picker-key">model</span>
-									<span class="picker-label">{modelLabel}</span>
-								</button>
-								{#if openPicker === 'model'}
-									<div class="picker-popover" transition:fly={rise(6)}>
-										<ModelSelect
-											options={modelOptions}
-											value={selModel}
-											onselect={onModelPick}
-											listOnly
-											onclose={() => (openPicker = null)}
-										/>
-									</div>
-								{/if}
-							</div>
+							<PickerSelect
+								options={modelOptions}
+								value={selModel}
+								onselect={onModelPick}
+								key="model"
+								label={modelLabel}
+								title="Model for the next turn (per-turn, no reconfiguration)"
+							/>
 
 							{#if curModelEfforts.length > 0}
-								<div class="picker">
-									<button
-										class="input-btn picker-trigger"
-										class:on={openPicker === 'effort'}
-										onclick={(e) => { e.stopPropagation(); openPicker = openPicker === 'effort' ? null : 'effort'; }}
-										title="Reasoning effort for the next turn"
-										aria-expanded={openPicker === 'effort'}
-									>
-										<span class="picker-key">effort</span>
-										<span class="picker-label">{effortLabel}</span>
-									</button>
-									{#if openPicker === 'effort'}
-										<div class="picker-popover" transition:fly={rise(6)}>
-											<ModelSelect
-											options={effortOptions}
-											bind:value={selEffort}
-											listOnly
-											onclose={() => (openPicker = null)}
-										/>
-										</div>
-									{/if}
-								</div>
+								<PickerSelect
+									options={effortOptions}
+									bind:value={selEffort}
+									key="effort"
+									label={effortLabel}
+									title="Reasoning effort for the next turn"
+								/>
 							{/if}
 						</div>
 						{#if !isDraft && turnRunning}
@@ -2490,55 +2445,8 @@
 		min-width: 0;
 	}
 
-	.picker {
-		position: relative;
-		display: flex;
-		flex-shrink: 1;
-		min-width: 0;
-	}
-
-	.picker-trigger {
-		max-width: 190px;
-		gap: 6px;
-	}
-
-	.picker-trigger.on {
-		background: var(--surface-hover);
-		color: var(--text-primary);
-		border-color: var(--border-strong);
-	}
-
-	/* mono lowercase category key (profile / model / effort): quiet label, the
-	   value is the readable part. */
-	.picker-key {
-		flex-shrink: 0;
-		font-family: var(--font-mono);
-		font-size: 9.5px;
-		letter-spacing: 0.08em;
-		text-transform: uppercase;
-		color: var(--text-tertiary);
-	}
-
-	.picker-label {
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
-		font-family: var(--font-mono);
-		font-size: 11px;
-	}
-
-	/* Opens upward (the input sits at the screen bottom), right-aligned to the
-	   trigger so the list stays within the composer width. The option list
-	   itself caps at ~5 rows and scrolls (`ModelSelect`), never running off
-	   the screen. */
-	.picker-popover {
-		position: absolute;
-		bottom: calc(100% + 6px);
-		right: 0;
-		z-index: var(--z-popover);
-		width: 300px;
-		max-width: min(300px, 80vw);
-	}
+	/* The per-picker trigger/popover styles live in `PickerSelect.svelte`; this
+	   cluster only lays the triggers out in a row. */
 
 	.input-hint {
 		font-size: 10.5px;

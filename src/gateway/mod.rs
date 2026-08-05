@@ -23,6 +23,7 @@
 mod actor;
 mod approval;
 mod config;
+pub(crate) mod langconfig;
 mod registry;
 mod server;
 mod status;

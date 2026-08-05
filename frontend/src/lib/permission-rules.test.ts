@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { toRows, fromRows, summaryOf, resolveEffective, type RowModel } from './permission-rules';
+import { toRows, fromRows, summaryOf, type RowModel } from './permission-rules';
 import type { PermissionPolicy } from '$lib/types/PermissionPolicy';
 import type { ToolInfo } from '$lib/types/ToolInfo';
 
@@ -256,61 +256,6 @@ describe('summaryOf', () => {
 	});
 });
 
-describe('resolveEffective', () => {
-	it('unions deny across tiers with source labels', () => {
-		const eff = resolveEffective(
-			{ deny: [{ tool: 'shell', contains: ['curl'] }] },
-			{ deny: [{ tool: 'read' }] },
-			{ deny: [{ tool: 'shell', contains: ['git push'] }] }
-		);
-		expect(eff.filter((e) => e.list === 'deny').map((e) => e.tier)).toEqual([
-			'gateway',
-			'profile',
-			'workspace'
-		]);
-	});
-
-	it('ask comes wholesale from the highest tier that sets any', () => {
-		const eff = resolveEffective(
-			{ ask: [{ tool: 'write' }] },
-			{ ask: [{ tool: 'edit' }] },
-			{ ask: [{ tool: 'shell' }] }
-		);
-		const asks = eff.filter((e) => e.list === 'ask');
-		expect(asks).toHaveLength(1);
-		expect(asks[0].tier).toBe('workspace');
-		expect(asks[0].rule.tool).toBe('shell');
-	});
-
-	it('falls through to profile ask when workspace sets none', () => {
-		const eff = resolveEffective({ ask: [{ tool: 'write' }] }, { ask: [{ tool: 'edit' }] }, {});
-		const asks = eff.filter((e) => e.list === 'ask');
-		expect(asks.map((a) => a.rule.tool)).toEqual(['edit']);
-		expect(asks[0].tier).toBe('profile');
-	});
-
-	it('empty tiers everywhere means everything allowed', () => {
-		expect(resolveEffective({}, undefined, {})).toEqual([]);
-	});
-
-	it('deny union still reports when ask comes from a higher tier', () => {
-		// A workspace ask does NOT wash out a gateway deny — different semantics
-		// per list (deny unions, ask replaces). Both must appear.
-		const eff = resolveEffective({ deny: [{ tool: 'shell' }] }, {}, { ask: [{ tool: 'write' }] });
-		expect(eff.some((e) => e.list === 'deny' && e.tier === 'gateway')).toBe(true);
-		expect(eff.some((e) => e.list === 'ask' && e.tier === 'workspace')).toBe(true);
-	});
-
-	it('allow unions across tiers with source labels', () => {
-		const eff = resolveEffective(
-			{ allow: [{ tool: 'shell', contains: ['npm install'] }] },
-			{},
-			{ allow: [{ tool: 'read' }] }
-		);
-		const allows = eff.filter((e) => e.list === 'allow');
-		expect(allows.map((a) => a.tier)).toEqual(['gateway', 'workspace']);
-	});
-});
 
 // Compare policies by their rule sets regardless of list ordering AND object key
 // ordering: rows preserve order but rebuild rule objects with a different key

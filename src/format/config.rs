@@ -9,10 +9,14 @@
 
 use std::collections::HashMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// The parsed contents of `config/format.toml` (`doc/format.md` §5).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+///
+/// `Serialize` exists for the settings UI's write path (`gateway::langconfig`),
+/// which rewrites the layer file the user edited; the runtime only ever
+/// deserializes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct FormatConfig {
     /// Each `[[formatters]]` table.
     #[serde(default)]
@@ -31,8 +35,9 @@ pub struct FormatConfig {
 
 /// The format mode (`doc/format.md` §5). `file` is the default: most stable,
 /// most "project-uniform" — at the cost of touching lines the model didn't.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub enum FormatMode {
     /// Format the whole file after every edit/write.
     #[default]
@@ -46,7 +51,12 @@ pub enum FormatMode {
 
 /// One configured formatter: a stateless stdin→stdout process call
 /// (`doc/format.md` §3).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+///
+/// `Serialize` exists for the settings UI's write path (`gateway::langconfig`);
+/// every field is written explicitly (the file the user reads back is the
+/// full record they sent, with no skipped defaults to second-guess).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct FormatterConfig {
     /// Unique name; namespaces the formatter in logs and the UI's
     /// "formatted by \<name\>" annotation.

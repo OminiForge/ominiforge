@@ -151,5 +151,24 @@ state = "starting" | "running" | "failed"
 - 真正的 LSP 工具：`definition`/`references`/`hover`/`document_symbols`（客户端层已就绪）。
 - 位置编码消费：当前诊断直接渲染服务器行号，未来 request 类工具需用 `position_encoding` 做 UTF-8/UTF-16 偏移换算。
 - `languageId` 映射：内置常见扩展名→`languageId` 映射（`src/lsp/mod.rs` 的 `language_id_for`），可按需并入注册表。
-- **Web 配置编辑器**：分层配置的图形化编辑（等价 `PermissionRulesEditor` 的三层解析 + round-trip 纯函数 + 双主题），单独排期，不在本次。
 - profile/UI 层暴露 LSP 总开关与超时配置。
+
+## 8. Web 配置编辑器
+
+LSP 的图形化配置分两层，替代手写 `lsp.toml`。**注册表驱动的固定清单**（与 permission 编辑器的增量规则列表语义相反，`frontend/DESIGN.md` §4.10）：内置服务器默认全列出——含被墓碑禁用的（标灰、可重新勾选启用）——每条带来源层徽章（内置 / 全局 / 项目）与安装探测徽章；未安装的行弱化显示且 **command 不可改**（服务端同样强制：对未安装条目的 command 写入一律拒绝）。
+
+**两个编辑场所**（对应 §3 的分层）：
+
+- **全局默认**：Settings → **全局设置** tab 的「语言服务器」一节。读写 gateway 配置 root 链，写回 primary root 的 `lsp.toml`。**此层不显示安装标注、不按安装门控 command**——「装没装」是 per-project 的（一个 server 可全局没装但每个项目都装），gateway PATH 的探测在此视图不可靠也无意义；command 始终可改（改错只是 spawn 时 fail-open，不阻塞）。
+- **项目覆盖**：工作区侧栏齿轮的 `WorkspaceConfigDialog`（`doc/workspace-config.md`）。读写 `<workspace>/.omini/config/lsp.toml`（最高层），安装探测用**该 workspace 的 env-overlay PATH**——nix flake / direnv 项目里由项目环境提供的 server 在此显示「已安装」，即使它不在全局 PATH 上。**安装标注与 command 门控只在这一层出现**，因为此处的探测才是真实的「装没装」。
+
+**运行时**：`app::assemble` 经 `lang_config_roots` 把 session workspace 的 `.omini` 置于 roots 链最高层再 `LspConfig::load`——项目的 lsp.toml 因此生效（此前只读 gateway 链）。lsp.toml 是 spawn 配置而非安全策略，从 agent 可写的项目目录读取是安全的（与 `mcp.toml` 同一信任姿态）。
+
+**端点**（`gateway::langconfig`，读返回 `LspServerView{layer, builtin, installed, …有效配置}`，tombstone 的内置条目保留 `enabled=false` 而非丢弃）：
+
+- 全局：`GET/PUT /config/lsp`（写回 primary root）。
+- 项目：`GET/PUT /workspaces/{id}/config/lsp`（写回 `<workspace>/.omini/config/lsp.toml`；未知 id 404）。
+
+**写语义**（两者一致）：`PUT` 携带完整清单（只含用户字段：enabled/command/两个超时；`args`/`env`/`extensions` 由服务端从当前注册表重取，不信客户端），整体重写目标层文件（含墓碑序列化），写后重 `load` 验证生效（不生效即报错，绝不静默）。
+
+**前端**：`frontend/src/lib/lang-tools.ts` 纯函数（`lspToRows`/`lspFromRows`，含 vitest round-trip）+ `LspConfigEditor.svelte`（两个场所复用）；全局设置 tab 懒加载 + SaveBar dirty tracking，workspace dialog 随其 config 一并保存。来源层标签由 `layerLabel` 给中文（内置/全局/项目覆盖/项目新增）。

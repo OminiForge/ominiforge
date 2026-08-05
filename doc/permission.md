@@ -138,7 +138,7 @@ CLI 运行只经过 profile 层（gateway/workspace 两层都是 gateway 侧，C
 用户配置门控时**不手输工具名/字段名**。`GET /tools` 返回内置工具目录（`crate::tool::builtin_catalog`：read/write/edit/shell 的友好标签 + 可作为 `field` 的输入字段列表 + 字段是否为路径）。前端配置界面是**增量规则列表**（`PermissionRulesEditor.svelte`）：每层只渲染用户真正添加的规则，空层 = 一行说明 +「添加规则」按钮，绝不预渲染全量工具列表。规则行折叠态是大白话摘要（「拒绝 运行命令：当 命令 包含 rm -rf」），展开后才出现决策 seg、工具下拉（目录 +「任意工具 (*)」）与条件区（field/mode/白名单/值，默认折叠）；无条件规则即该工具在本层的默认裁决。gateway 层额外提供折叠的**工具默认表**（每目录工具一行三态 seg），编辑的同样是 bare rules。
 
 - 磁盘 = 机器读，结构化/规范化（`Rule` 全字段）；用户层 = 规则行，简单零负担。二者转换是纯函数（`permission-rules.ts` 的 `toRows`/`fromRows`）。
-- 门控 tab 底部有只读的**生效结果视图**：`resolveEffective` 前端复刻三层解析（deny 并集逐条标来源层、ask 取最高设置层并提示被整表替换的低层规则）。
+- **三层各归其位**（不再是单页三层并列）：gateway 基线在 Settings → **全局设置** tab（含工具默认表）；profile 层在 Settings → **Profiles** tab 随该 profile 编辑；workspace 层在工作区 `WorkspaceConfigDialog`（与 network 并列）。曾经的「生效结果视图」已删除——它只是按来源层罗列规则、并不做真实裁决计算，名不副实；将来若需要，应在能凑齐三层的 workspace 侧重写为真求值。
 - 内置 4 种工具目录是静态的（无需子进程），故 profile 层与 gateway 层配置界面都能用（`GET /tools`）。
 - MCP 动态工具按 workspace best-effort 列举：`GET /workspaces/{id}/tools` 起 MCP 子进程读 `tools/list`，失败则跳过该 server、仍返回内置项（不报错）。仅 workspace 层用它（gateway/profile 层无具体 workspace 上下文）。MCP 工具无字段元数据，条件退化为「任意输入」，仍可门控。
 
@@ -269,8 +269,9 @@ pub enum PermissionEvent {
   `Decided` 清除标记 → 卡片终态由 `Tool::Completed/Failed` 驱动（并行分发下按完成顺序即时更新）。
 - 会话列表状态灯 `SessionStatusIcon.svelte` 的 `awaiting` 态（琥珀脉冲点）；仅当该 session 无 pending
   ask 时才回到 Running（并行 ask 未全部解决不闪动）。
-- 三层配置 UI 在 Settings → 门控 tab（`frontend/DESIGN.md` §4.10）：增量规则列表 + gateway 工具默认表 +
-  生效结果视图；workspace 层另可从工作区侧栏齿轮的 `WorkspaceConfigDialog` 快捷编辑。
+- 三层配置 UI 各归其位（`frontend/DESIGN.md` §4.10）：gateway 基线在 Settings → **全局设置**（增量规则列表 +
+  工具默认表），profile 层在 Settings → **Profiles** 随 profile 编辑，workspace 层在工作区侧栏齿轮的
+  `WorkspaceConfigDialog`。生效结果视图已删除（见 §3.2）。
 
 ## 9. 实现状态与待完善
 
@@ -281,8 +282,8 @@ pub enum PermissionEvent {
 profile TOML / `gateway.toml`（`config_write_lock` 串行化 + `spawn_blocking`））+
 并行分发（§5.2：两阶段 dispatch、独立链批准即执行、Decided 即时落盘、结果按完成序、模型消息按 call 序、
 cancel 经 `ChainAbortGuard` 召回执行链）+
-Web 审批（tool 卡内 ApprovalControls，含作用域选择）+ 三层 Web 配置 UI（Settings → 门控 tab：增量规则列表、
-gateway 工具默认表、生效结果视图；`frontend/DESIGN.md` §4.10）。
+Web 审批（tool 卡内 ApprovalControls，含作用域选择）+ 三层 Web 配置 UI（各归其位：全局设置 tab 的 gateway
+基线 + 工具默认表、Profiles tab 的 profile 层、WorkspaceConfigDialog 的 workspace 层；`frontend/DESIGN.md` §4.10）。
 
 待后续：
 - 规则匹配升级：`substring`/`prefix` + `field` 定位 + `negate` 白名单**已实现**（§3 规则模型）；未来可加 glob / regex。

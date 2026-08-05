@@ -269,6 +269,12 @@ ominiforge Web 控制台是**开发者每天盯 8 小时的 agent 生产工具**
 - 骨架屏用 `components/Skeleton.svelte`（shimmer 只扫 canvas token 色），替代纯文字「加载中…」；骨架要复刻真实布局，避免加载完成时跳动。
 - 弹层/对话框必须有进入+退出过渡；消失动画和出现同等重要，用 `transition:` 不用 `in:`。
 
+### 3.3 浮层定位（铁律）
+
+🔴 **任何弹层/浮层（popover / dropdown / tooltip / context menu）禁止把定位方向硬编码进 CSS**（`right: 0` / `bottom: 100%` 之类）。触发器在屏幕上的位置是调用方决定的，组件无法预判——硬编码方向必然在某个摆放位置溢出视口或被遮挡（已踩过：弹层在右置触发器用 `right: 0` 是对的，搬到左置触发器就超出左缘）。
+
+**规则：浮层打开时必须按触发器的视口矩形自动选向**——测量 `getBoundingClientRect`，空间不足就翻转（下→上、右对齐→左对齐）。参考实现 `PickerSelect.svelte` 的 `measure()`。新增浮层组件一律照此；复用现有浮层时**不要**为它加「左/右/上/下」之类的方向 prop 让调用方记着选——那是把会犯的错推给每个调用点，不是泛化。
+
 ---
 
 ## 4. 组件规范
@@ -309,8 +315,16 @@ ominiforge Web 控制台是**开发者每天盯 8 小时的 agent 生产工具**
 - **纯 token 渲染**：trigger `--canvas-base` + `--border-default`（hover/focus `--border-strong` + accent 淡发光 focus ring）；选项列表 `--canvas-float`（比它所在的 overlay popover 高一层，符合 surface ladder）+ `--border-default` hairline + `--shadow-md`。
 - **选项行**：label（mono）+ 可选 muted detail（provider/描述）；hover 升一层到 `--canvas-overlay`；选中行 `--accent-dim` 底 + `--accent-ink` 对勾（选中态只用极少量 accent，不铺）。
 - **行为**：`listOnly` 模式（session picker）下点**任何地方**（列表外任意元素、或再点一次触发器）都关闭——list 监听 window `click`，触发器 click `stopPropagation` 避免被当成「外部点击」；普通模式下点外部 / Escape 关闭；`up` 时向上弹（输入区底部场景）；进出过渡走 `lib/motion.ts` 的 `rise`，禁用态降透明。
-- **两种模式**：默认 = trigger + 下拉列表（settings 等表单）；`listOnly` = 只渲染选项列表（session picker，宿主自备触发器）。
+- **两种模式**：默认 = trigger + 下拉列表；`listOnly` = 只渲染选项列表（宿主自备触发器，见 `PickerSelect`）。
 - 双向绑定 `value`，可选 `onselect`（值变化后回调，供宿主把空串还原成 `null`）与 `onclose`（选中/外部点击后通知宿主卸载列表）。
+
+### 4.11.1 PickerSelect（KEY value 配置选择器，推荐默认）
+
+`ModelSelect` 统一了「选项列表」；**`PickerSelect.svelte` 统一「触发器 + 弹层 + 开闭」**——凡需要「选一个值」的地方（session 输入区的 profile/model/effort、settings Profiles 的 default model/thinking effort、Format 的 mode）一律用它，不再各自手滚 trigger。
+
+- **触发器 = 当前值**：安静的 mono `KEY` 类别标签（`profile`/`model`/`effort`/`mode`，uppercase、tertiary）+ 可读的值（mono），hairline chip；一点开列表、一点选定。值永远是具体生效值，不显示裸 `default`。
+- **弹层**：选项列表由内部 `ModelSelect listOnly` 渲染（限高滚动）。点外部 / Escape 关。
+- **复用即一致**：新增下拉不要重写 trigger——给它 `options` + 双向 `value` + `key` + `label` 即可。这消灭了 Conversation 输入区与 settings 之间曾经两套 trigger 的漂移（后者一度是较素的 `ModelSelect` 默认 trigger）。
 
 ### 4.3 侧栏 + Detail Rail（`+layout.svelte` + `Conversation.svelte`）
 
@@ -436,18 +450,42 @@ workspace，`doc/permission.md` §3）。核心原则：**磁盘配置结构化�
   （允许/询问/拒绝），编辑的是 bare rules；与规则列表同源——目录工具的 bare 行由默认表承载，列表不再
   重复渲染（`*` 与非目录工具的 bare 行仍在列表里）。基线层语义上就该全量看一眼，故只此层提供。
 - **纯函数映射**：规则行 ⇄ `PermissionPolicy` 的编译/反编译在 `permission-rules.ts`
-  （`toRows`/`fromRows`/`summaryOf`/`resolveEffective`），有 vitest round-trip 测试。无法表达的规则
+  （`toRows`/`fromRows`/`summaryOf`），有 vitest round-trip 测试。无法表达的规则
   （未知 mode、negate 无 patterns 的异形）进 **advanced 桶原样保留**，绝不静默丢弃用户配置。
-- **生效结果视图**：门控 tab 底部的只读折叠区块，`resolveEffective` 前端复刻三层解析（deny 三层并集
-  逐条标注来源层；allow 同样并集且命中豁免 ask；ask 取最高设置层，低层被整表替换时给提示）。
-- **三处复用**（同一组件，不同宿主）：
-  1. **profile 层** — Settings → 门控 tab，选 profile 后 `bind:policy={profile.permission}`，随 profile 一起存。
-  2. **gateway 层** — Settings → 门控 tab，编辑 `default_permission`（最低基线）+ 工具默认表；
-     `PUT /gateway/permission` 对新会话即时生效并落 `gateway.toml`。
-  3. **workspace 层** — Settings → 门控 tab（主场所）+ 工作区侧栏齿轮 `WorkspaceConfigDialog`（快捷入口），
-     编辑该 workspace 的 `[permission]`（最高层）；存于网关可信目录。
+- **三层各归其位**（不再是单页三层并列；原「生效结果视图」已删除——它只按来源层罗列规则、不做真实裁决计算，
+  名不副实）：
+  1. **gateway 层** — Settings → **全局设置** tab「权限基线」，编辑 `default_permission`（最低基线）+
+     工具默认表；`PUT /gateway/permission` 对新会话即时生效并落 `gateway.toml`。
+  2. **profile 层** — Settings → **Profiles** tab，选中 profile 后在其编辑区内 `bind:policy={profile.permission}`，
+     随 profile 一起存。
+  3. **workspace 层** — 工作区侧栏齿轮 `WorkspaceConfigDialog`（与 network 并列），编辑该 workspace 的
+     `[permission]`（最高层）；存于网关可信目录。
 
 ---
+
+### 4.12 语言工具清单编辑器（LSP / Format）—— 注册表驱动固定清单
+
+配置语言服务器 / 格式化器，组件 `LspConfigEditor.svelte` / `FormatConfigEditor.svelte`
+（`doc/lsp.md` §8、`doc/format.md` §8）。与门控编辑器（§4.10）的**关键差异**：permission 是「用户自增规则，
+空层即空」，而 LSP/format 是「**注册表驱动的固定清单 + 勾选启用**」——内置条目默认全列出（含被墓碑禁用的，
+标灰但不隐藏，可重新勾选），用户要看有哪些可开。**不照抄 permission 的增量语义。**
+
+- **行 = 一个 server/formatter**：启用开关（纯 CSS、token 化）+ 名称（mono）+ 扩展名 + command +
+  徽章组。开关关掉即写 `enabled = false` 墓碑。
+- **徽章**（全走 `--state-*`/`--canvas-float` token，中文字体）：来源层（内置/全局/项目覆盖/项目新增）；
+  Format 额外有「局部」（`supports_line_range`，琥珀）徽章。
+- **安装标注（`showInstalled`）只在 workspace 视图出现**：探测跑该 workspace 的 env-overlay PATH，是真实的
+  「装没装」。此时未安装的行弱化显示且 command 不可改（服务端同样强制）。**全局视图不显示安装标注、
+  不门控 command**——gateway PATH 对 per-project 工具不可靠，标注会误导（`doc/lsp.md` §8）。
+- **来源层是行内属性**，不是外层卡片：清单是扁平的，**不套 `.tier` 层卡片壳**（那是 permission 三层并列的
+  隐喻，套在一张清单上是概念错位）。
+- **Format 的 `mode` 是清单的全局头**（file/edit/off，`PickerSelect`），放清单上方一条安静工具行，
+  不混进清单行。
+- **两处复用**：Settings → **全局设置** tab（`showInstalled=false`）+ 工作区 `WorkspaceConfigDialog`
+  （`showInstalled=true`，env-overlay PATH 探测——flake/direnv 提供的工具在此显示已安装）。同一组件，不同宿主。
+- **纯函数映射**：行 ⇄ `PUT` body 在 `lang-tools.ts`（`lspToRows`/`lspFromRows`/`fmtToRows`/`fmtFromRows`），
+  有 vitest round-trip。dirty 信号 diff **PUT body** 而非行（行带 layer/installed 等只读展示字段，
+  diff 行会幻影 dirty）。
 
 ## 5. 反 AI slop 禁令（硬清单）
 

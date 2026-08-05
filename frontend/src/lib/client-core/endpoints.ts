@@ -43,6 +43,14 @@ export const endpoints = {
 	workspaceTools: (id: string) => `${API}/workspaces/${encodeURIComponent(id)}/tools`,
 	/** Gateway-wide baseline permission policy; bottom tier of the gate. */
 	gatewayPermission: () => `${API}/gateway/permission`,
+	/** Layered LSP settings view (registry-driven checklist + install probes). */
+	lspConfig: () => `${API}/config/lsp`,
+	/** Layered format settings view (mode + formatter checklist). */
+	formatConfig: () => `${API}/config/format`,
+	/** Workspace-scoped LSP view (its `.omini` over the chain, overlay probes). */
+	workspaceLspConfig: (id: string) => `${API}/workspaces/${encodeURIComponent(id)}/config/lsp`,
+	/** Workspace-scoped format view. */
+	workspaceFormatConfig: (id: string) => `${API}/workspaces/${encodeURIComponent(id)}/config/format`,
 	secrets: () => `${API}/secrets`,
 	secret: (provider: string) => `${API}/secrets/${encodeURIComponent(provider)}`
 } as const;

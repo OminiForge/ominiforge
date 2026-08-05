@@ -61,16 +61,22 @@
 	// Rows rendered in the list. With the defaults table on, bare rows for
 	// catalog tools live in the table instead — showing them twice would let
 	// the two editors fight. Bare rows for "*" / non-catalog tools stay here.
+	// EXCEPTION: a row currently open for editing always shows — hiding the row
+	// the user is mid-edit on (e.g. a just-added rule that is still bare) reads
+	// as "the rule vanished", the恶性 bug this guards.
 	const listRows = $derived(
 		showDefaults
 			? rows.filter(
-					(r) => hasCondition(r) || r.tool === '*' || !tools.some((t) => t.name === r.tool)
-				)
+					(r) =>
+						r.open || hasCondition(r) || r.tool === '*' || !tools.some((t) => t.name === r.tool)
+					)
 			: rows
 	);
 
 	function addRow() {
 		const tool = tools[0]?.name ?? '*';
+		// The new row opens for editing; an open row always renders in the list
+		// (see listRows), so it can never silently land in the defaults table.
 		rows.push({
 			list: 'ask',
 			tool,

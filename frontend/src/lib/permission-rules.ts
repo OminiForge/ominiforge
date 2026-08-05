@@ -10,11 +10,6 @@
 // verbatim in an `advanced` bucket rather than silently dropped — never lose a
 // user's config.
 //
-// Also home to `resolveEffective`: a client-side per-tier SOURCE VIEW of the
-// three-tier resolution (`doc/permission.md` §3.1) for the read-only
-// "effective policy" view — deny unions across tiers, the highest tier with
-// any ask rules wins the ask list wholesale, and every rule keeps the tier
-// that set it (not a byte-for-byte mirror of the backend merge; see its doc).
 
 import type { PermissionPolicy } from '$lib/types/PermissionPolicy';
 import type { Rule } from '$lib/types/Rule';
@@ -168,53 +163,3 @@ export function summaryOf(row: RuleRow, catalog: ToolInfo[]): string {
 	return `${toolLabel}: when ${fieldLabel} ${rel} ${vals}`;
 }
 
-/** The tier a rule comes from, for the effective view's source badges. */
-export type Tier = 'gateway' | 'profile' | 'workspace';
-
-export interface EffectiveRule {
-	list: Decision;
-	tier: Tier;
-	rule: Rule;
-}
-
-/**
- * Effective-policy SOURCE VIEW for the settings 门控 tab (`doc/permission.md`
- * §3.1): the three tiers resolved into one list, every rule labeled with the
- * tier that set it — 逐条标注来源层 is the point of the view (DESIGN.md §4.10).
- * The merge rules mirror `app::resolve_permission` / `PermissionPolicy::layer_over`:
- * - `deny` unions across all three tiers (any tier's denial holds; upper tiers
- *   cannot reopen it).
- * - `allow` unions the same way; an allow hit exempts a call from `ask` rules
- *   (never from `deny`).
- * - `ask` is wholesale replacement: the highest tier (workspace > profile >
- *   gateway) with ANY ask rules supplies the entire effective ask list.
- * Deliberately NOT a full mirror of the backend: `layer_over` also collapses
- * duplicate deny/allow rules across tiers, while this view reports a
- * duplicated rule once per tier that set it — the source badge is the
- * information. An empty result means "everything allowed".
- */
-export function resolveEffective(
-	gateway: PermissionPolicy | undefined,
-	profile: PermissionPolicy | undefined,
-	workspace: PermissionPolicy | undefined
-): EffectiveRule[] {
-	const out: EffectiveRule[] = [];
-	const tiers: [Tier, PermissionPolicy | undefined][] = [
-		['gateway', gateway],
-		['profile', profile],
-		['workspace', workspace]
-	];
-	for (const [tier, pol] of tiers) {
-		for (const rule of pol?.deny ?? []) out.push({ list: 'deny', tier, rule });
-		for (const rule of pol?.allow ?? []) out.push({ list: 'allow', tier, rule });
-	}
-	// Highest tier first; the first tier with any ask rules wins the list.
-	for (const [tier, pol] of [...tiers].reverse()) {
-		const asks = pol?.ask ?? [];
-		if (asks.length > 0) {
-			for (const rule of asks) out.push({ list: 'ask', tier, rule });
-			break;
-		}
-	}
-	return out;
-}

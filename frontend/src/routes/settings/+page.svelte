@@ -7,18 +7,29 @@
 	import Skeleton from '$lib/components/Skeleton.svelte';
 	import Toasts from '$lib/components/Toasts.svelte';
 	import { pushToast } from '$lib/toast';
-	import ModelSelect, { type SelectOption } from '$lib/components/ModelSelect.svelte';
-	import { resolveEffective, ruleToRow, summaryOf, type Tier } from '$lib/permission-rules';
+	import PickerSelect from '$lib/components/PickerSelect.svelte';
+	import { type SelectOption } from '$lib/components/ModelSelect.svelte';
+	import LspConfigEditor from '$lib/components/LspConfigEditor.svelte';
+	import FormatConfigEditor from '$lib/components/FormatConfigEditor.svelte';
+	import {
+		lspToRows,
+		lspFromRows,
+		fmtToRows,
+		fmtFromRows,
+		type LspRow,
+		type FmtRow
+	} from '$lib/lang-tools';
+	import type { LspConfigView } from '$lib/types/LspConfigView';
+	import type { FormatConfigView } from '$lib/types/FormatConfigView';
+	import type { FormatMode } from '$lib/types/FormatMode';
 	import type { ProviderConfig } from '$lib/types/ProviderConfig';
 	import type { ModelSummary } from '$lib/types/ModelSummary';
 	import type { Profile } from '$lib/types/Profile';
 	import type { ProfileSummary } from '$lib/types/ProfileSummary';
 	import type { PermissionPolicy } from '$lib/types/PermissionPolicy';
 	import type { ToolInfo } from '$lib/types/ToolInfo';
-	import type { WorkspaceSummary } from '$lib/types/WorkspaceSummary';
-	import type { WorkspaceConfig } from '$lib/types/WorkspaceConfig';
 
-	type Tab = 'providers' | 'profiles' | 'permissions';
+	type Tab = 'providers' | 'profiles' | 'global';
 	let tab = $state<Tab>('providers');
 
 	// ---- Providers state ----
@@ -40,22 +51,25 @@
 	// dropdown and its reasoning-effort tier list).
 	let modelList = $state<ModelSummary[]>([]);
 
-	// ---- Permissions tab state ----
-	// The three gate tiers (doc/permission.md §3.1): gateway baseline (bottom),
-	// profile, workspace (top). Loaded lazily on first tab open so the
-	// providers/profiles path pays nothing.
+	// ---- 全局设置 tab state ----
+	// The gateway-wide defaults (doc/permission.md §3.1 baseline, doc/lsp.md §8,
+	// doc/format.md §8): the permission floor + the LSP/format registry
+	// checklists. Profile- and workspace-level overrides live on the Profiles
+	// tab and in the workspace config dialog respectively — not here. Loaded
+	// lazily on first tab open so the providers/profiles path pays nothing.
 	let gatewayPolicy = $state<PermissionPolicy | null>(null);
 	let gatewaySnapshot = $state<string | null>(null);
-	let wsList = $state<WorkspaceSummary[]>([]);
-	let selectedWs = $state<string>('');
-	let wsConfig = $state<WorkspaceConfig | null>(null);
-	let wsTools = $state<ToolInfo[]>([]);
-	let wsSnapshot = $state<string | null>(null);
-	let permLoaded = $state(false);
+	let lspView = $state<LspConfigView | null>(null);
+	let lspRows = $state<LspRow[]>([]);
+	let lspSnapshot = $state<string | null>(null);
+	let fmtView = $state<FormatConfigView | null>(null);
+	let fmtRows = $state<FmtRow[]>([]);
+	let fmtMode = $state<FormatMode>('file');
+	let fmtSnapshot = $state<string | null>(null);
+	let globalLoaded = $state(false);
 
-	// Tool catalog for the rule editors' tool pickers. Loaded once with
-	// providers/profiles; the workspace tier swaps in its own catalog (built-ins
-	// + MCP tools) when a workspace is selected.
+	// Tool catalog for the permission rule editors' tool pickers (gateway
+	// baseline here, per-profile on the Profiles tab).
 	let toolCatalog = $state<ToolInfo[]>([]);
 
 	// ---- Shared UI ----
@@ -73,7 +87,7 @@
 		if (active) pill = { x: active.offsetLeft, w: active.offsetWidth };
 	});
 
-	// ---- Dirty tracking (SaveBar units: profiles + the two permission tiers).
+	// ---- Dirty tracking (SaveBar units: profile + the global units).
 	// Providers are intentionally absent — each card saves itself. ----
 	// New-profile state has no snapshot (nothing on disk to differ from) — an
 	// unsaved draft is dirty by definition, or the SaveBar would never offer
@@ -86,10 +100,18 @@
 			gatewaySnapshot !== null &&
 			JSON.stringify(gatewayPolicy) !== gatewaySnapshot
 	);
-	const wsDirty = $derived(
-		wsConfig !== null && wsSnapshot !== null && JSON.stringify(wsConfig) !== wsSnapshot
+	// The LSP/format dirty signal is the serialized PUT body, not the rows:
+	// rows carry display-only fields (layer/installed) that never change the
+	// wire, so diffing them would report phantom edits.
+	const lspDirty = $derived(
+		lspSnapshot !== null && JSON.stringify(lspFromRows(lspRows)) !== lspSnapshot
 	);
-	const dirtyCount = $derived([profileDirty, gatewayDirty, wsDirty].filter(Boolean).length);
+	const fmtDirty = $derived(
+		fmtSnapshot !== null && JSON.stringify(fmtFromRows(fmtRows, fmtMode)) !== fmtSnapshot
+	);
+	const dirtyCount = $derived(
+		[profileDirty, gatewayDirty, lspDirty, fmtDirty].filter(Boolean).length
+	);
 
 	// Intercept page leave with unsaved edits — the SaveBar is always visible,
 	// but a route change / tab close is not.
@@ -120,18 +142,38 @@
 		toolCatalog = await client.listTools();
 	}
 
-	// Lazy-load the permissions tab's data the first time it is opened.
+	// Seed the LSP editor from a fetched view: rows + the dirty baseline. The
+	// snapshot is the PUT body of the unedited rows (what the dirty signal
+	// diffs against), NOT the rows themselves — rows carry display-only fields
+	// (layer/installed) that never change the wire.
+	function seedLsp(v: LspConfigView) {
+		lspView = v;
+		lspRows = lspToRows(v);
+		lspSnapshot = JSON.stringify(lspFromRows(lspRows));
+	}
+
+	function seedFormat(v: FormatConfigView) {
+		fmtView = v;
+		fmtRows = fmtToRows(v);
+		fmtMode = v.mode;
+		fmtSnapshot = JSON.stringify(fmtFromRows(fmtRows, fmtMode));
+	}
+
+	// Lazy-load the 全局设置 tab's data the first time it is opened: the gateway
+	// permission baseline plus the LSP/format registry checklists.
 	$effect(() => {
-		if (tab === 'permissions' && !permLoaded) {
-			permLoaded = true;
+		if (tab === 'global' && !globalLoaded) {
+			globalLoaded = true;
 			(async () => {
-				const [gw, workspaces] = await Promise.all([
+				const [gw, lsp, fmt] = await Promise.all([
 					client.getGatewayPermission(),
-					client.listWorkspaces()
+					client.getLspConfig(),
+					client.getFormatConfig()
 				]);
 				gatewayPolicy = gw ?? {};
 				gatewaySnapshot = JSON.stringify(gatewayPolicy);
-				wsList = workspaces;
+				seedLsp(lsp);
+				seedFormat(fmt);
 			})().catch((e) => {
 				error = e instanceof Error ? e.message : String(e);
 			});
@@ -269,37 +311,24 @@
 		}
 	}
 
-	async function selectWorkspace(id: string) {
-		error = null;
-		selectedWs = id;
-		wsConfig = null;
-		wsTools = [];
-		wsSnapshot = null;
-		if (!id) return;
+	// ---- 全局设置 save ----
+	async function saveLsp(): Promise<boolean> {
 		try {
-			// This workspace's tool catalog: built-ins + its MCP tools (best-effort;
-			// MCP failures degrade to built-ins server-side).
-			const [cfg, tools] = await Promise.all([
-				client.getWorkspaceConfig(id),
-				client.listWorkspaceTools(id)
-			]);
-			// The backend omits empty sections; normalize before binding.
-			cfg.permission ??= {};
-			cfg.mounts ??= [];
-			cfg.network ??= null;
-			wsConfig = cfg;
-			wsTools = tools;
-			wsSnapshot = JSON.stringify(cfg);
+			await client.saveLspConfig(lspFromRows(lspRows));
+			// Re-seed from the fresh view: install probes / source layers may have
+			// shifted, and this re-baselines the dirty snapshot.
+			seedLsp(await client.getLspConfig());
+			return true;
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
+			return false;
 		}
 	}
 
-	async function saveWorkspace(): Promise<boolean> {
-		if (!wsConfig || !selectedWs) return true;
+	async function saveFormat(): Promise<boolean> {
 		try {
-			await client.saveWorkspaceConfig(selectedWs, wsConfig);
-			wsSnapshot = JSON.stringify(wsConfig);
+			await client.saveFormatConfig(fmtFromRows(fmtRows, fmtMode));
+			seedFormat(await client.getFormatConfig());
 			return true;
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
@@ -315,7 +344,8 @@
 			// Stop at the first failure; already-saved units stay saved.
 			if (profileDirty && !(await saveProfile())) return;
 			if (gatewayDirty && !(await saveGateway())) return;
-			if (wsDirty && !(await saveWorkspace())) return;
+			if (lspDirty && !(await saveLsp())) return;
+			if (fmtDirty && !(await saveFormat())) return;
 			flash('Saved');
 		} finally {
 			saving = false;
@@ -338,34 +368,11 @@
 				gatewaySnapshot = JSON.stringify(gatewayPolicy);
 			}
 		}
-		if (wsDirty && selectedWs) await selectWorkspace(selectedWs);
+		// Re-seeding from a fresh view discards the local edits and re-baselines
+		// the dirty snapshot in one step.
+		if (lspDirty) seedLsp(await client.getLspConfig());
+		if (fmtDirty) seedFormat(await client.getFormatConfig());
 	}
-
-	// ---- Effective view (read-only, doc/permission.md §3.1) ----
-	let effOpen = $state(false);
-	const effCatalog = $derived(wsTools.length > 0 ? wsTools : toolCatalog);
-	const effective = $derived(
-		resolveEffective(gatewayPolicy ?? {}, profile?.permission ?? {}, wsConfig?.permission ?? {})
-	);
-	// Ask rules on tiers shadowed by a higher tier's ask list never fire
-	// (wholesale replacement) — surface that, it is otherwise invisible.
-	const shadowedAsks = $derived.by(() => {
-		const askTiers = [
-			['workspace', wsConfig?.permission] as const,
-			['profile', profile?.permission] as const,
-			['gateway', gatewayPolicy] as const
-		]
-			.map(([tier, pol]) => ({ tier: tier as Tier, count: pol?.ask?.length ?? 0 }))
-			.filter((t) => t.count > 0);
-		const winner = askTiers[0];
-		return { winner: winner?.tier ?? null, shadowed: askTiers.slice(1) };
-	});
-
-	const TIER_LABEL: Record<Tier, string> = {
-		gateway: 'Gateway baseline',
-		profile: 'Profile',
-		workspace: 'Workspace'
-	};
 
 	// ---- Profile model picker options ----
 	// The default model is chosen from the usable models (credentials-resolved
@@ -388,6 +395,17 @@
 		{ value: '', label: 'Model default' },
 		...(selectedModelEntry?.think_efforts ?? []).map((t) => ({ value: t, label: t }))
 	]);
+
+	// Trigger labels for the pickers: the current value, or the empty-value
+	// option's label when nothing is selected (mirrors the option list).
+	const modelPickerLabel = $derived(
+		modelOptions.find((o) => o.value === (profile?.model.default ?? ''))?.label ??
+			'None (gateway default)'
+	);
+	const effortPickerLabel = $derived(
+		effortOptions.find((o) => o.value === (profile?.model.think_effort ?? ''))?.label ??
+			'Model default'
+	);
 
 	// Bridge a nullable-number model field to a text input (empty = null).
 	function numOrNull(v: string): number | null {
@@ -415,12 +433,8 @@
 				<button class="tab" class:active={tab === 'profiles'} onclick={() => (tab = 'profiles')}>
 					Profiles
 				</button>
-				<button
-					class="tab"
-					class:active={tab === 'permissions'}
-					onclick={() => (tab = 'permissions')}
-				>
-					Permissions
+				<button class="tab" class:active={tab === 'global'} onclick={() => (tab = 'global')}>
+					全局设置
 				</button>
 			</div>
 		</header>
@@ -518,20 +532,24 @@
 						<div class="grid2">
 							<label class="field">
 								<span class="key">Default model</span>
-								<ModelSelect
+								<PickerSelect
 									options={modelOptions}
 									value={pf.model.default ?? ''}
 									onselect={(v) => (pf.model.default = v || null)}
+									key="model"
+									label={modelPickerLabel}
 								/>
 							</label>
 							<label class="field">
 								<span class="key">Thinking effort</span>
-								<ModelSelect
+								<PickerSelect
 									options={effortOptions}
 									value={pf.model.think_effort ?? ''}
 									onselect={(v) => (pf.model.think_effort = v || null)}
 									disabled={!selectedModelEntry ||
 										(selectedModelEntry.think_efforts ?? []).length === 0}
+									key="effort"
+									label={effortPickerLabel}
 								/>
 							</label>
 							<label class="field">
@@ -545,20 +563,32 @@
 								/>
 							</label>
 						</div>
+
+						<!-- Profile-tier permission gating (the middle tier, between the
+						     gateway floor and any workspace override). Edited here, with
+						     the profile it belongs to, not on a separate tab. -->
+						<div class="field">
+							<span class="key">Permission gating</span>
+							{#key selectedName}
+								<PermissionRulesEditor bind:policy={pf.permission} tools={toolCatalog} />
+							{/key}
+						</div>
 					{:else}
 						<p class="muted">Select a profile on the left to edit, or create a new one.</p>
 					{/if}
 				</div>
 			</section>
 		{:else}
-			<!-- PERMISSIONS-SECTION -->
+			<!-- GLOBAL-SECTION: the gateway-wide defaults in one flat container —
+			     permission floor + LSP/format registry checklists. Profile /
+			     workspace overrides live on the Profiles tab / workspace dialog. -->
 			<section class="stack">
-				<div class="tier">
-					<div class="tier-head">
-						<h2>Gateway baseline</h2>
-						<p class="tier-desc">
-							The lowest tier of the three-level resolution. Deny rules here are the gateway's
-							security floor — no profile or workspace can loosen them.
+				<!-- Permission floor -->
+				<div class="gsect">
+					<div class="gsect-head">
+						<h2>权限基线</h2>
+						<p class="gsect-desc">
+							三层裁决的最底层。这里的 deny 是网关的安全底线——任何 profile 或 workspace 都不能放宽它。
 						</p>
 					</div>
 					{#if gatewayPolicy}
@@ -566,11 +596,9 @@
 							bind:policy={gatewayPolicy}
 							tools={toolCatalog}
 							showDefaults
-							emptyHint="No rules — unmatched means allow"
+							emptyHint="无规则 —— 未命中即允许"
 						/>
 					{:else}
-						<!-- Mirror the loaded layout (defaults table + rule rows) so
-						     content doesn't jump when it lands (§3.2). -->
 						<div class="skel-rows" aria-hidden="true">
 							<Skeleton width="100%" height="38px" radius="var(--radius-md)" />
 							<Skeleton width="100%" height="28px" />
@@ -579,126 +607,44 @@
 					{/if}
 				</div>
 
-				<div class="tier">
-					<div class="tier-head">
-						<h2>Profile</h2>
-						<p class="tier-desc">
-							The middle tier. Only rules added at this tier are listed; an empty profile applies no
-							gating.
+				<!-- LSP checklist -->
+				<div class="gsect">
+					<div class="gsect-head">
+						<h2>语言服务器</h2>
+						<p class="gsect-desc">
+							内置注册表的完整清单（未安装/未启用的标灰但不隐藏）——勾选启用、禁用写入
+							enabled = false 墓碑。command 仅对已安装的二进制可改。
 						</p>
 					</div>
-					<select
-						class="in sel tier-picker"
-						value={selectedName}
-						onchange={(e) => selectProfile(e.currentTarget.value)}
-					>
-						<option value="">Select profile…</option>
-						{#each profileList as p (p.name)}
-							<option value={p.name}>{p.name}</option>
-						{/each}
-					</select>
-					{#if profile}
-						{#key selectedName}
-							<PermissionRulesEditor bind:policy={profile.permission} tools={toolCatalog} />
-						{/key}
-					{:else if selectedName}
+					{#if lspView}
+						<!-- Global view: no install badge / command lock — the gateway's
+						     PATH says nothing about per-project tools. -->
+						<LspConfigEditor bind:rows={lspRows} showInstalled={false} />
+					{:else}
 						<div class="skel-rows" aria-hidden="true">
-							<Skeleton width="100%" height="28px" />
-							<Skeleton width="72%" height="28px" />
-							<Skeleton width="48%" height="28px" />
+							<Skeleton width="100%" height="52px" radius="var(--radius-md)" />
+							<Skeleton width="100%" height="52px" radius="var(--radius-md)" />
+							<Skeleton width="100%" height="52px" radius="var(--radius-md)" />
 						</div>
 					{/if}
 				</div>
 
-				<div class="tier">
-					<div class="tier-head">
-						<h2>Workspace</h2>
-						<p class="tier-desc">
-							The highest tier, stored in the gateway’s trusted directory. Deny unions with lower
-							tiers (never shrinks); a set ask list wholesale replaces the tiers below.
+				<!-- Format checklist -->
+				<div class="gsect">
+					<div class="gsect-head">
+						<h2>格式化</h2>
+						<p class="gsect-desc">
+							edit/write 后的自动格式化。清单语义同语言服务器——勾选启用、禁用写墓碑，command
+							仅对已安装的可改。
 						</p>
 					</div>
-					<select
-						class="in sel tier-picker"
-						value={selectedWs}
-						onchange={(e) => selectWorkspace(e.currentTarget.value)}
-					>
-						<option value="">Select workspace…</option>
-						{#each wsList as w (w.id)}
-							<option value={w.id}>{w.path ?? w.id}</option>
-						{/each}
-					</select>
-					{#if wsConfig && wsConfig.permission}
-						{#key selectedWs}
-							<PermissionRulesEditor bind:policy={wsConfig.permission} tools={wsTools} />
-						{/key}
-					{:else if selectedWs}
+					{#if fmtView}
+						<FormatConfigEditor bind:rows={fmtRows} bind:mode={fmtMode} showInstalled={false} />
+					{:else}
 						<div class="skel-rows" aria-hidden="true">
-							<Skeleton width="100%" height="28px" />
-							<Skeleton width="72%" height="28px" />
-							<Skeleton width="48%" height="28px" />
-						</div>
-					{/if}
-				</div>
-
-				<div class="tier">
-					<h2 class="eff-title">
-						<button class="eff-head" onclick={() => (effOpen = !effOpen)} aria-expanded={effOpen}>
-							<svg
-								class="chev"
-								class:open={effOpen}
-								viewBox="0 0 14 14"
-								fill="none"
-								stroke="currentColor"
-								stroke-width="1.6"
-								stroke-linecap="round"
-								stroke-linejoin="round"
-							>
-								<polyline points="5,3 9,7 5,11" />
-							</svg>
-							Effective result
-							<span class="eff-count">
-								{effective.length > 0 ? `${effective.length} rules in effect` : 'All allowed'}
-							</span>
-						</button>
-					</h2>
-					{#if effOpen}
-						<div class="eff-body">
-							<p class="tier-desc">
-								Computed from the currently selected profile and workspace: deny unions across the
-								three tiers, ask comes from the highest tier that sets one, allow unions across the
-								three tiers and exempts from ask on a match.
-							</p>
-							{#if effective.length === 0}
-								<p class="muted">No rules on any tier — every tool is allowed outright.</p>
-							{:else}
-								{#each effective as eff, i (i)}
-									{@const row = ruleToRow(eff.rule, eff.list)}
-									<div class="eff-row">
-										<span
-											class="verdict"
-											class:deny={eff.list === 'deny'}
-											class:ask={eff.list === 'ask'}
-											class:allow={eff.list === 'allow'}
-										>
-											{eff.list === 'deny' ? 'Deny' : eff.list === 'allow' ? 'Allow' : 'Ask'}
-										</span>
-										<span class="eff-summary">
-											{row ? summaryOf(row, effCatalog) : JSON.stringify(eff.rule)}
-										</span>
-										<span class="tier-badge">{TIER_LABEL[eff.tier]}</span>
-									</div>
-								{/each}
-							{/if}
-							{#if shadowedAsks.shadowed.length > 0}
-								<p class="eff-note">
-									The {TIER_LABEL[shadowedAsks.winner ?? 'gateway']} tier sets ask rules, so the
-									{shadowedAsks.shadowed
-										.map((s) => `${s.count} ask rule(s) on the ${TIER_LABEL[s.tier]} tier`)
-										.join(' and ')}
-									are wholesale replaced and never take effect.
-								</p>
-							{/if}
+							<Skeleton width="100%" height="52px" radius="var(--radius-md)" />
+							<Skeleton width="100%" height="52px" radius="var(--radius-md)" />
+							<Skeleton width="100%" height="52px" radius="var(--radius-md)" />
 						</div>
 					{/if}
 				</div>
@@ -957,25 +903,31 @@
 		padding: var(--space-4);
 	}
 
-	/* ---- Permissions tab: tier sections ---- */
-	.tier {
-		border: 1px solid var(--border-subtle);
-		border-radius: var(--radius-md);
-		background: var(--canvas-raised);
-		padding: var(--space-4);
+	/* ---- 全局设置 tab: flat sections ----
+	   One container per concern (permission floor / LSP / format), a quiet
+	   heading + one-line desc, then the content directly — no nested tier
+	   cards (the checklist rows carry their own per-row source badges). */
+	.gsect {
 		display: flex;
 		flex-direction: column;
 		gap: var(--space-3);
+		padding-bottom: var(--space-5);
+		border-bottom: 1px solid var(--border-subtle);
 	}
 
-	.tier-head h2 {
+	.gsect:last-child {
+		border-bottom: none;
+		padding-bottom: 0;
+	}
+
+	.gsect-head h2 {
 		font-family: var(--font-chinese);
 		font-size: 13px;
 		font-weight: 600;
 		color: var(--text-primary);
 	}
 
-	.tier-desc {
+	.gsect-desc {
 		font-family: var(--font-chinese);
 		font-size: 11px;
 		line-height: 1.6;
@@ -983,125 +935,11 @@
 		margin-top: 2px;
 	}
 
-	.tier-picker {
-		max-width: 320px;
-	}
-
 	/* Loading placeholder: compact rows, same rhythm as the editor's `.rows`. */
 	.skel-rows {
 		display: flex;
 		flex-direction: column;
 		gap: 2px;
-	}
-
-	.sel {
-		font-family: var(--font-chinese);
-		background: var(--canvas-raised);
-	}
-
-	/* ---- Effective view ---- */
-	/* Heading wraps the toggle (button is valid phrasing content inside h2; the
-	   inverse nesting is not). The button inherits this font via the global
-	   `button { font: inherit }` reset. */
-	.eff-title {
-		font-family: var(--font-chinese);
-		font-size: 13px;
-		font-weight: 600;
-		color: var(--text-primary);
-	}
-
-	.eff-head {
-		display: flex;
-		align-items: center;
-		gap: var(--space-2);
-		width: 100%;
-		text-align: left;
-	}
-
-	.chev {
-		width: 12px;
-		height: 12px;
-		color: var(--text-tertiary);
-		transition: transform var(--dur-fast) var(--ease-out);
-	}
-
-	.chev.open {
-		transform: rotate(90deg);
-	}
-
-	.eff-count {
-		margin-left: auto;
-		font-family: var(--font-chinese);
-		font-size: 11px;
-		color: var(--text-tertiary);
-	}
-
-	.eff-body {
-		display: flex;
-		flex-direction: column;
-		gap: 2px;
-		border-top: 1px solid var(--border-subtle);
-		padding-top: var(--space-3);
-	}
-
-	.eff-row {
-		display: flex;
-		align-items: center;
-		gap: var(--space-2);
-		padding: 4px 0;
-	}
-
-	.verdict {
-		flex-shrink: 0;
-		font-family: var(--font-chinese);
-		font-size: 11px;
-		font-weight: 590;
-		padding: 1px 6px;
-		border-radius: var(--radius-sm);
-	}
-
-	.verdict.deny {
-		color: var(--state-error-text);
-		background: var(--state-error-bg);
-	}
-
-	.verdict.allow {
-		color: var(--state-done-text);
-		background: var(--state-done-bg);
-	}
-
-	.verdict.ask {
-		color: var(--state-running-text);
-		background: var(--state-running-bg);
-	}
-
-	.eff-summary {
-		flex: 1;
-		min-width: 0;
-		font-family: var(--font-chinese);
-		font-size: 12px;
-		color: var(--text-secondary);
-		white-space: nowrap;
-		overflow: hidden;
-		text-overflow: ellipsis;
-	}
-
-	.tier-badge {
-		flex-shrink: 0;
-		font-family: var(--font-chinese);
-		font-size: 11px;
-		color: var(--text-tertiary);
-		background: var(--canvas-float);
-		padding: 1px 6px;
-		border-radius: var(--radius-sm);
-	}
-
-	.eff-note {
-		margin-top: var(--space-2);
-		font-family: var(--font-chinese);
-		font-size: 11px;
-		line-height: 1.6;
-		color: var(--state-running-text);
 	}
 
 	@media (max-width: 768px) {

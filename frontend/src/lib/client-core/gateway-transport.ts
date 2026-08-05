@@ -27,6 +27,9 @@ import type { Profile } from '$lib/types/Profile';
 import type { WorkspaceSummary } from '$lib/types/WorkspaceSummary';
 import type { SessionStatus } from '$lib/types/SessionStatus';
 import type { PermissionPolicy } from '$lib/types/PermissionPolicy';
+import type { LspConfigView } from '$lib/types/LspConfigView';
+import type { FormatConfigView } from '$lib/types/FormatConfigView';
+import type { LspConfigEdit, FormatConfigEdit } from '$lib/lang-tools';
 import type { WorkspaceConfig } from '$lib/types/WorkspaceConfig';
 import type { ToolInfo } from '$lib/types/ToolInfo';
 import type { ApprovalScope } from '$lib/types/ApprovalScope';
@@ -298,6 +301,50 @@ export class GatewayTransport implements SessionClient {
 		return this.#send(endpoints.gatewayPermission(), {
 			method: 'PUT',
 			body: JSON.stringify(policy)
+		});
+	}
+
+	getLspConfig(): Promise<LspConfigView> {
+		return this.#json<LspConfigView>(endpoints.lspConfig());
+	}
+
+	saveLspConfig(edit: LspConfigEdit): Promise<void> {
+		return this.#send(endpoints.lspConfig(), {
+			method: 'PUT',
+			body: JSON.stringify(edit)
+		});
+	}
+
+	getFormatConfig(): Promise<FormatConfigView> {
+		return this.#json<FormatConfigView>(endpoints.formatConfig());
+	}
+
+	saveFormatConfig(edit: FormatConfigEdit): Promise<void> {
+		return this.#send(endpoints.formatConfig(), {
+			method: 'PUT',
+			body: JSON.stringify(edit)
+		});
+	}
+
+	getWorkspaceLspConfig(workspaceId: string): Promise<LspConfigView> {
+		return this.#json<LspConfigView>(endpoints.workspaceLspConfig(workspaceId));
+	}
+
+	saveWorkspaceLspConfig(workspaceId: string, edit: LspConfigEdit): Promise<void> {
+		return this.#send(endpoints.workspaceLspConfig(workspaceId), {
+			method: 'PUT',
+			body: JSON.stringify(edit)
+		});
+	}
+
+	getWorkspaceFormatConfig(workspaceId: string): Promise<FormatConfigView> {
+		return this.#json<FormatConfigView>(endpoints.workspaceFormatConfig(workspaceId));
+	}
+
+	saveWorkspaceFormatConfig(workspaceId: string, edit: FormatConfigEdit): Promise<void> {
+		return this.#send(endpoints.workspaceFormatConfig(workspaceId), {
+			method: 'PUT',
+			body: JSON.stringify(edit)
 		});
 	}
 

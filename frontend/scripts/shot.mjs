@@ -116,6 +116,112 @@ const PROVIDERS_VIEW = {
 	secret_names: ['anthropic']
 };
 
+/** LSP settings view (LspConfigView): the registry-driven checklist. Mixes
+ *  installed/enabled rows with a not-installed one and a tombstoned one so the
+ *  screenshot exercises every badge + the greyed-row treatment. */
+const LSP_VIEW = {
+	servers: [
+		{
+			layer: 'builtin',
+			builtin: true,
+			installed: true,
+			name: 'rust-analyzer',
+			command: 'rust-analyzer',
+			args: [],
+			env: {},
+			extensions: ['rs'],
+			enabled: true,
+			diag_timeout_ms: 400,
+			init_timeout_ms: 2000
+		},
+		{
+			layer: 'builtin',
+			builtin: true,
+			installed: true,
+			name: 'pyright',
+			command: 'pyright-langserver',
+			args: ['--stdio'],
+			env: {},
+			extensions: ['py', 'pyi'],
+			enabled: true,
+			diag_timeout_ms: 400,
+			init_timeout_ms: 2000
+		},
+		{
+			layer: 'builtin',
+			builtin: true,
+			installed: false,
+			name: 'gopls',
+			command: 'gopls',
+			args: [],
+			env: {},
+			extensions: ['go'],
+			enabled: true,
+			diag_timeout_ms: 400,
+			init_timeout_ms: 2000
+		},
+		{
+			layer: 'workspace',
+			builtin: true,
+			installed: true,
+			name: 'ruff',
+			command: 'ruff',
+			args: ['server'],
+			env: {},
+			extensions: ['py', 'pyi'],
+			enabled: false,
+			diag_timeout_ms: 400,
+			init_timeout_ms: 2000
+		}
+	]
+};
+
+/** Format settings view (FormatConfigView): mode + formatter checklist. */
+const FORMAT_VIEW = {
+	mode: 'file',
+	formatters: [
+		{
+			layer: 'builtin',
+			builtin: true,
+			installed: true,
+			name: 'rustfmt',
+			command: 'rustfmt',
+			args: ['--emit', 'stdout'],
+			env: {},
+			extensions: ['rs'],
+			enabled: true,
+			supports_line_range: true,
+			format_timeout_ms: 2000
+		},
+		{
+			layer: 'builtin',
+			builtin: true,
+			installed: false,
+			name: 'prettier',
+			command: 'prettier',
+			args: ['--stdin-filepath', '{file}'],
+			env: {},
+			extensions: ['js', 'ts', 'tsx', 'json', 'md'],
+			enabled: true,
+			supports_line_range: false,
+			format_timeout_ms: 2000
+		},
+		{
+			layer: 'builtin',
+			builtin: true,
+			installed: false,
+			name: 'black',
+			command: 'black',
+			args: ['-'],
+			env: {},
+			extensions: ['py', 'pyi'],
+			enabled: false,
+			supports_line_range: false,
+			format_timeout_ms: 2000
+		}
+	]
+};
+
 /** Derived summaries, keyed by id. `first_user_input` drives the list title. */
 const SUMMARY = {
 	'01J5SESSIONAAAAAAAAAAAAAAA': {
@@ -232,6 +338,11 @@ async function mockApi(page) {
 		if (path === '/profiles') return json({ profiles: PROFILES });
 		if (path === '/models') return json({ models: MODELS });
 		if (path === '/providers') return json(PROVIDERS_VIEW);
+		if (path === '/config/lsp') return json(LSP_VIEW);
+		if (path === '/config/format') return json(FORMAT_VIEW);
+		if (path === '/tools') return json({ tools: [] });
+		if (path === '/gateway/permission') return json({});
+		if (path === '/workspaces') return json({ workspaces: WORKSPACES });
 
 		const m = path.match(/^\/sessions\/([^/]+)(\/.*)?$/);
 		if (m) {
@@ -336,6 +447,25 @@ async function shoot() {
 		{ name: 'dashboard', path: '/', waitFor: '.card, .empty', contentSel: '.card' },
 		{ name: 'settings', path: '/settings', waitFor: '.panel, .muted', contentSel: '.panel' },
 		{
+			name: 'settings-lsp',
+			path: '/settings',
+			waitFor: '.cfg-editor .row, .muted',
+			contentSel: '.cfg-editor .row',
+			// Open the LSP tab before shooting (the checklist lazy-loads on first open).
+			before: async (page) => {
+				await page.getByRole('button', { name: 'LSP', exact: true }).click();
+			}
+		},
+		{
+			name: 'settings-format',
+			path: '/settings',
+			waitFor: '.cfg-editor .row, .muted',
+			contentSel: '.cfg-editor .row',
+			before: async (page) => {
+				await page.getByRole('button', { name: 'Format', exact: true }).click();
+			}
+		},
+		{
 			name: 'conversation',
 			path: '/workspaces/ws-ominiforge/sessions/01J5SESSIONAAAAAAAAAAAAAAA',
 			waitFor: '.item-text, .conv-inner',
@@ -356,6 +486,7 @@ async function shoot() {
 			await page.addInitScript((th) => localStorage.setItem('theme', th), theme);
 			await mockApi(page);
 			await page.goto(`${BASE}${t.path}`, { waitUntil: 'networkidle' });
+			if (t.before) await t.before(page);
 			await page.waitForSelector(t.waitFor, { timeout: 5000 }).catch(() => {});
 			await page.waitForTimeout(400); // settle fonts/animations
 			const file = resolve(outDir, `${t.name}-${theme}.png`);

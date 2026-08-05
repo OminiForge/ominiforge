@@ -135,6 +135,19 @@ fn router(state: AppState) -> Router {
             "/gateway/permission",
             get(get_gateway_permission).put(put_gateway_permission),
         )
+        .route("/config/lsp", get(get_lsp_config).put(put_lsp_config))
+        .route(
+            "/config/format",
+            get(get_format_config).put(put_format_config),
+        )
+        .route(
+            "/workspaces/{id}/config/lsp",
+            get(get_workspace_lsp_config).put(put_workspace_lsp_config),
+        )
+        .route(
+            "/workspaces/{id}/config/format",
+            get(get_workspace_format_config).put(put_workspace_format_config),
+        )
         .route(
             "/secrets/{provider}",
             axum::routing::put(put_secret).delete(delete_secret),
@@ -390,6 +403,138 @@ async fn put_gateway_permission(
     match state.registry.set_gateway_permission(policy).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => internal_error(&e),
+    }
+}
+
+/// `GET /config/lsp` — the layered LSP settings view: every registry server
+/// (tombstoned ones kept, greyed) plus user-defined ones, each labelled with
+/// its source layer and a `PATH` install probe (`doc/lsp.md` §7).
+async fn get_lsp_config(State(state): State<AppState>) -> Response {
+    match state.registry.lsp_config_view() {
+        Ok(view) => Json(view).into_response(),
+        Err(e) => internal_error(&e),
+    }
+}
+
+/// `PUT /config/lsp` — rewrite the primary root's `lsp.toml` from the edited
+/// list. `enabled = false` tombstones disable registry entries; `command`
+/// edits are accepted only for installed binaries (a greyed, not-installed
+/// row must not be silently armed). The reload must reflect the request or
+/// the write is an error, not a silent no-op (Karpathy §12).
+async fn put_lsp_config(
+    State(state): State<AppState>,
+    Json(edit): Json<super::langconfig::LspConfigEdit>,
+) -> Response {
+    match state.registry.save_lsp_config(&edit).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => bad_request(&e),
+    }
+}
+
+/// `GET /config/format` — the layered format settings view (mode + the
+/// registry-driven formatter list, `doc/format.md` §7).
+async fn get_format_config(State(state): State<AppState>) -> Response {
+    match state.registry.format_config_view() {
+        Ok(view) => Json(view).into_response(),
+        Err(e) => internal_error(&e),
+    }
+}
+
+/// `PUT /config/format` — rewrite the primary root's `format.toml` from the
+/// edited list (+ mode). Same tombstone / install-probe / reload-verify
+/// semantics as [`put_lsp_config`].
+async fn put_format_config(
+    State(state): State<AppState>,
+    Json(edit): Json<super::langconfig::FormatConfigEdit>,
+) -> Response {
+    match state.registry.save_format_config(&edit).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => bad_request(&e),
+    }
+}
+
+/// `GET /workspaces/{id}/config/lsp` — the LSP settings view scoped to a
+/// workspace: its `.omini` layered over the gateway chain, installs probed
+/// against its env-overlay PATH (a flake/direnv-provided tool is "installed"
+/// here even when absent from the gateway's PATH). 404 for an unknown id.
+async fn get_workspace_lsp_config(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.registry.lsp_config_view_for(&WorkspaceId(id)) {
+        Ok(view) => Json(view).into_response(),
+        Err(e) => {
+            if e.to_string().contains("unknown workspace id") {
+                not_found(&e)
+            } else {
+                internal_error(&e)
+            }
+        }
+    }
+}
+
+/// `PUT /workspaces/{id}/config/lsp` — write the workspace's
+/// `.omini/config/lsp.toml` (the project-level override). Same enforcement as
+/// the global PUT, against the workspace's env-overlay PATH. 404 unknown id.
+async fn put_workspace_lsp_config(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(edit): Json<super::langconfig::LspConfigEdit>,
+) -> Response {
+    match state
+        .registry
+        .save_lsp_config_for(&WorkspaceId(id), &edit)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            if e.to_string().contains("unknown workspace id") {
+                not_found(&e)
+            } else {
+                bad_request(&e)
+            }
+        }
+    }
+}
+
+/// `GET /workspaces/{id}/config/format` — the workspace-scoped format view
+/// (mode + checklist, workspace-overlay install probes). 404 unknown id.
+async fn get_workspace_format_config(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.registry.format_config_view_for(&WorkspaceId(id)) {
+        Ok(view) => Json(view).into_response(),
+        Err(e) => {
+            if e.to_string().contains("unknown workspace id") {
+                not_found(&e)
+            } else {
+                internal_error(&e)
+            }
+        }
+    }
+}
+
+/// `PUT /workspaces/{id}/config/format` — write the workspace's
+/// `.omini/config/format.toml` (mode + formatter overrides). 404 unknown id.
+async fn put_workspace_format_config(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(edit): Json<super::langconfig::FormatConfigEdit>,
+) -> Response {
+    match state
+        .registry
+        .save_format_config_for(&WorkspaceId(id), &edit)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            if e.to_string().contains("unknown workspace id") {
+                not_found(&e)
+            } else {
+                bad_request(&e)
+            }
+        }
     }
 }
 
@@ -3183,5 +3328,258 @@ default = "openai-main/gpt-4o"
             got["permission"].get("deny").is_none()
                 || got["permission"]["deny"].as_array().unwrap().is_empty()
         );
+    }
+
+    /// `PUT /config/lsp` then `GET` round-trips an edited list AND persists it
+    /// to `lsp.toml`. Tombstoning a built-in is the core flow (disable a
+    /// default), so that's what's pinned: the disabled row must still render
+    /// (greyed) in the view while the runtime `load` drops it.
+    #[tokio::test]
+    async fn lsp_config_put_then_get_and_persists() {
+        let (registry, dir) = test_registry_with_config();
+        let state = AppState {
+            registry,
+            api_key: None,
+        };
+        let base = serve_test(state).await;
+        let http = reqwest::Client::new();
+
+        // Read the view; flip one built-in off in the edit body.
+        let view: serde_json::Value = http
+            .get(format!("{base}/api/config/lsp"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let servers: Vec<serde_json::Value> = view["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| {
+                let enabled = if s["name"] == "pyright" {
+                    false
+                } else {
+                    s["enabled"].as_bool().unwrap()
+                };
+                json!({
+                    "name": s["name"],
+                    "enabled": enabled,
+                    "command": s["command"],
+                    "diag_timeout_ms": s["diag_timeout_ms"],
+                    "init_timeout_ms": s["init_timeout_ms"],
+                })
+            })
+            .collect();
+        let resp = http
+            .put(format!("{base}/api/config/lsp"))
+            .json(&json!({ "servers": servers }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204);
+
+        // GET: pyright still renders (greyed), others enabled.
+        let got: serde_json::Value = http
+            .get(format!("{base}/api/config/lsp"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let pyright = got["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "pyright")
+            .expect("tombstoned built-in stays visible");
+        assert_eq!(pyright["enabled"], false);
+
+        // Persisted: the runtime loader drops the tombstoned entry.
+        let text = std::fs::read_to_string(dir.path().join(".omini/config/lsp.toml")).unwrap();
+        assert!(text.contains("pyright"), "lsp.toml written, got: {text}");
+        let effective = crate::lsp::config::LspConfig::load(&[dir.path().join(".omini")]).unwrap();
+        assert!(!effective.servers.iter().any(|s| s.name == "pyright"));
+        assert!(effective.servers.iter().any(|s| s.name == "rust-analyzer"));
+    }
+
+    /// `PUT /config/format` round-trips a mode + tombstone and persists it to
+    /// `format.toml`.
+    #[tokio::test]
+    async fn format_config_put_then_get_and_persists() {
+        let (registry, dir) = test_registry_with_config();
+        let state = AppState {
+            registry,
+            api_key: None,
+        };
+        let base = serve_test(state).await;
+        let http = reqwest::Client::new();
+
+        let view: serde_json::Value = http
+            .get(format!("{base}/api/config/format"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(view["mode"], "file");
+        let formatters: Vec<serde_json::Value> = view["formatters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| {
+                json!({
+                    "name": f["name"],
+                    "enabled": f["name"] != "black",
+                    "command": f["command"],
+                    "format_timeout_ms": f["format_timeout_ms"],
+                })
+            })
+            .collect();
+        let resp = http
+            .put(format!("{base}/api/config/format"))
+            .json(&json!({ "mode": "edit", "formatters": formatters }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204);
+
+        let got: serde_json::Value = http
+            .get(format!("{base}/api/config/format"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(got["mode"], "edit");
+        let black = got["formatters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["name"] == "black")
+            .expect("tombstoned formatter stays visible");
+        assert_eq!(black["enabled"], false);
+
+        let text = std::fs::read_to_string(dir.path().join(".omini/config/format.toml")).unwrap();
+        assert!(
+            text.contains("black") && text.contains("edit"),
+            "format.toml written, got: {text}"
+        );
+    }
+
+    /// `PUT /workspaces/{id}/config/lsp` writes the WORKSPACE's
+    /// `.omini/config/lsp.toml` (not the gateway root's), and the workspace
+    /// view then reports that entry at the `workspace` layer. This is the
+    /// project-level override the global view cannot express.
+    #[tokio::test]
+    async fn workspace_lsp_config_put_then_get_scopes_to_workspace() {
+        let (registry, dir) = test_registry_with_config();
+        let ws = dir.path().join("proj");
+        std::fs::create_dir_all(&ws).unwrap();
+        let id = registry.record_workspace(&ws).unwrap();
+        let state = AppState {
+            registry,
+            api_key: None,
+        };
+        let base = serve_test(state).await;
+        let http = reqwest::Client::new();
+
+        // Read the workspace view (builtins + gateway chain; nothing local yet).
+        let view: serde_json::Value = http
+            .get(format!("{base}/api/workspaces/{}/config/lsp", id.0))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        // Disable pyright for THIS workspace only.
+        let servers: Vec<serde_json::Value> = view["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| {
+                let enabled = if s["name"] == "pyright" {
+                    false
+                } else {
+                    s["enabled"].as_bool().unwrap()
+                };
+                json!({
+                    "name": s["name"],
+                    "enabled": enabled,
+                    "command": s["command"],
+                    "diag_timeout_ms": s["diag_timeout_ms"],
+                    "init_timeout_ms": s["init_timeout_ms"],
+                })
+            })
+            .collect();
+        let resp = http
+            .put(format!("{base}/api/workspaces/{}/config/lsp", id.0))
+            .json(&json!({ "servers": servers }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204);
+
+        // The write landed in the WORKSPACE's .omini, not the gateway root.
+        let ws_toml = ws.join(".omini/config/lsp.toml");
+        assert!(ws_toml.is_file(), "workspace lsp.toml written");
+        let text = std::fs::read_to_string(&ws_toml).unwrap();
+        assert!(text.contains("pyright"), "got: {text}");
+
+        // The workspace view shows pyright disabled at the workspace layer.
+        let got: serde_json::Value = http
+            .get(format!("{base}/api/workspaces/{}/config/lsp", id.0))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let pyright = got["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "pyright")
+            .expect("tombstoned built-in stays visible");
+        assert_eq!(pyright["enabled"], false);
+        assert_eq!(pyright["layer"], "workspace");
+
+        // The GLOBAL view is untouched (pyright still enabled there).
+        let global: serde_json::Value = http
+            .get(format!("{base}/api/config/lsp"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let g_pyright = global["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "pyright")
+            .unwrap();
+        assert_eq!(g_pyright["enabled"], true, "global view unaffected");
+    }
+
+    /// An unknown workspace id is a 404 on the workspace-scoped LSP view, not
+    /// a 500 — the id simply doesn't resolve to a recorded workspace.
+    #[tokio::test]
+    async fn workspace_lsp_config_unknown_id_is_404() {
+        let (registry, _dir) = test_registry_with_config();
+        let state = AppState {
+            registry,
+            api_key: None,
+        };
+        let base = serve_test(state).await;
+        let resp = reqwest::get(format!("{base}/api/workspaces/nope/config/lsp"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
     }
 }

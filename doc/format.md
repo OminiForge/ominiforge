@@ -114,4 +114,18 @@ edit/write 产出模型的目标文本（内存中）
 ## 7. 后续
 
 - 与 LSP 注册表合并为一张「按扩展名的语言工具表」，消灭扩展名映射重复。
-- Web 配置编辑器（同 `doc/lsp.md` §7）。
+
+## 8. Web 配置编辑器
+
+Format 的图形化配置与 LSP 同构（`doc/lsp.md` §8）：顶部 `mode` 选择（file/edit/off，复用 `PickerSelect`）+ formatter 固定清单（内置全列出、墓碑标灰、来源层 + 安装探测徽章、未安装不可改 command）。`mode=edit` 时列表标注各 formatter 的 `局部`（`supports_line_range`）支持——不支持的在 edit 模式下跳过（§5），徽章让用户一眼看出哪些会生效。
+
+**两个编辑场所**（同 LSP）：全局默认在 Settings → **全局设置** tab 的「格式化」一节（不显示安装标注、不门控 command——见 `doc/lsp.md` §8 的理由）；项目覆盖在工作区 `WorkspaceConfigDialog`（写 `<workspace>/.omini/config/format.toml`，安装探测用该 workspace 的 env-overlay PATH，安装标注与 command 门控只在此层出现）。运行时 `app::assemble` 同样经 `lang_config_roots` 让项目 format.toml 生效。
+
+**端点**（`gateway::langconfig`，读返回 `FormatConfigView{mode, formatters:[FormatterView{layer, builtin, installed, …}]}`）：
+
+- 全局：`GET/PUT /config/format`（写回 primary root）。
+- 项目：`GET/PUT /workspaces/{id}/config/format`（写回 workspace `.omini`；未知 id 404）。
+
+**写语义**同 LSP：完整清单（只含用户字段；`supports_line_range`/`args` 由服务端重取）+ 整体重写目标层 + 重 `load` 验证。
+
+**前端**：`lang-tools.ts` 的 `fmtToRows`/`fmtFromRows`（vitest round-trip）+ `FormatConfigEditor.svelte`（两个场所复用）。

@@ -159,6 +159,10 @@ pub async fn assemble(
 
     let store = config;
 
+    // The session's LSP/format config roots put the workspace on top of the
+    // gateway's chain (`lang_config_roots`).
+    let lang_roots = lang_config_roots(&workspace, store);
+
     // Activate workspace env before registering tools, unless disabled. The
     // overlay is passed to subprocesses (shell/MCP/LSP) so commands run inside
     // the workspace's development environment without requiring `direnv exec`.
@@ -241,7 +245,7 @@ pub async fn assemble(
     // load `lsp.toml`, build one manager per session. `None` when no server is
     // configured, so read/edit/write pay nothing. Nothing spawns here — servers
     // start lazily on the first file of their language.
-    let lsp_manager = crate::lsp::LspConfig::load(store.roots())
+    let lsp_manager = crate::lsp::LspConfig::load(&lang_roots)
         .context("failed to load lsp.toml")
         .map(|cfg| {
             crate::lsp::LspManager::new(lsp_service, &cfg, workspace.clone(), env_overlay.clone())
@@ -251,7 +255,7 @@ pub async fn assemble(
     // a stateless manager. `None` when `mode = "off"` or no formatter is
     // configured, so edit/write pay nothing. Unlike the LSP manager this owns
     // no subprocess — each format is a fresh stdin→stdout call.
-    let format_manager = crate::format::FormatConfig::load(store.roots())
+    let format_manager = crate::format::FormatConfig::load(&lang_roots)
         .context("failed to load format.toml")
         .map(|cfg| crate::format::FormatManager::new(cfg, env_overlay.clone()))?;
 
@@ -433,6 +437,19 @@ pub fn resolve_workspace(requested: &Path) -> Result<PathBuf> {
         .with_context(|| format!("workspace does not exist: {}", requested.display()))
 }
 
+/// The session's LSP/format config roots: the workspace's own `.omini` sits on
+/// TOP of the gateway's config root chain (`doc/lsp.md` §3, `doc/format.md`
+/// §5) so a project can override/disable the machine-wide defaults.
+/// lsp.toml/format.toml are spawn configuration, not a security policy, so
+/// reading them from the (agent-writable) workspace is safe — the same trust
+/// posture as `mcp.toml` (which the chain already reads). Split out so the
+/// layering is unit-testable without standing up a full `assemble`.
+fn lang_config_roots(workspace: &Path, store: &crate::config::ConfigStore) -> Vec<PathBuf> {
+    std::iter::once(workspace.join(".omini"))
+        .chain(store.roots().iter().cloned())
+        .collect()
+}
+
 /// Load a single `.env` file into the environment, if one is found.
 ///
 /// Search order: each config root's `.env` (project `.omini` before user
@@ -501,6 +518,42 @@ mod tests {
     fn dotenv_absent_everywhere_is_none() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(pick_dotenv_path(&[dir.path().to_owned()], dir.path()), None);
+    }
+
+    /// `lang_config_roots` puts the workspace's `.omini` ABOVE the gateway's
+    /// config chain, and the merge honours it: a workspace `lsp.toml` shadows /
+    /// tombstones the machine-wide default (`doc/lsp.md` §3). This is the
+    /// behaviour change that makes a project's own LSP config take effect.
+    #[test]
+    fn lang_roots_workspace_overrides_global() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global/.omini");
+        let ws = dir.path().join("proj");
+        // Global root: rust-analyzer present.
+        std::fs::create_dir_all(global.join("config")).unwrap();
+        std::fs::write(
+            global.join("config/lsp.toml"),
+            "[[servers]]\nname = \"rust-analyzer\"\ncommand = \"rust-analyzer\"\nextensions = [\"rs\"]\n",
+        )
+        .unwrap();
+        // Workspace root: tombstone rust-analyzer (disable it for this project).
+        std::fs::create_dir_all(ws.join(".omini/config")).unwrap();
+        std::fs::write(
+            ws.join(".omini/config/lsp.toml"),
+            "[[servers]]\nname = \"rust-analyzer\"\ncommand = \"rust-analyzer\"\nextensions = [\"rs\"]\nenabled = false\n",
+        )
+        .unwrap();
+
+        let store = crate::config::ConfigStore::from_roots(vec![global]);
+        let roots = lang_config_roots(&ws, &store);
+        // The workspace root is first (highest precedence).
+        assert_eq!(roots[0], ws.join(".omini"));
+
+        let cfg = crate::lsp::LspConfig::load(&roots).unwrap();
+        // The workspace tombstone wins over the global enable.
+        assert!(!cfg.servers.iter().any(|s| s.name == "rust-analyzer"));
+        // Untouched built-ins survive.
+        assert!(cfg.servers.iter().any(|s| s.name == "pyright"));
     }
 
     /// The default profile leaves `[tools].builtin` unset, which means "all

@@ -62,6 +62,8 @@ contains = ["git push"]
 - 记录整体对**未来 workspace memory** 等仍开放(同文件加 section),当前定义 `[network]` + `[[mounts]]` + `[permission]`——其余需求未落地前不设字段(现在设计=猜)。
 - 未知键忽略，向前兼容。
 
+> **LSP/format 的项目覆盖不在本文件。** 安全策略（network/permission）必须在网关可信目录（§2）；但 lsp.toml/format.toml 是 **spawn 配置**而非安全策略，故项目覆盖直接读写 **`<workspace>/.omini/config/lsp.toml|format.toml`**（`doc/lsp.md` §8 / `doc/format.md` §8），由同一 `WorkspaceConfigDialog` 承载（与 network/permission 并列），运行时经 `app::assemble` 的 `lang_config_roots` 生效。install 探测用该 workspace 的 env-overlay PATH。
+
 ## 4. 生命周期与 GC
 
 配置可比其项目活得久：项目被移走/删掉，但策略文件还在 `<gateway>/.omini/workspaces/`。

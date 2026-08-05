@@ -15,6 +15,9 @@ import type { Profile } from '$lib/types/Profile';
 import type { WorkspaceSummary } from '$lib/types/WorkspaceSummary';
 import type { SessionStatus } from '$lib/types/SessionStatus';
 import type { PermissionPolicy } from '$lib/types/PermissionPolicy';
+import type { LspConfigView } from '$lib/types/LspConfigView';
+import type { FormatConfigView } from '$lib/types/FormatConfigView';
+import type { LspConfigEdit, FormatConfigEdit } from '$lib/lang-tools';
 import type { WorkspaceConfig } from '$lib/types/WorkspaceConfig';
 import type { ToolInfo } from '$lib/types/ToolInfo';
 import type { ApprovalScope } from '$lib/types/ApprovalScope';
@@ -214,6 +217,25 @@ export interface SessionClient {
 	/** Replace the gateway baseline policy. Applies to new sessions immediately
 	 *  and persists to `gateway.toml`. */
 	saveGatewayPermission(policy: PermissionPolicy): Promise<void>;
+	/** The layered LSP settings view: the registry-driven server checklist with
+	 *  per-row source layer + `PATH` install probe (`doc/lsp.md` §7). */
+	getLspConfig(): Promise<LspConfigView>;
+	/** Rewrite the primary root's `lsp.toml` from the edited list (tombstones
+	 *  disable registry entries; the reload must reflect the request). */
+	saveLspConfig(edit: LspConfigEdit): Promise<void>;
+	/** The layered format settings view (mode + formatter checklist). */
+	getFormatConfig(): Promise<FormatConfigView>;
+	/** Rewrite the primary root's `format.toml` from the edited list + mode. */
+	saveFormatConfig(edit: FormatConfigEdit): Promise<void>;
+	/** The workspace-scoped LSP view (its `.omini` over the chain, installs
+	 *  probed against its env-overlay PATH). Backs the workspace config dialog. */
+	getWorkspaceLspConfig(workspaceId: string): Promise<LspConfigView>;
+	/** Write the workspace's `.omini/config/lsp.toml` (project-level override). */
+	saveWorkspaceLspConfig(workspaceId: string, edit: LspConfigEdit): Promise<void>;
+	/** The workspace-scoped format view. */
+	getWorkspaceFormatConfig(workspaceId: string): Promise<FormatConfigView>;
+	/** Write the workspace's `.omini/config/format.toml` (mode + overrides). */
+	saveWorkspaceFormatConfig(workspaceId: string, edit: FormatConfigEdit): Promise<void>;
 	/** The per-workspace config (network + mounts + permission; top tier of the
 	 *  gate) for the workspace `id` resolves to. A never-configured workspace
 	 *  returns `{}` (the backend omits empty sections), so the optional fields may

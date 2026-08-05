@@ -3,10 +3,14 @@
 
 use std::collections::HashMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// The parsed contents of `.omini/config/lsp.toml` (`doc/lsp.md` §3).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+///
+/// `Serialize` exists for the settings UI's write path (`gateway::langconfig`),
+/// which rewrites the layer file the user edited; the runtime only ever
+/// deserializes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct LspConfig {
     /// Each `[[servers]]` table.
     #[serde(default)]
@@ -15,7 +19,12 @@ pub struct LspConfig {
 
 /// One configured language server. Stdio only, spawned on the host (mirrors
 /// [`crate::mcp::McpServerConfig`] — the same trust model applies).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+///
+/// `Serialize` exists for the settings UI's write path (`gateway::langconfig`);
+/// every field is written explicitly (the file the user reads back is the
+/// full record they sent, with no skipped defaults to second-guess).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct LspServerConfig {
     /// Unique name; namespaces the server in logs.
     pub name: String,

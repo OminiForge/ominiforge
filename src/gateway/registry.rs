@@ -651,6 +651,157 @@ impl SessionRegistry {
             .map(|p| p.clone())
     }
 
+    /// The LSP settings view over the config root chain: every registry entry
+    /// (tombstoned ones kept, greyed) plus user-defined servers, each labelled
+    /// with its source layer and a `PATH` install probe (`gateway::langconfig`).
+    /// Backs `GET /config/lsp`.
+    ///
+    /// # Errors
+    /// A present-but-malformed `lsp.toml` in any root (fail loud).
+    pub fn lsp_config_view(&self) -> Result<super::langconfig::LspConfigView> {
+        super::langconfig::lsp_config_view(&self.inner.defaults.config)
+    }
+
+    /// Persist an edited LSP list to the primary root's `lsp.toml` and verify
+    /// the reload reflects it. Serialized with every other config write
+    /// (`config_write_lock`). Backs `PUT /config/lsp`.
+    ///
+    /// # Errors
+    /// A `command` edit on a not-installed entry, an unknown server name, no
+    /// config root, serialize/io failure, or the post-write reload not
+    /// reflecting the request.
+    pub async fn save_lsp_config(&self, edit: &super::langconfig::LspConfigEdit) -> Result<()> {
+        let _guard = self.inner.config_write_lock.lock().await;
+        super::langconfig::save_lsp_config(&self.inner.defaults.config, edit)
+    }
+
+    /// The format settings view over the config root chain (mode + the
+    /// registry-driven formatter list). Backs `GET /config/format`.
+    ///
+    /// # Errors
+    /// A present-but-malformed `format.toml` in any root (fail loud).
+    pub fn format_config_view(&self) -> Result<super::langconfig::FormatConfigView> {
+        super::langconfig::format_config_view(&self.inner.defaults.config)
+    }
+
+    /// Persist an edited format list (+ mode) to the primary root's
+    /// `format.toml` and verify the reload reflects it. Serialized with every
+    /// other config write (`config_write_lock`). Backs `PUT /config/format`.
+    ///
+    /// # Errors
+    /// Same conditions as [`save_lsp_config`](Self::save_lsp_config).
+    pub async fn save_format_config(
+        &self,
+        edit: &super::langconfig::FormatConfigEdit,
+    ) -> Result<()> {
+        let _guard = self.inner.config_write_lock.lock().await;
+        super::langconfig::save_format_config(&self.inner.defaults.config, edit)
+    }
+
+    /// The workspace's env-overlay snapshot (its direnv-exported PATH etc.),
+    /// when one has been prepared. Read-only and non-blocking — this never
+    /// triggers a direnv evaluation. `None` when the workspace id is unknown
+    /// or no snapshot exists yet (the install probe then falls back to the
+    /// gateway PATH, matching how a session with no prepared env would run).
+    fn workspace_env_snapshot(
+        &self,
+        id: &super::workspace::WorkspaceId,
+    ) -> Option<(PathBuf, std::collections::BTreeMap<String, Option<String>>)> {
+        let path = self.resolve_or_seed_workspace_id(id)?;
+        let root = self.inner.defaults.config.roots().first()?;
+        let cache = crate::env::WorkspaceEnvCache::anchored_at(root);
+        cache.snapshot(&path).map(|env| (path, env))
+    }
+
+    /// The LSP settings view scoped to workspace `id` (its `.omini` over the
+    /// gateway chain, installs probed against its env-overlay PATH). Backs
+    /// `GET /workspaces/{id}/config/lsp`.
+    ///
+    /// # Errors
+    /// An unknown workspace id, or a malformed `lsp.toml` in the chain.
+    pub fn lsp_config_view_for(
+        &self,
+        id: &super::workspace::WorkspaceId,
+    ) -> Result<super::langconfig::LspConfigView> {
+        let (path, env) = self
+            .workspace_env_snapshot(id)
+            .map(|(p, e)| (p, Some(e)))
+            .or_else(|| {
+                // No snapshot: still need the path to read the workspace's
+                // `.omini` layer. Resolve it directly (404 if unknown).
+                self.resolve_or_seed_workspace_id(id).map(|p| (p, None))
+            })
+            .ok_or_else(|| anyhow!("unknown workspace id `{}`", id.0))?;
+        super::langconfig::lsp_config_view_for(&self.inner.defaults.config, &path, env.as_ref())
+    }
+
+    /// Persist an edited LSP list to workspace `id`'s `.omini/config/lsp.toml`.
+    /// Backs `PUT /workspaces/{id}/config/lsp`.
+    ///
+    /// # Errors
+    /// An unknown workspace id; see also
+    /// [`save_lsp_config`](Self::save_lsp_config).
+    pub async fn save_lsp_config_for(
+        &self,
+        id: &super::workspace::WorkspaceId,
+        edit: &super::langconfig::LspConfigEdit,
+    ) -> Result<()> {
+        let (path, env) = self
+            .workspace_env_snapshot(id)
+            .map(|(p, e)| (p, Some(e)))
+            .or_else(|| self.resolve_or_seed_workspace_id(id).map(|p| (p, None)))
+            .ok_or_else(|| anyhow!("unknown workspace id `{}`", id.0))?;
+        let _guard = self.inner.config_write_lock.lock().await;
+        super::langconfig::save_lsp_config_for(
+            &self.inner.defaults.config,
+            &path,
+            env.as_ref(),
+            edit,
+        )
+    }
+
+    /// The format settings view scoped to workspace `id`. Backs
+    /// `GET /workspaces/{id}/config/format`.
+    ///
+    /// # Errors
+    /// An unknown workspace id, or a malformed `format.toml` in the chain.
+    pub fn format_config_view_for(
+        &self,
+        id: &super::workspace::WorkspaceId,
+    ) -> Result<super::langconfig::FormatConfigView> {
+        let (path, env) = self
+            .workspace_env_snapshot(id)
+            .map(|(p, e)| (p, Some(e)))
+            .or_else(|| self.resolve_or_seed_workspace_id(id).map(|p| (p, None)))
+            .ok_or_else(|| anyhow!("unknown workspace id `{}`", id.0))?;
+        super::langconfig::format_config_view_for(&self.inner.defaults.config, &path, env.as_ref())
+    }
+
+    /// Persist an edited format list (+ mode) to workspace `id`'s
+    /// `.omini/config/format.toml`. Backs `PUT /workspaces/{id}/config/format`.
+    ///
+    /// # Errors
+    /// An unknown workspace id; see also
+    /// [`save_format_config`](Self::save_format_config).
+    pub async fn save_format_config_for(
+        &self,
+        id: &super::workspace::WorkspaceId,
+        edit: &super::langconfig::FormatConfigEdit,
+    ) -> Result<()> {
+        let (path, env) = self
+            .workspace_env_snapshot(id)
+            .map(|(p, e)| (p, Some(e)))
+            .or_else(|| self.resolve_or_seed_workspace_id(id).map(|p| (p, None)))
+            .ok_or_else(|| anyhow!("unknown workspace id `{}`", id.0))?;
+        let _guard = self.inner.config_write_lock.lock().await;
+        super::langconfig::save_format_config_for(
+            &self.inner.defaults.config,
+            &path,
+            env.as_ref(),
+            edit,
+        )
+    }
+
     /// The profile a rule pinned from session `sid` persists into: the session's
     /// stamped profile, or the gateway default when the session tracks the
     /// default (the same fallback [`runtime_info`](Self::runtime_info) uses).

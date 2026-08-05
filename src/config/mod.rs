@@ -650,7 +650,7 @@ fn read_optional(path: &Path) -> Result<Option<String>> {
 }
 
 /// The user's home directory from `HOME`, if set.
-fn home_dir() -> Option<PathBuf> {
+pub(crate) fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 

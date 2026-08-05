@@ -4,20 +4,37 @@
 	import { client } from '$lib/client';
 	import Button from './Button.svelte';
 	import PermissionRulesEditor from './PermissionRulesEditor.svelte';
+	import LspConfigEditor from './LspConfigEditor.svelte';
+	import FormatConfigEditor from './FormatConfigEditor.svelte';
 	import Skeleton from './Skeleton.svelte';
+	import { lspToRows, lspFromRows, fmtToRows, fmtFromRows, type LspRow, type FmtRow } from '$lib/lang-tools';
 	import type { WorkspaceConfig } from '$lib/types/WorkspaceConfig';
 	import type { ToolInfo } from '$lib/types/ToolInfo';
+	import type { FormatMode } from '$lib/types/FormatMode';
 
 	/** Per-workspace config editor (`doc/workspace-config.md`): the **top** tier
-	 *  of the permission gate plus the network override. The file lives in the
-	 *  gateway's trusted dir, so a workspace widening its own `deny` is safe
-	 *  (`doc/permission.md` §3.1). Loads on mount, saves full desired state. */
+	 *  of the permission gate plus the network override, AND the workspace-local
+	 *  LSP/format checklists (the project-level overrides written to the
+	 *  workspace's own `.omini`, `doc/lsp.md` §8 / `doc/format.md` §8). Install
+	 *  probes here run against the workspace's env-overlay PATH, so a
+	 *  flake/direnv-provided tool shows as installed. Loads on mount, saves full
+	 *  desired state. */
 	let { workspaceId, onclose }: { workspaceId: string; onclose: () => void } = $props();
 
 	let config = $state<WorkspaceConfig | null>(null);
 	let error = $state<string | null>(null);
 	let saving = $state(false);
 	let toolCatalog = $state<ToolInfo[]>([]);
+
+	// Workspace-local LSP/format checklists. Rows bind for editing; the dirty
+	// signal is the serialized PUT body (rows carry display-only fields).
+	let lspRows = $state<LspRow[]>([]);
+	let lspSnapshot = $state<string | null>(null);
+	let lspLoaded = $state(false);
+	let fmtRows = $state<FmtRow[]>([]);
+	let fmtMode = $state<FormatMode>('file');
+	let fmtSnapshot = $state<string | null>(null);
+	let fmtLoaded = $state(false);
 
 	// Network policy is a small enum; `null` = inherit profile/gateway. The
 	// allowlist hosts are edited only when the policy is `allowlist`.
@@ -41,9 +58,16 @@
 	});
 
 	// Whether the user has unsaved edits (config diverged from the loaded snapshot).
-	const dirty = $derived(
+	const configDirty = $derived(
 		initialSnapshot !== null && config !== null && JSON.stringify(config) !== initialSnapshot
 	);
+	const lspDirty = $derived(
+		lspSnapshot !== null && JSON.stringify(lspFromRows(lspRows)) !== lspSnapshot
+	);
+	const fmtDirty = $derived(
+		fmtSnapshot !== null && JSON.stringify(fmtFromRows(fmtRows, fmtMode)) !== fmtSnapshot
+	);
+	const dirty = $derived(configDirty || lspDirty || fmtDirty);
 
 	async function load() {
 		error = null;
@@ -64,6 +88,29 @@
 			config = loaded;
 			initialSnapshot = JSON.stringify(loaded);
 			toolCatalog = tools;
+			// The workspace-local checklists load alongside (independent of the
+			// network/permission config). Each seeds its rows + dirty baseline.
+			client
+				.getWorkspaceLspConfig(workspaceId)
+				.then((v) => {
+					lspRows = lspToRows(v);
+					lspSnapshot = JSON.stringify(lspFromRows(lspRows));
+					lspLoaded = true;
+				})
+				.catch(() => {
+					lspLoaded = true; // a failed probe renders as an empty note, not a hang
+				});
+			client
+				.getWorkspaceFormatConfig(workspaceId)
+				.then((v) => {
+					fmtRows = fmtToRows(v);
+					fmtMode = v.mode;
+					fmtSnapshot = JSON.stringify(fmtFromRows(fmtRows, fmtMode));
+					fmtLoaded = true;
+				})
+				.catch(() => {
+					fmtLoaded = true;
+				});
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 		}
@@ -100,7 +147,11 @@
 		saving = true;
 		error = null;
 		try {
-			await client.saveWorkspaceConfig(workspaceId, config);
+			// Save each dirty unit; stop at the first failure so the user sees
+			// which one failed (already-saved units stay saved).
+			if (configDirty) await client.saveWorkspaceConfig(workspaceId, config);
+			if (lspDirty) await client.saveWorkspaceLspConfig(workspaceId, lspFromRows(lspRows));
+			if (fmtDirty) await client.saveWorkspaceFormatConfig(workspaceId, fmtFromRows(fmtRows, fmtMode));
 			onclose();
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
@@ -184,6 +235,31 @@
 						<PermissionRulesEditor bind:policy={config.permission} tools={toolCatalog} />
 					</div>
 				{/if}
+
+				<!-- Workspace-local LSP/format: the project-level overrides. Install
+				     probes run against THIS workspace's env (flake/direnv), so these
+				     reflect what a session here can actually spawn. -->
+				<div class="perm-block">
+					<span class="key">语言服务器（本项目）</span>
+					{#if lspLoaded && lspRows.length > 0}
+						<LspConfigEditor bind:rows={lspRows} />
+					{:else if lspLoaded}
+						<p class="none-note">无法加载语言服务器配置。</p>
+					{:else}
+						<Skeleton width="100%" height="44px" radius="var(--radius-md)" />
+					{/if}
+				</div>
+
+				<div class="perm-block">
+					<span class="key">格式化（本项目）</span>
+					{#if fmtLoaded && fmtRows.length > 0}
+						<FormatConfigEditor bind:rows={fmtRows} bind:mode={fmtMode} />
+					{:else if fmtLoaded}
+						<p class="none-note">无法加载格式化配置。</p>
+					{:else}
+						<Skeleton width="100%" height="44px" radius="var(--radius-md)" />
+					{/if}
+				</div>
 			</div>
 		{:else if !error}
 			<div class="body" aria-hidden="true">
@@ -285,6 +361,12 @@
 		display: flex;
 		flex-direction: column;
 		gap: var(--space-2);
+	}
+
+	.none-note {
+		font-size: 11px;
+		color: var(--text-tertiary);
+		font-family: var(--font-chinese);
 	}
 
 	.key {

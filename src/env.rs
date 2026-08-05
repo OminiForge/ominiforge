@@ -229,6 +229,19 @@ impl WorkspaceEnvCache {
     pub(crate) fn remove(&self, workspace: &Path) {
         let _ = std::fs::remove_file(self.path_for(workspace));
     }
+
+    /// The cached env overlay for `workspace`, or `None` on any miss. This is
+    /// the read-side handle for consumers that need the workspace's exported
+    /// environment WITHOUT triggering a direnv evaluation (e.g. the workspace
+    /// config UI's install probe, which must not block on a `use flake`
+    /// evaluation). Stale-beats-empty applies here too: the snapshot is what
+    /// the last session actually ran with.
+    pub(crate) fn snapshot(
+        &self,
+        workspace: &Path,
+    ) -> Option<std::collections::BTreeMap<String, Option<String>>> {
+        self.load(workspace).map(|c| c.env)
+    }
 }
 
 /// The environment overlay a session in `workspace` should run with.
