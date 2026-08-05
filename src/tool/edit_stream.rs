@@ -53,10 +53,21 @@ struct FileGroup {
     /// The resolved absolute path — the grouping key, so `"src/a.rs"` and
     /// `"./src/a.rs"` merge into one group (mirroring `plan_all`).
     abs: PathBuf,
+    /// The raw file content as read, kept for byte-level `find_matches`.
+    content: String,
+    /// `content` split into lines (without terminators) for `render_hunks`.
     lines: Vec<String>,
-    /// `(start, end, new)` splices located so far, in insertion order.
-    /// `render_hunks` sorts and merges them, so order here doesn't matter.
+    /// `(start, end, new)` splices located so far, in LINE coordinates
+    /// (converted from the byte offsets `find_matches` returns). Insertion
+    /// order; `render_hunks` sorts and merges them, so order doesn't matter.
     splices: Vec<Splice>,
+}
+
+/// Convert a byte offset in `content` to a 0-based line index (count of `\n`
+/// before it). Used to express a byte-level match in the line coordinates
+/// `render_hunks` consumes.
+fn line_of(content: &str, byte: usize) -> usize {
+    content[..byte].matches('\n').count()
 }
 
 impl EditStreamPresenter {
@@ -86,6 +97,7 @@ impl EditStreamPresenter {
             rel_path: rel_path.to_owned(),
             abs,
             lines: content.lines().map(str::to_owned).collect(),
+            content,
             splices: Vec::new(),
         });
         Some(self.groups.len() - 1)
@@ -98,15 +110,29 @@ impl EditStreamPresenter {
         if old.is_empty() {
             return;
         }
-        let haystack: Vec<&str> = group.lines.iter().map(String::as_str).collect();
-        let matches = super::edit::find_matches(&haystack, old);
+        // Byte-level match against the raw content, then expressed in line
+        // coordinates for `render_hunks`. The presenter is optimistic (module
+        // docs): it matches the model's LF-joined `old` directly, without the
+        // execute's CRLF adaptation — stage 3 re-plans against the live file
+        // and is the authority on the exact span.
+        let needle = old.join("\n");
+        let matches = super::edit::find_matches(&group.content, &needle);
         let starts: &[usize] = if replace_all {
             &matches
         } else {
             &matches[..1.min(matches.len())]
         };
         for &start in starts {
-            group.splices.push((start, start + old.len(), new.to_vec()));
+            let line_start = line_of(&group.content, start);
+            // Absorb the line terminator after the match, mirroring the
+            // execute's `locate_matches`, so a whole-line `old` renders as a
+            // replacement of that line (not an insertion before it).
+            let mut end = start + needle.len();
+            if group.content[end..].starts_with('\n') {
+                end += 1;
+            }
+            let line_end = line_of(&group.content, end);
+            group.splices.push((line_start, line_end, new.to_vec()));
         }
     }
 }
@@ -187,12 +213,18 @@ impl EditStreamPresenter {
         if old.is_empty() {
             return None;
         }
-        let haystack: Vec<&str> = group.lines.iter().map(String::as_str).collect();
-        let start = super::edit::find_matches(&haystack, &old)
+        let needle = old.join("\n");
+        let start = super::edit::find_matches(&group.content, &needle)
             .into_iter()
             .next()?;
         let new = entry.streaming_lines("new").unwrap_or_default();
-        Some((idx, (start, start + old.len(), new)))
+        let line_start = line_of(&group.content, start);
+        let mut end = start + needle.len();
+        if group.content[end..].starts_with('\n') {
+            end += 1;
+        }
+        let line_end = line_of(&group.content, end);
+        Some((idx, (line_start, line_end, new)))
     }
 }
 

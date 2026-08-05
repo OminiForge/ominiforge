@@ -98,26 +98,39 @@ impl Tool for WriteTool {
         // diff old→new. A missing/unreadable file is treated as a new file.
         let old = tokio::fs::read_to_string(&path).await.ok();
 
+        // Line-ending preservation: overwriting a CRLF file with bare-LF
+        // content must not silently rewrite every line ending to LF. Normalize
+        // the model's content to the file's existing convention (CRLF → the
+        // whole file), so a `write` keeps the file's own style. A NEW file has
+        // no convention to preserve, so the model's content lands as given.
+        let model_content = match &old {
+            Some(old) if super::edit::detect_line_ending(old) == super::edit::LineEnding::Crlf => {
+                normalize_to_crlf(&args.content)
+            }
+            _ => args.content.clone(),
+        };
+
         // Auto-format the content BEFORE it lands (`doc/format.md` §6): a
         // `write` replaces the whole file, so it always formats whole-file
         // (`edited_lines = None`). The FINAL text is written once, and the
         // diff/diagnostics below are anchored to it. Fail-closed: a skip keeps
-        // the model's content.
+        // the model's content. Formatting runs on the line-ending-normalized
+        // content so the on-disk result keeps the file's convention.
         let outcome = match &self.format {
-            Some(fmt) => fmt.format(&path, &args.content, None).await,
+            Some(fmt) => fmt.format(&path, &model_content, None).await,
             None => crate::format::FormatOutcome::Skipped {
-                text: args.content.clone(),
+                text: model_content.clone(),
             },
         };
         // Record the formatter only when it actually changed the content,
-        // plus how many change regions it made (model content → formatted).
+        // plus how many change regions it made (normalized content → formatted).
         let formatter = match &outcome {
             crate::format::FormatOutcome::Formatted { formatter, text }
-                if *text != args.content =>
+                if *text != model_content =>
             {
                 Some((
                     formatter.clone(),
-                    super::diffview::change_region_count(&args.content, text),
+                    super::diffview::change_region_count(&model_content, text),
                 ))
             }
             _ => None,
@@ -239,6 +252,19 @@ fn write_summary(path: &str, old: Option<&str>, new: &str) -> String {
     format!("wrote {path} (~, +{added} -{removed})")
 }
 
+/// Normalize bare LF line endings to CRLF, preserving any existing `\r\n`.
+/// Used when overwriting a CRLF file so the model's LF content adopts the
+/// file's own convention instead of silently rewriting every line to LF.
+fn normalize_to_crlf(content: &str) -> String {
+    // Split on `\n`, strip a trailing `\r` from each piece (so an already-CRLF
+    // line isn't doubled to `\r\r\n`), then rejoin with `\r\n`.
+    content
+        .split('\n')
+        .map(|piece| piece.strip_suffix('\r').unwrap_or(piece))
+        .collect::<Vec<_>>()
+        .join("\r\n")
+}
+
 fn business_error(path: &str, e: &std::io::Error) -> ToolOutput {
     ToolOutput {
         content: vec![Content::Text(format!("failed to write {path}: {e}"))],
@@ -282,6 +308,51 @@ mod tests {
             tool.invoke(input("../escape", "x")).await,
             Err(ToolError::InvalidInput(_))
         ));
+    }
+
+    /// Overwriting a CRLF file with bare-LF content keeps the file's CRLF
+    /// convention — the write must not silently rewrite every line to LF.
+    #[tokio::test]
+    async fn overwrite_crlf_file_preserves_crlf() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "a\r\nb\r\n").unwrap();
+        let tool = WriteTool::new(dir.path().to_path_buf());
+
+        let out = tool.invoke(input("f.txt", "x\ny\n")).await.unwrap();
+        assert!(!out.is_error);
+        assert_eq!(
+            std::fs::read(dir.path().join("f.txt")).unwrap(),
+            b"x\r\ny\r\n",
+            "LF content normalized to the file's CRLF convention"
+        );
+    }
+
+    /// Overwriting an LF file keeps LF (no spurious `\r` introduced), and a
+    /// brand-new file lands exactly as the model wrote it.
+    #[tokio::test]
+    async fn overwrite_lf_file_and_new_file_keep_lf() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lf.txt"), "a\nb\n").unwrap();
+        let tool = WriteTool::new(dir.path().to_path_buf());
+
+        let out = tool.invoke(input("lf.txt", "x\ny\n")).await.unwrap();
+        assert!(!out.is_error);
+        assert_eq!(std::fs::read(dir.path().join("lf.txt")).unwrap(), b"x\ny\n");
+
+        let out = tool.invoke(input("new.txt", "p\nq\n")).await.unwrap();
+        assert!(!out.is_error);
+        assert_eq!(
+            std::fs::read(dir.path().join("new.txt")).unwrap(),
+            b"p\nq\n",
+            "a new file has no convention to preserve"
+        );
+    }
+
+    #[test]
+    fn normalize_to_crlf_does_not_double_existing_cr() {
+        assert_eq!(normalize_to_crlf("a\nb\n"), "a\r\nb\r\n");
+        assert_eq!(normalize_to_crlf("a\r\nb\r\n"), "a\r\nb\r\n");
+        assert_eq!(normalize_to_crlf("a\nb"), "a\r\nb");
     }
 
     fn view(out: &ToolOutput) -> Option<&str> {

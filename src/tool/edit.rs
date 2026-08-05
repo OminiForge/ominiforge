@@ -137,12 +137,12 @@ fn edit_input_schema() -> serde_json::Value {
                 "type": "array",
                 "items": { "type": "string" },
                 "minItems": 1,
-                "description": "The exact current lines to replace, one file line per array item. Quote this verbatim from a FRESH `read` — paraphrasing a long line from memory almost always diffs by one character and is rejected rather than guessed at (a `not_found` result names the first differing line so you can repair the quote). A single string is accepted and split on newlines; an array item containing a newline is likewise split, but one-per-item stays the canonical form."
+                "description": "The exact current lines to replace, one file line per array item, matched byte-for-byte INCLUDING leading whitespace. Quote verbatim from a FRESH `read` — a one-character diff (indent, spacing) is rejected rather than guessed at (a `not_found` result names the first differing line so you can repair the quote). Line endings are matched too, but a bare-LF quote still matches a CRLF file (adapted for you, with the file's CRLF preserved). A single string is accepted and split on newlines. NEVER put JSON keys (`path`, `old`, `new`, `replace_all`) or `key: value` fragments into these items — they are file text only."
             },
             "new": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "Replacement lines, one per array item. Empty array deletes `old` outright. To insert, include an unchanged anchor line in both `old` and `new` alongside the inserted lines. (Newlines inside an item are split as for `old`.)"
+                "description": "Replacement lines, one per array item. Empty array deletes `old` outright. To insert, include an unchanged anchor line in both `old` and `new` alongside the inserted lines. (Newlines inside an item are split as for `old`.) File text only — no JSON keys or `key: value` fragments."
             },
             "replace_all": {
                 "type": "boolean",
@@ -180,7 +180,12 @@ impl Tool for EditTool {
                           verbatim from a `read`/`edit`/`write` output, one file line per \
                           array item), `new` is what it becomes (empty array deletes; an \
                           insert keeps an unchanged anchor line in both `old` and `new` \
-                          alongside the new lines). Quote `old` from a FRESH `read` — \
+                          alongside the new lines). \
+                          WARNING: `old`/`new` hold FILE TEXT ONLY — never put JSON keys \
+                          (`path`, `old`, `new`, `replace_all`) or `key: value` fragments \
+                          into them; `replace_all` is a sibling field of the entry object, \
+                          not a line of text. Quote `old` from a FRESH `read` — \
+path
                           paraphrasing or recalling a long line from memory almost always \
                           diffs by one character and is rejected rather than guessed at. \
                           `old` must match exactly one place in the file unless \
@@ -262,17 +267,28 @@ impl Tool for EditTool {
                 final_text,
                 replacement_count: plan.replacement_count,
                 formatter,
+                crlf_adapted: plan.crlf_adapted,
             });
         }
 
         let mut summaries = Vec::with_capacity(written.len());
         for w in &written {
-            summaries.push(format!(
+            let mut line = format!(
                 "edited {} ({} replacement{})",
                 w.rel_path,
                 w.replacement_count,
                 if w.replacement_count == 1 { "" } else { "s" }
-            ));
+            );
+            // Explicit-tell: the file's CRLF was preserved by adapting the
+            // model's LF quote, so the model knows the on-disk bytes differ
+            // from what it typed (and keeps its next quote consistent).
+            if w.crlf_adapted {
+                line.push_str(
+                    " [note: file uses CRLF (\\r\\n) line endings; your LF `old` was matched and the \
+                     file's CRLF style preserved]",
+                );
+            }
+            summaries.push(line);
         }
 
         let mut output = ToolOutput {
@@ -319,6 +335,8 @@ struct WrittenFile {
     /// The formatter that changed the text plus how many change regions it
     /// made (drives `formatted_by` / the "N 处调整" annotation).
     formatter: Option<(String, usize)>,
+    /// Carried from [`PlannedWrite`]: whether CRLF adaptation was surfaced.
+    crlf_adapted: bool,
 }
 
 /// Render the written files' diff views into a JSON envelope
@@ -436,8 +454,13 @@ struct Entry {
     /// 1-based position in the incoming `edits` array, cited in error
     /// messages so the model knows which entry to fix.
     ordinal: usize,
+    /// `old` as the model supplied it, one file line per element. Kept for
+    /// the line-level `not_found` diagnosis (`z_prefix_lengths`).
     old: Vec<String>,
-    new: Vec<String>,
+    /// `old`/`new` joined with `\n` into single match/replacement strings.
+    /// These are what byte-level matching and `replace_range` consume.
+    old_str: String,
+    new_str: String,
     replace_all: bool,
 }
 
@@ -453,6 +476,10 @@ struct PlannedWrite {
     /// The 1-based inclusive line range the edits touched, for `mode = "edit"`
     /// formatting. `None` when nothing actually changed.
     edited_lines: Option<(u32, u32)>,
+    /// True when the file is CRLF and at least one entry's bare-LF `old` was
+    /// matched via CRLF adaptation — surfaced to the model as an explicit note
+    /// so the silent accommodation is never a hidden surprise.
+    crlf_adapted: bool,
 }
 
 impl EditTool {
@@ -472,87 +499,85 @@ impl EditTool {
                 &format!("failed to read {rel_path} for edit: {e}"),
             )
         })?;
-        let trailing_newline = content.ends_with('\n');
-        let lines: Vec<&str> = content.lines().collect();
 
-        // Resolve every entry's `old` to splices against the ORIGINAL lines
-        // (matching, not mutating, as we go) — same "anchor to one snapshot"
-        // guarantee the old line-number scheme gave, but the snapshot here is
-        // just "the file as read at the top of this call".
-        let mut splices: Vec<(usize, usize, &Entry)> = Vec::new();
+        // Resolve every entry's `old` to BYTE splices against the ORIGINAL
+        // content (matching, not mutating, as we go) — same "anchor to one
+        // snapshot" guarantee the old line-number scheme gave, but the
+        // snapshot here is just "the file as read at the top of this call".
+        // Each splice carries its OWN replacement text because CRLF
+        // adaptation / trailing-newline absorption may rewrite it per-match.
+        let mut splices: Vec<Splice> = Vec::new();
         for entry in ops {
-            let matches = find_matches(&lines, &entry.old);
+            let matches = locate_matches(&content, entry);
             match matches.len() {
                 0 => {
                     return Err(business_error(
                         "not_found",
-                        &not_found_message(rel_path, &lines, entry),
+                        &not_found_message(rel_path, &content, entry),
                     ));
                 }
-                1 => splices.push((matches[0], matches[0] + entry.old.len(), entry)),
-                _ if entry.replace_all => {
-                    splices.extend(
-                        matches
-                            .into_iter()
-                            .map(|start| (start, start + entry.old.len(), entry)),
-                    );
-                }
+                1 => splices.extend(matches),
+                _ if entry.replace_all => splices.extend(matches),
                 n => {
                     return Err(business_error(
                         "ambiguous",
                         &format!(
                             "{rel_path}: `old` matches {n} places; pass `replace_all: true` or narrow \
-                             the quoted lines to make it unique"
+                             the quoted text to make it unique"
                         ),
                     ));
                 }
             }
         }
 
-        // Overlap check: two entries touching the same line is rejected as a
-        // whole, same as the old op-based scheme. Name the conflicting entries
-        // by their 1-based `edits` position so the model can merge or narrow
-        // them. (Two splices from one `replace_all` entry can't overlap —
-        // `find_matches` skips past each match.)
-        splices.sort_by_key(|&(start, ..)| start);
+        // Overlap check: two entries touching the same byte range is rejected
+        // as a whole. Name the conflicting entries by their 1-based `edits`
+        // position so the model can merge or narrow them. (Two splices from
+        // one `replace_all` entry can't overlap — matching skips past each
+        // match.)
+        splices.sort_by_key(|s| s.start);
         let mut prev_end = 0usize;
         let mut prev_ordinal = 0usize;
-        for (idx, &(start, end, entry)) in splices.iter().enumerate() {
-            if idx > 0 && start < prev_end {
+        for (idx, s) in splices.iter().enumerate() {
+            if idx > 0 && s.start < prev_end {
                 return Err(business_error(
                     "overlapping_edits",
                     &format!(
                         "{rel_path}: entries {prev_ordinal} and {} overlap; merge them into one \
-                         entry or quote disjoint lines",
-                        entry.ordinal
+                         entry or quote disjoint text",
+                        s.ordinal
                     ),
                 ));
             }
-            prev_end = end;
-            prev_ordinal = entry.ordinal;
+            prev_end = s.end;
+            prev_ordinal = s.ordinal;
         }
 
         let replacement_count = splices.len();
 
+        // Apply high-index first so earlier splices' byte offsets stay valid.
+        // Splicing bytes into the original content (rather than rebuilding
+        // from `lines()`) leaves every untouched byte — line endings included
+        // — exactly as it was on disk, so a CRLF file stays CRLF.
+        let mut new_content = content.clone();
         // The 1-based inclusive line range the edits touch, in the NEW
         // content's coordinates (for `mode = "edit"` formatting). Computed
-        // from the splices BEFORE they are consumed below.
-        let edited_lines = edited_line_range(&splices);
-
-        // Apply high-index first so earlier splices' indices stay valid.
-        let mut out: Vec<String> = lines.iter().map(|s| (*s).to_owned()).collect();
-        for (start, end, entry) in splices.into_iter().rev() {
-            out.splice(start..end, entry.new.iter().cloned());
-        }
-
-        let mut new_content = out.join("\n");
-        if trailing_newline && !new_content.is_empty() {
-            new_content.push('\n');
+        // from the byte splices BEFORE they are consumed below.
+        let edited_lines = edited_line_range(&content, &splices);
+        for s in splices.into_iter().rev() {
+            new_content.replace_range(s.start..s.end, &s.replacement);
         }
 
         // `edited_lines` is meaningful only when the edit actually changed
         // something — an identical old/new leaves nothing to format locally.
         let changed = new_content != content;
+
+        // Explicit-tell for the implicit accommodation: the file is CRLF and
+        // some entry matched only because its bare-LF quote was rewritten to
+        // CRLF. (If every quote already carried `\r`, no accommodation happened
+        // and there is nothing to flag.)
+        let crlf_adapted = detect_line_ending(&content) == LineEnding::Crlf
+            && ops.iter().any(|e| !e.old_str.contains('\r'));
 
         Ok(PlannedWrite {
             abs_path: abs_path.to_path_buf(),
@@ -561,31 +586,39 @@ impl EditTool {
             new_content,
             replacement_count,
             edited_lines: if changed { edited_lines } else { None },
+            crlf_adapted,
         })
     }
 }
 
-/// The 1-based inclusive line range a set of splices touches, in the NEW
-/// content's coordinates (for `mode = "edit"` formatting, `doc/format.md`
-/// §5). Walks the sorted splices tracking the cumulative line shift from old
-/// to new coordinates. Coordinates stay in `isize` (a pure deletion can pull
-/// a later splice's new-start below its old one) and convert to `u32` once;
-/// line counts here are file lengths, far below any wrap concern.
+/// The 1-based inclusive line range a set of byte splices touches, in the
+/// NEW content's coordinates (for `mode = "edit"` formatting, `doc/format.md`
+/// §5). Byte offsets are converted to line numbers by counting `\n`; the
+/// cumulative line shift from old to new coordinates is tracked across the
+/// sorted splices. Coordinates stay in `isize` (a pure deletion can pull a
+/// later splice's new-start below its old one) and convert to `u32` once.
 #[allow(clippy::cast_possible_wrap)]
-fn edited_line_range(splices: &[(usize, usize, &Entry)]) -> Option<(u32, u32)> {
+fn edited_line_range(content: &str, splices: &[Splice]) -> Option<(u32, u32)> {
     if splices.is_empty() {
         return None;
     }
+    // 0-based line number of a byte offset = count of `\n` before it.
+    let line_of = |byte: usize| content[..byte].matches('\n').count() as isize;
     let mut first_new_start = isize::MAX;
     let mut last_new_end = 0isize;
     let mut shift = 0isize;
-    for (start, end, entry) in splices {
-        let new_start = *start as isize + shift;
+    for s in splices {
+        // Lines covered on each side, by terminator count. `replacement`
+        // already carries the file's own line endings (and any absorbed
+        // trailing terminator), so its `\n` count is its line span.
+        let old_lines = line_of(s.end) - line_of(s.start);
+        let new_lines = s.replacement.matches('\n').count() as isize;
+        let new_start = line_of(s.start) + shift;
         first_new_start = first_new_start.min(new_start);
-        last_new_end = last_new_end.max(new_start + entry.new.len() as isize);
-        shift += entry.new.len() as isize - (*end - *start) as isize;
+        last_new_end = last_new_end.max(new_start + new_lines);
+        shift += new_lines - old_lines;
     }
-    // 1-based inclusive [start, end]; a pure insertion has new.len() lines, a
+    // 1-based inclusive [start, end]; a pure insertion has new_lines lines, a
     // pure deletion touches the line it collapsed into.
     let to_u32 = |v: isize| u32::try_from(v).unwrap_or(u32::MAX);
     let start_line = to_u32(first_new_start + 1);
@@ -593,28 +626,95 @@ fn edited_line_range(splices: &[(usize, usize, &Entry)]) -> Option<(u32, u32)> {
     Some((start_line, end_line))
 }
 
-/// Every start index (0-based) at which `needle` occurs as a contiguous run in
-/// `haystack`, scanning left to right and skipping past a match so overlapping
-/// occurrences are not double-counted under `replace_all`.
-pub fn find_matches(haystack: &[&str], needle: &[String]) -> Vec<usize> {
+/// Every byte offset at which `needle` occurs in `haystack`, scanning left to
+/// right and skipping past each match so overlapping occurrences are not
+/// double-counted under `replace_all`. Matching is byte-exact against the raw
+/// file content.
+pub fn find_matches(haystack: &str, needle: &str) -> Vec<usize> {
     if needle.is_empty() || needle.len() > haystack.len() {
         return Vec::new();
     }
-    let mut starts = Vec::new();
-    let mut i = 0;
-    while i + needle.len() <= haystack.len() {
-        if haystack[i..i + needle.len()]
-            .iter()
-            .zip(needle)
-            .all(|(h, n)| *h == n.as_str())
-        {
-            starts.push(i);
-            i += needle.len();
-        } else {
-            i += 1;
-        }
+    haystack.match_indices(needle).map(|(i, _)| i).collect()
+}
+
+/// One located replacement, in byte offsets against the original content.
+struct Splice {
+    start: usize,
+    end: usize,
+    /// The text to splice in — the entry's `new` after CRLF adaptation and
+    /// trailing-newline absorption, so it is already in the file's own line
+    /// ending convention.
+    replacement: String,
+    /// The 1-based `edits` position of the originating entry (for overlap
+    /// errors).
+    ordinal: usize,
+}
+
+/// The file's dominant line-ending convention, detected from its first line
+/// terminator. `Mixed`/`None` (no terminator at all) are treated as LF — the
+/// common case — since there is no CRLF convention to preserve.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LineEnding {
+    Lf,
+    Crlf,
+}
+
+pub fn detect_line_ending(content: &str) -> LineEnding {
+    match content.find('\n') {
+        Some(i) if i > 0 && content.as_bytes()[i - 1] == b'\r' => LineEnding::Crlf,
+        _ => LineEnding::Lf,
     }
+}
+
+/// Locate every place `entry.old` matches `content`, returning one [`Splice`]
+/// per occurrence. Matching is byte-exact on the model's LF-joined `old`,
+/// with one adaptation: when the file is CRLF but the quote is bare LF, the
+/// needle is rewritten to `\r\n` so a CRLF file is matched without forcing the
+/// model to type `\r`. Each match then ABSORBS the line terminator right after
+/// it (so a whole-line `old` removes/replaces the whole line, newline and
+/// all), and the replacement text is rewritten to the file's own line-ending
+/// convention so the edit never changes it.
+fn locate_matches(content: &str, entry: &Entry) -> Vec<Splice> {
+    let ending = detect_line_ending(content);
+    // The needle and the line separator between the model's `old` lines.
+    let (needle, sep) = match ending {
+        LineEnding::Crlf if !entry.old_str.contains('\r') => {
+            (entry.old_str.replace('\n', "\r\n"), "\r\n")
+        }
+        _ => (entry.old_str.clone(), "\n"),
+    };
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let starts = find_matches(content, &needle);
     starts
+        .into_iter()
+        .map(|start| {
+            let mut end = start + needle.len();
+            // Absorb the line terminator immediately after the match, so a
+            // whole-line `old` covers the whole line. (Not at EOF, where
+            // there may be no terminator.)
+            let tail = if content[end..].starts_with(sep) {
+                end += sep.len();
+                sep
+            } else {
+                ""
+            };
+            // The replacement keeps the file's own line endings: rewrite the
+            // model's `\n`-joined `new` to the file's convention, and re-add
+            // the absorbed trailing terminator unless this is a deletion.
+            let mut replacement = entry.new_str.replace('\n', sep);
+            if !replacement.is_empty() && !tail.is_empty() {
+                replacement.push_str(tail);
+            }
+            Splice {
+                start,
+                end,
+                replacement,
+                ordinal: entry.ordinal,
+            }
+        })
+        .collect()
 }
 
 /// Build the `not_found` message with a located diagnosis that mirrors
@@ -623,9 +723,15 @@ pub fn find_matches(haystack: &[&str], needle: &[String]) -> Vec<usize> {
 /// block breaks, `old` vs file side by side, plus the first differing
 /// character. Turns "no match" into "line N differs from file line M like
 /// this", so a one-character misquote costs one retry, not a full re-read.
-fn not_found_message(rel_path: &str, lines: &[&str], entry: &Entry) -> String {
+fn not_found_message(rel_path: &str, content: &str, entry: &Entry) -> String {
+    // The byte-level match failed; fall back to a LINE-level diagnosis so the
+    // model still gets a precise "line N differs from file line M" report. A
+    // CRLF file's lines are compared here without their `\r` (`str::lines`
+    // strips it), which is exactly right for pointing at the differing line —
+    // and if the ONLY difference is the line ending, the char hint surfaces it.
+    let lines: Vec<&str> = content.lines().collect();
     let header = format!(
-        "{rel_path}: no match for the given `old` lines (entry {})",
+        "{rel_path}: no match for the given `old` text (entry {})",
         entry.ordinal
     );
 
@@ -636,7 +742,7 @@ fn not_found_message(rel_path: &str, lines: &[&str], entry: &Entry) -> String {
     // every start's prefix length in O(M+N) instead of a naive O(MN) — same
     // matched-region reuse idea as KMP, but Z answers "prefix length at each
     // start" where KMP answers "where full matches end".
-    let prefix_lens = z_prefix_lengths(&entry.old, lines);
+    let prefix_lens = z_prefix_lengths(&entry.old, &lines);
     // Empty `lines` yields no start; (0, 0) still reports `old` line #1.
     let (best_start, best_len) = prefix_lens
         .iter()
@@ -663,6 +769,15 @@ fn not_found_message(rel_path: &str, lines: &[&str], entry: &Entry) -> String {
         );
     } else {
         msg.push_str("\nthe file ends there; the quoted `old` has extra lines");
+    }
+    // If every quoted line DOES appear but the byte match still failed, the
+    // culprit is almost always the line-ending convention (the file is CRLF,
+    // the quote LF). Say so explicitly instead of leaving the model guessing.
+    if content.contains('\r') && !entry.old_str.contains('\r') {
+        msg.push_str(
+            "\nnote: the file uses CRLF (\\r\\n) line endings; the quoted `old` used LF (\\n). \
+             Re-quote the lines exactly as read (including the carriage return) to match.",
+        );
     }
     msg
 }
@@ -761,24 +876,70 @@ fn validate_entries(edits: Vec<EditEntryArg>) -> Result<Vec<Entry>, String> {
                     e.path
                 ));
             }
+            // Protocol-pollution guard: a `replace_all: ...` / `new= ...` /
+            // `path: ...` fragment pasted as an `old`/`new` line can never
+            // match file content, so reject it here as a protocol error with
+            // a corrective hint instead of letting it surface as `not_found`.
+            for line in old.iter().chain(new.iter()) {
+                if let Some(field) = json_field_leak(line) {
+                    return Err(format!(
+                        "{ctx} ({}): `{field}` is a separate field of the edit object, not a line of \
+                         file text — remove it from the `old`/`new` array and pass it as its own \
+                         JSON field",
+                        e.path
+                    ));
+                }
+            }
+            let old_str = old.join("\n");
+            let new_str = new.join("\n");
             Ok(Entry {
                 path: e.path,
                 ordinal: idx + 1,
                 old,
-                new,
+                old_str,
+                new_str,
                 replace_all: e.replace_all,
             })
         })
         .collect()
 }
 
+/// Detect an edit-object field name (`path` / `old` / `new` / `replace_all`)
+/// leaked into an `old`/`new` line as `name:`/`name=`/`name =` etc. Returns
+/// the field name when the line is nothing but that JSON-ish fragment (or a
+/// leading fragment of one), so genuine code lines that merely CONTAIN these
+/// words (e.g. a Rust `let replace_all = ...;`) are not rejected. The leak
+/// shapes seen in practice are short and value-only (`replace_all: false`,
+/// `new=[`, `new:""]`, `new2=""],`), so the check stays conservative: the
+/// field name must be at the very start and the whole line stays short.
+fn json_field_leak(line: &str) -> Option<&'static str> {
+    const FIELDS: [&str; 4] = ["replace_all", "path", "old", "new"];
+    let t = line.trim_start();
+    for field in FIELDS {
+        let Some(rest) = t.strip_prefix(field) else {
+            continue;
+        };
+        // After the field name we expect a JSON-ish separator (`:`, `=`),
+        // optionally followed by a short scalar/bracket fragment. A word
+        // character right after the name (e.g. `new2`, `old_path`) or a Rust
+        // `(`/` ` means this is real code, not a leaked field.
+        let rest = rest.trim_start();
+        let is_sep = rest.starts_with(':') || rest.starts_with('=');
+        if is_sep && t.len() <= 40 {
+            return Some(field);
+        }
+    }
+    None
+}
+
 /// Flatten an `old`/`new` array to one element per line: items containing
-/// `\n` are split, and a trailing `\r` on each resulting line is stripped so
-/// CRLF-pasted content matches the file's lines (which `str::lines` already
-/// yields without a `\r`). Blank pieces are preserved — a blank line is real
-/// content; only the array itself being empty is meaningful. A multi-line
-/// block pasted as one item is split for you, but one-item-per-line stays
-/// the canonical form this module's docs and schema describe.
+/// `\n` are split, and a trailing `\r` on each resulting line is stripped —
+/// a `\r` is almost always transport noise from copying a CRLF source, not an
+/// intent to match CRLF bytes. (Matching a CRLF FILE is handled separately:
+/// the matcher retries with `\r\n` when the file is CRLF — see `plan_path`.)
+/// Blank pieces are preserved — a blank line is real content; only the array
+/// itself being empty is meaningful. A multi-line block pasted as one item is
+/// split for you, but one-item-per-line stays the canonical form.
 fn split_lines(lines: Vec<String>) -> Vec<String> {
     lines
         .into_iter()
@@ -816,10 +977,6 @@ mod tests {
 
     fn tool(workspace: PathBuf) -> EditTool {
         EditTool::new(workspace)
-    }
-
-    fn lines(items: &[&str]) -> Vec<String> {
-        items.iter().map(|s| (*s).to_owned()).collect()
     }
 
     // Takes `edits` by value: it is moved straight into the `json!` object, so a
@@ -1679,17 +1836,143 @@ b
 
     #[test]
     fn find_matches_is_non_overlapping() {
-        let hay = ["a", "a", "a"];
-        let needle = lines(&["a", "a"]);
-        // Matches at 0..2, then resumes scanning at 2 — only a single-line "a"
-        // left, no second full match, so exactly one hit.
-        assert_eq!(find_matches(&hay, &needle), vec![0]);
+        // Byte offsets: "a\na" matches at 0..3, then scanning resumes at 3 —
+        // only a lone "a" left, no second full match, so exactly one hit.
+        assert_eq!(find_matches("a\na\na", "a\na"), vec![0]);
     }
 
     #[test]
     fn find_matches_finds_every_occurrence_for_replace_all() {
-        let hay = ["x", "y", "x", "z", "x"];
-        let needle = lines(&["x"]);
-        assert_eq!(find_matches(&hay, &needle), vec![0, 2, 4]);
+        // "x" occurs at byte offsets 0, 4, 8 in "x\ny\nx\nz\nx".
+        assert_eq!(find_matches("x\ny\nx\nz\nx", "x"), vec![0, 4, 8]);
+    }
+
+    #[test]
+    fn find_matches_is_byte_exact_on_line_endings() {
+        // A CRLF file does NOT match a bare-LF needle — the `\r` is a real
+        // byte. (The CRLF adaptation that lets a model's LF quote still match
+        // lives in `locate_matches`, not here.)
+        assert!(find_matches("a\r\nb\r\n", "a\nb").is_empty());
+        assert_eq!(find_matches("a\r\nb\r\n", "a\r\nb"), vec![0]);
+    }
+
+    #[test]
+    fn locate_matches_preserves_crlf_and_absorbs_terminator() {
+        // A CRLF file edited with a bare-LF quote stays CRLF end to end, and
+        // a single-line `old` absorbs its trailing `\r\n` so deleting it
+        // leaves no empty line behind.
+        let entry = |old: &[&str], new: &[&str], ordinal: usize| Entry {
+            path: "f".to_owned(),
+            ordinal,
+            old: old.iter().map(|s| (*s).to_owned()).collect(),
+            old_str: old.join("\n"),
+            new_str: new.join("\n"),
+            replace_all: false,
+        };
+        // Replace one line in a CRLF file.
+        let e = entry(&["b"], &["B"], 1);
+        let sp = locate_matches("a\r\nb\r\nc\r\n", &e);
+        assert_eq!(sp.len(), 1);
+        assert_eq!((sp[0].start, sp[0].end), (3, 6), "match absorbs b\r\n");
+        assert_eq!(sp[0].replacement, "B\r\n", "replacement keeps CRLF");
+        // Delete the middle line.
+        let e = entry(&["b"], &[], 1);
+        let sp = locate_matches("a\r\nb\r\nc\r\n", &e);
+        assert_eq!(sp[0].replacement, "", "deletion splices in nothing");
+        // LF file, same absorption with `\n`.
+        let e = entry(&["b"], &["B"], 1);
+        let sp = locate_matches("a\nb\nc\n", &e);
+        assert_eq!((sp[0].start, sp[0].end), (2, 4));
+        assert_eq!(sp[0].replacement, "B\n");
+    }
+
+    /// End to end: a CRLF file edited with a bare-LF quote keeps its CRLF
+    /// line endings on disk, and the result carries the explicit CRLF note.
+    #[tokio::test]
+    async fn crlf_file_stays_crlf_and_result_notes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "a\r\nb\r\nc\r\n").unwrap();
+        let t = tool(dir.path().to_path_buf());
+
+        let out = t
+            .invoke(call(serde_json::json!([
+                { "path": "f.txt", "old": ["b"], "new": ["B"] }
+            ])))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{:?}", out.content);
+        // CRLF preserved end to end — never rewritten to LF.
+        assert_eq!(
+            std::fs::read(dir.path().join("f.txt")).unwrap(),
+            b"a\r\nB\r\nc\r\n"
+        );
+        // The explicit-tell note rides the summary.
+        assert!(
+            text(&out).contains("CRLF"),
+            "summary must flag the CRLF accommodation: {}",
+            text(&out)
+        );
+    }
+
+    /// A single-line delete in a CRLF file removes the whole line (terminator
+    /// included), leaving no empty line and the rest of the file untouched.
+    #[tokio::test]
+    async fn crlf_single_line_delete_leaves_no_empty_line() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "a\r\nb\r\nc\r\n").unwrap();
+        let t = tool(dir.path().to_path_buf());
+
+        let out = t
+            .invoke(call(serde_json::json!([
+                { "path": "f.txt", "old": ["b"], "new": [] }
+            ])))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{:?}", out.content);
+        assert_eq!(
+            std::fs::read(dir.path().join("f.txt")).unwrap(),
+            b"a\r\nc\r\n"
+        );
+    }
+
+    /// A `replace_all` / `new= ...` fragment pasted as an `old` line can never
+    /// match file content — it is a protocol error with a corrective hint,
+    /// surfaced at validation time (not as a misleading `not_found`).
+    #[tokio::test]
+    async fn json_field_leak_in_old_is_protocol_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "a\nb\n").unwrap();
+        let t = tool(dir.path().to_path_buf());
+
+        let out = t
+            .invoke(call(serde_json::json!([
+                { "path": "f.txt", "old": ["a", "replace_all: false"], "new": ["x"] }
+            ])))
+            .await;
+        match out {
+            Err(ToolError::InvalidInput(msg)) => {
+                assert!(msg.contains("replace_all"), "{msg}");
+                assert!(msg.contains("separate field"), "{msg}");
+            }
+            other => panic!("expected InvalidInput protocol error, got {other:?}"),
+        }
+        // The file is untouched.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "a\nb\n"
+        );
+    }
+
+    /// A genuine code line that merely CONTAINS a field word must not be
+    /// rejected — the leak guard stays conservative.
+    #[test]
+    fn json_field_leak_ignores_real_code_lines() {
+        assert!(json_field_leak("let replace_all = true;").is_none());
+        assert!(json_field_leak("\tnew_path()").is_none());
+        assert!(json_field_leak("old_value").is_none());
+        // But the actual leak shapes are caught.
+        assert_eq!(json_field_leak("replace_all: false"), Some("replace_all"));
+        assert_eq!(json_field_leak("new=["), Some("new"));
+        assert_eq!(json_field_leak("new:\"\"],"), Some("new"));
     }
 }
