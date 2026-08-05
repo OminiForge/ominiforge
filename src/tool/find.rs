@@ -137,15 +137,16 @@ impl Tool for FindTool {
         // The effective limit: the caller's `max_results` (defaulting to the
         // built-in cap) may tighten but never widen the RESULT_CAP ceiling — a
         // model asking for 10_000 paths still gets at most RESULT_CAP.
-        let limit = args.max_results.map_or(RESULT_CAP, |n| n.clamp(1, RESULT_CAP));
+        let limit = args
+            .max_results
+            .map_or(RESULT_CAP, |n| n.clamp(1, RESULT_CAP));
 
         let workspace = self.workspace.clone();
         // `ignore::Walk` is synchronous and does blocking I/O; keep it off the
         // async runtime's worker threads.
-        let outcome =
-            tokio::task::spawn_blocking(move || walk(&workspace, &globset, limit))
-                .await
-                .map_err(|e| ToolError::Execution(e.to_string()))?;
+        let outcome = tokio::task::spawn_blocking(move || walk(&workspace, &globset, limit))
+            .await
+            .map_err(|e| ToolError::Execution(e.to_string()))?;
 
         Ok(render(&outcome))
     }

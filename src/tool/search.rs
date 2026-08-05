@@ -197,7 +197,9 @@ impl Tool for SearchTool {
         // The effective limit: the caller's `max_results` (defaulting to the
         // built-in cap) may tighten but never widen the RESULT_CAP ceiling — a
         // model asking for 10_000 lines still gets at most RESULT_CAP.
-        let limit = args.max_results.map_or(RESULT_CAP, |n| n.clamp(1, RESULT_CAP));
+        let limit = args
+            .max_results
+            .map_or(RESULT_CAP, |n| n.clamp(1, RESULT_CAP));
 
         let workspace = self.workspace.clone();
         // `grep_searcher` is synchronous and does blocking I/O; keep it off the
@@ -306,7 +308,8 @@ fn render(outcome: &Outcome) -> ToolOutput {
     let header = if outcome.total == 0 {
         // Never answer a 0-hit query with bare emptiness: name the miss and the
         // way out, so the model's next step is actionable.
-        "0 matches — no lines matched; broaden the pattern or widen the path/include scope".to_owned()
+        "0 matches — no lines matched; broaden the pattern or widen the path/include scope"
+            .to_owned()
     } else if outcome.total > outcome.hits.len() {
         format!(
             "{} matches (showing first {})",
