@@ -2,7 +2,7 @@
 
 本文档定义从当前架构（Web 前端 + Gateway）到新架构（GPUI 客户端 + 多机分布式）的完整实施计划。
 
-**当前进度**：Phase 0-1 ✅ 已完成 | Phase 2（Core 重构）⏳ 待开始
+**当前进度**：Phase 0-2 ✅ 已完成 | Phase 3（GPUI 技术验证）⏳ 待开始
 
 **核心原则**：
 - 文档先行：先更新文档定义清楚，再按文档执行
@@ -33,60 +33,13 @@
 - CI 前端步骤：`ts-check`、`pnpm build`、整个 `frontend` job
 - 保留：`frontend/` 目录（过渡期方案，见 `frontend/README.md`）
 
----
+### Phase 2: Core 重构 ✅
 
-## Phase 2: Core 重构（3-5 天）
-
-**目标**：按 `doc/architecture.md` §5 定义，重构 Core 为 Service 架构
-
-### 2.1 定义 Service Traits
-
-**按 `doc/architecture.md` §5 定义**
-
-**任务**：
-- [ ] 定义 `LspService` trait
-- [ ] 定义 `SyntaxService` trait
-- [ ] 定义 `FormatService` trait
-- [ ] 定义 `SandboxService` trait（预留）
-
-**文件**：
-- `src/lsp/mod.rs`：定义 `LspService` trait
-- `src/parsing/mod.rs`：新建，定义 `SyntaxService` trait
-- `src/format/mod.rs`：定义 `FormatService` trait
-- `src/sandbox/mod.rs`：定义 `SandboxService` trait（预留）
-
-### 2.2 重构现有实现
-
-**按 `doc/architecture.md` §5 定义**
-
-**任务**：
-- [ ] 重构 LSP 代码为 `LspService` 实现
-- [ ] 重构 Tree-sitter 代码为 `SyntaxService` 实现
-- [ ] 重构 Formatter 代码为 `FormatService` 实现
-
-**文件**：
-- `src/lsp/`：重构现有代码，实现 `LspService` trait
-- `src/parsing/`：新建，从现有代码抽取 Tree-sitter 相关功能
-- `src/format/`：重构现有代码，实现 `FormatService` trait
-
-### 2.3 更新 Agent 使用 Service
-
-**按 `doc/architecture.md` §5 定义**
-
-**任务**：
-- [ ] Agent 通过 `LspService` trait 访问 LSP
-- [ ] Agent 通过 `SyntaxService` trait 访问语法解析
-- [ ] Agent 通过 `FormatService` trait 访问格式化
-
-**文件**：
-- `src/agent/`：更新 Agent 代码，使用 Service traits
-
-### 2.4 验证
-
-**任务**：
-- [ ] 运行所有测试（`cargo test`）
-- [ ] 运行 clippy（`cargo clippy`）
-- [ ] 确保 Agent 功能正常
+已完成 Service trait 化：
+- `src/lsp/service.rs`：`LspService`（registry-facing）+ `LspRouter`（manager-facing）trait，`ProcessLspService` 实现
+- `src/format/mod.rs`：`FormatService` trait，`ProcessFormatService` 实现
+- `LspManager` 持有 `Arc<dyn LspRouter>`，tools 持有 `Arc<dyn FormatService>`
+- 未做：`SyntaxService`（无 tree-sitter 实现，Phase 3 需要时再做）、`SandboxService`（已有 trait）
 
 ---
 
@@ -374,16 +327,16 @@
 |-------|------|------|------|
 | Phase 0: 文档更新 | 1-2 天 | 文档定义完成 | ✅ 已完成 |
 | Phase 1: 代码清理 | 1-2 天 | 干净的代码库 | ✅ 已完成 |
-| Phase 2: Core 重构 | 3-5 天 | Service traits 定义完成 | ⏳ 待开始 |
+| Phase 2: Core 重构 | 3-5 天 | Service traits 定义完成 | ✅ 已完成 |
 | Phase 3: GPUI 技术验证 | 1-2 周 | GPUI + Neovim 原型 | ⏳ 待开始 |
 | Phase 4: GPUI 核心功能 | 2-3 周 | 基本可用 | ⏳ 待开始 |
 | Phase 5: GPUI 完整功能 | 3-4 周 | 功能完整 | ⏳ 待开始 |
 | Phase 6: Web 前端退出 | 1 周 | 完成切换 | ⏳ 待开始 |
-| **总计** | **10-15 周** | **新架构完成** | **Phase 0-1/7 完成** |
+| **总计** | **10-15 周** | **新架构完成** | **Phase 0-2/7 完成** |
 
-**已完成**：Phase 0-1（2/7）
-**当前**：Phase 2（Core 重构）
-**剩余**：Phase 2-7（6 个 Phase）
+**已完成**：Phase 0-2（3/7）
+**当前**：Phase 3（GPUI 技术验证）
+**剩余**：Phase 3-7（5 个 Phase）
 
 ---
 
@@ -406,6 +359,7 @@
 3. **模块化 + 超低耦合 + 组合优先**：每个功能域是独立 crate，通过 trait 通信
 4. **不重复维护多套**：所有共享功能在 core，Editor 和 Agent 都是客户端
 5. **验证驱动**：每个 Phase 结束都有明确的验证标准
+6. **完成即清理**：完成一个 Phase 后，将详细任务清单从正文删除，换成简短总结移入「已完成 Phase」区域，保持文档只反映当前待做的工作
 
 ---
 
