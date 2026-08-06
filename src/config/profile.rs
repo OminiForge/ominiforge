@@ -15,7 +15,6 @@ use serde::{Deserialize, Serialize};
 /// A parsed profile. Optional sections default so partial files load; unknown
 /// keys are ignored for forward compatibility.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct Profile {
     pub profile: ProfileMeta,
 
@@ -52,7 +51,6 @@ pub struct Profile {
 
 /// `[profile]`: identity and inheritance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct ProfileMeta {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -64,7 +62,6 @@ pub struct ProfileMeta {
 
 /// `[prompt]`: the system prompt, inline or from a file.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct PromptSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
@@ -75,7 +72,6 @@ pub struct PromptSection {
 
 /// `[model]`: which model to use and parameter overrides.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct ModelSection {
     /// Default model reference, `provider_name/model_id` or short `model_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -98,7 +94,6 @@ pub struct ModelSection {
 
 /// `[tools]`: which built-in tools and MCP servers are available.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct ToolsSection {
     /// Built-in tools to enable. `None` means "all registered built-ins".
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -121,7 +116,6 @@ pub struct ToolsSection {
 /// The link-local block (cloud metadata, `169.254.0.0/16` / `fe80::/10`) is
 /// NOT configurable: it is applied on top of whatever this section says.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct WebFetchSection {
     /// Accept plain `http://` URLs (default true; `https://` always works).
     #[serde(default = "default_true")]
@@ -163,7 +157,6 @@ impl ToolsSection {
 
 /// `[context]`: compaction and injection knobs (parsed; not yet wired).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct ContextSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_threshold: Option<f32>,
@@ -178,7 +171,6 @@ pub struct ContextSection {
 
 /// `[skills]` (parsed; not yet wired).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct SkillsSection {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enabled: Vec<String>,
@@ -186,7 +178,6 @@ pub struct SkillsSection {
 
 /// `[memory]` (parsed; not yet wired).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct MemorySection {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scopes: Vec<String>,
@@ -203,7 +194,6 @@ pub struct MemorySection {
 /// once it has spent the full threshold it injects a reminder every round
 /// until the todo list moves or the turn ends.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct BudgetSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_max_usd: Option<f64>,
@@ -227,7 +217,6 @@ pub struct BudgetSection {
 
 /// `[hooks]` (parsed; not yet wired).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct HooksSection {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub before_tool: Vec<String>,
@@ -241,7 +230,6 @@ pub struct HooksSection {
 /// [`NetworkPolicy`](crate::sandbox::NetworkPolicy) from this section, falling
 /// back to the gateway default when `policy` is unset (`doc/profile.md` §7).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct NetworkSection {
     /// Egress policy: `isolated` (no network), `allowlist` (only `allow` hosts),
     /// or `open` (unrestricted). `None` inherits the gateway default.

@@ -42,7 +42,6 @@ pub enum Decision {
 /// something a non-expert can reason about. Richer matching (glob / regex) can
 /// be added as new variants without breaking existing rules.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 #[serde(rename_all = "snake_case")]
 pub enum MatchMode {
     /// A pattern matches when it occurs anywhere as a substring. The default, and
@@ -71,7 +70,6 @@ pub enum MatchMode {
 /// [`Default`] yields an empty rule with `tool = ""`, which matches no real tool
 /// — a harmless base for `..Default::default()` in construction.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct Rule {
     /// The tool name this rule applies to. `"*"` matches any tool; otherwise the
     /// match is exact. A rule scoped to `"*"` with no patterns matches every call
@@ -187,7 +185,6 @@ impl Rule {
 /// section imposes no gate — existing behavior is preserved
 /// (`doc/permission.md` §2).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct PermissionPolicy {
     /// Rules that, when matched, block the call. Highest precedence.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

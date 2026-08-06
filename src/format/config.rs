@@ -37,7 +37,6 @@ pub struct FormatConfig {
 /// most "project-uniform" — at the cost of touching lines the model didn't.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub enum FormatMode {
     /// Format the whole file after every edit/write.
     #[default]
@@ -56,7 +55,6 @@ pub enum FormatMode {
 /// every field is written explicitly (the file the user reads back is the
 /// full record they sent, with no skipped defaults to second-guess).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct FormatterConfig {
     /// Unique name; namespaces the formatter in logs and the UI's
     /// "formatted by \<name\>" annotation.

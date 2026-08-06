@@ -37,7 +37,6 @@ const DEFAULT_CAPACITY: usize = 1024;
 /// against a locally-remembered acknowledged seq — the gateway cannot know what a
 /// user has *looked at*, only what the session is *doing*.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 #[serde(rename_all = "snake_case")]
 pub enum ActivityStatus {
     /// A turn is running (the actor is mid-turn).
@@ -59,7 +58,6 @@ pub enum ActivityStatus {
 /// `seq` (the same monotonic sequence the SSE stream uses as its resume cursor).
 /// `latest_seq` lets the front-end decide "unseen" without a second request.
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct SessionStatus {
     /// The session this status is for.
     pub session_id: SessionId,

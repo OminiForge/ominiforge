@@ -297,7 +297,7 @@ mod tests {
                     chunks2
                         .lock()
                         .unwrap()
-                        .push(String::from_utf8_lossy(c).into_owned())
+                        .push(String::from_utf8_lossy(c).into_owned());
                 }),
             )
             .await

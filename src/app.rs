@@ -191,8 +191,8 @@ pub async fn assemble(
         .context("failed to load providers.toml")?;
     if providers.providers.is_empty() {
         bail!(
-            "no providers configured. Run `ominiforge init` to scaffold \
-             .omini/config/providers.toml, then set the model's api_key_env."
+            "no providers configured. Create .omini/config/providers.toml \
+             (see doc/profile.md §2), then set the model's api_key_env."
         );
     }
     let profile = store

@@ -46,7 +46,6 @@ use super::workspace::{WorkspaceId, WorkspaceRegistry};
 /// `doc/gateway.md`) without a schema change forcing every file to be
 /// rewritten. Unknown keys are ignored for forward compatibility.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 #[serde(default)]
 pub struct WorkspaceConfig {
     /// Sandbox network egress override for sessions in this workspace. `None`
@@ -80,7 +79,6 @@ pub struct WorkspaceConfig {
 /// (session-private / workspace-shared / gateway-global) rather than a fixed
 /// purpose — the user composes what to put there.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct MountSpec {
     /// Sharing scope: `session` (per-session private), `workspace` (shared across
     /// sessions in this workspace), or `gateway` (global). Resolved to a host

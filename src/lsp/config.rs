@@ -24,7 +24,6 @@ pub struct LspConfig {
 /// every field is written explicitly (the file the user reads back is the
 /// full record they sent, with no skipped defaults to second-guess).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct LspServerConfig {
     /// Unique name; namespaces the server in logs.
     pub name: String,

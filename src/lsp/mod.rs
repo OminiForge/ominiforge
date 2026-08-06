@@ -54,7 +54,6 @@ use std::time::Duration;
 /// One server's runtime state, surfaced to the UI (`RuntimeInfo.lsp`,
 /// `doc/lsp.md` §5.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 #[serde(rename_all = "kebab-case")]
 pub enum ServerState {
     /// Spawned and past the handshake, but not yet known ready (no successful
@@ -69,7 +68,6 @@ pub enum ServerState {
 
 /// A snapshot of one server for display.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct ServerStatus {
     /// Config `name`.
     pub name: String,

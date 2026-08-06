@@ -12,7 +12,6 @@ use serde::{Deserialize, Serialize};
 
 /// The parsed contents of a `providers.toml` file.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct ProvidersFile {
     /// Each `[[providers]]` table.
     #[serde(default)]
@@ -21,7 +20,6 @@ pub struct ProvidersFile {
 
 /// One configured provider and the models it serves.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct ProviderConfig {
     /// Unique identifier; profiles reference it in `provider_name/model_id`.
     pub name: String,
@@ -56,7 +54,6 @@ impl ProviderConfig {
 /// config files load, but selecting them surfaces
 /// [`ConfigError::UnsupportedProviderType`](super::ConfigError).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderType {
     /// OpenAI Chat Completions API — compatible with many third parties.
@@ -84,7 +81,6 @@ impl ProviderType {
 
 /// A model offered by a provider.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct ModelConfig {
     /// The model identifier sent to the API (e.g. `gpt-4o`).
     pub id: String,
@@ -122,7 +118,6 @@ pub struct ModelConfig {
 /// from "can think if asked": Kimi's `kimi-k2.7-code` always reasons (it cannot
 /// be disabled) while `kimi-k2.6` reasons only by default/optionally.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 #[serde(rename_all = "kebab-case")]
 pub enum Thinking {
     /// No reasoning mode (the default when unspecified).

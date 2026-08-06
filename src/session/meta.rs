@@ -13,7 +13,6 @@ use crate::core::SessionId;
 
 /// The contents of a session's `session.toml`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct SessionMeta {
     /// The session id (also the directory name).
     pub id: SessionId,
@@ -67,7 +66,6 @@ pub struct SessionMeta {
 /// backends that carry no durable identity (passthrough shares the host
 /// workspace and is rebuilt from scratch on re-attach).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct SandboxDescriptor {
     /// Backend name, e.g. `"passthrough"` or `"boxlite"`.
     pub backend: String,
@@ -80,7 +78,6 @@ pub struct SandboxDescriptor {
 /// How a session was born. `kind` carries the semantics; `parent_id` and
 /// `fork_at_seq` are shared across the non-`new` kinds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct Origin {
     pub kind: OriginKind,
 
@@ -95,7 +92,6 @@ pub struct Origin {
 
 /// The four ways a session can come into being. See `doc/architecture.md` §5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 #[serde(rename_all = "snake_case")]
 pub enum OriginKind {
     /// A user starting a fresh conversation. No parent, no context snapshot.

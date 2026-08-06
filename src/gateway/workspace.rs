@@ -20,7 +20,6 @@ use crate::session::SessionMeta;
 /// Workspace identifier: either a hash of the absolute path, or the sentinel
 /// `"none"` for sessions without a workspace.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct WorkspaceId(pub String);
 
 impl WorkspaceId {
@@ -173,7 +172,6 @@ impl WorkspaceRegistry {
 /// One workspace in the dashboard: its path (or `None` for the `"none"` group),
 /// the session IDs belonging to it, and the most recent session timestamp.
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct WorkspaceSummary {
     /// Workspace identifier (hash of path, or `"none"`).
     pub id: WorkspaceId,

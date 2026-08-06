@@ -73,7 +73,6 @@ pub struct ResolvedModel {
 /// §3.1). Deliberately shallow — enumerating profiles must not resolve the
 /// `extends` chain (a broken parent must not hide a usable child).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct ProfileSummary {
     /// Profile name (the `<name>.toml` the session binds to).
     pub name: String,
@@ -86,7 +85,6 @@ pub struct ProfileSummary {
 /// The override is sent back as `provider/model_id` (the qualified identity),
 /// since two providers may serve the same `model_id`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct ModelSummary {
     /// Provider name (e.g. `openai-main`).
     pub provider: String,
@@ -662,6 +660,7 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
 fn builtin_providers() -> &'static ProvidersFile {
     use std::sync::OnceLock;
     static CATALOG: OnceLock<ProvidersFile> = OnceLock::new();
+    #[allow(clippy::expect_used)]
     CATALOG
         .get_or_init(|| toml::from_str(CATALOG_TOML).expect("embedded provider catalog must parse"))
 }

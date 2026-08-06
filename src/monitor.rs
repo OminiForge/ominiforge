@@ -18,7 +18,6 @@ use crate::core::payload::{ErrorEvent, EventPayload, ModelEvent, ToolEvent, Turn
 ///
 /// All counts are saturating.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct SessionSummary {
     pub total_turns: u32,
     pub total_model_requests: u32,

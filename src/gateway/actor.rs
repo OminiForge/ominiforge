@@ -52,7 +52,6 @@ const INBOX_CAPACITY: usize = 64;
 /// What a front-end sees on the wire for one session. Tagged JSON so a client
 /// can switch on `type`.
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GatewayEvent {
     /// A committed, persisted event. The flattened event's `seq` is its session
@@ -104,7 +103,6 @@ pub enum GatewayEvent {
 
 /// A live streaming delta, mirroring [`StreamSink`] callbacks.
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 #[serde(tag = "delta", rename_all = "snake_case")]
 pub enum Delta {
     /// A new content block opened.
@@ -1161,7 +1159,7 @@ mod tests {
             self.seen
                 .lock()
                 .unwrap()
-                .push((request.model.clone(), request.think_effort.clone()));
+                .push((request.model, request.think_effort));
             let batch = self
                 .rounds
                 .lock()
@@ -1367,12 +1365,13 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        let seen = seen.seen.lock().unwrap();
+        let seen_guard = seen.seen.lock().unwrap();
         assert_eq!(
-            seen.first().map(|(m, e)| (m.as_str(), e.as_deref())),
+            seen_guard.first().map(|(m, e)| (m.as_str(), e.as_deref())),
             Some(("mock-pro", Some("high"))),
-            "the override model + effort must reach the request, got {seen:?}"
+            "the override model + effort must reach the request, got {seen_guard:?}"
         );
+        drop(seen_guard);
     }
 
     /// A turn publishes `Running` then `Idle` to the status hub, and the `Idle`

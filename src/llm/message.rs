@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 
 /// One message in a conversation, in provider-neutral form.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub enum Message {
     /// The system prompt / agent identity.
     System { content: String },
@@ -31,7 +30,6 @@ pub enum Message {
 /// A tool invocation requested by the model. `arguments` is the raw JSON string
 /// as produced by the model (parsed by the tool dispatcher, not here).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct ToolCall {
     pub id: String,
     pub name: String,

@@ -459,11 +459,11 @@ fn fold_hook(seq: u64, h: &HookEvent, items: &mut Vec<ViewItem>) {
     });
 }
 
-/// Fold a context injection: Runtime and RoundBudget injections surface in
+/// Fold a context injection: Runtime and `RoundBudget` injections surface in
 /// the flow — they are the loop nudging itself mid-turn (completion gate /
 /// stuck-step / round-budget reminders, not user input, so the user must see
 /// why the agent kept going). Assembly-time sources (Memory/RAG/Hook/
-/// ProjectGuidance) stay inspect-only.
+/// `ProjectGuidance`) stay inspect-only.
 fn fold_injection(seq: u64, i: &InjectionEvent, items: &mut Vec<ViewItem>) {
     let InjectionEvent::ContextInjected {
         source, content, ..

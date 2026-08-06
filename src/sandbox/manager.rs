@@ -290,7 +290,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs KVM + image pull; run manually on a supported host"]
     async fn choice_boxlite_builds_working_manager() {
-        let mgr = SandboxManager::from_choice(SandboxBackendChoice::Boxlite, &|_| {}).unwrap();
+        let mgr = SandboxManager::from_choice(SandboxBackendChoice::Boxlite).unwrap();
         assert_eq!(mgr.backend().name(), "boxlite");
         let sid = SessionId("s1".to_owned());
         let sandbox = mgr

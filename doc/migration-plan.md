@@ -2,6 +2,8 @@
 
 本文档定义从当前架构（Web 前端 + Gateway）到新架构（GPUI 客户端 + 多机分布式）的完整实施计划。
 
+**当前进度**：Phase 0-1 ✅ 已完成 | Phase 2（Core 重构）⏳ 待开始
+
 **核心原则**：
 - 文档先行：先更新文档定义清楚，再按文档执行
 - 大刀阔斧：不考虑过渡兼容，该删的直接删
@@ -10,158 +12,26 @@
 
 ---
 
-## 当前状态
+## 已完成 Phase
 
-**已有的**：
-- Rust Core（agent、session、event、tool、LSP、format、MCP）
-- Gateway（HTTP/SSE server）
-- Web 前端（SvelteKit，过渡期使用）
-- CLI（serve/init/inspect/eval）
-- 冻结版本（dist/freeze，可一直使用）
+### Phase 0: 文档更新 ✅
 
-**需要的**：
-- GPUI 客户端（唯一 UI）
-- Neovim 嵌入（编辑器）
-- 全局 vim 键绑定
-- 多机连接（P2P）
-- Lua 配置系统
-- 配置同步
+已完成的架构文档：
+- `doc/architecture.md`：更新 §3、§5、§18，新增 §21-26
+- `doc/editor.md`：新建（EditorBackend、NeovimBackend、Grid 渲染、IME 桥接）
+- `doc/gpui-app.md`：新建（GPUI 架构、UI 组件库、全局 vim 键绑定）
+- `doc/config-lua.md`：新建（Lua 配置、LSP 支持、图形界面、配置同步）
+- `doc/network.md`：新建（ClientProtocol、Local/WebSocket/QuicProtocol、ConnectionManager）
+- `doc/gateway.md`：更新（WebSocket endpoint、QUIC endpoint）
+- 删除：`doc/frontend.md`、`doc/tool-streaming.md`
 
----
+### Phase 1: 代码清理 ✅
 
-## Phase 0: 文档更新（1-2 天）
-
-**目标**：更新所有架构文档，明确新架构的定义
-
-### 0.1 更新 `doc/architecture.md`
-
-**任务**：
-- [ ] 更新 §3（入口形态）：明确 GPUI 客户端是唯一 UI，Web 前端是过渡期方案
-- [ ] 更新 §5（Workspace 拆分）：定义新的 crate 结构
-- [ ] 更新 §18（Gateway 与 Scheduler）：明确 Gateway 继续存在，但客户端改为 GPUI
-- [ ] 新增 §21（Editor 系统）：定义 Neovim 嵌入、EditorBackend trait
-- [ ] 新增 §22（通信协议）：定义 ClientProtocol trait、本地/远程模式
-- [ ] 新增 §23（配置系统）：定义 Lua 配置、图形界面、配置同步
-- [ ] 新增 §24（多机连接）：定义 ConnectionManager、Direct/Tunnel/P2P、设备发现
-
-**产出**：`doc/architecture.md` 更新完成
-
-### 0.2 新建 `doc/editor.md`
-
-**任务**：
-- [ ] 定义 EditorBackend trait
-- [ ] 定义 NeovimBackend 实现细节
-- [ ] 定义 Grid 渲染机制
-- [ ] 定义 IME 桥接机制
-- [ ] 定义键盘输入路由
-
-**产出**：`doc/editor.md` 新建完成
-
-### 0.3 新建 `doc/gpui-app.md`
-
-**任务**：
-- [ ] 定义 GPUI 应用架构
-- [ ] 定义 UI 组件库（theme、components、panels）
-- [ ] 定义全局 vim 键绑定系统
-- [ ] 定义面板布局和焦点管理
-
-**产出**：`doc/gpui-app.md` 新建完成
-
-### 0.4 新建 `doc/config-lua.md`
-
-**任务**：
-- [ ] 定义 Lua 配置格式
-- [ ] 定义 LSP 支持（类型定义文件）
-- [ ] 定义图形界面配置
-- [ ] 定义配置同步机制（Last-Write-Wins + 字段级合并）
-
-**产出**：`doc/config-lua.md` 新建完成
-
-### 0.5 新建 `doc/network.md`
-
-**任务**：
-- [ ] 定义 ClientProtocol trait
-- [ ] 定义 LocalProtocol（本地模式）
-- [ ] 定义 WebSocketProtocol（远程模式）
-- [ ] 定义 QuicProtocol（未来优化）
-- [ ] 定义 ConnectionManager
-- [ ] 定义设备发现和权限管理
-
-**产出**：`doc/network.md` 新建完成
-
-### 0.6 更新 `doc/gateway.md`
-
-**任务**：
-- [ ] 明确 Gateway 继续存在
-- [ ] 新增 WebSocket endpoint（GPUI App 远程模式用）
-- [ ] 新增 QUIC endpoint（未来优化）
-- [ ] 保留 HTTP/SSE（Web 前端过渡期用）
-
-**产出**：`doc/gateway.md` 更新完成
-
-### 0.7 删除冗余文档
-
-**任务**：
-- [ ] 删除 `doc/frontend.md`（Web 前端文档，过渡期后删除）
-- [ ] 删除 `doc/tool-streaming.md`（Web 前端的 tool view 设计）
-
-**产出**：冗余文档删除完成
-
----
-
-## Phase 1: 代码清理（1-2 天）
-
-**目标**：按文档定义，删除冗余代码
-
-### 1.1 删除 CLI 子命令
-
-**按 `doc/architecture.md` §3.1 定义**
-
-**任务**：
-- [ ] 删除 `init` 子命令
-- [ ] 删除 `inspect` 子命令
-- [ ] 保留 `serve` 子命令
-- [ ] 保留 `eval` 子命令（标记为 feature）
-
-**文件**：
-- `src/cli.rs`：删除 `InitArgs`、`InspectArgs`、`init()`、`inspect()` 函数
-- `src/app.rs`：删除 init/inspect 相关的 assemble 逻辑
-
-### 1.2 删除 ts-rs 相关
-
-**按 `doc/architecture.md` §5 定义**
-
-**任务**：
-- [ ] 删除 `ts-export` feature
-- [ ] 删除 `ts-rs` dependency
-- [ ] 删除所有 `#[derive(TS)]` 标记
-- [ ] 删除 `export_bindings` 测试
-- [ ] 删除 `justfile` 中的 `ts-export` 和 `ts-check` targets
-
-**文件**：
-- `Cargo.toml`：删除 `ts-rs` dependency 和 `ts-export` feature
-- `src/**/*.rs`：删除所有 `#[derive(TS)]` 和 `#[ts(export)]`
-- `justfile`：删除 `ts-export` 和 `ts-check` targets
-
-### 1.3 删除 CI 前端步骤
-
-**按本文档 Phase 5 定义**
-
-**任务**：
-- [ ] 删除 `ts-check` step
-- [ ] 删除 `pnpm build` step
-
-**文件**：
-- `.github/workflows/ci.yml`：删除前端相关的 CI 步骤
-
-### 1.4 保留 frontend/（暂时）
-
-**任务**：
-- [ ] 保留 `frontend/` 目录（冻结版本在用）
-- [ ] 在 `frontend/README.md` 中添加说明：这是过渡期方案，最终会被 GPUI 客户端替代
-
-**文件**：
-- `frontend/README.md`：添加过渡期说明
+已删除的冗余代码：
+- CLI 子命令：`init`、`inspect`（保留 `serve`、`eval`）
+- ts-rs 相关：依赖、feature、89 处 `#[derive(TS)]` 标记、justfile targets
+- CI 前端步骤：`ts-check`、`pnpm build`、整个 `frontend` job
+- 保留：`frontend/` 目录（过渡期方案，见 `frontend/README.md`）
 
 ---
 
@@ -500,16 +370,20 @@
 
 ## 时间线估算
 
-| Phase | 时间 | 产出 |
-|-------|------|------|
-| Phase 0: 文档更新 | 1-2 天 | 文档定义完成 |
-| Phase 1: 代码清理 | 1-2 天 | 干净的代码库 |
-| Phase 2: Core 重构 | 3-5 天 | Service traits 定义完成 |
-| Phase 3: GPUI 技术验证 | 1-2 周 | GPUI + Neovim 原型 |
-| Phase 4: GPUI 核心功能 | 2-3 周 | 基本可用 |
-| Phase 5: GPUI 完整功能 | 3-4 周 | 功能完整 |
-| Phase 6: Web 前端退出 | 1 周 | 完成切换 |
-| **总计** | **10-15 周** | **新架构完成** |
+| Phase | 时间 | 产出 | 状态 |
+|-------|------|------|------|
+| Phase 0: 文档更新 | 1-2 天 | 文档定义完成 | ✅ 已完成 |
+| Phase 1: 代码清理 | 1-2 天 | 干净的代码库 | ✅ 已完成 |
+| Phase 2: Core 重构 | 3-5 天 | Service traits 定义完成 | ⏳ 待开始 |
+| Phase 3: GPUI 技术验证 | 1-2 周 | GPUI + Neovim 原型 | ⏳ 待开始 |
+| Phase 4: GPUI 核心功能 | 2-3 周 | 基本可用 | ⏳ 待开始 |
+| Phase 5: GPUI 完整功能 | 3-4 周 | 功能完整 | ⏳ 待开始 |
+| Phase 6: Web 前端退出 | 1 周 | 完成切换 | ⏳ 待开始 |
+| **总计** | **10-15 周** | **新架构完成** | **Phase 0-1/7 完成** |
+
+**已完成**：Phase 0-1（2/7）
+**当前**：Phase 2（Core 重构）
+**剩余**：Phase 2-7（6 个 Phase）
 
 ---
 

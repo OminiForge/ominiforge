@@ -47,7 +47,6 @@ pub enum ApprovalDecision {
 /// (`doc/permission.md` §5). Serialized `snake_case` so a gateway client can
 /// send it on the wire alongside the decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalScope {
     /// This call only — the resting case; nothing is pinned anywhere.

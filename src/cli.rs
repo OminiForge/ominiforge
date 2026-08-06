@@ -2,21 +2,20 @@
 //!
 //! The command line is the operator's entry point, not a chat front-end:
 //! `ominiforge serve` runs the gateway (the single backend every interactive
-//! front-end talks to), `ominiforge init` scaffolds the config files
-//! (`.omini/config/providers.toml` + `.omini/profiles/*.toml`, see
-//! `doc/profile.md`), `ominiforge inspect` summarizes a session offline, and
-//! `ominiforge eval` runs eval suites. API keys are never stored in config: a
-//! provider names an env var via `api_key_env`, and the key is read from the
+//! front-end talks to) and `ominiforge eval` runs eval suites. Configuration
+//! is managed via Lua config files + the GPUI settings panel (see
+//! `doc/config-lua.md`); session analysis happens in the GPUI monitor panel
+//! (see `doc/gpui-app.md`). API keys are never stored in config: a provider
+//! names an env var via `api_key_env`, and the key is read from the
 //! environment. See `doc/architecture.md` §3.1, §15.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 
-use crate::app::{self, DEFAULT_PROFILE, SESSIONS_SUBDIR};
+use crate::app::{self, DEFAULT_PROFILE};
 use crate::config::ConfigStore;
-use crate::session::SessionStore;
 
 /// Ominiforge command-line interface.
 #[derive(Debug, Parser)]
@@ -38,10 +37,6 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Print a derived metrics summary for a session (offline, from its log).
-    Inspect(InspectArgs),
-    /// Scaffold `.omini/` config files (providers + a default profile).
-    Init(InitArgs),
     /// Run the gateway server (HTTP/SSE/WebSocket) in the foreground.
     Serve(ServeArgs),
     /// Run an eval suite (TOML case files) and persist scores.
@@ -62,34 +57,6 @@ struct ServeArgs {
     /// Bind address, overriding `gateway.toml` (host:port).
     #[arg(long)]
     bind: Option<String>,
-
-    /// Do not auto-load a `.env` file; use only the existing environment.
-    #[arg(long)]
-    no_dotenv: bool,
-}
-
-/// Arguments for `ominiforge init`.
-/// Arguments for `ominiforge inspect`.
-#[derive(Debug, Parser)]
-struct InitArgs {
-    /// Directory to scaffold `.omini/` under (default: current directory).
-    #[arg(long)]
-    workspace: Option<PathBuf>,
-
-    /// Overwrite existing config files instead of skipping them.
-    #[arg(long)]
-    force: bool,
-}
-
-/// Arguments for `ominiforge inspect`.
-#[derive(Debug, Parser)]
-struct InspectArgs {
-    /// The session id to inspect (a directory under `.omini/sessions`).
-    session_id: String,
-
-    /// Workspace whose sessions to read (default: current directory).
-    #[arg(long)]
-    workspace: Option<PathBuf>,
 
     /// Do not auto-load a `.env` file; use only the existing environment.
     #[arg(long)]
@@ -224,8 +191,6 @@ pub async fn run() -> Result<()> {
             println!();
             Ok(())
         }
-        Some(Command::Inspect(args)) => inspect(config_dir.as_deref(), &args),
-        Some(Command::Init(args)) => init(&args),
         Some(Command::Serve(args)) => serve_cmd(config_dir, args).await,
         Some(Command::Eval(args)) => eval_cmd(config_dir, args).await,
     }
@@ -643,183 +608,3 @@ fn persist_run(
 
     Ok(())
 }
-
-/// Print a derived metrics summary for a session, computed offline by replaying
-/// its `events.jsonl` through the monitor (`doc/monitor.md` §8).
-fn inspect(config_dir: Option<&Path>, args: &InspectArgs) -> Result<()> {
-    let requested = match args.workspace.clone() {
-        Some(path) => path,
-        None => std::env::current_dir().context("cannot determine current directory")?,
-    };
-    let workspace = app::resolve_workspace(&requested)?;
-    // Config comes from --config-dir / launch cwd / home, independent of the
-    // session's workspace (`doc/architecture.md` §15).
-    let launch_cwd = std::env::current_dir().context("cannot determine current directory")?;
-    let config = ConfigStore::discover_with(config_dir, &launch_cwd);
-    if !args.no_dotenv {
-        app::load_dotenv(config.roots(), &workspace);
-    }
-
-    let store = SessionStore::new(workspace.join(SESSIONS_SUBDIR));
-    let sid = crate::core::SessionId(args.session_id.clone());
-    let events = store
-        .read_events(&sid)
-        .with_context(|| format!("failed to read session `{}`", args.session_id))?;
-
-    let summary = crate::monitor::summarize(&events);
-    print_summary(&args.session_id, &summary);
-    Ok(())
-}
-
-/// Render a [`SessionSummary`](crate::monitor::SessionSummary) to stdout.
-fn print_summary(session_id: &str, s: &crate::monitor::SessionSummary) {
-    println!("session {session_id}");
-    println!("  turns:          {}", s.total_turns);
-    println!("  model requests: {}", s.total_model_requests);
-    println!(
-        "  tool calls:     {} ({} failed)",
-        s.total_tool_calls, s.total_tool_failures
-    );
-    println!(
-        "  tokens:         {} in / {} out",
-        s.total_input_tokens, s.total_output_tokens
-    );
-    println!(
-        "  cache hit rate: {:.1}% ({} read tokens)",
-        s.cache_hit_rate * 100.0,
-        s.total_cache_read_tokens
-    );
-    println!("  context:        {} tokens (est.)", s.context_tokens);
-    if !s.tools_used.is_empty() {
-        let mut tools: Vec<_> = s.tools_used.iter().collect();
-        tools.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
-        let rendered: Vec<String> = tools.iter().map(|(n, c)| format!("{n}×{c}")).collect();
-        println!("  tools used:     {}", rendered.join(", "));
-    }
-    if !s.errors.is_empty() {
-        let mut errors: Vec<_> = s.errors.iter().collect();
-        errors.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
-        let rendered: Vec<String> = errors.iter().map(|(c, n)| format!("{c}×{n}")).collect();
-        println!("  errors:         {}", rendered.join(", "));
-    }
-}
-
-/// Scaffold `.omini/config/providers.toml` and `.omini/profiles/default.toml`.
-fn init(args: &InitArgs) -> Result<()> {
-    let base = match &args.workspace {
-        Some(path) => path.clone(),
-        None => std::env::current_dir().context("cannot determine current directory")?,
-    };
-    let omini = base.join(".omini");
-    let config_dir = omini.join("config");
-    let profiles_dir = omini.join("profiles");
-    std::fs::create_dir_all(&config_dir)
-        .with_context(|| format!("failed to create {}", config_dir.display()))?;
-    std::fs::create_dir_all(&profiles_dir)
-        .with_context(|| format!("failed to create {}", profiles_dir.display()))?;
-
-    write_scaffold(
-        &config_dir.join("providers.toml"),
-        PROVIDERS_TEMPLATE,
-        args.force,
-    )?;
-    write_scaffold(
-        &profiles_dir.join("default.toml"),
-        PROFILE_TEMPLATE,
-        args.force,
-    )?;
-
-    write_scaffold(
-        &config_dir.join("gateway.toml"),
-        GATEWAY_TEMPLATE,
-        args.force,
-    )?;
-
-    eprintln!(
-        "scaffolded {}\n  edit config/providers.toml, set the api_key_env vars, then:\n  ominiforge serve",
-        omini.display()
-    );
-    Ok(())
-}
-
-/// Write `contents` to `path`, skipping (unless `force`) if it already exists.
-fn write_scaffold(path: &Path, contents: &str, force: bool) -> Result<()> {
-    if path.exists() && !force {
-        eprintln!("skip (exists): {}", path.display());
-        return Ok(());
-    }
-    std::fs::write(path, contents)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    eprintln!("wrote: {}", path.display());
-    Ok(())
-}
-
-/// Starter `providers.toml`. Keys are referenced by env-var name, never inlined.
-const PROVIDERS_TEMPLATE: &str = r#"# Provider + model definitions. See doc/profile.md §2.
-# API keys are NOT stored here: `api_key_env` names an environment variable
-# that holds the key (set it in your shell or a git-ignored .env file).
-
-[[providers]]
-name = "openai-main"
-type = "openai-chat"                  # openai-chat is the only wired type today
-base_url = "https://api.openai.com/v1"
-api_key_env = "OPENAI_API_KEY"
-
-[[providers.models]]
-id = "gpt-4o"
-context_window = 128000
-max_output_tokens = 16384
-default_temperature = 0.0
-
-# Any OpenAI-compatible endpoint works (local servers, third parties, Xiaomi
-# MiMo via an OpenAI-shaped gateway, ...). Example:
-#
-# [[providers]]
-# name = "xiaomi-local"
-# type = "openai-chat"
-# base_url = "http://localhost:8080/v1"
-# api_key_env = "XIAOMI_MIMO_API_KEY"
-#
-# [[providers.models]]
-# id = "mimo-7b"
-# context_window = 32000
-# max_output_tokens = 8192
-# default_temperature = 0.7
-"#;
-
-/// Starter `default.toml` profile. Points at the example provider/model above.
-const PROFILE_TEMPLATE: &str = r#"# The default agent profile. See doc/profile.md §3.
-
-[profile]
-name = "default"
-description = "Default agent profile"
-
-[prompt]
-system = """
-You are Ominiforge, a capable software agent. Use the available tools to
-accomplish the user's task, and explain what you did.
-"""
-
-[model]
-default = "openai-main/gpt-4o"        # provider_name/model_id
-
-[tools]
-builtin = ["read", "write", "edit", "shell"]
-"#;
-
-/// Starter `gateway.toml`. Auth is off until you uncomment `api_key_env` and set
-/// the named env var; the gateway binds loopback so it is only reachable behind a
-/// reverse proxy. See doc/gateway.md.
-const GATEWAY_TEMPLATE: &str = r#"# Gateway server config. See doc/gateway.md.
-# The gateway is the backend every interactive front-end (Web/desktop/mobile)
-# talks to; the command line itself is operator tooling, not a chat front-end.
-
-bind = "127.0.0.1:7878"            # loopback 示例；默认见 gateway/config.rs DEFAULT_BIND，反向代理终结 TLS
-
-# Bearer-token auth. Uncomment and set the named env var to require a token on
-# every route except /healthz. Left unset, the gateway is UNAUTHENTICATED —
-# only safe behind loopback + a trusted reverse proxy.
-# api_key_env = "OMINI_GATEWAY_KEY"
-
-idle_timeout_secs = 1800           # evict an idle session actor after 30 min
-"#;

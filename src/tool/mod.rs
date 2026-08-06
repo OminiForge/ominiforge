@@ -220,7 +220,6 @@ pub struct ToolDescriptor {
 /// hand-authored catalog entry today. A tool with no entry (e.g. an MCP tool)
 /// still gates fine — the UI falls back to a generic "whole input" card.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct ToolInfo {
     /// The tool name a [`crate::permission::Rule`] targets (its `tool` field).
     pub name: String,
@@ -239,7 +238,6 @@ pub struct ToolInfo {
 
 /// One targetable input field of a tool, for the config UI's field dropdown.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct ToolField {
     /// The JSON key a rule's `field` targets (e.g. `"command"`, `"path"`).
     pub key: String,

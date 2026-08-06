@@ -25,7 +25,6 @@ use super::error::{EvalError, Result};
 
 /// One eval case: an input to send an agent plus how to judge the result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct EvalCase {
     /// Stable unique id. Also the join key for scores across runs, so it must
     /// be unique within a suite and stable across case edits.
@@ -73,7 +72,6 @@ pub struct EvalCase {
 
 /// How a case came to exist (`doc/eval.md` §3.1, §8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 #[serde(rename_all = "snake_case")]
 pub enum CaseSource {
     /// Hand-authored from a real failure (the main line).
@@ -87,7 +85,6 @@ pub enum CaseSource {
 
 /// Whether a case participates in the regression gate (`doc/eval.md` §4.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 #[serde(rename_all = "snake_case")]
 pub enum CaseStatus {
     /// Reviewed and part of the gate; run by default.
@@ -100,7 +97,6 @@ pub enum CaseStatus {
 
 /// A coarse difficulty hint for slicing pass rate by hardness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 #[serde(rename_all = "snake_case")]
 pub enum Difficulty {
     Easy,
@@ -110,7 +106,6 @@ pub enum Difficulty {
 
 /// A file dropped into the scratch workspace before the agent runs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct CaseFile {
     /// Path relative to the scratch workspace root.
     pub path: PathBuf,
@@ -123,7 +118,6 @@ pub struct CaseFile {
 /// `kind` (`snake_case`) selects the variant; each carries only the data its
 /// scorer needs. Scorers that consume these are implemented in Step 2.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Checker {
     /// Normalized exact string match against `target`.
@@ -171,7 +165,6 @@ impl Checker {
 
 /// An expectation about one workspace file after the run (`state` checker).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct ExpectedFile {
     /// Path relative to the scratch workspace root.
     pub path: PathBuf,

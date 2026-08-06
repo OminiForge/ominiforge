@@ -63,7 +63,6 @@ use serde::Serialize;
 
 /// Which layer of the config chain supplied an entry (`doc/lsp.md` §3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 #[serde(rename_all = "lowercase")]
 pub enum ConfigLayer {
     /// The compiled-in registry (lowest precedence).
@@ -79,7 +78,6 @@ pub enum ConfigLayer {
 /// One row of the LSP settings view: the effective server config, the layer
 /// that supplied it, and whether its binary is on `PATH`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct LspServerView {
     /// Which layer's `lsp.toml` (or the registry) this row came from.
     pub layer: ConfigLayer,
@@ -97,7 +95,6 @@ pub struct LspServerView {
 
 /// The full LSP settings view (`GET /config/lsp`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct LspConfigView {
     /// Every built-in entry plus user-defined ones, in merge order, with
     /// tombstoned built-ins retained (greyed) rather than dropped.
@@ -106,7 +103,6 @@ pub struct LspConfigView {
 
 /// One row of the format settings view (same shape as [`LspServerView`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct FormatterView {
     /// Which layer's `format.toml` (or the registry) this row came from.
     pub layer: ConfigLayer,
@@ -122,7 +118,6 @@ pub struct FormatterView {
 
 /// The full format settings view (`GET /config/format`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub struct FormatConfigView {
     /// The resolved format mode (highest layer that sets one wins; `file`
     /// when none does).
@@ -860,8 +855,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let global = dir.path().join("global/.omini");
         let ws = dir.path().join("proj");
-        std::fs::create_dir_all(&global);
-        std::fs::create_dir_all(&ws);
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::create_dir_all(&ws).unwrap();
         // A fake `pyright-langserver` binary in a dir NOT on the gateway PATH.
         let bin = dir.path().join("flake-bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -874,9 +869,7 @@ mod tests {
         }
         // The workspace overlay's PATH points at the flake bin dir.
         let overlay: BTreeMap<String, Option<String>> =
-            [("PATH".to_owned(), Some(bin.display().to_string()))]
-                .into_iter()
-                .collect();
+            std::iter::once(("PATH".to_owned(), Some(bin.display().to_string()))).collect();
         let store = ConfigStore::from_roots(vec![global]);
         let view = lsp_config_view_for(&store, &ws, Some(&overlay)).unwrap();
         let pyright = view

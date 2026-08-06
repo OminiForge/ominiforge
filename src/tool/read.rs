@@ -167,7 +167,7 @@ impl Tool for ReadTool {
                         (start, end) => {
                             // render() bounds-checked this same window.
                             clamp_range(start.unwrap_or(1), end.unwrap_or(n), n)
-                                .map_err(|e| ToolError::InvalidInput(e.to_string()))?
+                                .map_err(ToolError::InvalidInput)?
                         }
                     };
                     let view = serde_json::json!({
