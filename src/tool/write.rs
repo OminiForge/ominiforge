@@ -10,7 +10,7 @@ use super::{
     resolve_in_workspace,
 };
 use crate::core::payload::{Content, ToolOutput};
-use crate::format::FormatManager;
+use crate::format::FormatService;
 use crate::lsp::LspManager;
 
 /// Writes a text file relative to the session workspace, creating parent
@@ -23,7 +23,7 @@ pub struct WriteTool {
     lsp: Option<Arc<LspManager>>,
     /// Optional auto-format: when set, the written content is formatted before
     /// the diff/diagnostics are produced (`doc/lsp.md`).
-    format: Option<Arc<FormatManager>>,
+    format: Option<Arc<dyn FormatService>>,
 }
 
 #[derive(Deserialize)]
@@ -50,10 +50,10 @@ impl WriteTool {
         self
     }
 
-    /// Attach a [`FormatManager`] so successful writes are formatted before
+    /// Attach a [`FormatService`] so successful writes are formatted before
     /// their diff/diagnostics are produced (`doc/lsp.md`).
     #[must_use]
-    pub fn with_format(mut self, format: Option<Arc<FormatManager>>) -> Self {
+    pub fn with_format(mut self, format: Option<Arc<dyn FormatService>>) -> Self {
         self.format = format;
         self
     }
@@ -447,9 +447,9 @@ e
 
     // --- auto-format integration (`doc/lsp.md`) --------------------------
 
-    /// A `FormatManager` whose only formatter strips trailing whitespace via
+    /// A `FormatService` whose only formatter strips trailing whitespace via
     /// `sed` (a whitespace-only change that passes the fail-closed check).
-    fn fmt_manager() -> std::sync::Arc<crate::format::FormatManager> {
+    fn fmt_manager() -> std::sync::Arc<dyn crate::format::FormatService> {
         let config = crate::format::FormatConfig {
             mode: Some(crate::format::FormatMode::File),
             formatters: vec![crate::format::FormatterConfig {
@@ -463,7 +463,7 @@ e
                 format_timeout_ms: 5_000,
             }],
         };
-        crate::format::FormatManager::new(config, std::collections::BTreeMap::new()).unwrap()
+        crate::format::ProcessFormatService::new(config, std::collections::BTreeMap::new()).unwrap()
     }
 
     /// An overwrite whose content carries trailing whitespace is written
@@ -491,7 +491,7 @@ e
         assert_eq!(view_json["files"][0]["formatted_by"], "trim-ws");
     }
 
-    /// `mode = "off"` produces no `FormatManager` at all (`FormatManager::new`
+    /// `mode = "off"` produces no `FormatService` at all (`ProcessFormatService::new`
     /// returns `None`), so a write is never touched.
     #[tokio::test]
     async fn mode_off_writes_content_verbatim() {
@@ -511,7 +511,8 @@ e
         };
         // `None` manager → the tool is constructed without a formatter.
         assert!(
-            crate::format::FormatManager::new(config, std::collections::BTreeMap::new()).is_none()
+            crate::format::ProcessFormatService::new(config, std::collections::BTreeMap::new())
+                .is_none()
         );
         let out = WriteTool::new(dir.path().to_path_buf())
             .invoke(input("f.txt", "a   \n"))

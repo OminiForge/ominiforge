@@ -21,7 +21,7 @@ use super::{
     resolve_in_workspace,
 };
 use crate::core::payload::{Content, ToolOutput};
-use crate::format::FormatManager;
+use crate::format::FormatService;
 use crate::lsp::LspManager;
 
 /// Applies content-anchored edits relative to the session workspace.
@@ -33,7 +33,7 @@ pub struct EditTool {
     lsp: Option<Arc<LspManager>>,
     /// Optional auto-format: when set, the written file is formatted before
     /// the diff/diagnostics are produced (`doc/lsp.md`).
-    format: Option<Arc<FormatManager>>,
+    format: Option<Arc<dyn FormatService>>,
 }
 
 #[derive(Deserialize)]
@@ -114,10 +114,10 @@ impl EditTool {
         self
     }
 
-    /// Attach a [`FormatManager`] so successful edits are formatted before
+    /// Attach a [`FormatService`] so successful edits are formatted before
     /// their diff/diagnostics are produced (`doc/lsp.md`).
     #[must_use]
-    pub fn with_format(mut self, format: Option<Arc<FormatManager>>) -> Self {
+    pub fn with_format(mut self, format: Option<Arc<dyn FormatService>>) -> Self {
         self.format = format;
         self
     }
@@ -1087,10 +1087,10 @@ b
 
     // --- auto-format integration (`doc/lsp.md`) --------------------------
 
-    /// A `FormatManager` whose only formatter strips trailing whitespace via
+    /// A `FormatService` whose only formatter strips trailing whitespace via
     /// `sed` — a deterministic *whitespace-only* change, so it passes the
     /// fail-closed consistency check (non-whitespace content is unchanged).
-    fn fmt_manager() -> std::sync::Arc<crate::format::FormatManager> {
+    fn fmt_manager() -> std::sync::Arc<dyn crate::format::FormatService> {
         let config = crate::format::FormatConfig {
             mode: Some(crate::format::FormatMode::File),
             formatters: vec![crate::format::FormatterConfig {
@@ -1104,7 +1104,7 @@ b
                 format_timeout_ms: 5_000,
             }],
         };
-        crate::format::FormatManager::new(config, std::collections::BTreeMap::new()).unwrap()
+        crate::format::ProcessFormatService::new(config, std::collections::BTreeMap::new()).unwrap()
     }
 
     /// When the formatter changes the text, the edit writes the FORMATTED
@@ -1188,7 +1188,8 @@ b
             }],
         };
         let fmt =
-            crate::format::FormatManager::new(config, std::collections::BTreeMap::new()).unwrap();
+            crate::format::ProcessFormatService::new(config, std::collections::BTreeMap::new())
+                .unwrap();
         let t = EditTool::new(dir.path().to_path_buf()).with_format(Some(fmt));
 
         let out = t

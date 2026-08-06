@@ -1,5 +1,5 @@
-//! [`LspService`]: the process-level owner of language-server instances,
-//! shared across every session that works in the same root
+//! [`LspService`] / [`LspRouter`]: the process-level owner of language-server
+//! instances, shared across every session that works in the same root
 //! (`doc/lsp.md` §5.2).
 //!
 //! ## Why a service, not a per-session manager
@@ -12,6 +12,19 @@
 //! share the single client. This mirrors [`crate::sandbox::manager::SandboxManager`]
 //! — a process-level service the registry owns, handed to each session's
 //! assembly so the tools reach shared state.
+//!
+//! ## Two traits, two callers
+//!
+//! - [`LspService`] — the **registry-facing** surface: `status`,
+//!   `reclaim_inactive`, `close_idle_documents`. The gateway registry and its
+//!   background sweeper hold `Arc<dyn LspService>`.
+//! - [`LspRouter`] — the **manager-facing** surface: `shared_server`,
+//!   `get_or_spawn`, `note_answered`, `note_died`. The session-level
+//!   [`crate::lsp::LspManager`] holds `Arc<dyn LspRouter>` and routes each
+//!   file op's diagnostics through it.
+//!
+//! [`ProcessLspService`] implements both; the split is by caller, not by
+//! implementation.
 //!
 //! ## Concurrency (the whole point of the locking)
 //!
@@ -104,7 +117,8 @@ impl Lifecycle {
 // (`doc/lsp.md` §5.2).
 
 /// One shared language-server instance plus the metadata its lifecycle needs.
-/// Lives in [`LspService`]'s map, `Arc`-shared by every session under its root.
+/// Lives in [`ProcessLspService`]'s map, `Arc`-shared by every session under
+/// its root.
 pub struct SharedServer {
     config: LspServerConfig,
     /// `None` until the first touch spawns the server; holds the live client
@@ -152,10 +166,61 @@ impl SharedServer {
     }
 }
 
-/// The process-level owner of shared language servers (`doc/lsp.md` §5.2).
-/// The registry owns one; each session's [`crate::lsp::LspManager`] is a thin
-/// per-session view that routes to it.
-pub struct LspService {
+/// The registry-facing surface of the process-level language-server service.
+/// The gateway registry and its background sweeper hold `Arc<dyn LspService>`.
+#[async_trait::async_trait]
+pub trait LspService: Send + Sync {
+    /// A snapshot of `root`'s **activated** servers for the UI
+    /// (`doc/lsp.md` §5.1).
+    async fn status(&self, root: &Path) -> Vec<ServerStatus>;
+
+    /// Reclaim the servers of every root that is **inactive** and idle past
+    /// the grace period. Returns the number reclaimed.
+    async fn reclaim_inactive(&self, active_roots: &std::collections::HashSet<PathBuf>) -> usize;
+
+    /// `didClose` every open document idle past the configured period.
+    /// Returns the total closed.
+    async fn close_idle_documents(&self) -> usize;
+}
+
+/// The manager-facing surface: routes a session's diagnostics requests to
+/// the right shared server. The session-level [`crate::lsp::LspManager`]
+/// holds `Arc<dyn LspRouter>`.
+///
+/// Inherits [`LspService`] so the manager can also read server status for
+/// the UI without needing a second trait object.
+#[async_trait::async_trait]
+pub trait LspRouter: LspService {
+    /// The shared server for `(root, config)`, registering it on first use.
+    /// Cheap: only the map lookup happens here; spawning is lazy (`get_or_spawn`).
+    async fn shared_server(&self, root: &Path, config: &LspServerConfig) -> Arc<SharedServer>;
+
+    /// The server's live client, spawning it on first use. Holds the
+    /// per-server `client` mutex across `connect().await` so concurrent
+    /// first-touches spawn exactly one server, and a crash respawn serializes
+    /// against every session that noticed the death. Returns `None` (never an
+    /// error) when the server can't start — diagnostics are best-effort
+    /// (`doc/lsp.md` §4).
+    async fn get_or_spawn(
+        &self,
+        server: &Arc<SharedServer>,
+        root: &Path,
+        env_overlay: &std::collections::BTreeMap<String, Option<String>>,
+    ) -> Option<Arc<LspClient>>;
+
+    /// Note that `server` answered diagnostics successfully — the (a1) ready
+    /// signal that moves it from `starting` to `running`.
+    async fn note_answered(&self, server: &Arc<SharedServer>);
+
+    /// Drop `server`'s cached client after a mid-session death (a sync
+    /// failure): the next `get_or_spawn` respawns through the same lock.
+    async fn note_died(&self, server: &Arc<SharedServer>);
+}
+
+/// The concrete process-level owner of shared language servers
+/// (`doc/lsp.md` §5.2). The registry owns one; each session's
+/// [`crate::lsp::LspManager`] is a thin per-session view that routes to it.
+pub struct ProcessLspService {
     servers: Mutex<HashMap<ServerKey, Arc<SharedServer>>>,
     /// Grace period before a root with no active session is reclaimed.
     reclaim_grace: Duration,
@@ -163,13 +228,13 @@ pub struct LspService {
     doc_idle_close: Duration,
 }
 
-impl Default for LspService {
+impl Default for ProcessLspService {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl LspService {
+impl ProcessLspService {
     /// Build a service with the default reclaim grace and doc-idle-close
     /// periods.
     #[must_use]
@@ -189,111 +254,22 @@ impl LspService {
         self
     }
 
-    /// The shared server for `(root, config)`, registering it on first use.
-    /// Cheap: only the map lookup happens here; spawning is lazy (`get_or_spawn`).
-    pub(crate) async fn shared_server(
-        &self,
-        root: &Path,
-        config: &LspServerConfig,
-    ) -> Arc<SharedServer> {
-        let key = ServerKey {
-            root: root.to_path_buf(),
-            name: config.name.clone(),
-        };
-        let mut servers = self.servers.lock().await;
-        servers
-            .entry(key)
-            .or_insert_with(|| Arc::new(SharedServer::new(config.clone())))
-            .clone()
+    /// Total servers currently held (any root, any state) — a test/monitor
+    /// hook for the reclaim path.
+    #[cfg(test)]
+    pub(crate) async fn server_count(&self) -> usize {
+        self.servers.lock().await.len()
     }
+}
 
-    /// The server's live client, spawning it on first use. Holds the
-    /// per-server `client` mutex across `connect().await` so concurrent
-    /// first-touches spawn exactly one server, and a crash respawn serializes
-    /// against every session that noticed the death. Returns `None` (never an
-    /// error) when the server can't start — diagnostics are best-effort
-    /// (`doc/lsp.md` §4).
-    // The guard is deliberately held across `connect().await`: that is what
-    // serializes concurrent spawns so exactly one wins.
-    #[allow(clippy::significant_drop_tightening)]
-    pub(crate) async fn get_or_spawn(
-        &self,
-        server: &Arc<SharedServer>,
-        root: &Path,
-        env_overlay: &std::collections::BTreeMap<String, Option<String>>,
-    ) -> Option<Arc<LspClient>> {
-        *server.last_touched.lock().await = Instant::now();
-        let mut guard = server.client.lock().await;
-        if let Some(client) = guard.as_ref() {
-            return Some(Arc::clone(client));
-        }
-        // Recently failed? Skip the retry (and its init_timeout stall) until
-        // the cooldown elapses.
-        {
-            let last = server.last_failed_at.lock().await;
-            if last.is_some_and(|t| t.elapsed() < START_RETRY_COOLDOWN) {
-                return None;
-            }
-        }
-        *server.lifecycle.lock().await = Lifecycle::Starting;
-        let init_timeout = Duration::from_millis(server.config.init_timeout_ms);
-        match LspClient::connect(&server.config, root, env_overlay, init_timeout).await {
-            Ok(client) => {
-                let client = Arc::new(client);
-                *guard = Some(Arc::clone(&client));
-                // Spawned + handshook but not yet known ready → `starting`
-                // until the first successful diagnostics (heuristic a1).
-                *server.lifecycle.lock().await = Lifecycle::Starting;
-                Some(client)
-            }
-            Err(e) => {
-                *server.last_failed_at.lock().await = Some(Instant::now());
-                *server.lifecycle.lock().await = Lifecycle::Failed;
-                // A misconfigured server must not fail 100% silently (§12).
-                tracing::warn!(
-                    server = %server.config.name,
-                    cooldown_secs = START_RETRY_COOLDOWN.as_secs(),
-                    "lsp: server failed to start ({e}); diagnostics disabled"
-                );
-                None
-            }
-        }
-    }
-
-    /// Note that `server` answered diagnostics successfully — the (a1) ready
-    /// signal that moves it from `starting` to `running`.
-    pub(crate) async fn note_answered(&self, server: &Arc<SharedServer>) {
-        *server.last_touched.lock().await = Instant::now();
-        let mut lifecycle = server.lifecycle.lock().await;
-        if *lifecycle == Lifecycle::Starting {
-            *lifecycle = Lifecycle::Running;
-        }
-    }
-
-    /// Drop `server`'s cached client after a mid-session death (a sync
-    /// failure): the next `get_or_spawn` respawns through the same lock.
-    /// Marks the failure so the cooldown guards a thrashing server, and the
-    /// lifecycle flips to `failed`. Returns immediately if another session
-    /// already dropped it (the guard would be `None`).
-    pub(crate) async fn note_died(&self, server: &Arc<SharedServer>) {
-        let mut guard = server.client.lock().await;
-        if guard.take().is_some() {
-            *server.last_failed_at.lock().await = Some(Instant::now());
-            *server.lifecycle.lock().await = Lifecycle::Failed;
-            tracing::warn!(
-                server = %server.config.name,
-                cooldown_secs = START_RETRY_COOLDOWN.as_secs(),
-                "lsp: server stopped responding; client dropped, will respawn on next touch"
-            );
-        }
-    }
-
+#[async_trait::async_trait]
+impl LspService for ProcessLspService {
     /// A snapshot of `root`'s **activated** servers for the UI
     /// (`doc/lsp.md` §5.1): those that spawned (starting/running) or tried
     /// and failed (failed/cooldown). Servers never touched — including
     /// built-in defaults for languages this project doesn't use — are
     /// omitted, so a rust+ts root never lists clangd/gopls.
-    pub async fn status(&self, root: &Path) -> Vec<ServerStatus> {
+    async fn status(&self, root: &Path) -> Vec<ServerStatus> {
         // Snapshot the root's servers (Arc clones) and release the map lock
         // before awaiting each server's inner mutexes, so a status read never
         // holds the shared map across an await.
@@ -339,10 +315,7 @@ impl LspService {
     /// that merely went quiet for a few minutes keeps its index. The caller
     /// (the registry's sweeper) supplies the active-root set; this method only
     /// applies the grace + drop. Returns the number of servers reclaimed.
-    pub(crate) async fn reclaim_inactive(
-        &self,
-        active_roots: &std::collections::HashSet<PathBuf>,
-    ) -> usize {
+    async fn reclaim_inactive(&self, active_roots: &std::collections::HashSet<PathBuf>) -> usize {
         // Collect the keys to reclaim first (reading `last_touched` is async,
         // so it can't happen inside `retain`'s sync closure).
         let mut servers = self.servers.lock().await;
@@ -374,7 +347,7 @@ impl LspService {
     /// period, across every live server (`doc/lsp.md` §5.2). Runs on the
     /// sweeper's cadence; distinct from [`reclaim_inactive`](Self::reclaim_inactive),
     /// which drops whole servers for gone-idle roots. Returns the total closed.
-    pub(crate) async fn close_idle_documents(&self) -> usize {
+    async fn close_idle_documents(&self) -> usize {
         // Snapshot the servers (Arc clones) up front so the shared map lock is
         // never held across the per-server client-lock awaits.
         let servers: Vec<Arc<SharedServer>> =
@@ -391,11 +364,87 @@ impl LspService {
         }
         closed
     }
+}
 
-    /// Total servers currently held (any root, any state) — a test/monitor
-    /// hook for the reclaim path.
-    #[cfg(test)]
-    pub(crate) async fn server_count(&self) -> usize {
-        self.servers.lock().await.len()
+#[async_trait::async_trait]
+impl LspRouter for ProcessLspService {
+    async fn shared_server(&self, root: &Path, config: &LspServerConfig) -> Arc<SharedServer> {
+        let key = ServerKey {
+            root: root.to_path_buf(),
+            name: config.name.clone(),
+        };
+        let mut servers = self.servers.lock().await;
+        servers
+            .entry(key)
+            .or_insert_with(|| Arc::new(SharedServer::new(config.clone())))
+            .clone()
+    }
+
+    // The guard is deliberately held across `connect().await`: that is what
+    // serializes concurrent spawns so exactly one wins.
+    #[allow(clippy::significant_drop_tightening)]
+    async fn get_or_spawn(
+        &self,
+        server: &Arc<SharedServer>,
+        root: &Path,
+        env_overlay: &std::collections::BTreeMap<String, Option<String>>,
+    ) -> Option<Arc<LspClient>> {
+        *server.last_touched.lock().await = Instant::now();
+        let mut guard = server.client.lock().await;
+        if let Some(client) = guard.as_ref() {
+            return Some(Arc::clone(client));
+        }
+        // Recently failed? Skip the retry (and its init_timeout stall) until
+        // the cooldown elapses.
+        {
+            let last = server.last_failed_at.lock().await;
+            if last.is_some_and(|t| t.elapsed() < START_RETRY_COOLDOWN) {
+                return None;
+            }
+        }
+        *server.lifecycle.lock().await = Lifecycle::Starting;
+        let init_timeout = Duration::from_millis(server.config.init_timeout_ms);
+        match LspClient::connect(&server.config, root, env_overlay, init_timeout).await {
+            Ok(client) => {
+                let client = Arc::new(client);
+                *guard = Some(Arc::clone(&client));
+                // Spawned + handshook but not yet known ready → `starting`
+                // until the first successful diagnostics (heuristic a1).
+                *server.lifecycle.lock().await = Lifecycle::Starting;
+                Some(client)
+            }
+            Err(e) => {
+                *server.last_failed_at.lock().await = Some(Instant::now());
+                *server.lifecycle.lock().await = Lifecycle::Failed;
+                // A misconfigured server must not fail 100% silently (§12).
+                tracing::warn!(
+                    server = %server.config.name,
+                    cooldown_secs = START_RETRY_COOLDOWN.as_secs(),
+                    "lsp: server failed to start ({e}); diagnostics disabled"
+                );
+                None
+            }
+        }
+    }
+
+    async fn note_answered(&self, server: &Arc<SharedServer>) {
+        *server.last_touched.lock().await = Instant::now();
+        let mut lifecycle = server.lifecycle.lock().await;
+        if *lifecycle == Lifecycle::Starting {
+            *lifecycle = Lifecycle::Running;
+        }
+    }
+
+    async fn note_died(&self, server: &Arc<SharedServer>) {
+        let mut guard = server.client.lock().await;
+        if guard.take().is_some() {
+            *server.last_failed_at.lock().await = Some(Instant::now());
+            *server.lifecycle.lock().await = Lifecycle::Failed;
+            tracing::warn!(
+                server = %server.config.name,
+                cooldown_secs = START_RETRY_COOLDOWN.as_secs(),
+                "lsp: server stopped responding; client dropped, will respawn on next touch"
+            );
+        }
     }
 }

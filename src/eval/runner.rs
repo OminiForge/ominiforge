@@ -78,7 +78,7 @@ pub async fn run_case(case: &EvalCase, config: &RunConfig<'_>) -> Result<CaseRes
         Vec::new(),
         // Each eval case is its own scratch workspace, so there is nothing to
         // share servers across: a per-run service is correct (`doc/lsp.md` §5.2).
-        std::sync::Arc::new(crate::lsp::LspService::new()),
+        std::sync::Arc::new(crate::lsp::ProcessLspService::new()),
     )
     .await
     .context("failed to assemble agent for eval case")?;

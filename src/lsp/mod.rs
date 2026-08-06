@@ -28,7 +28,9 @@ mod protocol;
 pub(crate) mod registry;
 mod service;
 
-pub use service::{DEFAULT_DOC_IDLE_CLOSE, DEFAULT_RECLAIM_GRACE, LspService};
+pub use service::{
+    DEFAULT_DOC_IDLE_CLOSE, DEFAULT_RECLAIM_GRACE, LspRouter, LspService, ProcessLspService,
+};
 
 pub use client::{LspClient, LspError, uri_for};
 pub use config::{ConfigError, LspConfig, LspServerConfig};
@@ -85,7 +87,9 @@ pub struct ServerStatus {
 pub struct LspManager {
     /// The process-level owner of shared server instances (`doc/lsp.md`
     /// §5.2): every session under the same root routes to the same clients.
-    service: Arc<LspService>,
+    /// Behind the [`LspRouter`] trait so the concrete implementation can be
+    /// swapped (e.g. a test double) without changing this struct.
+    router: Arc<dyn LspRouter>,
     /// This session's root — the `root_uri` the shared servers index.
     workspace: PathBuf,
     env_overlay: BTreeMap<String, Option<String>>,
@@ -114,7 +118,7 @@ impl LspManager {
     /// visible; per-start failures surface later via `tracing` (§12 fail-loud).
     #[must_use]
     pub fn new(
-        service: Arc<LspService>,
+        router: Arc<dyn LspRouter>,
         config: &LspConfig,
         workspace: PathBuf,
         env_overlay: BTreeMap<String, Option<String>>,
@@ -130,7 +134,7 @@ impl LspManager {
             );
         }
         Some(Arc::new(Self {
-            service,
+            router,
             workspace,
             env_overlay,
             configs: config.servers.clone(),
@@ -157,7 +161,7 @@ impl LspManager {
     /// of `RuntimeInfo`, which refreshes on turn settle — exactly when a file
     /// op may have changed a server's state.
     pub async fn status(&self) -> Vec<ServerStatus> {
-        self.service.status(&self.workspace).await
+        self.router.status(&self.workspace).await
     }
 
     /// Get diagnostics for `abs_path` given its current `text`, or `None` when
@@ -244,9 +248,9 @@ impl LspManager {
         language_id: &str,
         text: &str,
     ) -> Option<Vec<Diagnostic>> {
-        let server = self.service.shared_server(&self.workspace, config).await;
+        let server = self.router.shared_server(&self.workspace, config).await;
         let client = self
-            .service
+            .router
             .get_or_spawn(&server, &self.workspace, &self.env_overlay)
             .await?;
 
@@ -259,7 +263,7 @@ impl LspManager {
             // mid-session. Drop it via the service (marking the failure +
             // flipping the lifecycle to `failed`) so a later op respawns
             // through the same single-spawn lock (§12 fail-loud).
-            self.service.note_died(&server).await;
+            self.router.note_died(&server).await;
             return None;
         };
         let budget = Duration::from_millis(config.diag_timeout_ms);
@@ -267,7 +271,7 @@ impl LspManager {
         drop(doc_guard);
         // Answered (possibly "clean"): the (a1) ready signal that moves the
         // server from `starting` to `running`.
-        self.service.note_answered(&server).await;
+        self.router.note_answered(&server).await;
         Some(diags)
     }
 }
@@ -411,21 +415,17 @@ mod tests {
     }
 
     fn manager(cfg: &LspConfig) -> Arc<LspManager> {
-        LspManager::new(
-            Arc::new(LspService::new()),
-            cfg,
-            PathBuf::from("/ws"),
-            BTreeMap::new(),
-        )
-        .unwrap()
+        let router: Arc<dyn LspRouter> = Arc::new(ProcessLspService::new());
+        LspManager::new(router, cfg, PathBuf::from("/ws"), BTreeMap::new()).unwrap()
     }
 
     /// No configured servers → no manager at all, so callers pay nothing.
     #[test]
     fn empty_config_yields_no_manager() {
+        let router: Arc<dyn LspRouter> = Arc::new(ProcessLspService::new());
         assert!(
             LspManager::new(
-                Arc::new(LspService::new()),
+                router,
                 &LspConfig::default(),
                 PathBuf::from("/ws"),
                 BTreeMap::new(),
@@ -621,7 +621,7 @@ while True:
         let dir = tempfile::tempdir().unwrap();
         let config = mock_lsp_config(dir.path());
         let manager = LspManager::new(
-            Arc::new(LspService::new()),
+            Arc::new(ProcessLspService::new()),
             &config,
             dir.path().to_path_buf(),
             BTreeMap::new(),
@@ -650,7 +650,7 @@ while True:
         let dir = tempfile::tempdir().unwrap();
         let config = mock_lsp_config(dir.path());
         let manager = LspManager::new(
-            Arc::new(LspService::new()),
+            Arc::new(ProcessLspService::new()),
             &config,
             dir.path().to_path_buf(),
             BTreeMap::new(),
@@ -677,7 +677,7 @@ while True:
         let dir = tempfile::tempdir().unwrap();
         let config = mock_lsp_config(dir.path());
         let manager = LspManager::new(
-            Arc::new(LspService::new()),
+            Arc::new(ProcessLspService::new()),
             &config,
             dir.path().to_path_buf(),
             BTreeMap::new(),
@@ -706,7 +706,7 @@ while True:
     async fn sessions_under_one_root_share_a_server() {
         let dir = tempfile::tempdir().unwrap();
         let config = mock_lsp_config(dir.path());
-        let service = Arc::new(LspService::new());
+        let service: Arc<dyn LspRouter> = Arc::new(ProcessLspService::new());
         let root = dir.path().to_path_buf();
         let mk = || {
             LspManager::new(Arc::clone(&service), &config, root.clone(), BTreeMap::new()).unwrap()
@@ -737,7 +737,7 @@ while True:
         let dir_a = tempfile::tempdir().unwrap();
         let dir_b = tempfile::tempdir().unwrap();
         let config = mock_lsp_config(dir_a.path());
-        let service = Arc::new(LspService::new());
+        let service: Arc<dyn LspRouter> = Arc::new(ProcessLspService::new());
         let ma = LspManager::new(
             Arc::clone(&service),
             &config,
@@ -775,7 +775,7 @@ while True:
     async fn starting_until_first_answer_then_running() {
         let dir = tempfile::tempdir().unwrap();
         let config = mock_lsp_config(dir.path());
-        let service = Arc::new(LspService::new());
+        let service: Arc<dyn LspRouter> = Arc::new(ProcessLspService::new());
         let root = dir.path().to_path_buf();
         let server = service.shared_server(&root, &config.servers[0]).await;
 
@@ -806,25 +806,28 @@ while True:
         let root = dir.path().to_path_buf();
 
         // Zero grace: any inactive root is immediately reclaimable.
-        let service = Arc::new(
-            LspService::new().with_periods(std::time::Duration::ZERO, DEFAULT_DOC_IDLE_CLOSE),
+        let concrete = Arc::new(
+            ProcessLspService::new()
+                .with_periods(std::time::Duration::ZERO, DEFAULT_DOC_IDLE_CLOSE),
         );
+        // `concrete` kept for state assertions (`server_count` is not on the trait).
+        let service: Arc<dyn LspRouter> = concrete.clone();
         let m =
             LspManager::new(Arc::clone(&service), &config, root.clone(), BTreeMap::new()).unwrap();
         m.diagnostics(&dir.path().join("lib.rs"), "fn x() {}\n")
             .await
             .unwrap();
-        assert_eq!(service.server_count().await, 1);
+        assert_eq!(concrete.server_count().await, 1);
 
         // Active root → kept even with zero grace.
         let active = std::collections::HashSet::from([root.clone()]);
         assert_eq!(service.reclaim_inactive(&active).await, 0);
-        assert_eq!(service.server_count().await, 1);
+        assert_eq!(concrete.server_count().await, 1);
 
         // Inactive root + grace elapsed → reclaimed.
         let empty = std::collections::HashSet::new();
         assert_eq!(service.reclaim_inactive(&empty).await, 1);
-        assert_eq!(service.server_count().await, 0);
+        assert_eq!(concrete.server_count().await, 0);
     }
 
     /// A root reclaimed inside its grace period is kept: with a LONG grace,
@@ -835,17 +838,19 @@ while True:
         let dir = tempfile::tempdir().unwrap();
         let config = mock_lsp_config(dir.path());
         let root = dir.path().to_path_buf();
-        let service = Arc::new(LspService::new()); // default 30-min grace
+        let concrete = Arc::new(ProcessLspService::new()); // default 30-min grace
+        // `concrete` kept for state assertions (`server_count` is not on the trait).
+        let service: Arc<dyn LspRouter> = concrete.clone();
         let m =
             LspManager::new(Arc::clone(&service), &config, root.clone(), BTreeMap::new()).unwrap();
         m.diagnostics(&dir.path().join("lib.rs"), "fn x() {}\n")
             .await
             .unwrap();
-        assert_eq!(service.server_count().await, 1);
+        assert_eq!(concrete.server_count().await, 1);
         // Inactive but well within grace → kept.
         let empty = std::collections::HashSet::new();
         assert_eq!(service.reclaim_inactive(&empty).await, 0);
-        assert_eq!(service.server_count().await, 1);
+        assert_eq!(concrete.server_count().await, 1);
     }
 
     /// An open document idle past the period is `didClose`d (freeing the
@@ -858,8 +863,8 @@ while True:
         let config = mock_lsp_config(dir.path());
         let root = dir.path().to_path_buf();
         // Zero idle-close period: every open doc is immediately closeable.
-        let service = Arc::new(
-            LspService::new().with_periods(DEFAULT_RECLAIM_GRACE, std::time::Duration::ZERO),
+        let service: Arc<dyn LspRouter> = Arc::new(
+            ProcessLspService::new().with_periods(DEFAULT_RECLAIM_GRACE, std::time::Duration::ZERO),
         );
         let m =
             LspManager::new(Arc::clone(&service), &config, root.clone(), BTreeMap::new()).unwrap();
@@ -896,7 +901,7 @@ while True:
         };
         let dir = tempfile::tempdir().unwrap();
         let manager = LspManager::new(
-            Arc::new(LspService::new()),
+            Arc::new(ProcessLspService::new()),
             &config,
             dir.path().to_path_buf(),
             BTreeMap::new(),
@@ -919,7 +924,7 @@ while True:
         let dir = tempfile::tempdir().unwrap();
         let config = mock_lsp_config(dir.path());
         let manager = LspManager::new(
-            Arc::new(LspService::new()),
+            Arc::new(ProcessLspService::new()),
             &config,
             dir.path().to_path_buf(),
             BTreeMap::new(),

@@ -67,25 +67,49 @@ impl FormatOutcome {
     }
 }
 
-/// Routes `edit`/`write`'s touched files to their formatter and runs it
-/// fail-closed. Held per session like [`crate::lsp::LspManager`]; stateless
-/// beyond the config (each format is a fresh subprocess).
-pub struct FormatManager {
+/// The auto-format service: routes touched files to their formatter and runs
+/// it fail-closed.
+///
+/// Defined as a trait so the formatting implementation can be swapped (e.g. a
+/// test double) without changing the tools that consume it. The concrete
+/// implementation is [`ProcessFormatService`].
+#[async_trait::async_trait]
+pub trait FormatService: Send + Sync {
+    /// Format `text` for `abs_path`, fail-closed.
+    ///
+    /// `edited_lines` is the 1-based inclusive `(start, end)` range the edit
+    /// touched, used only in `mode = "edit"`; `write` passes `None` (a write
+    /// replaces the whole file, so it always formats whole-file). Returns
+    /// [`FormatOutcome::Skipped`] with the original text whenever formatting
+    /// must not touch the result.
+    async fn format(
+        &self,
+        abs_path: &Path,
+        text: &str,
+        edited_lines: Option<(u32, u32)>,
+    ) -> FormatOutcome;
+}
+
+/// The concrete format service, routing touched files to their formatter.
+///
+/// Runs fail-closed. Held per session like [`crate::lsp::LspManager`];
+/// stateless beyond the config (each format is a fresh subprocess).
+pub struct ProcessFormatService {
     config: FormatConfig,
     env_overlay: BTreeMap<String, Option<String>>,
 }
 
-impl std::fmt::Debug for FormatManager {
+impl std::fmt::Debug for ProcessFormatService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FormatManager")
+        f.debug_struct("ProcessFormatService")
             .field("formatters", &self.config.formatters.len())
             .field("mode", &self.config.resolved_mode())
             .finish_non_exhaustive()
     }
 }
 
-impl FormatManager {
-    /// Build a manager for `config`. Returns `None` when formatting can never
+impl ProcessFormatService {
+    /// Build a service for `config`. Returns `None` when formatting can never
     /// do anything — `mode = "off"` or no formatters configured — so callers
     /// skip the whole step with zero overhead.
     #[must_use]
@@ -114,15 +138,11 @@ impl FormatManager {
             .iter()
             .find(|f| f.extensions.iter().any(|e| e == ext))
     }
+}
 
-    /// Format `text` for `abs_path`, fail-closed.
-    ///
-    /// `edited_lines` is the 1-based inclusive `(start, end)` range the edit
-    /// touched, used only in `mode = "edit"`; `write` passes `None` (a write
-    /// replaces the whole file, so it always formats whole-file). Returns
-    /// [`FormatOutcome::Skipped`] with the original text whenever formatting
-    /// must not touch the result.
-    pub async fn format(
+#[async_trait::async_trait]
+impl FormatService for ProcessFormatService {
+    async fn format(
         &self,
         abs_path: &Path,
         text: &str,

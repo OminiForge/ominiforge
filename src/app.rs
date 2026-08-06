@@ -153,7 +153,7 @@ pub async fn assemble(
     default_permission: crate::permission::PermissionPolicy,
     workspace_permission: crate::permission::PermissionPolicy,
     mounts: Vec<crate::sandbox::VolumeMount>,
-    lsp_service: Arc<crate::lsp::LspService>,
+    lsp_router: Arc<dyn crate::lsp::LspRouter>,
 ) -> Result<Assembled> {
     let workspace = resolve_workspace(&workspace)?;
 
@@ -248,16 +248,20 @@ pub async fn assemble(
     let lsp_manager = crate::lsp::LspConfig::load(&lang_roots)
         .context("failed to load lsp.toml")
         .map(|cfg| {
-            crate::lsp::LspManager::new(lsp_service, &cfg, workspace.clone(), env_overlay.clone())
+            crate::lsp::LspManager::new(lsp_router, &cfg, workspace.clone(), env_overlay.clone())
         })?;
 
     // Auto-format after edit/write (doc/lsp.md): load `format.toml`, build
     // a stateless manager. `None` when `mode = "off"` or no formatter is
     // configured, so edit/write pay nothing. Unlike the LSP manager this owns
     // no subprocess — each format is a fresh stdin→stdout call.
-    let format_manager = crate::format::FormatConfig::load(&lang_roots)
-        .context("failed to load format.toml")
-        .map(|cfg| crate::format::FormatManager::new(cfg, env_overlay.clone()))?;
+    let format_manager: Option<Arc<dyn crate::format::FormatService>> =
+        crate::format::FormatConfig::load(&lang_roots)
+            .context("failed to load format.toml")
+            .map(|cfg| {
+                crate::format::ProcessFormatService::new(cfg, env_overlay.clone())
+                    .map(|svc| svc as Arc<dyn crate::format::FormatService>)
+            })?;
 
     register_profile_tools(
         &mut tools,
@@ -390,7 +394,7 @@ fn register_profile_tools(
     workspace: PathBuf,
     sandbox: Arc<dyn crate::sandbox::Sandbox>,
     lsp: Option<Arc<crate::lsp::LspManager>>,
-    format: Option<Arc<crate::format::FormatManager>>,
+    format: Option<Arc<dyn crate::format::FormatService>>,
 ) {
     if profile.tools.allows("find") {
         registry.register(Arc::new(FindTool::new(workspace.clone())));

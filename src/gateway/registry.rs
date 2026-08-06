@@ -268,7 +268,7 @@ struct RegistryInner {
     /// Process-level owner of shared language servers (`doc/lsp.md` §5.2):
     /// one server per `(root_uri, language)`, shared by every session under
     /// the root. Handed to each assembly so the tools reach shared clients.
-    lsp_service: Arc<crate::lsp::LspService>,
+    lsp_service: Arc<dyn crate::lsp::LspRouter>,
     /// Fallback sandbox network policy for sessions whose profile does not set
     /// one (`doc/sandbox.md` §6.2). Resolved once from `gateway.toml` at boot so
     /// a malformed default fails loud here, not per session.
@@ -428,7 +428,7 @@ impl SessionRegistry {
                 workspaces,
                 status_hub: StatusHub::new(),
                 sandbox_manager,
-                lsp_service: Arc::new(crate::lsp::LspService::new().with_periods(
+                lsp_service: Arc::new(crate::lsp::ProcessLspService::new().with_periods(
                     config.lsp_reclaim_grace(),
                     crate::lsp::DEFAULT_DOC_IDLE_CLOSE,
                 )),
