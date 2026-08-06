@@ -165,7 +165,7 @@ impl StatusHub {
     /// The last-known activity status for one session, or `None` if it has never
     /// published one (no actor has run a turn for it this process). Used to gate
     /// destructive lifecycle ops (`archive`): a `Running` session must not be
-    /// retired out from under a live turn (`doc/session-storage.md` §9).
+    /// retired out from under a live turn (`doc/architecture.md` §9).
     #[must_use]
     pub fn status_of(&self, session_id: &SessionId) -> Option<ActivityStatus> {
         self.inner

@@ -27,14 +27,7 @@
 
 ## 3. Cache 命中率标准化
 
-不同 provider 返回格式不同，统一为：
-
-```rust
-pub struct CacheMetrics {
-    pub read_tokens: u32,   // 命中 prefix cache 读取的 tokens
-    pub write_tokens: u32,  // 本次写入 cache 的 tokens
-}
-```
+不同 provider 返回格式不同，monitor 统一为 `Usage` 中的 cache read/write 两个计数（`read_tokens` = 命中 prefix cache 读取的 tokens，`write_tokens` = 本次写入 cache 的 tokens）。结构定义见 [`src/core/payload.rs`](../src/core/payload.rs) 的 `Usage`。
 
 Provider 映射：
 
@@ -121,8 +114,8 @@ MCP server 作为子进程，额外追踪：
 ## 8. Session 级汇总
 
 Session 结束时生成 `SessionSummary`（turns / model requests / tool calls / input+output
-tokens / cache_hit_rate / context_tokens / tools_used / errors），用于 `inspect` 离线展示、
-evolution 分析、Web dashboard 报告。结构与离线入口 `summarize` 见 `src/monitor.rs`。
+tokens / cache_hit_rate / context_tokens / tools_used / errors），用于 GPUI 客户端的监控面板、
+evolution 分析。结构与聚合入口 `summarize` 见 `src/monitor.rs`。
 
 `context_tokens` 是 context 占用量的持久化读数：monitor 取最后一个
 `RequestStarted.input_tokens_estimate`（agent ledger 在发送前持久化的 running 估计，

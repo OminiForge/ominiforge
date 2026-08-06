@@ -1,4 +1,4 @@
-//! Workspace development environments via direnv (`doc/env.md`).
+//! Workspace development environments via direnv (`doc/architecture.md`).
 //!
 //! A workspace's `.envrc` is the single source of truth for its development
 //! environment (nix flake, uv, … — the mechanism is irrelevant, direnv is the
@@ -250,7 +250,7 @@ impl WorkspaceEnvCache {
 /// whenever direnv's own cache is warm (the common case). Slow path: fall back
 /// to the last snapshot and spawn a background refresh so the NEXT session is
 /// warm. Either way assembly never blocks on an expensive evaluation
-/// (`doc/env.md`). A missing/broken direnv or a blocked `.envrc` degrades to
+/// (`doc/architecture.md`). A missing/broken direnv or a blocked `.envrc` degrades to
 /// "no workspace env" with an actionable warning, never a failed session.
 pub(crate) async fn session_env(
     workspace: &Path,

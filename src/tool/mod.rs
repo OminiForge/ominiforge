@@ -374,7 +374,7 @@ impl std::fmt::Debug for ToolInput {
 ///
 /// [`descriptors`](Self::descriptors) returns them sorted by name so the tool
 /// schema block sent to the model is stable, preserving prefix-cache hits
-/// (`doc/context-management.md` §3).
+/// (`doc/architecture.md` §3).
 #[derive(Clone, Default)]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,

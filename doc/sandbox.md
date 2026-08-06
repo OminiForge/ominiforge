@@ -19,66 +19,12 @@
 
 ## 2. 核心抽象：`trait Sandbox`
 
-```rust
-/// 沙箱生命周期抽象。
-///
-/// 每个沙箱封装一个隔离的执行环境（workspace 文件系统 + shell + 网络策略）。
-/// 快照/fork 操作假设沙箱处于【静止态】（无执行中的工具进程，shell 停在提示符）。
-#[async_trait]
-pub trait Sandbox: Send + Sync {
-    /// 创建一个新沙箱，从 rootfs 镜像冷启动。
-    async fn create(config: SandboxConfig) -> Result<Self>;
-
-    /// 在沙箱中执行命令，返回 stdout/stderr + exit code。
-    async fn exec(&self, cmd: &str) -> Result<ExecOutput>;
-
-    /// 捕获当前沙箱状态为快照。
-    ///
-    /// **契约**：调用者必须确保沙箱处于静止态（无执行中进程）。
-    /// 捕获内容：文件系统状态（最低保证）；内存/进程状态为可选能力（见 `capabilities()`）。
-    /// 返回快照 ID，可用于 `restore` 或 `fork`。
-    async fn snapshot(&self) -> Result<SnapshotId>;
-
-    /// 从快照恢复/克隆出一个新沙箱。
-    ///
-    /// **契约**：产出的沙箱具有快照时的文件系统状态，处于就绪（ready）态。
-    /// 对于仅文件系统快照的后端，这是冷启动；对于内存快照后端，可能是热恢复。
-    /// 使用者只感知性能差异（启动延迟、密度），行为等价。
-    async fn restore(id: SnapshotId) -> Result<Self>;
-
-    /// 释放此沙箱及其关联资源。
-    ///
-    /// **契约**：声明「我用完了」。后端可回收此沙箱**及其独占**的资源；
-    /// 若它是从快照 fork 来的、父快照仍被别的沙箱依赖，后端负责不误删父快照。
-    /// 「是否还有依赖」如何判定是后端内部细节（boxlite 用引用计数），抽象层不关心。
-    async fn release(self) -> Result<()>;
-
-    /// 查询此后端的能力标志。
-    fn capabilities(&self) -> SandboxCapabilities;
-}
-
-/// 沙箱创建配置。
-pub struct SandboxConfig {
-    /// Rootfs 镜像（OCI ref 或本地路径）。
-    pub rootfs: String,
-    /// 资源限制。
-    pub resources: ResourceLimits,
-    /// 网络策略（隔离 / allow-list / 全开）。
-    pub network: NetworkPolicy,
-    /// 初始文件挂载（可选，用于注入 workspace 初始内容）。
-    pub volumes: Vec<VolumeMount>,
-}
-
-/// 后端能力标志（可选特性）。
-pub struct SandboxCapabilities {
-    /// 是否支持内存快照（live checkpoint/restore），而非仅文件系统快照。
-    pub live_snapshot: bool,
-    /// 是否支持热 fork（秒级从快照克隆），而非冷启动。
-    pub hot_fork: bool,
-    /// 快照链是否自动 GC（引用计数级联回收）。
-    pub refcounted_gc: bool,
-}
-```
+每个沙箱封装一个隔离的执行环境（workspace 文件系统 + shell + 网络策略）。抽象层的
+操作集为：`create`（从 rootfs 冷启动）、`exec`（执行命令，返回 stdout/stderr + exit
+code）、`snapshot`（捕获文件系统状态为快照 ID）、`restore`（从快照 ID 克隆出就绪沙箱）、
+`release`（声明用完，可回收）、`capabilities`（查询后端可选能力）。精确签名与类型
+（`Sandbox` / `SandboxBackend` / `SandboxConfig` / `SandboxCapabilities`）以代码为准：
+[`src/sandbox/mod.rs`](../src/sandbox/mod.rs)。
 
 **设计要点**：
 
@@ -86,7 +32,7 @@ pub struct SandboxCapabilities {
 - **fork = `restore`**。没有单独的 `fork()` 方法——fork 就是"从快照 ID restore 出一个新沙箱"。session fork 会先 `snapshot` 父沙箱，再用返回的 ID `restore` 出子沙箱（§4.2）。
 - **`release` 不计数、不推理**。抽象层调 `release` 表示「用完」，仅此。快照被多少沙箱引用、何时能真删，全在后端内部（boxlite 自带引用计数 + 级联 GC）——上层不维护平行的计数，避免和后端打架。
 
-> **实现形态说明**：上面的单 trait 是概念契约。落地时拆成两个 object-safe trait（`src/sandbox/mod.rs`）——`SandboxBackend`（工厂：`create`/`restore` → `Arc<dyn Sandbox>`）+ `Sandbox`（实例：`exec`/`snapshot`/`release`/`capabilities`，全 `&self`）——因为上层要把沙箱藏在 trait object 后（§3.2），而 `create/restore -> Result<Self>` + `release(self)` 不是 object-safe。语义不变，只是接收者形态变。`capabilities` 实际还带一个 `filesystem_snapshot` 标志（passthrough 为 false，boxlite 为 true），用于 fork 的能力门控。
+> **实现形态说明**：概念上是单个 `Sandbox` 契约，落地拆成两个 object-safe trait——`SandboxBackend`（工厂：`create`/`restore`）+ `Sandbox`（实例：`exec`/`snapshot`/`release`/`capabilities`）——因为上层要把沙箱藏在 trait object 后（§3.2）。语义不变。`capabilities` 还带一个 `filesystem_snapshot` 标志（passthrough 为 false，boxlite 为 true），用于 fork 的能力门控。
 
 ---
 
@@ -175,7 +121,7 @@ session 落盘不再只是 jsonl + toml，多出它**自己拥有**的工作目�
 | `workspace` | `<gateway>/.omini/workspaces/<workspace_id>/shared/` | 同 workspace 跨 session 共享 |
 | `gateway` | `<gateway>/.omini/shared/` | 全局共享 |
 
-- 配置住 **workspace.toml** 的 `[[mounts]]`(`doc/workspace-config.md`)。根全在**网关侧、可信**——不放 agent 可写的项目目录。
+- 配置住 **workspace.toml** 的 `[[mounts]]`(`doc/gateway.md`)。根全在**网关侧、可信**——不放 agent 可写的项目目录。
 - 每条 `{ anchor, path?, guest, ro }`:`path` 是锚点根内相对子路径(缺省=根本身;禁 `..`/绝对逃逸,fail-loud);`guest` 必须绝对路径(否则 fail-loud);`ro` 默认 false(RW)。host 目录按需创建(三根都是 app 拥有的)。
 - **锚点解析在 `SessionRegistry::MountAnchors`**(它才有网关根 + session/workspace id),产出 `Vec<VolumeMount>` 喂给 `SandboxConfig.volumes`。
 - **id 时序**:`session` 锚点需 session id,而沙箱在 `create_new` 之前建 → 网关**提前 mint id**(`SessionStore::mint_id` → `create_new_with_id`),同一 id 既解析锚点又落盘。
@@ -310,7 +256,7 @@ Agent 调用 shell tool:
 **下发现状**：
 - **后端映射已完成**：`box_options()` 把 `SandboxConfig.network`（Isolated→无 NIC / AllowList→白名单 / Open）和 `resources.cpus`/`memory_mb` 逐字段翻译成 boxlite `BoxOptions`；passthrough 按契约忽略（宿主无隔离）。
 - **network 已接三档分层下发**（本步）：策略沿 **workspace `workspace.toml` > profile `[network]` > gateway `default_network` 兜底 > 硬编码 `Open`** 派生，写进 `SandboxConfig.network`（`app::resolve_network` 一处可测，`app.rs`）。
-  - **workspace 层 = 网关侧、可信**（`doc/workspace-config.md`）：配置存 `<gateway>/.omini/workspaces/<workspace_id>.toml`（`workspace_id` = 路径哈希，复用 `WorkspaceId`），**不放项目目录**——项目目录 agent 可写（§3.3），从那读安全策略 = 提权，撞 secret-store 威胁模型。网关侧由部署者掌控。
+  - **workspace 层 = 网关侧、可信**（`doc/gateway.md`）：配置存 `<gateway>/.omini/workspaces/<workspace_id>.toml`（`workspace_id` = 路径哈希，复用 `WorkspaceId`），**不放项目目录**——项目目录 agent 可写（§3.3），从那读安全策略 = 提权，撞 secret-store 威胁模型。网关侧由部署者掌控。
   - **profile 层**归属见 `doc/profile.md` §7（network = agent 能力，同 tool set）。
   - effective 兜底 = `Open`——一个新 boxlite session 默认能联网，锁死交给显式配置（否则 `NetworkPolicy::default()=Isolated` 会让每个未配置 session 断网）。
   - 任一层策略名非法 **fail loud**（Karpathy §12），不静默回退：workspace.toml 坏 → 建 session 失败；profile 坏 → 同样硬报错。
@@ -338,7 +284,7 @@ MCP server 作为子进程的额外监控指标（启动耗时、崩溃/重启�
 | **Step 2** | BoxLite 后端 | `src/sandbox/boxlite.rs`：create/exec/snapshot/restore/release 打通（feature `sandbox-boxlite`） | ✅ 完成（映射单测绿；运行期需真机） |
 | **Step 3** | 接入 shell tool | shell tool 从 `tokio::Command` 改走 `sandbox.exec`，默认注入 passthrough | ✅ 核心完成 |
 | **Step 4** | **Session 沙箱一等公民** | `SandboxManager`（按 session 持有、跨 thread 存活）+ `assemble` 建/接收沙箱并注入 `shell` + 描述符落 meta（`bind_sandbox`）+ `fork` 先 `fork_from` 父沙箱再注入子 agent（能力门控，passthrough→fallback）<br>**不接 release/GC**（当前无「删除 session」路径，无触发点）<br>验证：passthrough 全绿单测（367 测试绿）；**boxlite 真机 fork 已在 KVM 上验证通过**（3 个 `#[ignore]` 集成测试全绿，含 `manager_fork_from_yields_isolated_child`：子环境继承父 FS、写时分离、父不变） | ✅ 完成（真机验证通过） |
-| **Step 5** | 打磨细节 | ✅ **网关侧 boxlite 后端选择**（`gateway.toml` `sandbox_backend = passthrough\|boxlite\|auto`，`SandboxManager::from_choice`，boxlite fail-loud / auto WARN 回退）+ ✅ **生产 flake**（`packages.default`：boxlite release，用 **nixpkgs 的 `libkrun`/`libkrunfw`/`bubblewrap`** 供库，`BOXLITE_DEPS_STUB=1` 让 boxlite 不下载自带 blob，运行期库/bwrap wrap 进 PATH——**零硬编 URL/哈希，依赖归 nixpkgs**）+ ✅ **boxlite workspace 挂载**（`box_options` 把 workspace 作 RW bind→`/workspace`+`working_dir`，fork 经 `clone_box` 继承；真机 `#[ignore]` 测试确认 `pwd==/workspace`、宿主↔guest 双向直通；§9 Q6 已定）+ ✅ **session archive + `release` 触发**（`POST /sessions/{id}/archive`：拒绝运行中(409)→停 actor→`SandboxManager::release`→`.archived` sidecar；`list()` 过滤 archived、文件保留供分析；`unarchive` 反向；§9 Q5 已定，`doc/session-storage.md` §9）<br>剩余：**boxlite-on-NixOS jailer**（证书布局等宿主适配，去掉 `OMINI_BOXLITE_INSECURE` 开发 hack）+ 挂载策略（§3.7 私有 tmp/delivery/共享）+ 资源/网络下发（§6.2）+ **hard delete 路径**（物理删目录，危险、需确认机制）+ snapshot 粒度（§9 Q4）+ edge case | ⏳ 进行中 |
+| **Step 5** | 打磨细节 | ✅ **网关侧 boxlite 后端选择**（`gateway.toml` `sandbox_backend = passthrough\|boxlite\|auto`，`SandboxManager::from_choice`，boxlite fail-loud / auto WARN 回退）+ ✅ **生产 flake**（`packages.default`：boxlite release，用 **nixpkgs 的 `libkrun`/`libkrunfw`/`bubblewrap`** 供库，`BOXLITE_DEPS_STUB=1` 让 boxlite 不下载自带 blob，运行期库/bwrap wrap 进 PATH——**零硬编 URL/哈希，依赖归 nixpkgs**）+ ✅ **boxlite workspace 挂载**（`box_options` 把 workspace 作 RW bind→`/workspace`+`working_dir`，fork 经 `clone_box` 继承；真机 `#[ignore]` 测试确认 `pwd==/workspace`、宿主↔guest 双向直通；§9 Q6 已定）+ ✅ **session archive + `release` 触发**（`POST /sessions/{id}/archive`：拒绝运行中(409)→停 actor→`SandboxManager::release`→`.archived` sidecar；`list()` 过滤 archived、文件保留供分析；`unarchive` 反向；§9 Q5 已定，`doc/architecture.md` §9）<br>剩余：**boxlite-on-NixOS jailer**（证书布局等宿主适配，去掉 `OMINI_BOXLITE_INSECURE` 开发 hack）+ 挂载策略（§3.7 私有 tmp/delivery/共享）+ 资源/网络下发（§6.2）+ **hard delete 路径**（物理删目录，危险、需确认机制）+ snapshot 粒度（§9 Q4）+ edge case | ⏳ 进行中 |
 
 **Future**（§5.3，不在当前范围）：第二后端、服务式后端、协议后端(E2B)、内存快照。
 
@@ -357,7 +303,7 @@ MCP server 作为子进程的额外监控指标（启动耗时、崩溃/重启�
 - **这是 boxlite 0.9.7 的上游缺陷**（绑目录后又绑其内的悬垂 symlink），**不在我们的 Rust 代码里**：`system_ca_paths` 硬编码于 boxlite，`SecurityOptions` 无 cert 字段可覆盖，我们无法在集成层修掉它而不整体关 jailer。真根因（真机 bwrap 复现）：NixOS 上 `/etc/ssl/certs/ca-certificates.crt` 是 symlink→`/etc/static`→`/nix/store`，boxlite 先把父目录 `/etc/ssl/certs` 只读绑入，该 symlink 便以悬垂态露出（目标未绑入沙箱），bwrap 为它建挂载点时 `open()` 跟随悬垂链到不存在目标 → `Can't create file`。标准 FHS 那里是真实文件、不悬垂，故不炸。
 - **决策（2+3）——因为 NixOS 就是我们的部署目标，必须开箱即用**：
   1. **代码侧自动降级**：`advanced_options()` 检测到 `/etc/NIXOS`（或 `OMINI_BOXLITE_INSECURE=1`）即自动关**宿主** jailer，并在**首次**大声 WARN（`OnceLock` 去重）：宿主侧加固（seccomp/chroot/降权）关闭，但 **microVM/KVM 主隔离仍在**——跑不可信 guest 代码的边界不受影响，丢的只是 libkrun 万一被攻破时的第二道防线。这样 NixOS 上不设任何 env 就能起 box（真机验证：不带 INSECURE，`choice_boxlite_builds_working_manager` 绿 + WARN 打出）。env override 保留给其他受影响宿主。
-  2. **上游修复**：issue 草稿在 `doc/boxlite-nixos-jailer-issue.md`（建议 `system_ca_paths` 消费者去掉「已被父目录覆盖」的路径）。合并升级后即可去掉本地自动降级、恢复完整 jailer。
+  2. **上游修复**：向 boxlite 提 issue（建议 `system_ca_paths` 消费者去掉「已被父目录覆盖」的路径）。合并升级后即可去掉本地自动降级、恢复完整 jailer。
 - **非 NixOS 标准 FHS 部署不受影响**，jailer 默认完整开启。
 - **修了一个 Step 2 遗留的测试 bug**：旧 `#[ignore]` 测试写 `/tmp/marker` 验证快照——但 `/tmp` 是 tmpfs（RAM），**文件系统快照不捕获**，restore 后子环境看不到。改写持久 rootfs 路径 `/marker` 后三测全绿。这正是「运行期必须真机验证」的价值：纯映射单测发现不了。
 
@@ -376,7 +322,7 @@ MCP server 作为子进程的额外监控指标（启动耗时、崩溃/重启�
 4. **Snapshot 粒度**：每次 tool 调用都 snapshot？只对写操作？手动 checkpoint？
    **待定**：先做手动 `sandbox.snapshot()`（CLI 命令或 session compaction 时），自动 snapshot 逻辑等 Step 5 实测开销后定。
 
-5. **release 触发时机**：`release` 何时被调用？前提是先有「退役 session」路径。**已定（已实现）**：session 的 **archive**（`POST /sessions/{id}/archive`，`doc/session-storage.md` §9）就是 release 触发点——归档时依次「拒绝运行中(409) → 停 actor → `SandboxManager::release(id)` → 写 `.archived` 标记」。archive 是**单向终态**（无 unarchive）：沙箱一旦 release 便无法重建（workspace 文件在用户外部目录本就完好，但 CoW 盘里的沙箱内部状态没了），archived session 的运行入口一律 410 Gone、只读入口照常。boxlite 的 `try_gc_base` 在 release 时自查：若父快照仍被 fork 子依赖则不真删，**退役 session 天然安全，我们无需自己算**。抽象层只管「用完就 release」，判定与回收归后端。hard delete（物理删目录）走同样的 release 前序，留作独立切。
+5. **release 触发时机**：`release` 何时被调用？前提是先有「退役 session」路径。**已定（已实现）**：session 的 **archive**（`POST /sessions/{id}/archive`，`doc/architecture.md` §9）就是 release 触发点——归档时依次「拒绝运行中(409) → 停 actor → `SandboxManager::release(id)` → 写 `.archived` 标记」。archive 是**单向终态**（无 unarchive）：沙箱一旦 release 便无法重建（workspace 文件在用户外部目录本就完好，但 CoW 盘里的沙箱内部状态没了），archived session 的运行入口一律 410 Gone、只读入口照常。boxlite 的 `try_gc_base` 在 release 时自查：若父快照仍被 fork 子依赖则不真删，**退役 session 天然安全，我们无需自己算**。抽象层只管「用完就 release」，判定与回收归后端。hard delete（物理删目录）走同样的 release 前序，留作独立切。
 
 6. **boxlite workspace 挂载模式**：~~启动快照 vs virtiofs 实时直通~~。**已定（真机实测）**：workspace 走 **FUSE bind 实时直通**（RW），外部编辑对 guest 立即可见、guest 写立即回宿主。理由：workspace = 用户外部路径，app 不 CoW 它（§3.3）；fork 隔离只覆盖 box 的 CoW 盘（沙箱自有非版本化产物），代码合并走 git。子沙箱经 `clone_box` 复用父 `BoxOptions` 自然继承该挂载，fork 侧零改动。
 

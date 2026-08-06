@@ -15,19 +15,18 @@
 
 ```text
 Tool
-├── Built-in（Rust 代码，编译进 ominiforge binary）
-│   ├── read        # 读取文件（输出 [path] + 行号，行号仅供定位）
-│   ├── write       # 整文件写入
-│   ├── edit        # 内容锚定替换（old→new，按文本定位，无行号无 tag）
-│   ├── shell       # 执行 shell 命令
-│   ├── search      # 代码搜索
-│   ├── lsp         # Language Server Protocol 交互
-│   └── ...         # 按需增加
+├── Built-in（Rust 代码，编译进 ominiforge binary，随版本发布）
 └── MCP（外部 MCP server，stdio/SSE 通信）
     ├── 用户自建 MCP server
     ├── 社区 MCP server
     └── 第三方 SaaS MCP server
 ```
+
+内置工具的权威清单以代码为准（`register_builtin`，见
+[`src/tool/mod.rs`](../src/tool/mod.rs)），不在此手列——避免清单与实现漂移。
+各工具的行为契约在各自源文件头部注释里定义（如 `edit` 见 §11）。
+LSP 诊断不是独立工具，而是 `edit`/`write` 结果的附加块，见
+[`lsp.md`](./lsp.md)。
 
 ## 3. 统一 Tool Interface
 
@@ -339,7 +338,7 @@ edited src/lib.rs (1 replacement)
 
 UI 需要的 diff **不再由前端构建**，而是后端在执行时（握着真实 pre-edit 内容）产出，
 作为 `ToolEvent::Completed` 的 `view` 字段随事件下发——见
-[`tool-view.md`](./tool-view.md)。旧方案（前端复刻匹配算法 + 文件缓存自建 diff）
+[`tool-streaming.md`](./tool-streaming.md)。旧方案（前端复刻匹配算法 + 文件缓存自建 diff）
 已废弃，废弃理由与该契约的完整定义见该文档。
 
 ### 11.5 尚未实现

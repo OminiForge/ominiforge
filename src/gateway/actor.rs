@@ -153,7 +153,7 @@ pub enum Command {
     /// stands; the runtime is rebuilt from the log.
     Cancel,
     /// Summarize and switch to a compaction session. `keep_last` keeps the last
-    /// N user turns verbatim (`doc/context-management.md` §4).
+    /// N user turns verbatim (`doc/architecture.md` §4).
     Compact { keep_last: Option<usize> },
     /// Deliver a human decision for a tool call the permission policy suspended
     /// (`doc/permission.md` §5). Routed to the parked waiter by `call_id`; an

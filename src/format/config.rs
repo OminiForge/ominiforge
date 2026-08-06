@@ -1,6 +1,6 @@
 //! `format.toml` configuration: which formatter to run for which file
 //! extensions, and whether formatting runs against the whole file or just the
-//! edited line range (`doc/format.md` §5).
+//! edited line range (`doc/lsp.md` §5).
 //!
 //! Mirrors [`crate::lsp::config`]: the same layered scheme (built-in registry
 //! → global → workspace), the same `enabled` tombstone semantics, and the same
@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-/// The parsed contents of `config/format.toml` (`doc/format.md` §5).
+/// The parsed contents of `config/format.toml` (`doc/lsp.md` §5).
 ///
 /// `Serialize` exists for the settings UI's write path (`gateway::langconfig`),
 /// which rewrites the layer file the user edited; the runtime only ever
@@ -24,7 +24,7 @@ pub struct FormatConfig {
     /// Whether `edit`/`write` auto-format the touched file. `file` (default)
     /// formats the whole file; `edit` formats only the edited line range when
     /// the formatter supports it (and skips otherwise — never silently falls
-    /// back to `file`, `doc/format.md` §5); `off` disables formatting.
+    /// back to `file`, `doc/lsp.md` §5); `off` disables formatting.
     ///
     /// `Option` at the parse layer so a higher-priority layer that sets it
     /// shadows a lower one; [`FormatConfig::load`] resolves it to a concrete
@@ -33,7 +33,7 @@ pub struct FormatConfig {
     pub mode: Option<FormatMode>,
 }
 
-/// The format mode (`doc/format.md` §5). `file` is the default: most stable,
+/// The format mode (`doc/lsp.md` §5). `file` is the default: most stable,
 /// most "project-uniform" — at the cost of touching lines the model didn't.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -50,7 +50,7 @@ pub enum FormatMode {
 }
 
 /// One configured formatter: a stateless stdin→stdout process call
-/// (`doc/format.md` §3).
+/// (`doc/lsp.md` §3).
 ///
 /// `Serialize` exists for the settings UI's write path (`gateway::langconfig`);
 /// every field is written explicitly (the file the user reads back is the
@@ -89,12 +89,12 @@ pub struct FormatterConfig {
     /// Whether this formatter can format a line range rather than the whole
     /// file (`mode = "edit"`). When `false` and `mode = "edit"`, the
     /// formatter is skipped with a log — never silently run whole-file
-    /// (`doc/format.md` §5).
+    /// (`doc/lsp.md` §5).
     #[serde(default)]
     pub supports_line_range: bool,
 
     /// Milliseconds an `edit`/`write` waits for the formatter before giving
-    /// up and writing the unformatted text (fail-closed, `doc/format.md`
+    /// up and writing the unformatted text (fail-closed, `doc/lsp.md`
     /// §4.3). Bounds the formatting overhead on every file op.
     #[serde(default = "default_format_timeout_ms")]
     pub format_timeout_ms: u64,
@@ -106,7 +106,7 @@ pub const fn default_format_timeout_ms() -> u64 {
 
 /// `enabled` defaults to `true` (a layer tombstones a built-in with `false`).
 /// Local, not borrowed from `lsp::config`: the two systems share a config
-/// *shape*, never code (`doc/format.md` §1).
+/// *shape*, never code (`doc/lsp.md` §1).
 const fn default_enabled() -> bool {
     true
 }

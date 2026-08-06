@@ -54,32 +54,10 @@ Hook
 
 ## 5. Built-in Hook
 
-```rust
-#[async_trait]
-pub trait BeforeHook: Send + Sync {
-    fn name(&self) -> &str;
-    fn hook_point(&self) -> HookPoint;
-    fn priority(&self) -> u32 { 100 }
-    fn failure_mode(&self) -> FailureMode { FailureMode::Open }
-
-    async fn intercept(&self, req: &HookRequest) -> HookAction;
-}
-
-#[async_trait]
-pub trait AfterHook: Send + Sync {
-    fn name(&self) -> &str;
-    fn hook_point(&self) -> HookPoint;
-    fn priority(&self) -> u32 { 100 }
-
-    async fn notify(&self, req: &HookRequest);
-}
-
-pub enum HookAction {
-    Pass,
-    Modify(serde_json::Value),
-    Block { reason: String },
-}
-```
+Built-in hook 分两个 trait：`BeforeHook` 在 pipeline 内同步拦截、返回
+`HookAction`（`Pass` / `Modify(payload)` / `Block{reason}`）；`AfterHook` 在 pipeline
+外异步观察、无返回。两者均带 `name` / `hook_point` / `priority`（默认 100），
+`BeforeHook` 另有 `failure_mode`（默认 `Open`）。精确签名以代码为准（`src/hook/`）。
 
 Built-in hook 直接注册到 HookRegistry，零 IPC 开销。
 

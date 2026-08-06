@@ -32,7 +32,7 @@ pub struct EditTool {
     /// file's diagnostics to the result (`doc/lsp.md`).
     lsp: Option<Arc<LspManager>>,
     /// Optional auto-format: when set, the written file is formatted before
-    /// the diff/diagnostics are produced (`doc/format.md`).
+    /// the diff/diagnostics are produced (`doc/lsp.md`).
     format: Option<Arc<FormatManager>>,
 }
 
@@ -115,7 +115,7 @@ impl EditTool {
     }
 
     /// Attach a [`FormatManager`] so successful edits are formatted before
-    /// their diff/diagnostics are produced (`doc/format.md`).
+    /// their diff/diagnostics are produced (`doc/lsp.md`).
     #[must_use]
     pub fn with_format(mut self, format: Option<Arc<FormatManager>>) -> Self {
         self.format = format;
@@ -220,7 +220,7 @@ path
             Err(PlanErr::Business(out)) => return Ok(out),
         };
 
-        // Auto-format each planned file BEFORE it lands (`doc/format.md` §6):
+        // Auto-format each planned file BEFORE it lands (`doc/lsp.md` §6):
         // the formatter consumes the model's target text in memory, the FINAL
         // text is written once, and the diff/diagnostics below are anchored to
         // it — so the model's next edit anchors to the real, formatted state
@@ -299,10 +299,10 @@ path
         // The UI diff view rides as a `TextView` block after the model-facing
         // summary: rendered by the front-end, skipped by `render_output`, so
         // the model never pays tokens for a diff of its own arguments
-        // (`doc/tool-view.md`). The diff is `old_content → final_text` — when
+        // (`doc/tool-streaming.md`). The diff is `old_content → final_text` — when
         // a formatter ran it includes the formatter's reflow, annotated with
         // `formatted_by` so the reader knows part of the change is not the
-        // model's (`doc/format.md` §6).
+        // model's (`doc/lsp.md` §6).
         let view_text = written_view(&written);
         if !view_text.is_empty() {
             output.content.push(Content::TextView {
@@ -341,7 +341,7 @@ struct WrittenFile {
 
 /// Render the written files' diff views into a JSON envelope
 /// `{ kind: "diff", files: [{ path, patch, formatted_by? }] }`. The diff is
-/// `old_content → final_text` (`doc/format.md` §6): when a formatter changed
+/// `old_content → final_text` (`doc/lsp.md` §6): when a formatter changed
 /// the text, the diff includes its reflow and the file entry carries a
 /// `formatted_by` annotation so the reader knows part of the change is not
 /// the model's. `render_hunks`'s splice-anchored render can't be used here
@@ -469,7 +469,7 @@ struct PlannedWrite {
     abs_path: PathBuf,
     rel_path: String,
     /// The file's content before the edit — the diff's "before" side and the
-    /// base for re-rendering after auto-format (`doc/format.md` §6).
+    /// base for re-rendering after auto-format (`doc/lsp.md` §6).
     old_content: String,
     new_content: String,
     replacement_count: usize,
@@ -592,7 +592,7 @@ impl EditTool {
 }
 
 /// The 1-based inclusive line range a set of byte splices touches, in the
-/// NEW content's coordinates (for `mode = "edit"` formatting, `doc/format.md`
+/// NEW content's coordinates (for `mode = "edit"` formatting, `doc/lsp.md`
 /// §5). Byte offsets are converted to line numbers by counting `\n`; the
 /// cumulative line shift from old to new coordinates is tracked across the
 /// sorted splices. Coordinates stay in `isize` (a pure deletion can pull a
@@ -1009,7 +1009,7 @@ mod tests {
 
     /// A single-line replacement yields the model-facing summary PLUS a
     /// `TextView` with the exact unified diff (headers + hunk), and the view
-    /// never leaks into the model-facing `Text` (`doc/tool-view.md` §2–§3).
+    /// never leaks into the model-facing `Text` (`doc/tool-streaming.md` §2–§3).
     #[tokio::test]
     async fn successful_edit_carries_a_ui_diff_view() {
         let dir = tempfile::tempdir().unwrap();
@@ -1085,7 +1085,7 @@ b
         assert!(view(&out).is_none());
     }
 
-    // --- auto-format integration (`doc/format.md`) --------------------------
+    // --- auto-format integration (`doc/lsp.md`) --------------------------
 
     /// A `FormatManager` whose only formatter strips trailing whitespace via
     /// `sed` — a deterministic *whitespace-only* change, so it passes the
@@ -1109,7 +1109,7 @@ b
 
     /// When the formatter changes the text, the edit writes the FORMATTED
     /// text and the diff view reflects it (annotated `formatted_by`), so the
-    /// model's next edit anchors to the real on-disk state (`doc/format.md`
+    /// model's next edit anchors to the real on-disk state (`doc/lsp.md`
     /// §2/§6). The model's `new` here carries trailing whitespace; the
     /// formatter strips it, and the diff shows the stripped line.
     #[tokio::test]

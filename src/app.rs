@@ -10,7 +10,7 @@
 //! The only thing kept out is *what to do with the result*: one turn, an
 //! interactive loop, or a network session. Operator diagnostics (a skipped MCP
 //! server, a loaded `.env`) go through `tracing`; business/agent events stay in
-//! the session's `events.jsonl` (doc/session-storage.md).
+//! the session's `events.jsonl` (doc/architecture.md).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -112,7 +112,7 @@ fn resolve_network(
 ///
 /// All three tiers are gateway-trusted or deployer-owned config — none is read
 /// from the agent-writable project dir — so the workspace tier widening `deny`
-/// is safe (`doc/workspace-config.md`, "Why gateway-side").
+/// is safe (`doc/gateway.md`, "Why gateway-side").
 fn resolve_permission(
     workspace: crate::permission::PermissionPolicy,
     profile: crate::permission::PermissionPolicy,
@@ -167,7 +167,7 @@ pub async fn assemble(
     // overlay is passed to subprocesses (shell/MCP/LSP) so commands run inside
     // the workspace's development environment without requiring `direnv exec`.
     // Assembly never blocks on a slow direnv evaluation: a fast export, else
-    // the last snapshot while a background refresh re-warms (`doc/env.md`).
+    // the last snapshot while a background refresh re-warms (`doc/architecture.md`).
     let env_overlay = if no_dotenv {
         BTreeMap::new()
     } else {
@@ -251,7 +251,7 @@ pub async fn assemble(
             crate::lsp::LspManager::new(lsp_service, &cfg, workspace.clone(), env_overlay.clone())
         })?;
 
-    // Auto-format after edit/write (doc/format.md): load `format.toml`, build
+    // Auto-format after edit/write (doc/lsp.md): load `format.toml`, build
     // a stateless manager. `None` when `mode = "off"` or no formatter is
     // configured, so edit/write pay nothing. Unlike the LSP manager this owns
     // no subprocess — each format is a fresh stdin→stdout call.
@@ -278,7 +278,7 @@ pub async fn assemble(
 
     // Skills: list those enabled by the profile (empty = all) and inject their
     // index into the system prompt. The `load_skill` tool is registered only
-    // when at least one skill is available (`doc/skill.md` §2).
+    // when at least one skill is available (`doc/profile.md` §2).
     let skills_dir = workspace.join(SKILLS_SUBDIR);
     let skills = crate::skill::SkillStore::new(skills_dir.clone()).list(&profile.skills.enabled);
     let skill_index = crate::skill::skill_index_block(&skills);
@@ -294,7 +294,7 @@ pub async fn assemble(
 
     // Project guidance: the workspace-root `AGENTS.md` (or `CLAUDE.md` fallback)
     // is always-on context, appended to the system prompt where it stays in the
-    // prefix cache (`doc/agents-md.md`). Nested sub-directory files are loaded
+    // prefix cache (`doc/architecture.md`). Nested sub-directory files are loaded
     // lazily by the agent loop as their subtrees are touched.
     let root_guidance = crate::agents_md::read_root(&workspace)
         .map(|g| format!("\n\n{}", crate::agents_md::wrap(&g.label, &g.body)))
@@ -322,7 +322,7 @@ pub async fn assemble(
         },
     );
 
-    // Optional dedicated compaction model (`doc/context-management.md`). It
+    // Optional dedicated compaction model (`doc/architecture.md`). It
     // may name a different provider, so resolve and build it independently; a bad
     // reference is fatal (the user asked for it explicitly).
     if let Some(model_ref) = profile.context.compaction_model.as_deref() {
@@ -441,7 +441,7 @@ pub fn resolve_workspace(requested: &Path) -> Result<PathBuf> {
 }
 
 /// The session's LSP/format config roots: the workspace's own `.omini` sits on
-/// TOP of the gateway's config root chain (`doc/lsp.md` §3, `doc/format.md`
+/// TOP of the gateway's config root chain (`doc/lsp.md` §3, `doc/lsp.md`
 /// §5) so a project can override/disable the machine-wide defaults.
 /// lsp.toml/format.toml are spawn configuration, not a security policy, so
 /// reading them from the (agent-writable) workspace is safe — the same trust

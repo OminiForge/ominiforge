@@ -1,10 +1,10 @@
 //! Auto-format after `edit`/`write`: a stateless stdin→stdout formatter call
 //! sandwiched between the model's target text and the diff/diagnostics
-//! (`doc/format.md`).
+//! (`doc/lsp.md`).
 //!
 //! **This system is deliberately separate from [`crate::lsp`]** — the two
 //! share only a config *shape*. Their failure semantics are opposite
-//! (`doc/format.md` §1): LSP diagnostics are fail-open (a server that can't
+//! (`doc/lsp.md` §1): LSP diagnostics are fail-open (a server that can't
 //! answer just yields no diagnostics), formatting is **fail-closed** — any
 //! suspicious condition means *skip the format and use the original text*,
 //! never write a suspicious result to disk.
@@ -12,7 +12,7 @@
 //! ## The fail-closed invariant
 //!
 //! A formatter with a broken config can silently fall back to defaults and
-//! reformat the file into something the model never wrote (`doc/format.md` §4
+//! reformat the file into something the model never wrote (`doc/lsp.md` §4
 //! clang-format case). Writing that, and feeding the resulting diff back to
 //! the model, is worse than not formatting. So three defences, any of which
 //! skips the format (keeps the original text, logs once):
@@ -105,7 +105,7 @@ impl FormatManager {
     /// The enabled formatter handling `path`'s extension, if any. Routing is
     /// **first match wins** (config order): formatting *rewrites* the file, so
     /// running two formatters would have them fight — unlike LSP diagnostics,
-    /// which aggregate (`doc/format.md` vs `doc/lsp.md` §5). A project that
+    /// which aggregate (`doc/lsp.md` vs `doc/lsp.md` §5). A project that
     /// wants `ruff-format` over `black` tombstones `black`.
     fn formatter_for(&self, path: &Path) -> Option<&FormatterConfig> {
         let ext = path.extension().and_then(|e| e.to_str())?;
@@ -139,7 +139,7 @@ impl FormatManager {
             FormatMode::File => None,
             FormatMode::Edit => {
                 if !formatter.supports_line_range {
-                    // Never silently fall back to whole-file (`doc/format.md`
+                    // Never silently fall back to whole-file (`doc/lsp.md`
                     // §5): the user asked for minimal edits, so skip loudly.
                     tracing::debug!(
                         formatter = %formatter.name,

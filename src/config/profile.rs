@@ -169,7 +169,7 @@ pub struct ContextSection {
     pub compaction_threshold: Option<f32>,
     /// Model reference (`provider/model` or short `model`) used to generate
     /// compaction summaries. `None` reuses the session's current model
-    /// (`doc/context-management.md`).
+    /// (`doc/architecture.md`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -197,7 +197,7 @@ pub struct MemorySection {
 /// `[budget]`: per-turn round budget and the absolute hard cap.
 ///
 /// `max_rounds` is the absolute safety net on model rounds in one turn
-/// (`doc/todo.md` §7). `round_budget_threshold` + `round_budget_warn_pct`
+/// (`doc/architecture.md` §8.5). `round_budget_threshold` + `round_budget_warn_pct`
 /// drive the soft round-budget reminder: when the model has spent
 /// `warn_pct * threshold` rounds the loop injects a one-shot reminder, and
 /// once it has spent the full threshold it injects a reminder every round

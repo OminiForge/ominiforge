@@ -91,7 +91,7 @@ pub struct SessionDefaults {
 
 /// The config-layer model identity for a session: the provider and model.
 ///
-/// This is what the gateway resolves for the session (`doc/frontend.md`,
+/// This is what the gateway resolves for the session (`doc/gpui-app.md`,
 /// RUNTIME panel) — the *configured* selection, stable for the session's
 /// lifetime — not whatever a given model request happened to use
 /// (subagents/forks may differ; that divergence is a runtime-validation
@@ -113,7 +113,7 @@ pub struct RuntimeInfo {
     /// Environment labels detected from the activated session environment (e.g.
     /// `["dev shell: impure (nix-shell-env)"]` or `["venv: .venv"]`). Empty
     /// when no activation signal is present — the RUNTIME panel only shows the
-    /// row when non-empty ("detected, therefore shown"; `doc/frontend.md`, B2).
+    /// row when non-empty ("detected, therefore shown"; `doc/gpui-app.md`, B2).
     pub env: Vec<String>,
     /// Reasoning-effort tiers the session's model declares (raw provider
     /// strings). Drives the per-turn effort picker; empty = the model offers
@@ -284,7 +284,7 @@ struct RegistryInner {
     /// rather than captured once. A security control that silently required a
     /// restart to take effect would be a fail-silent trap (Karpathy §12).
     default_permission: RwLock<crate::permission::PermissionPolicy>,
-    /// Per-workspace sandbox config overrides (`doc/workspace-config.md`), keyed
+    /// Per-workspace sandbox config overrides (`doc/gateway.md`), keyed
     /// by workspace path hash, read from the gateway's trusted `.omini/workspaces/`
     /// — the top tier of the network resolution chain.
     workspace_config: super::workspace_config::WorkspaceConfigStore,
@@ -402,7 +402,7 @@ impl SessionRegistry {
     pub fn new(defaults: SessionDefaults, config: &GatewayConfig) -> Result<Self> {
         // The workspace map + per-workspace config dir live beside the session
         // store, under `.omini` (the gateway's trusted config root, not the
-        // agent-writable project dir — `doc/workspace-config.md`).
+        // agent-writable project dir — `doc/gateway.md`).
         let omini_dir = defaults
             .workspace
             .join(app::SESSIONS_SUBDIR)
@@ -564,7 +564,7 @@ impl SessionRegistry {
         let canonical = ws.path_for(&id);
         drop(ws);
         // Prepare the workspace's direnv environment in the background
-        // (`doc/env.md`): the first session here then finds a warm snapshot
+        // (`doc/architecture.md`): the first session here then finds a warm snapshot
         // and never pays the (possibly minutes-long) evaluation cost.
         if !self.inner.defaults.no_dotenv
             && let Some(canonical) = canonical
@@ -601,7 +601,7 @@ impl SessionRegistry {
     }
 
     /// List per-workspace configs whose workspace path no longer resolves
-    /// (`doc/workspace-config.md` GC). Read-only — surfaces orphans for an
+    /// (`doc/gateway.md` GC). Read-only — surfaces orphans for an
     /// explicit [`delete_workspace_config`](Self::delete_workspace_config); never
     /// deletes on its own. Each orphan carries the path it *was* for, when known.
     #[must_use]
@@ -615,7 +615,7 @@ impl SessionRegistry {
         )
     }
 
-    /// Delete one per-workspace config by id (`doc/workspace-config.md` GC).
+    /// Delete one per-workspace config by id (`doc/gateway.md` GC).
     /// Idempotent: a missing config is `Ok`. This is the only path that removes a
     /// config file — GC is always explicit.
     ///
@@ -627,7 +627,7 @@ impl SessionRegistry {
             .delete(id)
             .with_context(|| format!("failed to delete workspace config `{}`", id.0))?;
         // The workspace's env snapshot shares the config's lifecycle
-        // (`doc/env.md` §4). Best-effort: an unresolvable path or a missing
+        // (`doc/architecture.md` §4). Best-effort: an unresolvable path or a missing
         // file is not a deletion failure.
         if let Some(path) = self.resolve_or_seed_workspace_id(id)
             && let Some(root) = self.inner.defaults.config.roots().first()
@@ -1085,7 +1085,7 @@ impl SessionRegistry {
     }
 
     /// Archive `id`: retire it from the active session list while keeping its
-    /// files for later inspection (`doc/session-storage.md` §9). This is the
+    /// files for later inspection (`doc/architecture.md` §9). This is the
     /// **release trigger** for the sandbox lifecycle (`doc/sandbox.md` §9 Q5) —
     /// the first path that actually ends a session:
     ///
@@ -1125,7 +1125,7 @@ impl SessionRegistry {
             .with_context(|| format!("failed to archive session `{}`", id.0))
     }
 
-    /// Permanently delete `id`'s files (`doc/session-storage.md` §9).
+    /// Permanently delete `id`'s files (`doc/architecture.md` §9).
     /// **Irreversible.** Requires the session to be **archived first** — that
     /// two-step is the confirmation gate; a non-archived session is refused
     /// (surfaced as a 409). Since archiving already stopped the actor and released
@@ -1249,7 +1249,7 @@ impl SessionRegistry {
     // exactly that race.
     #[allow(clippy::significant_drop_tightening)]
     pub async fn get_or_spawn(&self, id: &SessionId) -> Result<ActorHandle> {
-        // Archived sessions are retired for good (`doc/session-storage.md` §9):
+        // Archived sessions are retired for good (`doc/architecture.md` §9):
         // refuse to bring one back to run. Every run/stream path routes through
         // here, so this single gate covers them all; read-only paths (`meta`,
         // `read_events`) bypass it, keeping the session inspectable. Checked

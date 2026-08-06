@@ -15,7 +15,7 @@ use crate::config::ConfigError;
 /// Default bind address: loopback only. Public exposure is the reverse proxy's
 /// job (`doc/architecture.md` §18.1, TLS terminated upstream), so the gateway
 /// itself never listens on a public interface by default.
-const DEFAULT_BIND: &str = "127.0.0.1:7878";
+const DEFAULT_BIND: &str = "127.0.0.1:5173";
 
 /// Default idle timeout before a live session actor is evicted (releasing its
 /// event-log lock so the session can be reopened on demand). 30 minutes.

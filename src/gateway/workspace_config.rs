@@ -1,4 +1,4 @@
-//! Per-workspace sandbox configuration (`doc/workspace-config.md`).
+//! Per-workspace sandbox configuration (`doc/gateway.md`).
 //!
 //! A workspace-level override layer for sandbox policy, sitting between the
 //! profile and the gateway default in the resolution chain
@@ -43,7 +43,7 @@ use super::workspace::{WorkspaceId, WorkspaceRegistry};
 ///
 /// `[network]`, `[[mounts]]`, and `[permission]` are defined today; the record
 /// stays open for further sections (e.g. workspace memory,
-/// `doc/workspace-config.md`) without a schema change forcing every file to be
+/// `doc/gateway.md`) without a schema change forcing every file to be
 /// rewritten. Unknown keys are ignored for forward compatibility.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]

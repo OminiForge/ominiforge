@@ -1,4 +1,4 @@
-//! The LSP / format Web configuration views (`doc/lsp.md` §7, `doc/format.md`
+//! The LSP / format Web configuration views (`doc/lsp.md` §7, `doc/lsp.md`
 //! §7): read the layered `lsp.toml` / `format.toml` chain into a
 //! source-annotated list for the settings UI, and write an edited list back
 //! to the primary config root.
@@ -170,7 +170,7 @@ pub struct FormatterEdit {
     /// The executable. Editable only for installed rows (enforced in
     /// [`save_format_config`]).
     pub command: String,
-    /// Whole-call timeout (fail-closed, `doc/format.md` §4.3).
+    /// Whole-call timeout (fail-closed, `doc/lsp.md` §4.3).
     pub format_timeout_ms: u64,
 }
 

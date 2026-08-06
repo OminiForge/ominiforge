@@ -1,6 +1,6 @@
 //! The `session.toml` data model: pure metadata, no runtime state.
 //!
-//! Mirrors `doc/session-storage.md` §2. There is deliberately no `status`
+//! Mirrors `doc/architecture.md` §2. There is deliberately no `status`
 //! field (a session exists, therefore it is usable) and no `system_prompt`
 //! (that lives in the context snapshot / messages, not here).
 
@@ -50,7 +50,7 @@ pub struct SessionMeta {
     /// How this session came to exist.
     pub origin: Origin,
 
-    /// Whether this session is archived (`doc/session-storage.md` §9): retired
+    /// Whether this session is archived (`doc/architecture.md` §9): retired
     /// from every active listing, files kept readable. The `.archived` sidecar
     /// marker — not this field — is the source of truth; `read_meta` stamps it
     /// from the marker on every read so API consumers see the real state.
@@ -93,7 +93,7 @@ pub struct Origin {
     pub fork_at_seq: Option<u64>,
 }
 
-/// The four ways a session can come into being. See `doc/session-storage.md` §5.
+/// The four ways a session can come into being. See `doc/architecture.md` §5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 #[serde(rename_all = "snake_case")]
@@ -130,7 +130,7 @@ impl Origin {
     }
 
     /// Origin for a fork: branched from `parent_id` at `fork_at_seq`
-    /// (`doc/session-storage.md` §5, `doc/architecture.md` §6.1).
+    /// (`doc/architecture.md` §5, `doc/architecture.md` §6.1).
     #[must_use]
     pub const fn fork(parent_id: SessionId, fork_at_seq: u64) -> Self {
         Self {

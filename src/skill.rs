@@ -1,5 +1,5 @@
 //! Skill lifecycle: Markdown + frontmatter templates, progressive disclosure,
-//! and the `load_skill` built-in tool. See `doc/skill.md`.
+//! and the `load_skill` built-in tool. See `doc/profile.md`.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -100,7 +100,7 @@ struct TemplateCtx {
 }
 
 /// Expand `{{...}}` template variables. Runs every template, collecting errors
-/// instead of failing fast (`doc/skill.md` §4.1). Returns (rendered, errors).
+/// instead of failing fast (`doc/profile.md` §4.1). Returns (rendered, errors).
 async fn render(content: &str, ctx: &TemplateCtx) -> (String, Vec<String>) {
     let mut result = String::with_capacity(content.len());
     let mut errors = Vec::new();

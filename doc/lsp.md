@@ -10,7 +10,7 @@
 
 **本阶段不做**：独立的 `lsp` 工具、rename/format/code-actions、补全、SSE/远程服务器、在 sandbox 内运行服务器。
 
-> 自动格式化（format）**不属于** LSP——它是无状态一次性进程调用，失败语义与本系统相反，见 `doc/format.md`。
+> 自动格式化（format）**不属于** LSP——它是无状态一次性进程调用，失败语义与本系统相反，见 `doc/lsp.md`。
 
 ## 2. 与 MCP 的异同
 
@@ -37,7 +37,7 @@
 workspace 配置  .omini/config/lsp.toml      项目级覆盖 / 新增自定义服务器（最高层）
 ```
 
-- **内置注册表**为常见语言提供 `command` + `args` + `extensions`。用户什么都不写，碰到对应扩展名即用（二进制经 PATH / direnv env-overlay 解析，见 `doc/env.md`）。
+- **内置注册表**为常见语言提供 `command` + `args` + `extensions`。用户什么都不写，碰到对应扩展名即用（二进制经 PATH / direnv env-overlay 解析，见 `doc/architecture.md`）。
 - **`enabled`（墓碑语义）**：高优先级层写一条同名 `enabled = false`，使该服务器在合并结果中**整条消失**——这是"关闭某个内置默认"的方式，不是新增一个缺 `command` 的畸形条目。
 - 内置条目里的 `command`/`extensions`/`args` 可被更高层同名字段覆盖。
 
@@ -102,7 +102,7 @@ state = "starting" | "running" | "failed"
 
 - `starting`：已 spawn、`initialize` 握手完成但尚未就绪（启发式 (a1)：未首次成功返回诊断）。琥珀色，是「索引中」的瞬态指示——输入区上方的「`<name>` 索引中…」读的就是它。
 - `running`：client 存活，正在应答诊断。
-- `failed`：上次启动/同步失败，处于 30s 重试冷却（`doc/lsp.md` §4.6）。
+- `failed`：上次启动/同步失败，处于 30s 重试冷却（`doc/lsp.md` §4）。
 
 **接线**：`LspService.status(root)` 生成快照（root 级共享服务，见 §5.2）→ `registry.lsp_status(root)` → `session_runtime` handler 按 `meta.workspace` 查出 root 并入 `RuntimeInfo.lsp`。root 无激活服务器时 `lsp` 为空——服务器本就懒启动，无可报。
 
@@ -153,22 +153,102 @@ state = "starting" | "running" | "failed"
 - `languageId` 映射：内置常见扩展名→`languageId` 映射（`src/lsp/mod.rs` 的 `language_id_for`），可按需并入注册表。
 - profile/UI 层暴露 LSP 总开关与超时配置。
 
-## 8. Web 配置编辑器
+## 8. 配置编辑器（GPUI 客户端）
 
-LSP 的图形化配置分两层，替代手写 `lsp.toml`。**注册表驱动的固定清单**（与 permission 编辑器的增量规则列表语义相反，`frontend/DESIGN.md` §4.10）：内置服务器默认全列出——含被墓碑禁用的（标灰、可重新勾选启用）——每条带来源层徽章（内置 / 全局 / 项目）与安装探测徽章；未安装的行弱化显示且 **command 不可改**（服务端同样强制：对未安装条目的 command 写入一律拒绝）。
+LSP 配置的图形化编辑在 GPUI 客户端的设置面板中实现。配置分两层（对应 §3 的分层）：
 
-**两个编辑场所**（对应 §3 的分层）：
+- **全局默认**：Gateway 配置 root 链的 `lsp.toml`
+- **项目覆盖**：`<workspace>/.omini/config/lsp.toml`（最高层）
 
-- **全局默认**：Settings → **全局设置** tab 的「语言服务器」一节。读写 gateway 配置 root 链，写回 primary root 的 `lsp.toml`。**此层不显示安装标注、不按安装门控 command**——「装没装」是 per-project 的（一个 server 可全局没装但每个项目都装），gateway PATH 的探测在此视图不可靠也无意义；command 始终可改（改错只是 spawn 时 fail-open，不阻塞）。
-- **项目覆盖**：工作区侧栏齿轮的 `WorkspaceConfigDialog`（`doc/workspace-config.md`）。读写 `<workspace>/.omini/config/lsp.toml`（最高层），安装探测用**该 workspace 的 env-overlay PATH**——nix flake / direnv 项目里由项目环境提供的 server 在此显示「已安装」，即使它不在全局 PATH 上。**安装标注与 command 门控只在这一层出现**，因为此处的探测才是真实的「装没装」。
+**配置端点**（Gateway API）：
+- 全局：`GET/PUT /api/config/lsp`
+- 项目：`GET/PUT /api/workspaces/{id}/config/lsp`
 
-**运行时**：`app::assemble` 经 `lang_config_roots` 把 session workspace 的 `.omini` 置于 roots 链最高层再 `LspConfig::load`——项目的 lsp.toml 因此生效（此前只读 gateway 链）。lsp.toml 是 spawn 配置而非安全策略，从 agent 可写的项目目录读取是安全的（与 `mcp.toml` 同一信任姿态）。
+**写语义**：`PUT` 携带完整清单，整体重写目标层文件，写后重新 `load` 验证生效。
 
-**端点**（`gateway::langconfig`，读返回 `LspServerView{layer, builtin, installed, …有效配置}`，tombstone 的内置条目保留 `enabled=false` 而非丢弃）：
+GPUI 客户端的配置编辑器实现见代码。
 
-- 全局：`GET/PUT /config/lsp`（写回 primary root）。
-- 项目：`GET/PUT /workspaces/{id}/config/lsp`（写回 `<workspace>/.omini/config/lsp.toml`；未知 id 404）。
+## 9. 自动格式化（format）
 
-**写语义**（两者一致）：`PUT` 携带完整清单（只含用户字段：enabled/command/两个超时；`args`/`env`/`extensions` 由服务端从当前注册表重取，不信客户端），整体重写目标层文件（含墓碑序列化），写后重 `load` 验证生效（不生效即报错，绝不静默）。
+自动格式化与 LSP **完全解耦**——虽然两者都按扩展名路由，但本质是两个系统，失败语义相反，不可混入 LSP。
 
-**前端**：`frontend/src/lib/lang-tools.ts` 纯函数（`lspToRows`/`lspFromRows`，含 vitest round-trip）+ `LspConfigEditor.svelte`（两个场所复用）；全局设置 tab 懒加载 + SaveBar dirty tracking，workspace dialog 随其 config 一并保存。来源层标签由 `layerLabel` 给中文（内置/全局/项目覆盖/项目新增）。
+### 9.1 为什么不属于 LSP
+
+| 维度 | LSP 诊断 | 自动格式化 |
+|---|---|---|
+| 接口 | 有状态长连接 JSON-RPC 协议 | 无状态一次性进程调用 |
+| 失败语义 | **fail-open**：拿不到诊断就不附带，绝不阻塞文件操作 | **fail-closed**：任何可疑状况→跳过格式化、用原始文本，绝不写入可疑结果 |
+| 状态 | 服务器常驻，需 `didOpen`/`didChange` 同步 | 调用即弃，无状态 |
+
+把 fail-closed 的同步改写塞进 fail-open 的异步诊断模块，会让性能模型与失败哲学互相打架。
+
+### 9.2 定位与目标
+
+`edit`/`write` 写盘后、生成 diff 与诊断**之前**，同步地用该文件的格式化器把内容格式化，**返回给模型的 diff 与诊断都基于格式化后的最终文本**。
+
+- 模型的下一次编辑锚定的是真实（已格式化）的文件状态，不会因格式化漂移而 `not_found`。
+- 诊断与 diff 天然一致，消掉「格式化器改文件 vs LSP 读旧文本」的时序竞态。
+
+### 9.3 统一接口：薄调用约定，非协议
+
+格式化器没有 LSP 那样的协议，唯一公约数是 CLI 习惯。统一接口是一个**极薄的按扩展名路由 + 调用约定**，不是客户端层。
+
+**首选 stdin→stdout 模式**：ominiforge 把源码喂给 formatter 的 stdin、读 stdout 的结果、**自己写盘、自己生成 diff**。绝不依赖 formatter 的原地改写（`rustfmt --emit files` / `clang-format -i` / `prettier --write`）——那样 ominiforge 就失去了「最终文本」，无法出 diff 和喂诊断。
+
+**配置文件发现交给 formatter 自己**（`.clang-format` / `rustfmt.toml` 向上查找）。不显式指定配置路径——那绑死用户的既有工作流，丧失灵活性；配置错误的检测靠失败信号，而非显式指定。
+
+**语言级配置零干预。** 我们只设 cwd（文件所在目录），formatter 自己向上找配置——`rustfmt.toml`（含 `edition`）、`.clang-format`、`.prettierrc` 都是 formatter 自己的事。
+
+### 9.4 fail-closed：静默回退的防线
+
+**要防的坑**（clang-format 实例）：配置文件有错误时，clang-format 不显式报错，而是回退到内置默认配置把代码排成另一个格式，exit code 仍是 0。若把这种结果写进文件、把被默认配置重排的 diff 喂给模型，模型会以为那是它自己编辑的合理结果——比不格式化更糟。
+
+防御（三层）：
+
+1. **stderr 非空即失败**：formatter 配置解析错误时通常在 stderr 打一行（即使 exit 0）。判定：`exit != 0` **或** `stderr 非空` ⇒ 失败。丢弃输出、用原始文本、stderr 内容记录日志一次（fail-loud，但不阻塞 edit/write）。这把「静默回退」变成「响亮跳过」。
+2. **一致性校验**：格式化必须幂等且不丢内容。输出为空而输入非空，或行数/非空白 token 数与原文偏差超阈值 ⇒ 判定异常，跳过。挡住「配置错误导致整个文件面目全非」（那种情况 token 结构通常剧烈变化）。
+3. **有界且 best-effort**：formatter 不存在/超时/报错 ⇒ 跳过格式化，直接用原始文本出 diff。绝不能让一次 edit 因为 prettier 没装而失败。
+
+**核心不变量**：宁可返回未格式化但真实的编辑结果，也绝不返回可疑的格式化结果。
+
+### 9.5 配置：与 LSP 同构的分层 + 注册表
+
+复用 LSP 的「内置注册表 + 全局 + workspace 分层 + `enabled` 墓碑」机制（§3），把调用表做成编译进的注册表，用户可覆盖 command、禁用某个内置 formatter、或新增自定义 formatter。
+
+配置文件是各 root 的 `config/format.toml`（与 `lsp.toml` 同层、同合并语义）：顶层 `mode` 键 + `[[formatters]]` 表。
+
+**路由是 first-match**（与 LSP 的多对多不同）：格式化是**改写**，跑两个 formatter 会互相覆盖，所以一个文件只路由到**第一个**声明其扩展名的启用 formatter。
+
+### 9.6 format file vs format edit（用户可选）
+
+`mode = "file" | "edit" | "off"`，**默认 `file`**。两者语义不同，且对某些 formatter **产出结果不同**——clang-format 对「局部片段」（缺外围上下文）和「完整文件」的缩进/折行决策不一样，故这是真实差异，不是偏好：
+
+- `file`：整文件格式化。结果最稳定、最符合「项目统一风格」，但可能顺带改了模型没动的部分。
+- `edit`：只格式化本次 edit 触碰的行段。改动最小、归因最干净，但局部排版可能和整文件排版不一致。
+- `off`：禁用。
+
+**`mode="edit"` 且 formatter 不支持局部 ⇒ 跳过 + 日志，绝不静默回退 `file`**（静默回退正是要避免的「结果与预期不一致」）。
+
+### 9.7 执行顺序
+
+```text
+edit/write 产出模型的目标文本（内存中）
+  → format（stdin→stdout，fail-closed；mode 决定整文件或行段）
+  → 盘上完整文件（fmt 后）
+       ├─ diff：编辑前 → fmt 后【完整文本】，给模型看的「改动呈现」
+       │        （合并 diff，块上方标注 "formatted by <name>"）
+       └─ diagnostic：对 fmt 后【完整文本】做分析（不是消费 diff）
+  → 返回模型：合并 diff（带 fmt 标注）+ 诊断
+```
+
+**diff 与 diagnostic 是同一完整文本的两个独立产物**：diff 是「编辑前 vs 完整文本」的呈现，diagnostic 是对完整文本的语义分析（LSP/tree-sitter 需要全文解析，给它 diff 无意义）。两者输入都是完整文件，互不依赖。
+
+### 9.8 配置编辑器（GPUI 客户端）
+
+Format 配置的图形化编辑与 LSP 同构（§8）：顶部 `mode` 选择（file/edit/off）+ formatter 固定清单（内置全列出、墓碑标灰、来源层 + 安装探测徽章、未安装不可改 command）。
+
+**配置端点**（Gateway API）：
+- 全局：`GET/PUT /api/config/format`
+- 项目：`GET/PUT /api/workspaces/{id}/config/format`
+
+GPUI 客户端的配置编辑器实现见代码。

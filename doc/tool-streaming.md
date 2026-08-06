@@ -1,7 +1,7 @@
 # Tool Streaming：工具调用的流式渲染管线
 
 定义 tool call 从「模型开始吐 args」到「结果定稿」之间，后端如何向前端提供**可渲染的
-中间形态**。核心原则与 `doc/tool-view.md` 一脉相承：**前端只渲染；一切对流式 args 的
+中间形态**。核心原则与 `doc/tool-streaming.md` 一脉相承：**前端只渲染；一切对流式 args 的
 加工（partial-JSON 提取、diff 构建、节流）都在后端。** 前端看到的永远是一个已经处理好、
 可直接渲染的 view，而不是需要自己拼凑的原始 JSON 碎片。
 
@@ -82,17 +82,7 @@ provider ──StreamEvent──▶ collector ──▶ StreamSink ──▶ Gat
 `stream_presenter()`（默认 `None` = 无流式，自动正确），`ToolRegistry::stream_presenter(name)`
 按名查找：
 
-```rust
-// src/tool/mod.rs —— 默认 None，新工具零成本获得正确行为
-fn stream_presenter(&self) -> Option<Box<dyn StreamPresenter>> { None }
-
-// 快照契约：输入是【完整累积 args】（非 delta），输出是与阶段三同构的 TextView 信封。
-// 在节流下被调用，绝不逐 token。返回 None = 此刻还无法渲染，调用方保留上一帧。
-#[async_trait]
-pub trait StreamPresenter: Send {
-    async fn render(&mut self, accumulated_args: &str) -> Option<String>;
-}
-```
+快照契约（精确签名见 [`src/tool/mod.rs`](../src/tool/mod.rs)）：`Tool::stream_presenter()` 默认返回 `None`（新工具零成本获得正确行为）；`StreamPresenter::render(accumulated_args)` 输入是【完整累积 args】（非 delta），输出是与阶段三同构的 TextView 信封，在节流下被调用、绝不逐 token，返回 `None` 表示此刻还无法渲染（调用方保留上一帧）。
 
 **已实现的组件**：
 
@@ -166,7 +156,7 @@ pub trait StreamPresenter: Send {
 
 ## 6. 不变量
 
-- **view 永不进模型上下文**：与 `tool-view.md` §3 同一边界。`ToolProgress` 是 live
+- **view 永不进模型上下文**：与本文档 §2 阶段三同一边界。`ToolProgress` 是 live
   delta（不持久化、不回放、不进 `render_output`），天然满足。
 - **快照自包含**：任何一帧 `ToolProgress` 都可独立渲染，丢弃任意前序帧不影响正确性。
 - **阶段二 ≡ 阶段三同构**：前端用同一个 `view` 字段、同一个渲染组件贯穿流式与定稿。

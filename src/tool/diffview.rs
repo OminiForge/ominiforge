@@ -1,6 +1,6 @@
 //! Backend construction of the UI diff view for `edit`/`write` results.
 //!
-//! This is the `doc/tool-view.md` home for what used to be the front-end's
+//! This is the `doc/tool-streaming.md` home for what used to be the front-end's
 //! `diff-builder.ts` (since deleted): the same unified-diff rendering, now
 //! living next to the matching that produced it, so the diff is exact — built
 //! from the real pre-edit content the tool already read, not a cache the
@@ -146,7 +146,7 @@ struct Flat {
 /// Myers) and windows it into hunks.
 ///
 /// `formatted` annotates the file entry when an auto-formatter changed the
-/// text (`doc/format.md` §6): the formatter's name plus how many change
+/// text (`doc/lsp.md` §6): the formatter's name plus how many change
 /// regions it made, so the front-end can note that part of the diff is the
 /// formatter's reflow, not the model's edit. Returns `""` when the contents
 /// are identical (a no-change write renders no diff block, same as the old

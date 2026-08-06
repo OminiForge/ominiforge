@@ -1,6 +1,6 @@
 //! The append-only `events.jsonl` event log.
 //!
-//! `events.jsonl` is the source of truth (see `doc/session-storage.md` §3).
+//! `events.jsonl` is the source of truth (see `doc/architecture.md` §3).
 //! One event per line. The `session_id` is *omitted* on disk — it is the
 //! session directory name — and restored on read. A single writer holds an
 //! exclusive advisory lock on the file for its lifetime (§8); readers do not

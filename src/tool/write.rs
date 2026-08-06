@@ -22,7 +22,7 @@ pub struct WriteTool {
     /// file's diagnostics to the result (`doc/lsp.md`).
     lsp: Option<Arc<LspManager>>,
     /// Optional auto-format: when set, the written content is formatted before
-    /// the diff/diagnostics are produced (`doc/format.md`).
+    /// the diff/diagnostics are produced (`doc/lsp.md`).
     format: Option<Arc<FormatManager>>,
 }
 
@@ -51,7 +51,7 @@ impl WriteTool {
     }
 
     /// Attach a [`FormatManager`] so successful writes are formatted before
-    /// their diff/diagnostics are produced (`doc/format.md`).
+    /// their diff/diagnostics are produced (`doc/lsp.md`).
     #[must_use]
     pub fn with_format(mut self, format: Option<Arc<FormatManager>>) -> Self {
         self.format = format;
@@ -110,7 +110,7 @@ impl Tool for WriteTool {
             _ => args.content.clone(),
         };
 
-        // Auto-format the content BEFORE it lands (`doc/format.md` §6): a
+        // Auto-format the content BEFORE it lands (`doc/lsp.md` §6): a
         // `write` replaces the whole file, so it always formats whole-file
         // (`edited_lines = None`). The FINAL text is written once, and the
         // diff/diagnostics below are anchored to it. Fail-closed: a skip keeps
@@ -155,7 +155,7 @@ impl Tool for WriteTool {
                 };
                 // UI view: an overwrite diffs old→new (`similar`, same engine
                 // `write_summary` counts with); a new file's view is its full
-                // content. Never model input (`doc/tool-view.md`). When a
+                // content. Never model input (`doc/tool-streaming.md`). When a
                 // formatter changed the text the diff carries `formatted_by`.
                 let view = write_view(
                     &args.path,
@@ -187,7 +187,7 @@ impl Tool for WriteTool {
     }
 }
 
-/// The write UI view as a JSON envelope (`doc/tool-view.md`): an overwrite is a
+/// The write UI view as a JSON envelope (`doc/tool-streaming.md`): an overwrite is a
 /// `diff` of old→new; a new file is its full `code` content. `None` for a
 /// no-change write (empty diff = no block) or an empty new file. Shared by
 /// `invoke` (executed `TextView`) and `preview` (approval gate), so the gate
@@ -385,7 +385,7 @@ mod tests {
 
     /// An overwrite's view is the exact old→new unified diff, built from the
     /// real pre-write content — never a front-end reconstruction
-    /// (`doc/tool-view.md` §4).
+    /// (`doc/tool-streaming.md` §4).
     #[tokio::test]
     async fn overwrite_view_is_the_diff() {
         let dir = tempfile::tempdir().unwrap();
@@ -445,7 +445,7 @@ e
         assert!(view(&out).is_none());
     }
 
-    // --- auto-format integration (`doc/format.md`) --------------------------
+    // --- auto-format integration (`doc/lsp.md`) --------------------------
 
     /// A `FormatManager` whose only formatter strips trailing whitespace via
     /// `sed` (a whitespace-only change that passes the fail-closed check).
@@ -468,7 +468,7 @@ e
 
     /// An overwrite whose content carries trailing whitespace is written
     /// FORMATTED, and the diff view (old → formatted) is annotated
-    /// `formatted_by` (`doc/format.md` §6) — the model sees the real on-disk
+    /// `formatted_by` (`doc/lsp.md` §6) — the model sees the real on-disk
     /// change, part of which is the formatter's.
     #[tokio::test]
     async fn formatted_write_diff_is_annotated() {

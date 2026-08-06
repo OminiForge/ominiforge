@@ -137,8 +137,8 @@ You are a software engineering assistant. You write clean, tested code.
 default = "openai-main/gpt-4o"      # provider_name/model_id（设置页从可用模型下选）
 fallback = "openai-main/gpt-4o-mini" # 降级模型
 think_effort = "high"               # 默认推理强度档位（须为所选模型声明的档位）
-# temperature / max_output_tokens 不再由 profile 覆盖：它们是模型自身的元数据
-# （providers.toml 的 ModelConfig），profile 只引用模型。
+# temperature / max_output_tokens 可选：profile 覆盖 provider 的默认值（ModelConfig）。
+# 省略则沿用该模型在 providers.toml 里声明的 default_temperature / max_output_tokens。
 
 [context]
 compaction_threshold = 0.8           # 何时触发压缩（% of context window）
@@ -196,8 +196,8 @@ tool = "write"
 | skills.* | ✗ | 默认全部可用 |
 | memory.* | ✗ | 默认 scopes=["user","project"], auto_write=true |
 | budget.session_max_usd | ✗ | 金钱预算；默认无限制 |
-| budget.max_rounds | ✗ | 单 turn 模型轮次绝对硬顶；默认 1000。见 `doc/todo.md` §7 |
-| budget.round_budget_threshold | ✗ | 每步软 round 预算；默认 20，`0` 禁用。见 `doc/todo.md` §7b |
+| budget.max_rounds | ✗ | 单 turn 模型轮次绝对硬顶；默认 1000。见 `doc/architecture.md` §7 |
+| budget.round_budget_threshold | ✗ | 每步软 round 预算；默认 20，`0` 禁用。见 `doc/architecture.md` §8.6 |
 | budget.round_budget_warn_pct | ✗ | 软预算首次提醒比例；默认 0.8 |
 | hooks.* | ✗ | 默认无额外 hook |
 | network.policy | ✗ | 沙箱网络策略 `isolated`/`allowlist`/`open`；缺省继承 gateway `default_network`（兜底 = `open`）。见 `doc/sandbox.md` §6.2 |
@@ -275,7 +275,7 @@ session_max_usd = 10.00  # 覆盖
 | default_temperature | Provider (model) | model 推荐默认值 |
 | think_efforts（可选档位） | Provider (model) | model 支持的推理强度集合 |
 | think_effort 默认档 | Profile | agent 行为偏好（引用模型的档位），会话内可每轮覆盖 |
-| temperature / max_output_tokens | Provider (model) | model 固有元数据，profile 不再覆盖 |
+| temperature / max_output_tokens | Provider 默认，Profile 可 override | model 提供默认值，profile 按需覆盖（见 §3.1） |
 | compaction_threshold | Profile | 用户偏好 |
 | injection_max_tokens | Profile | 用户偏好 |
 | budget limit | Profile | 不同 agent 角色预算不同 |
@@ -283,7 +283,7 @@ session_max_usd = 10.00  # 覆盖
 | tool set | Profile | agent 能力 |
 | skill set | Profile | agent 能力 |
 | memory scope | Profile | agent 知识范围 |
-| network policy | Profile（workspace 覆盖 / gateway 兜底） | agent 能力（能否联网、可达哪些主机）；解析链 `workspace.toml > profile > gateway default_network > Open`，见 `doc/workspace-config.md` |
+| network policy | Profile（workspace 覆盖 / gateway 兜底） | agent 能力（能否联网、可达哪些主机）；解析链见 `doc/sandbox.md` §6.2 |
 
 ## 8. 文件系统布局
 
@@ -300,9 +300,203 @@ session_max_usd = 10.00  # 覆盖
     └── daily.toml
 ```
 
-## 9. 待后续完善
+## 9. Skill 系统
+
+Skill 是可复用的任务模板，包含 prompt instructions + 动态内容。
+
+### 9.1 设计原则
+
+- Skill 加载由 model 自主决定（渐进式披露），不靠关键词匹配。
+- `load_skill` 是 built-in tool call，执行动态命令后返回完整内容。
+- 动态命令全部执行、全部收集错误，不 fail-fast。
+- Skill 人类可读可编辑（Markdown + frontmatter）。
+
+### 9.2 加载机制
+
+#### 渐进式披露
+
+```text
+System prompt
+  → 包含 skill 索引（name + description 列表）
+  → Model 根据当前任务判断是否需要加载某 skill
+  → 调用 load_skill tool
+  → 获得完整 instructions（动态内容已替换）
+  → 按 instructions 执行
+```
+
+Model 自主决定何时需要 skill，不靠外部触发。
+
+#### Skill 索引注入
+
+System prompt 中 skill 部分示例：
+
+```text
+## Available Skills
+
+- git-commit: Generate conventional commit message from staged changes
+- code-review: Review code changes for bugs and style issues
+- refactor: Refactor code with safety checks and tests
+
+Use load_skill when your task matches a known skill.
+```
+
+索引只包含 name + description，不包含 instructions（节省 context）。
+
+#### load_skill Tool
+
+执行流程：
+1. 根据 name 定位 `.omini/skills/{name}.md`
+2. 解析 frontmatter + body
+3. 扫描所有模板变量
+4. **全部执行**，收集所有结果（成功和失败）
+5. 替换成功的变量
+6. 如有失败：返回替换后的内容 + 附带所有失败信息（不中断）
+7. 记入 ToolEvent
+
+### 9.3 Skill 文件格式
+
+```markdown
+---
+name: "git-commit"
+version: "0.1.0"
+description: "Generate conventional commit message from staged changes"
+tools_used: ["shell"]
+created_by: "user"
+created_at: "2026-06-15T10:00:00Z"
+---
+
+## Context
+
+Current directory: {{exec "pwd"}}
+Current branch: {{exec "git branch --show-current"}}
+Staged files: {{exec "git diff --cached --name-only"}}
+Current time: {{now}}
+
+## Instructions
+
+Based on the staged changes above:
+1. Analyze what changed and why.
+2. Generate a Conventional Commits message.
+3. Subject ≤50 chars, body only when why isn't obvious.
+4. Ask user to confirm before committing.
+
+## Examples
+
+User: "commit this"
+Steps: read staged diff → generate message → confirm → git commit
+```
+
+### 9.4 模板语法
+
+| 语法 | 说明 | 示例 |
+|------|------|------|
+| `{{exec "cmd"}}` | 执行 shell 命令，替换为 stdout | `{{exec "git branch --show-current"}}` |
+| `{{now}}` | 当前时间（ISO 8601） | `2026-06-15T10:30:00Z` |
+| `{{workspace}}` | 当前 workspace 路径 | `/home/user/project` |
+| `{{env "VAR"}}` | 环境变量值 | `{{env "USER"}}` → `duskgrow` |
+| `{{profile}}` | 当前 profile name | `coding` |
+| `{{session_id}}` | 当前 session ID | `01JXYZ...` |
+
+#### exec 错误处理
+
+所有模板变量全部执行，不 fail-fast：
+
+```text
+模板执行结果：
+  {{exec "pwd"}}              → ✓ "/home/user/project"
+  {{exec "git branch ..."}}   → ✓ "main"
+  {{exec "invalid-cmd"}}      → ✗ exit_code=127, stderr="command not found"
+  {{exec "timeout-cmd"}}      → ✗ timeout after 5s
+
+返回给 model：
+  - 替换后的 content（失败的变量保留原始 `{{exec ...}}` 或标记为 [FAILED]）
+  - 附带错误摘要：
+    "2 template executions failed:
+     - `invalid-cmd`: command not found (exit 127)
+     - `timeout-cmd`: timeout after 5000ms"
+```
+
+Model 收到错误信息后可以：
+- 忽略非关键信息继续执行
+- 告知用户某些上下文获取失败
+- 尝试用其他方式获取信息
+
+### 9.5 生命周期
+
+```text
+created → active → (needs_review | stale | broken) → updated | disabled
+```
+
+#### 状态判定
+
+| 条件 | 状态 |
+|------|------|
+| `load_partial / total_loads > 0.3` | needs_review（模板命令不稳定） |
+| `task_failed / task_completed > 0.3` | needs_review（instructions 效果差） |
+| `last_used` > 30 天 | stale |
+| 引用的 tool 被移除 | broken |
+
+#### Evolution 处理
+
+Evolution worker 定期扫描 metrics，生成提案：
+- 修复失败的模板命令
+- 改进 instructions
+- 标记废弃 skill
+- 基于 session 历史提出新 skill 草案
+
+### 9.6 Skill 审批流程
+
+#### 来源
+
+| 来源 | 审批 |
+|------|------|
+| 用户手动创建 | 不需要，直接可用 |
+| Evolution 提议 | 需要 review |
+| 社区共享（未来） | 用户自行决定安装 |
+
+#### Evolution 提议流程
+
+```text
+Evolution 生成 skill 草案
+  → /evolution review
+  → 用户选择：
+    - approve → 移入 .omini/skills/，状态 active
+    - reject → 丢弃
+    - revise "修改意见" → evolution 修改 → 再次 review → 循环
+```
+
+用户可以多轮 revise 直到满意或 reject。
+
+### 9.7 显式调用
+
+除 model 自主加载外，用户也可显式调用：
+
+```text
+/skill git-commit      → 直接触发 load_skill，注入 context
+/skill list            → 列出所有可用 skill
+/skill edit git-commit → 打开编辑
+/skill disable old-one → 移入 _disabled/
+```
+
+### 9.8 文件系统布局
+
+```text
+.omini/
+└── skills/
+    ├── git-commit.md
+    ├── code-review.md
+    ├── refactor.md
+    └── _disabled/
+        └── old-deploy.md
+```
+
+## 10. 待后续完善
 
 - Profile 模板（ominiforge 预置几个常用 profile）。
 - Profile 导入导出（分享 profile 配置）。
 - Provider 健康检查和自动 fallback。
 - 多 provider 负载均衡（同一 model 多个 endpoint）。
+- Skill 间组合（一个 skill 引用另一个 skill）。
+- Skill 参数化（调用时传参，如 `/skill deploy --env production`）。
+- Skill 版本历史（git 管理或内置版本）。
+- Skill 与 profile 绑定（某些 skill 只在特定 profile 可用）。

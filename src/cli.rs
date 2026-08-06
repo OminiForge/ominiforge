@@ -204,7 +204,7 @@ struct EvalBootstrapArgs {
 /// Surfaces configuration, provider, and session errors to the process exit.
 pub async fn run() -> Result<()> {
     // Operator diagnostics to stderr. Business/agent events never go here —
-    // they belong to `events.jsonl` (doc/session-storage.md). Default to
+    // they belong to `events.jsonl` (doc/architecture.md). Default to
     // `info` for our own crate; RUST_LOG overrides (e.g. `RUST_LOG=debug`).
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -267,7 +267,7 @@ async fn serve_cmd(config_dir: Option<PathBuf>, args: ServeArgs) -> Result<()> {
     } else {
         tracing::warn!(
             "auth: DISABLED — no api_key_env configured. Only safe behind \
-             loopback + a trusted reverse proxy (doc/architecture.md §18.1)."
+             loopback + a trusted reverse proxy (doc/architecture.md §18)."
         );
     }
 
@@ -814,7 +814,7 @@ const GATEWAY_TEMPLATE: &str = r#"# Gateway server config. See doc/gateway.md.
 # The gateway is the backend every interactive front-end (Web/desktop/mobile)
 # talks to; the command line itself is operator tooling, not a chat front-end.
 
-bind = "127.0.0.1:7878"            # loopback; a reverse proxy terminates TLS
+bind = "127.0.0.1:7878"            # loopback 示例；默认见 gateway/config.rs DEFAULT_BIND，反向代理终结 TLS
 
 # Bearer-token auth. Uncomment and set the named env var to require a token on
 # every route except /healthz. Left unset, the gateway is UNAUTHENTICATED —

@@ -19,19 +19,13 @@ allow / deny / ask。核心原则——安全不能靠信任模型，要靠代�
 
 ## 2. 策略模型
 
-`PermissionPolicy`（`src/permission/mod.rs`）三个有序规则列表：
+`PermissionPolicy`（精确字段见 [`src/permission/mod.rs`](../src/permission/mod.rs)）持有**三个有序规则列表**：
 
-```rust
-pub struct PermissionPolicy {
-    pub deny:  Vec<Rule>,  // 命中即阻断，最高优先级
-    pub allow: Vec<Rule>,  // 命中且无 deny 命中 → 直接放行（固化的批准），压过 ask
-    pub ask:   Vec<Rule>,  // 命中且无 deny/allow 命中 → 需人工审批
-}
-pub struct Rule {
-    pub tool: String,          // 工具名；"*" 通配任意工具，否则精确匹配
-    pub contains: Vec<String>, // 子串模式；空 = 匹配该工具任意输入
-}
-```
+- `deny`：命中即阻断，最高优先级。
+- `allow`：命中且无 deny 命中 → 直接放行（固化的批准，§5.1），压过 ask。
+- `ask`：命中且无 deny/allow 命中 → 需人工审批。
+
+每条 `Rule` 以一个目标工具名（`"*"` 通配任意工具，否则精确匹配）加一组匹配模式表达；模式的匹配语义见 §3 规则模型。
 
 **求值顺序（固定）**：`deny` 命中 → `Deny`；否则 `allow` 命中 → `Allow`；否则 `ask` 命中 → `Ask`；
 否则 `Allow`。deny 永远压过 allow/ask（"已批准"与"请确认"都不能降级一条禁令）；allow 压过 ask——
@@ -113,7 +107,7 @@ gateway default_permission （gateway.toml，最低基线）
 
 解析函数 `app::resolve_permission(workspace, profile, gateway)`，等价于 `workspace.layer_over(profile.layer_over(gateway))`。
 
-三层都是 **gateway 可信或部署方拥有**的配置——**没有一层**读自 agent 可写的项目目录，所以 workspace 层加 `deny` 是安全的（见 `doc/workspace-config.md`「为何在 gateway 侧」）。
+三层都是 **gateway 可信或部署方拥有**的配置——**没有一层**读自 agent 可写的项目目录，所以 workspace 层加 `deny` 是安全的（见 `doc/gateway.md`「为何在 gateway 侧」）。
 
 gateway 基线（`gateway.toml`）：
 
@@ -167,22 +161,7 @@ CLI 运行只经过 profile 层（gateway/workspace 两层都是 gateway 侧，C
 
 ## 5. Ask 闭环（ApprovalGate）
 
-`ApprovalGate`（`src/agent/approval.rs`）是前端无关的注入点，同 `StreamSink`：
-
-```rust
-#[async_trait]
-pub trait ApprovalGate: Send + Sync {
-    // 三态而非二态：区分「人拒绝」与「无人应答的兜底拒绝」，让审计不撒谎（M2）。
-    // 返回值同时携带人选择的作用域（§5.1），无人决定时为 None。
-    async fn request(&self, req: ApprovalRequest) -> ApprovalOutcome;
-    // ApprovalOutcome { resolution: Approved | RejectedByUser | AutoDenied,
-    //                   scope: Option<ApprovalScope> }
-
-    // 能否并发受理多个 request：gateway 为 true（走共享表路由），启用 §5.2 的
-    // 两阶段并行分发；CLI/NullGate 为 false，保持逐条串行。
-    fn supports_concurrent_requests(&self) -> bool { false }
-}
-```
+`ApprovalGate`（精确签名见 [`src/agent/approval.rs`](../src/agent/approval.rs)）是前端无关的注入点，同 `StreamSink`。两个方法：`request(req) -> ApprovalOutcome` 挂起等决定——三态 `Approved | RejectedByUser | AutoDenied` 区分「人拒绝」与「无人应答的兜底拒绝」，让审计不撒谎（M2）；返回值同时携带人选择的作用域（§5.1），无人决定时为 `None`。`supports_concurrent_requests()` 声明能否并发受理多个 request：gateway 为 true（走共享表路由），启用 §5.2 的两阶段并行分发；CLI/NullGate 为 false，保持逐条串行。
 
 `ApprovalResolution` 三态映射到审计 `decided_by`：`Approved`/`RejectedByUser` = 人做了决定（`"user"`）；`AutoDenied` = 没人应答的 fail-closed 兜底（`"gate"`），绝不记成用户拒绝。
 
@@ -232,12 +211,9 @@ gate 的 `supports_concurrent_requests()` 为 true（gateway）时，一轮里�
 
 `EventPayload::Permission(PermissionEvent)`（`src/core/payload.rs`，`doc/event-schema.md` §3.9）：
 
-```rust
-pub enum PermissionEvent {
-    Requested { call_id, tool_name, input },
-    Decided   { call_id, outcome, decided_by, scope },  // outcome: Approved|Rejected|AutoDenied
-}
-```
+两个变体：`Requested { call_id, tool_name, input }`（仅在 ask 挂起等人应答时写）与
+`Decided { call_id, outcome, decided_by, scope }`（`outcome`: Approved|Rejected|AutoDenied）。
+字段定义见 [`src/core/payload.rs`](../src/core/payload.rs)。
 
 - **审批与 view 解耦**（`doc/tool-streaming.md` Phase 3）：`Requested` 不再携带 `preview`
   字段。历史上它存一份内容工具的 would-be diff（`Tool::preview` 在 ask 时 dry-run 算出），
@@ -261,29 +237,24 @@ pub enum PermissionEvent {
 - 幂等：未知/已决 call_id 被 actor 忽略。
 - ts 绑定：`PermissionEvent.ts` / `PermissionOutcome.ts` / `PermissionPolicy.ts` / `Rule.ts` / `ApprovalScope.ts`，改 wire 类型后跑 `just ts-export`。
 
-## 8. 前端（Web）
+## 8. 用户界面（GPUI 客户端）
 
-- 审批附着在会话流的 **tool 卡**上（`ApprovalControls.svelte`，`frontend/DESIGN.md` §4.9）：等待态为
-  琥珀脉冲 pip +「等待批准」+ 行内批准（acid-lime 主操作）/ 拒绝按钮（含作用域选择）；无独立审批弹窗。
-- 决策流（`conversation.ts` fold）：`Permission::Requested` 给该 call 的卡片置 `approvalPending` →
-  `Decided` 清除标记 → 卡片终态由 `Tool::Completed/Failed` 驱动（并行分发下按完成顺序即时更新）。
-- 会话列表状态灯 `SessionStatusIcon.svelte` 的 `awaiting` 态（琥珀脉冲点）；仅当该 session 无 pending
-  ask 时才回到 Running（并行 ask 未全部解决不闪动）。
-- 三层配置 UI 各归其位（`frontend/DESIGN.md` §4.10）：gateway 基线在 Settings → **全局设置**（增量规则列表 +
-  工具默认表），profile 层在 Settings → **Profiles** 随 profile 编辑，workspace 层在工作区侧栏齿轮的
-  `WorkspaceConfigDialog`。生效结果视图已删除（见 §3.2）。
+权限审批和配置在 GPUI 客户端中实现：
+
+- **审批界面**：tool 调用的审批在对话面板中进行，等待批准时显示审批按钮（批准/拒绝，含作用域选择）
+- **配置界面**：三层配置在设置面板中进行（gateway 基线、profile 层、workspace 层）
+
+GPUI 客户端的权限界面实现见代码。
 
 ## 9. 实现状态与待完善
 
 已实现：策略内核（deny/allow/ask 三列表，`deny > allow > ask`）+ 三层解析（workspace > profile > gateway，`deny`/`allow` 并集）+ dispatch 接入
-（allow/deny/ask）+ CLI 终端 gate + gateway 挂起-恢复闭环 + 持久化 `PermissionEvent` 审计（含 `Decided.scope`）+
+（allow/deny/ask）+ gateway 挂起-恢复闭环 + 持久化 `PermissionEvent` 审计（含 `Decided.scope`）+
 作用域审批（once/session/profile/gateway：`rule_from_call` 完整值编译规则，session 写会话内存 policy 即时生效
 （含同轮 pending ask 重评估、自动裁决记 `decided_by: "policy"`），profile/gateway 经 registry `on_scoped` 回调固化进
 profile TOML / `gateway.toml`（`config_write_lock` 串行化 + `spawn_blocking`））+
 并行分发（§5.2：两阶段 dispatch、独立链批准即执行、Decided 即时落盘、结果按完成序、模型消息按 call 序、
-cancel 经 `ChainAbortGuard` 召回执行链）+
-Web 审批（tool 卡内 ApprovalControls，含作用域选择）+ 三层 Web 配置 UI（各归其位：全局设置 tab 的 gateway
-基线 + 工具默认表、Profiles tab 的 profile 层、WorkspaceConfigDialog 的 workspace 层；`frontend/DESIGN.md` §4.10）。
+cancel 经 `ChainAbortGuard` 召回执行链）。
 
 待后续：
 - 规则匹配升级：`substring`/`prefix` + `field` 定位 + `negate` 白名单**已实现**（§3 规则模型）；未来可加 glob / regex。

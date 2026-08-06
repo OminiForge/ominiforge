@@ -129,7 +129,7 @@ impl StreamPresenter for WriteStreamPresenter {
                     complete,
                     super::diffview::default_context(),
                     // Streaming preview: no formatter has run yet, so no
-                    // `formatted_by` annotation (`doc/format.md` §6).
+                    // `formatted_by` annotation (`doc/lsp.md` §6).
                     None,
                 );
                 (!body.is_empty()).then_some(body)

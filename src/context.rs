@@ -1,7 +1,7 @@
 //! Context-window token accounting.
 //!
 //! Compaction, dynamic injection, and prefix-cache discipline follow in later
-//! steps. See `doc/context-management.md`.
+//! steps. See `doc/architecture.md`.
 //!
 //! ## Why a ledger and not a single counter
 //!
@@ -26,7 +26,7 @@
 use crate::llm::Message;
 
 /// Default fraction of the context window we aim to stay under before
-/// compacting (`doc/context-management.md` §4.2). A profile's
+/// compacting (`doc/architecture.md` §7.4). A profile's
 /// `[context].compaction_threshold` overrides it.
 pub const DEFAULT_COMPACTION_THRESHOLD: f32 = 0.8;
 
@@ -88,7 +88,7 @@ impl ContextLedger {
 
 /// The token budget a turn must stay under, leaving room for the model's reply.
 ///
-/// `threshold × context_window − max_output_tokens` (`doc/context-management.md`
+/// `threshold × context_window − max_output_tokens` (`doc/architecture.md`
 /// §4.2). Returns `None` when the context window is unknown (`0`), so callers
 /// skip threshold logic rather than treat everything as over-limit.
 #[must_use]

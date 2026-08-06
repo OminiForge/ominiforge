@@ -42,12 +42,12 @@ pub struct SessionSummary {
     /// sessions, so a fork does not read as an empty context.
     pub context_tokens: u32,
     /// The first turn's user input, if any — a human-readable title for the
-    /// session list (`doc/frontend.md`). `None` for sessions with no user turn
+    /// session list (`doc/gpui-app.md`). `None` for sessions with no user turn
     /// (e.g. an empty draft that was never sent). Not truncated server-side; the
     /// UI clips it for display.
     pub first_user_input: Option<String>,
     /// The timestamp of the *last* turn whose user input was non-empty — the
-    /// session's "last activity" for list ordering (`doc/frontend.md`). Unlike
+    /// session's "last activity" for list ordering (`doc/gpui-app.md`). Unlike
     /// [`first_user_input`](Self::first_user_input) (first-write-wins as a stable
     /// title), this is last-write-wins so the list surfaces recently-touched
     /// sessions. Deliberately keyed on the *user* message, not any event, so a

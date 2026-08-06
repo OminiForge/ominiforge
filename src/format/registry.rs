@@ -1,6 +1,6 @@
 //! The built-in formatter registry: out-of-the-box stdin→stdout invocations
 //! for common languages, so a workspace needs no `format.toml` to get
-//! formatting (`doc/format.md` §3/§5). These are the lowest-precedence
+//! formatting (`doc/lsp.md` §3/§5). These are the lowest-precedence
 //! configuration layer — a same-named formatter in any `format.toml` shadows
 //! or disables them.
 
@@ -10,15 +10,15 @@ use super::config::FormatterConfig;
 /// `[[formatters]]` table with the default timeout; `enabled` is `true` (a
 /// higher layer turns it off via `enabled = false`).
 ///
-/// Every entry uses the **stdin→stdout** convention (`doc/format.md` §3):
+/// Every entry uses the **stdin→stdout** convention (`doc/lsp.md` §3):
 /// ominiforge feeds the source on stdin and reads the formatted result on
 /// stdout, then writes it to disk itself — never the formatter's in-place
 /// mode. `supports_line_range` marks the formatters that can format an edited
-/// line range instead of the whole file (`doc/format.md` §5); a `{file}` arg
+/// line range instead of the whole file (`doc/lsp.md` §5); a `{file}` arg
 /// placeholder is substituted with the touched file's name at spawn time.
 ///
 /// Only binaries resolved through `PATH` / the session's direnv env-overlay
-/// (`doc/env.md`). A missing binary fails the spawn and the formatter is
+/// (`doc/architecture.md`). A missing binary fails the spawn and the formatter is
 /// skipped (fail-closed) — it never blocks a file op.
 pub fn builtin_formatters() -> Vec<FormatterConfig> {
     let entry = |name: &str,
@@ -104,7 +104,7 @@ mod tests {
         }
     }
 
-    /// The two line-range-capable formatters from `doc/format.md` §5 are the
+    /// The two line-range-capable formatters from `doc/lsp.md` §5 are the
     /// only ones flagged; everything else is skipped in `edit` mode.
     #[test]
     fn line_range_support_matches_design_table() {

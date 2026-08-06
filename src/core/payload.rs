@@ -74,7 +74,7 @@ pub enum TurnEvent {
 /// still leaves a trace: the loop records a `TurnEvent::Failed` with
 /// `reason: None` paired with an [`ErrorEvent::Raised`] carrying the detail, so
 /// `reason.is_some()` distinguishes a graceful stop from a hard abort. See
-/// `doc/event-schema.md` §4 and `doc/todo.md` §6–§7.
+/// `doc/event-schema.md` §4 and `doc/architecture.md` §6–§7.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub enum TurnFailureReason {
@@ -82,7 +82,7 @@ pub enum TurnFailureReason {
     /// model rounds without the model giving a final answer.
     MaxRoundsExceeded { max_rounds: u32 },
     /// The completion gate gave up: the model kept stopping with this many
-    /// non-terminal todo items after repeated nudges (`doc/todo.md` §6).
+    /// non-terminal todo items after repeated nudges (`doc/architecture.md` §6).
     TodoStalled { incomplete_steps: u32 },
     /// A `turn:start` before hook blocked the turn before any model round ran
     /// (`doc/hook-protocol.md` §7). `by` names the blocking hook.
@@ -256,7 +256,7 @@ pub enum Content {
     Text(String),
     /// A UI-only structured view of this call's result, produced by the tool
     /// at execution time and persisted with the event. The front-end renders
-    /// it verbatim — it never rebuilds anything client-side (`doc/tool-view.md`).
+    /// it verbatim — it never rebuilds anything client-side (`doc/tool-streaming.md`).
     /// NEVER fed to the model — `render_output` skips it. The `text` field is a
     /// JSON envelope `{ kind, ... }` where `kind` is one of the closed variants
     /// (`diff`/`code`/`terminal`/`listing`/`markdown`/`plain`); the front-end
@@ -281,7 +281,7 @@ pub const AUDIENCE_UI: &str = "ui";
 
 /// Session lifecycle. `Created` is always the first event and snapshots the
 /// initial config so replay is self-contained. See `doc/event-schema.md` §7
-/// and `doc/session-storage.md` §3.
+/// and `doc/architecture.md` §3.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub enum SessionEvent {
@@ -332,7 +332,7 @@ pub enum ArtifactEvent {
 
 /// Dynamic context injection, recorded so replay can reconstruct exactly what
 /// the model saw each turn. See `doc/event-schema.md` §9 and
-/// `doc/context-management.md` §5.
+/// `doc/architecture.md` §5.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS), ts(export))]
 pub enum InjectionEvent {
@@ -356,14 +356,14 @@ pub enum InjectionSource {
     Hook,
     /// The agent loop itself injected the text — e.g. a completion-gate or
     /// stuck-step reminder pushed into the context to keep a turn on track.
-    /// See `doc/todo.md` §8.
+    /// See `doc/architecture.md` §8.
     Runtime,
     /// The agent loop injected a round-budget reminder (soft threshold hit
     /// or budget exhausted) to nudge the model into opening/updating its
-    /// todo list. See `doc/todo.md` §7b.
+    /// todo list. See `doc/architecture.md` §8.6.
     RoundBudget,
     /// A project guidance file (`AGENTS.md`/`CLAUDE.md`) loaded lazily when the
-    /// agent first touched a file under its directory. See `doc/agents-md.md`.
+    /// agent first touched a file under its directory. See `doc/architecture.md`.
     ProjectGuidance,
 }
 
@@ -501,7 +501,7 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     /// The first event of every session is `SessionEvent::Created`. This mirrors
-    /// the events.jsonl line shown in `doc/session-storage.md` §3 and pins the
+    /// the events.jsonl line shown in `doc/architecture.md` §3 and pins the
     /// externally-tagged JSON wire shape (`{"Session":{"Created":{...}}}`).
     #[test]
     fn session_created_event_round_trips() {

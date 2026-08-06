@@ -1,5 +1,5 @@
 //! One stdin→stdout formatter invocation, with the fail-closed defences
-//! (`doc/format.md` §4). Pure of any tool/LSP coupling: config + text in,
+//! (`doc/lsp.md` §4). Pure of any tool/LSP coupling: config + text in,
 //! formatted text or a skip (carrying the original text) out.
 
 use std::collections::BTreeMap;
@@ -73,7 +73,7 @@ pub async fn run(
         .kill_on_drop(true)
         // Run from the file's directory so the formatter's own upward config
         // discovery (`.clang-format`, `rustfmt.toml`) finds the project config
-        // (`doc/format.md` §3: discovery is the formatter's job).
+        // (`doc/lsp.md` §3: discovery is the formatter's job).
         .current_dir(abs_path.parent().unwrap_or_else(|| Path::new(".")));
     apply_env_overlay(&mut command, env_overlay);
 
@@ -105,7 +105,7 @@ pub async fn run(
     };
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    // Defence 1 (`doc/format.md` §4.1): non-zero exit OR non-empty stderr is
+    // Defence 1 (`doc/lsp.md` §4.1): non-zero exit OR non-empty stderr is
     // failure. The stderr rule is what turns clang-format's silent-fallback
     // (exit 0, one stderr line, wrong result) into a loud skip.
     if !output.status.success() {
@@ -122,7 +122,7 @@ pub async fn run(
     }
 
     let formatted_text = String::from_utf8_lossy(&output.stdout).into_owned();
-    // Defence 2 (`doc/format.md` §4.2): consistency check — formatting must be
+    // Defence 2 (`doc/lsp.md` §4.2): consistency check — formatting must be
     // idempotent and must not drop content.
     if let Err(reason) = consistency_check(text, &formatted_text) {
         return skip(&reason, true);
@@ -131,7 +131,7 @@ pub async fn run(
 }
 
 /// The formatter-specific argv that narrows a run to the 1-based inclusive
-/// line range `[start, end]` (`doc/format.md` §5). Only called for formatters
+/// line range `[start, end]` (`doc/lsp.md` §5). Only called for formatters
 /// flagged `supports_line_range`; the registry guarantees those are the two
 /// below.
 fn line_range_args(name: &str, start: u32, end: u32) -> Vec<String> {

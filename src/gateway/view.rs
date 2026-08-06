@@ -1121,7 +1121,7 @@ mod tests {
 
     /// A round-budget reminder folds into an activity row with the `Timer`
     /// icon, so the user can tell a budget nudge apart from a completion-gate
-    /// nudge (`doc/todo.md` §7b).
+    /// nudge (`doc/architecture.md` §8.6).
     #[test]
     fn round_budget_injections_fold_into_timer_activity_rows() {
         let inject = |seq: u64, content: &str| {

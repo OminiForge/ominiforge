@@ -1,7 +1,6 @@
 # Gateway 系统
 
-Gateway 是所有交互式入口（Web / 桌面 / 手机 / 第三方）的唯一后端
-（`doc/architecture.md` §18）。Gateway 不实现 agent 逻辑——它是
+Gateway 是 GPUI 客户端远程模式的后端（`doc/architecture.md` §18）。Gateway 不实现 agent 逻辑——它是
 core 之上又一个 event 流消费者，复用同一套 `Agent` / `SessionStore` / `EventBus`。
 
 **精确类型与签名以代码为准**：配置见 [`src/gateway/config.rs`](../src/gateway/config.rs)；
@@ -23,7 +22,7 @@ session 会拿到 `Locked`——靠 flock 强制而非约定。
 
 ```text
 ominiforge serve
-  ├─ axum HTTP/SSE/WS server
+  ├─ axum HTTP/SSE/WS server（HTTP/SSE 保留，WebSocket 新增）
   ├─ auth middleware（单用户静态 bearer token）
   ├─ SessionRegistry          # session_id → 活跃 SessionActor handle
   └─ 每 session 一个 SessionActor task
@@ -87,6 +86,8 @@ spawn MCP）、进程多。换来完全隔离。共享池（按 profile 复用 a
 session API 统一挂在 `/api/*` 下，避免与前端 SPA 自身的 client-side 路由（同名
 `/sessions` 等）在同源托管时撞车（见 §10）。`/healthz` 留在根，不鉴权。
 
+Gateway 同时提供 HTTP/SSE（Web 前端过渡期保留）和 WebSocket（GPUI 客户端远程模式）：
+
 | Method | Path | 说明 |
 |--------|------|------|
 | GET  | `/healthz` | 健康检查，**不鉴权**，**不在 `/api` 下** |
@@ -97,7 +98,8 @@ session API 统一挂在 `/api/*` 下，避免与前端 SPA 自身的 client-sid
 | POST | `/api/sessions/{id}/message` | body `{text, model?, think_effort?}` → 入队一个 turn，`202 Accepted`（不阻塞） |
 | POST | `/api/sessions/{id}/cancel` | abort 正在跑的 turn |
 | POST | `/api/sessions/{id}/compact` | body 可选 `{keep_last}` → 摘要并切换 compaction session |
-| GET  | `/api/sessions/{id}/events` | SSE event 流（见 §4） |
+| GET  | `/api/sessions/{id}/events` | SSE event 流（见 §4，Web 前端用） |
+| GET  | `/ws` | WebSocket 连接（GPUI 客户端远程模式用，见 §4.1） |
 
 `message` 立即返回 202；turn 在 actor 内跑，输出走 event 流。这把“提交”与“观察”解耦。
 
@@ -109,6 +111,27 @@ session API 统一挂在 `/api/*` 下，避免与前端 SPA 自身的 client-sid
 带 `Last-Event-ID: <seq>` 重连，server 先从**持久 log** 重放该 seq 之后的 committed events，
 再挂上 live 流——无缝、不重不漏（§monitor §9，log 是 source of truth）。live deltas 瞬态，
 故意不重放。broadcast `Lagged` 的慢订阅者跳过缺口，靠 log 重放补齐。
+
+### 4.1 WebSocket 协议（GPUI 客户端远程模式）
+
+GPUI 客户端远程模式通过 WebSocket 连接 Gateway（`/ws` endpoint）。
+
+**消息格式**：
+- JSON 消息（与 HTTP API 一致）
+- 请求-响应模式（同步操作）
+- 流式模式（事件订阅）
+
+**连接管理**：
+- 单一 WebSocket 连接
+- 心跳保活
+- 断线重连（带 last_seq 重放）
+
+**与 SSE 的区别**：
+- SSE 是单向流（服务器→客户端），WebSocket 是双向流
+- SSE 需要单独的 HTTP 请求（客户端→服务器），WebSocket 单一连接
+- SSE 有 Last-Event-ID 续传，WebSocket 需要应用层实现
+
+详见 [`network.md`](./network.md) §4.1。
 
 ## 5. 认证
 
@@ -129,7 +152,7 @@ TLS（§18.1）。理由：少代码、标准运维、证书续期归代理。`b
 
 ```toml
 #:schema 见 FR-2（待 JSON Schema 接入）
-bind = "127.0.0.1:7878"          # 默认 loopback
+bind = "127.0.0.1:7878"          # loopback 示例；实际默认见 `src/gateway/config.rs` 的 `DEFAULT_BIND`
 api_key_env = "OMINI_GATEWAY_KEY" # 可选；不设=开放网关
 idle_timeout_secs = 1800          # 默认 30 分钟无活动逐出 actor（释放锁）
 sandbox_backend = "passthrough"   # 会话执行环境后端（见下）
@@ -155,9 +178,81 @@ loginctl enable-linger $USER               # logout 后续跑
 与 CLI 共享同一 UID / home / `.omini/` 数据。CLI 不连 Gateway；二者各自独立跑 agent loop，
 经共享文件系统（+ flock）保持一致。
 
-## 9. 待后续深入
+## 9. Workspace 配置
+
+per-workspace 的沙箱策略覆盖层，位于 profile 与 gateway 默认之间。
+
+### 9.1 解析链
+
+沙箱策略沿四档派生，高档覆盖低档：
+
+```text
+workspace.toml  >  profile [network]  >  gateway default_network  >  Open（硬编码兜底）
+```
+
+- 任一档命中即用该值；`Open` 是一个新 boxlite session 不至于默认断网的兜底。
+- 任一档策略名非法 → **fail loud**，建 session 失败，不静默回退到弱默认。
+- `permission` 走平行的三层解析（workspace > profile > gateway），但 `deny` 是**并集**（安全底线，非覆盖）、`ask` 覆盖——见 [`permission.md`](./permission.md)。
+
+### 9.2 位置：网关侧，不在项目目录
+
+```text
+<gateway_workspace>/.omini/workspaces/<workspace_id>.toml
+```
+
+- `workspace_id` = `WorkspaceId::from_path(canonical_path)`（FNV-1a 路径哈希，与 `workspaces.json` 同一套 id，版本稳定、可持久化）。
+- 与 `workspaces.json` 同目录家族——per-workspace 的服务端状态集中在一处可信目录。
+
+**为什么不放项目目录（如 `<project>/.omini/`）：** 项目目录是 **agent 可读写**的。从 agent 可写的地方读安全策略 = agent 能给自己放开网络/权限 = 权限提升。网关目录由**部署者掌控、可信**。
+
+### 9.3 结构
+
+workspace.toml 是一个 **workspace 命名空间**——不止网络策略，还承载共享挂载，以后 workspace memory 也放这。
+
+```toml
+# <gateway>/.omini/workspaces/<workspace_id>.toml
+[network]
+policy = "allowlist"                 # isolated | allowlist | open
+allow  = ["crates.io", "pypi.org"]   # 仅 allowlist 生效
+
+[[mounts]]
+anchor = "workspace"                 # session | workspace | gateway
+path   = "cache"                     # 锚点根内相对子路径(可空=根本身)
+guest  = "/cache"                    # guest 内绝对挂载点
+ro     = false                       # 只读挂载,默认 false(RW)
+
+[[permission.deny]]                  # 本 workspace 追加的工具禁令(最高层)
+tool     = "shell"
+contains = ["git push"]
+```
+
+- `[network]` 缺省或无 `policy` 键 → 不构成覆盖，落到 profile/gateway 档。
+- `[permission]` = 本 workspace 的工具门控，三层解析的**最高层**；合并语义（`deny` 并集 / `ask` 覆盖）见 [`permission.md`](./permission.md) §3.1。缺省=空=不贡献规则。
+- `[[mounts]]`：命名锚点辅助挂载。锚点命名**共享范围**，不是用途：
+
+  | anchor | host 根 | 共享范围 |
+  |---|---|---|
+  | `session` | `<gateway>/.omini/sessions/<session_id>/work/` | session 私有 |
+  | `workspace` | `<gateway>/.omini/workspaces/<workspace_id>/shared/` | 同 workspace 跨 session |
+  | `gateway` | `<gateway>/.omini/shared/` | 全局 |
+
+- 未知键忽略，向前兼容。
+
+### 9.4 生命周期与 GC
+
+配置可比其项目活得久：项目被移走/删掉，但策略文件还在 `<gateway>/.omini/workspaces/`。
+
+**原则：绝不自动物理删。** 路径消失可能是**瞬时的**（盘未挂载、项目 mid-move、worktree 临时删）；静默删一个用户手写的策略 = 不可回退的数据丢失。所以：
+
+| 操作 | 语义 |
+|------|------|
+| `GET /api/workspaces/config/orphans` | **只读**列出「路径已不可解析」的配置（含它曾对应的 path，供人识别）。不删任何东西。 |
+| `DELETE /api/workspaces/config/{workspace_id}` | **显式**删单个配置。幂等（不存在也返回 204）。GC 的唯一删除路径。 |
+
+无自动 GC 触发器——对齐 session archive 的「显式、one-way」退休哲学。
+
+## 10. 待后续深入
 
 - API key 存储与轮换机制（当前静态 env）。
 - Rate limiting 策略。
 - 共享 agent/MCP 池（per-session 隔离的性能优化）。
-- Web 前端（Phase 6）、桌面/手机（Phase 9/10）经此 API 接入。
