@@ -989,19 +989,15 @@ assemble（每次会话冷启动 / resume；CLI 与 gateway 同一入口）
 - **boxlite 沙箱后端不应用 env overlay**：overlay 值是宿主路径（如 `/nix/store/...`），guest 里没有挂载点了无意义——待 [`sandbox.md`](./sandbox.md) 的 `/nix/store` 挂载设计落地后再接。passthrough（默认后端）正常。
 - env 求值的是**宿主**环境；服务器类子进程（MCP/LSP）本就跑在宿主，与 sandbox 内的 shell 共享同一份 overlay。
 
-## 22. 初步实施顺序
-
-详见 [`migration-plan.md`](./migration-plan.md)。
-
-## 23. Editor 系统
+## 22. Editor 系统
 
 Editor 系统是 GPUI 客户端的核心组件，提供完整的 vim 编辑体验。
 
-### 23.1 EditorBackend trait
+### 22.1 EditorBackend trait
 
 所有编辑器后端实现统一的 `EditorBackend` trait：渲染编辑器内容、处理输入、管理文件状态、暴露 vim 模式与光标位置。签名以代码为准（`ominiforge-editor` crate），职责定义见 [`editor.md`](./editor.md) §2.1。
 
-### 23.2 NeovimBackend（唯一实现）
+### 22.2 NeovimBackend（唯一实现）
 
 当前唯一实现是 `NeovimBackend`，通过 `nvim --embed` 嵌入 Neovim：
 
@@ -1012,21 +1008,21 @@ Editor 系统是 GPUI 客户端的核心组件，提供完整的 vim 编辑体�
 
 详见 [`editor.md`](./editor.md)。
 
-### 23.3 全局 vim 键绑定
+### 22.3 全局 vim 键绑定
 
 使用 GPUI 的 Keymap/KeyContext 系统实现全局 vim 键绑定（编辑器面板内转发给 Neovim、面板外由应用的 modal 引擎处理）。机制定义见 [`editor.md`](./editor.md) §4，面板侧布局见 [`gpui-app.md`](./gpui-app.md)。
 
-## 24. 通信协议
+## 23. 通信协议
 
 GPUI 客户端与 Core 之间的通信通过统一的 `ClientProtocol` trait 抽象。
 
 底层传输可插拔：本地模式（`LocalProtocol`，直接链接 `ominiforge-core`，零网络开销）与远程模式（`WebSocketProtocol`，连接远程 Gateway；QUIC 传输为未来优化）。操作集与协议定义见 [`network.md`](./network.md) §2-§4。
 
-## 25. 配置系统
+## 24. 配置系统
 
 配置系统使用 Lua 作为统一配置语言（`ominiforge.lua`），配套 `lua-language-server` 类型定义（补全/校验/文档）、GPUI Settings 面板图形化编辑（双向同步）、以及多机配置同步（Last-Write-Wins + 字段级合并）。格式、分层、界面与同步的定义见 [`config-lua.md`](./config-lua.md)。
 
-## 26. 多机连接
+## 25. 多机连接
 
 多机连接通过 `ConnectionManager` 管理，支持多种传输，自动切换。
 

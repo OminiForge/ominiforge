@@ -17,6 +17,7 @@ Editor 系统是 GPUI 客户端的核心组件，提供完整的 vim 编辑体�
 Editor 系统通过 `EditorBackend` trait 抽象编辑器后端。所有编辑器实现必须实现此 trait。
 
 **职责**：
+
 - 渲染编辑器内容
 - 处理用户输入
 - 管理文件状态（打开、保存、关闭）
@@ -24,11 +25,13 @@ Editor 系统通过 `EditorBackend` trait 抽象编辑器后端。所有编辑�
 - 提供光标位置
 
 **实现**：
+
 - `NeovimBackend`：通过 `nvim --embed` 嵌入 Neovim（当前唯一实现）
 
 ### 2.2 编辑器面板
 
 编辑器面板是 GPUI 客户端的一个面板组件，包含：
+
 - 文件标签栏（打开的文件列表）
 - 编辑器区域（Neovim grid 渲染）
 - 状态栏（vim 模式、光标位置、文件状态）
@@ -40,10 +43,12 @@ Editor 系统通过 `EditorBackend` trait 抽象编辑器后端。所有编辑�
 NeovimBackend 通过 `nvim --embed` 启动 headless Neovim 进程，通过 msgpack-rpc 通信。
 
 **通信协议**：
+
 - Neovim UI 协议（grid-based）
 - msgpack-rpc over stdio
 
 **生命周期**：
+
 - 启动：`nvim --embed` 启动进程
 - 连接：建立 msgpack-rpc 连接
 - 附加：`nvim_ui_attach` 订阅 UI 事件
@@ -54,6 +59,7 @@ NeovimBackend 通过 `nvim --embed` 启动 headless Neovim 进程，通过 msgpa
 Neovim 的 UI 协议是基于字符网格（grid）的。NeovimBackend 接收 grid 事件，用 GPUI 渲染。
 
 **Grid 事件**：
+
 - `grid_resize`：grid 大小变化
 - `grid_line`：一行字符更新
 - `grid_clear`：清空 grid
@@ -61,6 +67,7 @@ Neovim 的 UI 协议是基于字符网格（grid）的。NeovimBackend 接收 gr
 - `hl_attr_define`：高亮属性定义
 
 **渲染策略**：
+
 - 每个 grid cell 包含字符和高亮 ID
 - 高亮 ID 映射到颜色/样式（fg、bg、bold、italic 等）
 - GPUI 的文本渲染管线绘制字符
@@ -71,11 +78,13 @@ Neovim 的 UI 协议是基于字符网格（grid）的。NeovimBackend 接收 gr
 IME（输入法编辑器）是中文/日文/韩文输入的关键。NeovimBackend 在 GPUI 层桥接 IME 事件。
 
 **IME 事件**：
+
 - `ImeCompositionStart`：开始组合
 - `ImeCompositionUpdate`：组合更新（未提交的文本）
 - `ImeCompositionEnd`：组合结束（提交最终文本）
 
 **桥接策略**：
+
 - 组合期间：在 GPUI 层显示组合文本，不发送给 Neovim
 - 组合结束：将最终文本发送给 Neovim
 - 光标位置：考虑组合文本的偏移
@@ -83,10 +92,12 @@ IME（输入法编辑器）是中文/日文/韩文输入的关键。NeovimBacken
 ### 3.4 键路由
 
 键盘输入的路由策略：
+
 - **编辑器面板有焦点**：按键转发给 Neovim（nvim 处理 vim 模式）
 - **其他面板有焦点**：按键由应用处理（全局 vim 键绑定）
 
 **Neovim 输入**：
+
 - 普通按键：通过 `nvim_input` 发送
 - 特殊按键：映射到 Neovim 的键码（如 `<C-w>`、`<Esc>`）
 - 修饰键：Ctrl、Alt、Shift 的组合
@@ -96,16 +107,19 @@ IME（输入法编辑器）是中文/日文/韩文输入的关键。NeovimBacken
 全局 vim 键绑定在 GPUI 层实现，不影响编辑器面板内的 Neovim。
 
 **实现方式**：
+
 - GPUI 的 Keymap/KeyContext 系统
 - 应用自己的 modal 引擎（normal/insert/visual 模式）
 - 面板特定的键绑定（文件树、对话面板等）
 
 **键绑定示例**：
+
 - 文件树：j/k 导航、/ 搜索、gg/G 跳转
 - 对话面板：j/k 滚动、q 关闭
 - 面板切换：Ctrl+W hjkl
 
 **状态栏显示**：
+
 - 编辑器面板内：显示 Neovim 的 vim 模式（来自 nvim RPC）
 - 编辑器面板外：显示应用的 modal 模式
 
@@ -114,11 +128,13 @@ IME（输入法编辑器）是中文/日文/韩文输入的关键。NeovimBacken
 Editor 系统通过 `LspService`（在 ominiforge-core 中）访问 LSP 功能。
 
 **共享 LSP 连接**：
+
 - Editor 和 Agent 共享同一个 LSP 服务器连接
 - rust-analyzer 等语言服务器只启动一次
 - 诊断、符号表等状态在 Editor 和 Agent 之间共享
 
 **Neovim LSP 桥接**：
+
 - Neovim 的 LSP 请求通过 ominiforge-core 的 `LspService` 转发
 - 避免 Neovim 和 Agent 各自启动 LSP 服务器
 
@@ -127,52 +143,7 @@ Editor 系统通过 `LspService`（在 ominiforge-core 中）访问 LSP 功能�
 Editor 系统通过 `SyntaxService`（在 ominiforge-core 中）访问语法高亮。
 
 **Tree-sitter 集成**：
+
 - Tree-sitter 解析在 ominiforge-core 中
 - Editor 通过 `SyntaxService` 获取语法树和高亮
 - Agent 通过 `SyntaxService` 获取代码结构分析
-
-## 7. 性能考虑
-
-**渲染优化**：
-- 增量渲染：只重绘变化的行
-- 视口裁剪：只渲染可见区域
-- GPU 加速：GPUI 的渲染管线
-
-**通信优化**：
-- 批量更新：Neovim 的 grid 事件是批量的
-- 异步处理：RPC 通信不阻塞 UI
-
-**内存优化**：
-- Grid 缓存：只保留可见区域的 grid 数据
-- 高亮缓存：复用高亮属性定义
-
-## 8. 测试策略
-
-**单元测试**：
-- Grid 渲染逻辑
-- IME 桥接逻辑
-- 键路由逻辑
-
-**集成测试**：
-- Neovim 进程启动和连接
-- 文件打开和保存
-- LSP 集成
-
-**端到端测试**：
-- 完整的编辑流程
-- vim 模式切换
-- 全局键绑定
-
-## 9. 未来扩展
-
-**其他编辑器后端**：
-- 虽然当前只有 NeovimBackend，但 `EditorBackend` trait 允许未来添加其他实现
-- 例如：SimpleBackend（通用编辑器，类似 VSCode）
-
-**协作编辑**：
-- Neovim 是单用户编辑器
-- 协作编辑需要 CRDT 或 OT，未来可以考虑
-
-**插件系统**：
-- Neovim 的插件系统（Lua 插件）
-- ominiforge 自己的插件系统（扩展 Editor 功能）
