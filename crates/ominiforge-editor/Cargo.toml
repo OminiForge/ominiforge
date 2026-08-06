@@ -1,0 +1,13 @@
+[package]
+name = "ominiforge-editor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Editor service: EditorBackend trait + NeovimBackend implementation"
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

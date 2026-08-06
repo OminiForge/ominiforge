@@ -3,7 +3,24 @@ db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 version = 2
 yanked = "warn"
-ignore = []
+# 全部是 gpui（doc/architecture-decisions.md §1）的传递依赖，上游停维但无
+# 已知漏洞、无替代品；待 gpui 升级解除。逐条来源见各条目注释。
+ignore = [
+  # async-std ← zed-async-tar ← gpui_http_client ← gpui
+  "RUSTSEC-2025-0052",
+  # proc-macro-error2 ← stacksafe ← gpui
+  "RUSTSEC-2026-0173",
+  # ttf-parser ← rustybuzz ← cosmic-text ← gpui
+  "RUSTSEC-2026-0192",
+  # rustybuzz ← cosmic-text ← gpui
+  "RUSTSEC-2026-0206",
+  # instant ← fastrand ← futures-lite ← gpui_util ← gpui
+  "RUSTSEC-2024-0384",
+  # paste ← pulp ← exr ← image ← gpui
+  "RUSTSEC-2024-0436",
+  # rustls-pemfile ← zed-reqwest ← gpui_http_client ← gpui
+  "RUSTSEC-2025-0134",
+]
 
 [licenses]
 version = 2
@@ -13,9 +30,19 @@ allow = [
   "Apache-2.0 WITH LLVM-exception",
   "BSD-2-Clause",
   "BSD-3-Clause",
+  # CC0-1.0：公共领域奉献，无义务。来源：hexf-parse（naga←blade-graphics←gpui）、
+  # tiny-keccak（ahash←gpui）。
+  "CC0-1.0",
   "CDLA-Permissive-2.0",
   "ISC",
   "MIT",
+  # MPL-2.0: weak copyleft（file-level），静态链接 Rust crate 无传染性，
+  # 仅修改 MPL 文件本身需公开。来源：cssparser/selectors/dtoa-short
+  # （dom_smoothie → web_fetch tool 的 Readability 提取链）。
+  "MPL-2.0",
+  # NCSA： permissive（UIUC），与 MIT/BSD 同级。来源：libfuzzer-sys
+  # （rav1e←ravif←image←gpui，target=all 才出现），仅用于 fuzz 构建。
+  "NCSA",
   "Unicode-3.0",
   "Zlib",
 ]

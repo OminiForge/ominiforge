@@ -1,0 +1,17 @@
+[package]
+name = "ominiforge-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "GPUI component library (theme, components, panels)"
+publish = false
+
+[dependencies]
+# gpui 0.2.x 自 2025-10 起发布在 crates.io（Apache-2.0），见
+# doc/architecture-decisions.md §1。组件层自建（不用 gpui-component），
+# 框架本体是唯一 UI 依赖。
+gpui = "0.2"
+
+[lints]
+workspace = true

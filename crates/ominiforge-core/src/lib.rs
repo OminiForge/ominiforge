@@ -1,9 +1,13 @@
 //! Ominiforge — a high-performance, extensible Rust agent platform.
 //!
 //! The core runtime is UI-agnostic: it executes tasks, manages session state,
-//! and emits a unified event stream that every front-end (Web / desktop /
-//! mobile, all via the gateway) consumes. See `doc/architecture.md` for the
-//! full design.
+//! and emits a unified event stream that every front-end (GPUI client / Web
+//! transition front-end, all via the gateway) consumes. See
+//! `doc/architecture.md` for the full design.
+//!
+//! This crate is `ominiforge-core` in the workspace (doc/architecture.md §5);
+//! the library target keeps the historical name `ominiforge` so module paths
+//! in the moved sources stay valid.
 
 pub mod core;
 

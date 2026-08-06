@@ -1,0 +1,132 @@
+[package]
+name = "ominiforge-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "a multi agent app"
+
+# The library keeps the historical crate name `ominiforge` so every module
+# path in the moved sources (`crate::…` internally, `ominiforge::…` in the
+# integration tests) stays valid without rewriting imports.
+[lib]
+name = "ominiforge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ominiforge"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = [
+  "serde",
+  "clock",
+] }
+clap = { version = "4", features = ["derive"] }
+dotenvy = "0.15"
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls",
+  "json",
+  "stream",
+  "http2",
+  "charset",
+] }
+# Web content extraction for the `web_fetch` tool (src/tool/web_fetch.rs):
+# dom_smoothie is a Rust port of Mozilla Readability (article main-content
+# extraction); htmd is a turndown.js port (full-page HTML → markdown) used as
+# the fallback when Readability finds no article (docs, dashboards, list
+# pages). `url` parses/validates the fetch target; `ipnet` matches resolved
+# addresses against blocked CIDRs (cloud metadata, private ranges). Pure-Rust
+# stacks keep the nix build offline/hermetic.
+dom_smoothie = "0.18"
+htmd = "0.5"
+url = "2"
+ipnet = "2"
+sha2 = "0.10"
+encoding_rs = "0.8"
+# SQLite-backed secret store for provider API keys (src/secrets.rs). `bundled`
+# compiles SQLite from vendored C source: no system libsqlite dependency, so the
+# nix sandboxed build stays offline/hermetic. Keys live here — never in
+# providers.toml and never in the process environment — so a shell/MCP
+# subprocess the agent spawns cannot read them via `env`.
+#
+# Pinned to 0.39 to match boxlite's rusqlite: both link the `sqlite3` native lib
+# (`links = "sqlite3"`), and cargo forbids two versions of a `links` crate in one
+# graph. Our usage is the stable core API (Connection/execute/query_row/prepare/
+# query_map/Error/ffi), so aligning versions is low-risk.
+rusqlite = { version = "0.39", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+similar = "2"
+thiserror = "2"
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "process",
+  "time",
+  "fs",
+  "io-util",
+  "sync",
+] }
+toml = "0.8"
+# Operator diagnostics (serve/gateway logs). `tracing` carries leveled,
+# module-scoped operational events (warnings, startup lines); business events
+# stay in `events.jsonl` — see doc/session-storage.md. Env-filtered, off
+# unless RUST_LOG asks for more; default level is set in cli::run.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ulid = "1"
+
+# Sandbox backend (feature `sandbox-boxlite`, doc/sandbox.md §4): libkrun microVM
+# runtime for isolated per-session execution. Optional and OFF by default —
+# libkrun only targets Linux + Apple Silicon (§8) and pulls a heavy vendored
+# native stack, so a default build ships only the passthrough backend and stays
+# fast/portable. Pre-1.0 and bus-factor≈1 (§4.2), so every boxlite dependency is
+# confined to src/sandbox/boxlite.rs behind `trait Sandbox` — swapping backends
+# touches that one file. v0.9.7 carries the fixes for RUSTSEC-2026-0147/0148
+# (both sandbox-escape CVEs, patched >= 0.9.0).
+boxlite = { version = "0.9.7", optional = true }
+
+# Gateway: HTTP/SSE/WS server — the single backend every interactive front-end
+# talks to. Unconditional: the command line is operator tooling (`serve`,
+# `eval`), and `serve` is the product. See doc/architecture.md §3.1, §5.1.
+axum = { version = "0.8", features = ["ws"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+# Response compression (gzip/br) for the gateway. The folded conversation
+# view (`GET /sessions/{id}/view`) is multi-MB of highly compressible JSON;
+# over a relayed link (SSH forward / reverse proxy) compression is the
+# difference between a 10s and a 1s session open.
+tower-http = { version = "0.6", features = [
+  "compression-gzip",
+  "compression-br",
+  "fs",
+] }
+
+ignore = "0.4.31"
+globset = "0.4.19"
+# Content search (src/tool/search.rs): ripgrep's own crates, pure Rust — no
+# external grep/rg binary, so behavior is identical on every platform (Windows
+# included). Same ecosystem as `ignore` (already used by `find`); the searcher
+# gives us binary-file detection and line-oriented matching for free.
+grep-regex = "0.1"
+grep-searcher = "0.1"
+
+[features]
+# No default features: the gateway is always compiled in (see the axum entry
+# above). The remaining features are genuine opt-ins.
+default = []
+# BoxLite microVM sandbox backend (doc/sandbox.md §4). OFF by default: libkrun is
+# Linux + Apple-Silicon only and heavy. Enable on a supported host with
+# `--features sandbox-boxlite`.
+sandbox-boxlite = ["dep:boxlite"]
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

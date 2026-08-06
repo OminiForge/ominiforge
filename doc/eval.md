@@ -1,6 +1,6 @@
 # Eval 系统设计
 
-代码入口：[`src/eval/`](../src/eval/)。本文讲设计意图与各层契约，实现细节以代码及其注释为准。
+代码入口：[`src/eval/`](../crates/ominiforge-core/src/eval/)。本文讲设计意图与各层契约，实现细节以代码及其注释为准。
 
 ## 1. 设计原则
 
@@ -80,8 +80,8 @@ Skip`）、可复盘的解释、以及 scorer 自定义的附加数据。
 Provider（这也是 `score` 为 async 的原因）。runner 未接入前 `messages` /
 `workspace` 为 `Option`（`None`），需要它们的 scorer 返回 `Skip`。
 
-精确签名与字段可空性以代码及其注释为准：[`src/eval/scorer.rs`](../src/eval/scorer.rs)
-（`Scorer`）、[`src/eval/score.rs`](../src/eval/score.rs)（`EvalContext` / `Score`）。
+精确签名与字段可空性以代码及其注释为准：[`src/eval/scorer.rs`](../crates/ominiforge-core/src/eval/scorer.rs)
+（`Scorer`）、[`src/eval/score.rs`](../crates/ominiforge-core/src/eval/score.rs)（`EvalContext` / `Score`）。
 
 scorer 与 metric 分离：scorer 出**每样本**的分，metric 做**跨样本**聚合（pass_rate / pass_at_k / pass_hat_k）。一个 case 可挂多个 scorer，各自独立出分（对标 HELM 多维度，不压成单一数字）。
 

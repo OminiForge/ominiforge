@@ -3,10 +3,10 @@
 Gateway 是 GPUI 客户端远程模式的后端（`doc/architecture.md` §18）。Gateway 不实现 agent 逻辑——它是
 core 之上又一个 event 流消费者，复用同一套 `Agent` / `SessionStore` / `EventBus`。
 
-**精确类型与签名以代码为准**：配置见 [`src/gateway/config.rs`](../src/gateway/config.rs)；
-session actor 见 [`src/gateway/actor.rs`](../src/gateway/actor.rs)；registry 见
-[`src/gateway/registry.rs`](../src/gateway/registry.rs)；HTTP/SSE/WS server 见
-[`src/gateway/server.rs`](../src/gateway/server.rs)。本文只讲设计意图与契约。
+**精确类型与签名以代码为准**：配置见 [`src/gateway/config.rs`](../crates/ominiforge-core/src/gateway/config.rs)；
+session actor 见 [`src/gateway/actor.rs`](../crates/ominiforge-core/src/gateway/actor.rs)；registry 见
+[`src/gateway/registry.rs`](../crates/ominiforge-core/src/gateway/registry.rs)；HTTP/SSE/WS server 见
+[`src/gateway/server.rs`](../crates/ominiforge-core/src/gateway/server.rs)。本文只讲设计意图与契约。
 
 ## 1. 核心约束：单写者锁决定一切
 
@@ -81,7 +81,7 @@ spawn MCP）、进程多。换来完全隔离。共享池（按 profile 复用 a
 
 ## 3. HTTP API
 
-完整路由与请求/响应以 [`src/gateway/server.rs`](../src/gateway/server.rs) 为准。
+完整路由与请求/响应以 [`src/gateway/server.rs`](../crates/ominiforge-core/src/gateway/server.rs) 为准。
 
 session API 统一挂在 `/api/*` 下，避免与前端 SPA 自身的 client-side 路由（同名
 `/sessions` 等）在同源托管时撞车（见 §10）。`/healthz` 留在根，不鉴权。

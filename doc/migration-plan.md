@@ -2,7 +2,7 @@
 
 本文档定义从当前架构（Web 前端 + Gateway）到新架构（GPUI 客户端 + 多机分布式）的完整实施计划。
 
-**当前进度**：Phase 0-2 ✅ 已完成 | Phase 3（GPUI 技术验证）⏳ 待开始
+**当前进度**：Phase 3.1 ✅ 已完成 | Phase 3.2（GPUI Hello World）⏳ 待开始
 
 **核心原则**：
 - 文档先行：先更新文档定义清楚，再按文档执行
@@ -47,23 +47,13 @@
 
 **目标**：按 `doc/gpui-app.md` 和 `doc/editor.md` 定义，验证 GPUI + Neovim 可行性
 
-### 3.1 创建 Workspace
+### 3.1 创建 Workspace ✅
 
-**按 `doc/architecture.md` §5 定义**
-
-**任务**：
-- [ ] 创建 `crates/` 目录
-- [ ] 移动现有代码到 `crates/ominiforge-core/`
-- [ ] 创建 `crates/ominiforge-ui/`
-- [ ] 创建 `crates/ominiforge-editor/`
-- [ ] 创建 `crates/ominiforge-app/`
-
-**文件**：
-- `Cargo.toml`：改为 workspace
-- `crates/ominiforge-core/Cargo.toml`：新建
-- `crates/ominiforge-ui/Cargo.toml`：新建
-- `crates/ominiforge-editor/Cargo.toml`：新建
-- `crates/ominiforge-app/Cargo.toml`：新建
+已完成（按 `doc/architecture.md` §5）：
+- 根 `Cargo.toml` 改为 virtual workspace（含 `[workspace.lints]`，成员 crate 统一继承 lint 配置）
+- `src/`、`tests/` 整体移入 `crates/ominiforge-core/`（lib target 保留名 `ominiforge`，源码 import 零改动）
+- 创建占位 crate：`ominiforge-ui`、`ominiforge-editor`、`ominiforge-app`（空 lib.rs，待后续 Phase 填充）
+- 未做：`ominiforge-config`/`ominiforge-net`/`ominiforge-cli` crate 按需在 Phase 4/5 再建
 
 ### 3.2 GPUI Hello World
 
@@ -328,7 +318,7 @@
 | Phase 0: 文档更新 | 1-2 天 | 文档定义完成 | ✅ 已完成 |
 | Phase 1: 代码清理 | 1-2 天 | 干净的代码库 | ✅ 已完成 |
 | Phase 2: Core 重构 | 3-5 天 | Service traits 定义完成 | ✅ 已完成 |
-| Phase 3: GPUI 技术验证 | 1-2 周 | GPUI + Neovim 原型 | ⏳ 待开始 |
+| Phase 3: GPUI 技术验证 | 1-2 周 | GPUI + Neovim 原型 | 🔵 进行中（3.1 ✅） |
 | Phase 4: GPUI 核心功能 | 2-3 周 | 基本可用 | ⏳ 待开始 |
 | Phase 5: GPUI 完整功能 | 3-4 周 | 功能完整 | ⏳ 待开始 |
 | Phase 6: Web 前端退出 | 1 周 | 完成切换 | ⏳ 待开始 |
