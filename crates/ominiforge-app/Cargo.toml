@@ -8,6 +8,7 @@ description = "GPUI desktop application (composes all modules)"
 publish = false
 
 [dependencies]
+gpui = "0.2"
 ominiforge-ui = { path = "../ominiforge-ui", version = "0.1" }
 
 [lints]

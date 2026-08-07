@@ -13,5 +13,9 @@ publish = false
 # 框架本体是唯一 UI 依赖。
 gpui = "0.2"
 
+[dev-dependencies]
+# TestAppContext 无窗口测试（doc/gpui-app.md §8 验证矩阵 B）。
+gpui = { version = "0.2", features = ["test-support"] }
+
 [lints]
 workspace = true
