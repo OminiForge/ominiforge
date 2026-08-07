@@ -1,0 +1,22 @@
+[package]
+name = "ominiforge-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ClientProtocol trait + Local/WebSocket implementations (doc/network.md)"
+
+[dependencies]
+ominiforge-core = { path = "../ominiforge-core" }
+anyhow = "1"
+async-trait = "0.1"
+futures-core = "0.3"
+tokio = { version = "1", features = ["sync"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+
+[lints]
+workspace = true

@@ -4944,6 +4944,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ominiforge-net"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures-core",
+ "ominiforge-core",
+ "tokio",
+ "tokio-stream",
+]
+
+[[package]]
 name = "ominiforge-ui"
 version = "0.1.0"
 dependencies = [

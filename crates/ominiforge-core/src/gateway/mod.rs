@@ -31,6 +31,7 @@ pub mod view;
 mod workspace;
 pub(crate) mod workspace_config;
 
+pub use actor::{ActorHandle, Command, Delta, GatewayEvent};
 pub use config::GatewayConfig;
 pub use registry::{RuntimeInfo, SessionDefaults, SessionRegistry, WorkspaceConfigError};
 pub use server::serve;

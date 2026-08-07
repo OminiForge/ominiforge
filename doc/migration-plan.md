@@ -2,7 +2,7 @@
 
 本文档定义从当前架构（Web 前端 + Gateway）到新架构（GPUI 客户端 + 多机分布式）的完整实施计划。
 
-**当前进度**：Phase 0-3.2 ✅ | Phase 3.3+（Agent 对话核心）⏳ 待开始
+**当前进度**：Phase 0-3.3 ✅ | Phase 3.4（Agent 对话面板）⏳ 待开始
 
 **核心原则**：
 - 文档先行：先更新文档定义清楚，再按文档执行
@@ -30,6 +30,16 @@
 
 **注**：曾有的 `StatusBar` 组件是 editor 残留（围绕 vim 模式），随 editor 后置一并移除。
 
+### Phase 3.3: ClientProtocol 本地模式 ✅
+
+已完成：
+- 新建 `ominiforge-net` crate；`ClientProtocol` trait 定义全部客户端↔Core 操作面（session 生命周期 / 消息 / 事件订阅 / 监控 / 配置 / 连接状态）
+- `LocalProtocol` 复用 `SessionRegistry` + `ActorHandle` + `StatusHub`（与 gateway 同一份，零网络零序列化）；事件订阅复刻 SSE 的 subscribe-first → replay → `ReplayEnd` → live 语义
+- core 侧补 `gateway::actor` 的 re-export（`GatewayEvent`/`Command`/`Delta`）
+- `cargo clippy -p ominiforge-net` 零警告，workspace 全量编译通过
+
+**文件**：`crates/ominiforge-net/src/{lib,local}.rs`；core 侧 `gateway/mod.rs` 增 re-export。
+
 ---
 
 ## 当前 Phase
@@ -37,19 +47,6 @@
 ## Phase 3.3+: GPUI Agent 核心功能
 
 **目标**：GPUI 客户端能完成完整的 agent 对话闭环（连接 core、发消息、收流式响应、工具调用可视化），不依赖任何 editor。
-
-### 3.3 ClientProtocol 本地模式
-
-**按 `doc/network.md` 定义**
-
-**任务**：
-- [ ] 定义 `ClientProtocol` trait
-- [ ] 实现 `LocalProtocol`（GPUI App 直接链接 `ominiforge-core`，零网络）
-- [ ] 事件订阅：把 core 的事件流接入 GPUI UI
-
-**文件**：
-- `crates/ominiforge-net/src/lib.rs`：`ClientProtocol` trait（此时建 `ominiforge-net` crate）
-- `crates/ominiforge-net/src/local.rs`：`LocalProtocol`
 
 ### 3.4 Agent 对话面板
 
@@ -176,7 +173,8 @@
 |-------|------|------|
 | Phase 0-2: 文档/清理/Core 重构 | 干净的代码库 + Service traits | ✅ 已完成 |
 | Phase 3.1-3.2: Workspace + GPUI 基础 | 组件测试模式 + 最小窗口 | ✅ 已完成 |
-| Phase 3.3+: Agent 对话核心 | 可用的 agent 对话客户端 | ⏳ 当前 |
+| Phase 3.3: ClientProtocol 本地模式 | `ominiforge-net` + `LocalProtocol` | ✅ 已完成 |
+| Phase 3.4+: Agent 对话核心 | 可用的 agent 对话客户端 | ⏳ 当前 |
 | Phase 4: 远程模式 + 多机 | 分布式连接 | ⏳ 待开始 |
 | Phase 5: 配置系统 | 图形化配置 | ⏳ 待开始 |
 | Phase 6: Web 前端退出 | 完成切换 | ⏳ 待开始 |
