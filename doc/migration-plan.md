@@ -2,13 +2,14 @@
 
 本文档定义从当前架构（Web 前端 + Gateway）到新架构（GPUI 客户端 + 多机分布式）的完整实施计划。
 
-**当前进度**：Phase 3.1 ✅ 已完成 | Phase 3.2（GPUI Hello World）⏳ 待开始
+**当前进度**：Phase 0-3.2 ✅ | Phase 3.3+（Agent 对话核心）⏳ 待开始
 
 **核心原则**：
 - 文档先行：先更新文档定义清楚，再按文档执行
 - 大刀阔斧：不考虑过渡兼容，该删的直接删
 - 模块化 + 超低耦合 + 组合优先
 - 不重复维护多套
+- **核心功能优先**：agent 对话、session、监控先行；editor 嵌入后置
 
 ---
 
@@ -16,317 +17,171 @@
 
 ### Phase 0: 文档更新 ✅
 
-已完成的架构文档：
-- `doc/architecture.md`：更新 §3、§5、§18，新增 §21-26
-- `doc/editor.md`：新建（EditorBackend、NeovimBackend、Grid 渲染、IME 桥接）
-- `doc/gpui-app.md`：新建（GPUI 架构、UI 组件库、全局 vim 键绑定）
-- `doc/config-lua.md`：新建（Lua 配置、LSP 支持、图形界面、配置同步）
-- `doc/network.md`：新建（ClientProtocol、Local/WebSocket/QuicProtocol、ConnectionManager）
-- `doc/gateway.md`：更新（WebSocket endpoint、QUIC endpoint）
-- 删除：`doc/frontend.md`、`doc/tool-streaming.md`
-
 ### Phase 1: 代码清理 ✅
-
-已删除的冗余代码：
-- CLI 子命令：`init`、`inspect`（保留 `serve`、`eval`）
-- ts-rs 相关：依赖、feature、89 处 `#[derive(TS)]` 标记、justfile targets
-- CI 前端步骤：`ts-check`、`pnpm build`、整个 `frontend` job
-- 保留：`frontend/` 目录（过渡期方案，见 `frontend/README.md`）
 
 ### Phase 2: Core 重构 ✅
 
-已完成 Service trait 化：
-- `src/lsp/service.rs`：`LspService`（registry-facing）+ `LspRouter`（manager-facing）trait，`ProcessLspService` 实现
-- `src/format/mod.rs`：`FormatService` trait，`ProcessFormatService` 实现
-- `LspManager` 持有 `Arc<dyn LspRouter>`，tools 持有 `Arc<dyn FormatService>`
-- 未做：`SyntaxService`（无 tree-sitter 实现，Phase 3 需要时再做）、`SandboxService`（已有 trait）
+### Phase 3.1-3.2: Workspace + GPUI 基础 ✅
+
+已完成：
+- workspace 拆分（`crates/ominiforge-core` / `-ui` / `-app`），`[workspace.package]` + `[workspace.lints]` 统一
+- gpui 0.2 依赖接入，`test-support` 无头测试链打通
+- 第一个组件 `StatusBar` + 行为/布局测试模式确立（`simulate_keystrokes` + `debug_bounds`）
+- `ominiforge-app` 最小窗口入口 + Tab 键位路由验证
 
 ---
 
-## Phase 3: GPUI 技术验证（1-2 周）
+## 当前 Phase
 
-**目标**：按 `doc/gpui-app.md` 和 `doc/editor.md` 定义，验证 GPUI + Neovim 可行性
+## Phase 3.3+: GPUI Agent 核心功能
 
-### 3.1 创建 Workspace ✅
+**目标**：GPUI 客户端能完成完整的 agent 对话闭环（连接 core、发消息、收流式响应、工具调用可视化），不依赖任何 editor。
 
-已完成（按 `doc/architecture.md` §5）：
-- 根 `Cargo.toml` 改为 virtual workspace（含 `[workspace.lints]`，成员 crate 统一继承 lint 配置）
-- `src/`、`tests/` 整体移入 `crates/ominiforge-core/`（lib target 保留名 `ominiforge`，源码 import 零改动）
-- 创建占位 crate：`ominiforge-ui`、`ominiforge-editor`、`ominiforge-app`（空 lib.rs，待后续 Phase 填充）
-- 未做：`ominiforge-config`/`ominiforge-net`/`ominiforge-cli` crate 按需在 Phase 4/5 再建
-
-### 3.2 GPUI Hello World
-
-**按 `doc/gpui-app.md` 定义**
-
-**任务**：
-- [ ] 创建最小 GPUI 窗口
-- [ ] 渲染文本和 UI 元素
-- [ ] 处理键盘输入
-
-**文件**：
-- `crates/ominiforge-app/src/main.rs`：GPUI 应用入口
-- `crates/ominiforge-ui/src/lib.rs`：基础 UI 组件
-
-### 3.3 Neovim 嵌入原型
-
-**按 `doc/editor.md` 定义**
-
-**任务**：
-- [ ] 启动 `nvim --embed`
-- [ ] 建立 msgpack-rpc 连接
-- [ ] 接收 grid 事件
-- [ ] 在 GPUI 中渲染 grid
-
-**文件**：
-- `crates/ominiforge-editor/src/neovim/mod.rs`：Neovim 连接管理
-- `crates/ominiforge-editor/src/neovim/grid.rs`：Grid 渲染
-- `crates/ominiforge-editor/src/neovim/rpc.rs`：RPC 通信
-
-### 3.4 键盘输入路由
-
-**按 `doc/editor.md` 定义**
-
-**任务**：
-- [ ] GPUI 键盘事件 → nvim 输入
-- [ ] GPUI Keymap 系统
-- [ ] 焦点管理
-
-**文件**：
-- `crates/ominiforge-app/src/keymap.rs`：键绑定系统
-- `crates/ominiforge-editor/src/neovim/input.rs`：输入路由
-
-### 3.5 IME 桥接
-
-**按 `doc/editor.md` 定义**
-
-**任务**：
-- [ ] GPUI IME 事件 → nvim 输入
-- [ ] IME composition 显示
-
-**文件**：
-- `crates/ominiforge-editor/src/neovim/ime.rs`：IME 桥接
-
-### 3.6 验证
-
-**任务**：
-- [ ] 能在 GPUI 窗口中用 vim 编辑文件
-- [ ] 能保存文件
-- [ ] 能输入中文
-- [ ] 全局键绑定工作（如 Ctrl+W hjkl 切换面板）
-
----
-
-## Phase 4: GPUI 核心功能（2-3 周）
-
-**目标**：GPUI 客户端可以完成基本的 Agent 对话 + 文件编辑
-
-### 4.1 文件树面板
-
-**按 `doc/gpui-app.md` 定义**
-
-**任务**：
-- [ ] 文件树 UI 组件
-- [ ] 文件浏览和选择
-- [ ] 打开文件到编辑器
-- [ ] vim 键绑定（j/k 导航、/ 搜索、gg/G 跳转）
-
-**文件**：
-- `crates/ominiforge-ui/src/panels/file_tree.rs`：文件树面板
-
-### 4.2 Agent 对话面板
-
-**按 `doc/gpui-app.md` 和 `doc/network.md` 定义**
-
-**任务**：
-- [ ] 对话 UI 组件
-- [ ] 连接 Gateway（通过 ClientProtocol）
-- [ ] 发送消息和接收流式响应
-- [ ] 工具调用可视化
-- [ ] vim 键绑定（j/k 滚动、q 关闭）
-
-**文件**：
-- `crates/ominiforge-ui/src/panels/chat.rs`：对话面板
-- `crates/ominiforge-net/src/client.rs`：ClientProtocol 实现
-
-### 4.3 状态栏
-
-**按 `doc/gpui-app.md` 定义**
-
-**任务**：
-- [ ] 状态栏 UI 组件
-- [ ] 显示 vim 模式（来自 nvim RPC）
-- [ ] 显示 session 状态
-- [ ] 显示连接状态
-
-**文件**：
-- `crates/ominiforge-ui/src/panels/status_bar.rs`：状态栏
-
-### 4.4 全局 vim 键绑定
-
-**按 `doc/gpui-app.md` 定义**
-
-**任务**：
-- [ ] 面板切换（Ctrl+W hjkl）
-- [ ] 列表导航（j/k、gg/G、/）
-- [ ] 模式显示和切换
-
-**文件**：
-- `crates/ominiforge-app/src/keymap.rs`：全局键绑定
-
-### 4.5 验证
-
-**任务**：
-- [ ] 能浏览文件并打开编辑
-- [ ] 能与 Agent 对话
-- [ ] 能在面板间切换
-- [ ] 全局键绑定工作
-
----
-
-## Phase 5: GPUI 完整功能（3-4 周）
-
-**目标**：GPUI 客户端功能与 Web 前端对等
-
-### 5.1 Session 管理
-
-**任务**：
-- [ ] Session 列表面板
-- [ ] 创建 Session
-- [ ] Fork Session
-- [ ] 删除 Session
-- [ ] Session 切换
-
-**文件**：
-- `crates/ominiforge-ui/src/panels/session_list.rs`：Session 列表面板
-
-### 5.2 监控 Dashboard
-
-**任务**：
-- [ ] Usage 统计面板
-- [ ] Cost 统计面板
-- [ ] Trace 查看面板
-
-**文件**：
-- `crates/ominiforge-ui/src/panels/monitor.rs`：监控面板
-
-### 5.3 配置管理
-
-**按 `doc/config-lua.md` 定义**
-
-**任务**：
-- [ ] Lua 配置解析（`mlua` crate）
-- [ ] 配置图形界面
-- [ ] 配置验证和错误提示
-- [ ] LSP 支持（`ominiforge.d.lua` 类型定义）
-
-**文件**：
-- `crates/ominiforge-config/src/lua.rs`：Lua 配置解析
-- `crates/ominiforge-ui/src/panels/settings.rs`：配置界面
-
-### 5.4 多机连接
+### 3.3 ClientProtocol 本地模式
 
 **按 `doc/network.md` 定义**
 
 **任务**：
-- [ ] `ConnectionManager` 实现
-- [ ] Direct 传输
-- [ ] Tunnel 传输（Cloudflare Tunnel）
-- [ ] P2P 传输（`iroh` crate）
+- [ ] 定义 `ClientProtocol` trait
+- [ ] 实现 `LocalProtocol`（GPUI App 直接链接 `ominiforge-core`，零网络）
+- [ ] 事件订阅：把 core 的事件流接入 GPUI UI
+
+**文件**：
+- `crates/ominiforge-net/src/lib.rs`：`ClientProtocol` trait（此时建 `ominiforge-net` crate）
+- `crates/ominiforge-net/src/local.rs`：`LocalProtocol`
+
+### 3.4 Agent 对话面板
+
+**按 `doc/gpui-app.md` §3.3 定义**
+
+**任务**：
+- [ ] 对话 UI 组件（消息列表、输入框）
+- [ ] 通过 `ClientProtocol` 发送消息
+- [ ] 渲染流式响应（text delta、tool call、tool result）
+- [ ] 工具调用可视化
+- [ ] 键位绑定（j/k 滚动、q 关闭、Enter 发送）
+
+**文件**：
+- `crates/ominiforge-ui/src/panels/chat.rs`
+
+### 3.5 Session 管理面板
+
+**任务**：
+- [ ] Session 列表 UI
+- [ ] 创建 / 切换 / 删除 session
+- [ ] Fork session
+
+**文件**：
+- `crates/ominiforge-ui/src/panels/session_list.rs`
+
+### 3.6 监控面板
+
+**任务**：
+- [ ] Usage / Cost 统计展示
+- [ ] Trace 查看
+
+**文件**：
+- `crates/ominiforge-ui/src/panels/monitor.rs`
+
+### 3.7 文件树面板（只读浏览）
+
+**任务**：
+- [ ] 文件树 UI
+- [ ] 浏览、选择、预览（只读，不编辑）
+- [ ] 键位绑定（j/k 导航、/ 搜索）
+
+**文件**：
+- `crates/ominiforge-ui/src/panels/file_tree.rs`
+
+### 3.8 验证
+
+**任务**：
+- [ ] 本地模式连上 core，发起一轮完整 agent 对话
+- [ ] 流式响应实时渲染
+- [ ] 工具调用可见
+- [ ] 能管理 session（创建/切换/fork）
+- [ ] 能浏览文件树
+- [ ] 所有面板键位在无头测试下断言（`simulate_keystrokes` + `debug_bounds`）
+
+---
+
+## 后续 Phase
+
+### Phase 4: 远程模式 + 多机连接
+
+**目标**：GPUI 客户端能连接远程 Gateway。
+
+### 4.1 WebSocket 协议
+
+- [ ] `WebSocketProtocol` 实现 `ClientProtocol`
+- [ ] Gateway 添加 WebSocket endpoint（与 HTTP/SSE 并存）
+
+### 4.2 ConnectionManager
+
+- [ ] Direct / Tunnel / P2P 传输抽象
+- [ ] 自动状态机与降级
 - [ ] 设备发现（mDNS）
-- [ ] 权限管理
 
-**文件**：
-- `crates/ominiforge-net/src/connection_manager.rs`：连接管理
-- `crates/ominiforge-net/src/transports/`：各种传输实现
+**文件**：`crates/ominiforge-net/src/`
 
-### 5.5 配置同步
+### 4.3 权限与认证
 
-**按 `doc/config-lua.md` 定义**
-
-**任务**：
-- [ ] Last-Write-Wins + 字段级合并
-- [ ] Version vector
-- [ ] 自动同步（连接建立时）
-
-**文件**：
-- `crates/ominiforge-config/src/sync.rs`：配置同步
-
-### 5.6 验证
-
-**任务**：
-- [ ] 所有功能与 Web 前端对等
-- [ ] 多机连接工作
-- [ ] 配置同步工作
+- [ ] token 认证
+- [ ] 连接 ≠ 授权
 
 ---
 
-## Phase 6: Web 前端退出（1 周）
+### Phase 5: 配置系统
 
-**目标**：Web 前端停止维护，最终移除
+**目标**：配置管理（图形界面为主入口）。
 
-### 6.1 标记 deprecated
+- [ ] 配置图形界面（Settings 面板）
+- [ ] 配置验证与错误提示
+- [ ] 配置同步（Last-Write-Wins + 字段级合并）
 
-**任务**：
-- [ ] 在 `frontend/README.md` 中标记为 deprecated
+**文件**：`crates/ominiforge-config/`（此时建 crate）
+
+**说明**：Lua 配置（`config-lua.md`）作为**高级可选项**延后，非必须。初期用图形界面 + 简单格式即可。
+
+---
+
+### Phase 6: Web 前端退出
+
+- [ ] GPUI 客户端功能与 Web 前端对等的部分全部覆盖后，标记 `frontend/` deprecated
 - [ ] 停止新功能开发
-
-### 6.2 决定最终命运
-
-**任务**：
-- [ ] 选项 1：完全移除 `frontend/`
-- [ ] 选项 2：保留为只读/轻量入口
-
-### 6.3 清理
-
-**任务**：
-- [ ] 删除 `frontend/`（如果选择选项 1）
-- [ ] 删除 Gateway 的静态文件服务（如果 Web 前端移除）
-- [ ] 更新文档
+- [ ] 决定最终移除或保留只读
 
 ---
 
-## Phase 7: 高级功能（后续）
+### Phase 7: Editor 嵌入（后置，高级功能）
 
-**目标**：实现高级功能
+**状态**：**明确后置**。Editor 嵌入（NeovimBackend / 自研模态引擎）是一个独立的、工程量巨大的高级功能，与 agent 核心解耦。在 agent 对话、session、监控、远程连接全部稳定之前，不投入。
 
-### 7.1 Sandbox（feature request）
+**启动条件**（届时才评估，现在不展开）：
+- Agent 核心功能完整且稳定
+- 重新评估 vim 完备度目标（键位手感 vs 完整 vim）
+- 基于 `editor_embed_report.agent.final.md` 的结论选型
 
-**任务**：
-- [ ] 设计 Sandbox 架构
-- [ ] 实现 `SandboxService` trait
-- [ ] 实现多种 Sandbox Runtime（boxlite、Nix、Docker）
-
-### 7.2 Eval 系统
-
-**任务**：
-- [ ] 启用 `eval` feature
-- [ ] 完善 Eval 系统
-
-### 7.3 手机 App
-
-**任务**：
-- [ ] 设计手机 App 架构
-- [ ] 实现手机 App（原生或跨平台）
+**已否决的路线**（调研结论，见该报告）：
+- libnvim 静态库嵌入（官方不支持，唯一生产用户已放弃）
+- zed editor crate（技术耦合 + GPL 双否决）
+- 依赖系统 nvim 的 `nvim --embed` 子进程（非自包含，与产品定位冲突）
 
 ---
 
 ## 时间线估算
 
-| Phase | 时间 | 产出 | 状态 |
-|-------|------|------|------|
-| Phase 0: 文档更新 | 1-2 天 | 文档定义完成 | ✅ 已完成 |
-| Phase 1: 代码清理 | 1-2 天 | 干净的代码库 | ✅ 已完成 |
-| Phase 2: Core 重构 | 3-5 天 | Service traits 定义完成 | ✅ 已完成 |
-| Phase 3: GPUI 技术验证 | 1-2 周 | GPUI + Neovim 原型 | 🔵 进行中（3.1 ✅） |
-| Phase 4: GPUI 核心功能 | 2-3 周 | 基本可用 | ⏳ 待开始 |
-| Phase 5: GPUI 完整功能 | 3-4 周 | 功能完整 | ⏳ 待开始 |
-| Phase 6: Web 前端退出 | 1 周 | 完成切换 | ⏳ 待开始 |
-| **总计** | **10-15 周** | **新架构完成** | **Phase 0-2/7 完成** |
+| Phase | 产出 | 状态 |
+|-------|------|------|
+| Phase 0-2: 文档/清理/Core 重构 | 干净的代码库 + Service traits | ✅ 已完成 |
+| Phase 3.1-3.2: Workspace + GPUI 基础 | 组件测试模式 + 最小窗口 | ✅ 已完成 |
+| Phase 3.3+: Agent 对话核心 | 可用的 agent 对话客户端 | ⏳ 当前 |
+| Phase 4: 远程模式 + 多机 | 分布式连接 | ⏳ 待开始 |
+| Phase 5: 配置系统 | 图形化配置 | ⏳ 待开始 |
+| Phase 6: Web 前端退出 | 完成切换 | ⏳ 待开始 |
+| Phase 7: Editor 嵌入 | （后置，启动条件满足才排期） | 🔒 锁定 |
 
-**已完成**：Phase 0-2（3/7）
-**当前**：Phase 3（GPUI 技术验证）
-**剩余**：Phase 3-7（5 个 Phase）
+**关键变化**：editor 从「Phase 3 核心」降级为「Phase 7 后置高级功能」，agent 对话核心提前为当前最高优先级。
 
 ---
 
@@ -334,11 +189,9 @@
 
 | 风险 | 影响 | 缓解措施 |
 |------|------|----------|
-| GPUI 学习曲线陡峭 | Phase 3 延期 | 先做最小原型验证可行性 |
-| Neovim 嵌入复杂 | Phase 3 延期 | 参考 Neovide 架构，分步实现 |
-| IME 问题 | 中文输入不可用 | 提前测试，参考 GPUI 文档 |
-| P2P 复杂 | Phase 5 延期 | 先用 Tunnel，P2P 作为后续优化 |
-| Lua 配置复杂 | Phase 5 延期 | 先用 TOML，Lua 作为后续优化 |
+| GPUI 学习曲线 | 面板开发慢 | 先用最小组件验证，复用 Zed 测试模式 |
+| ClientProtocol 抽象不当 | 本地/远程模式分叉 | 先只实现 LocalProtocol，远程模式验证后再抽象 |
+| Editor 后置导致返工 | 面板布局需预留 editor 位置 | 面板系统设计为可插拔（dock），editor 面板后续作为一个新 panel 加入 |
 
 ---
 
@@ -347,9 +200,10 @@
 1. **文档先行**：先更新文档定义清楚，再按文档执行
 2. **大刀阔斧**：不考虑过渡兼容，该删的直接删
 3. **模块化 + 超低耦合 + 组合优先**：每个功能域是独立 crate，通过 trait 通信
-4. **不重复维护多套**：所有共享功能在 core，Editor 和 Agent 都是客户端
-5. **验证驱动**：每个 Phase 结束都有明确的验证标准
-6. **完成即清理**：完成一个 Phase 后，将详细任务清单从正文删除，换成简短总结移入「已完成 Phase」区域，保持文档只反映当前待做的工作
+4. **不重复维护多套**：所有共享功能在 core，各客户端统一接口
+5. **核心功能优先**：agent 对话、session、监控先行；editor 嵌入后置
+6. **验证驱动**：每个 Phase 结束都有明确的验证标准
+7. **完成即清理**：完成一个 Phase 后，将详细任务清单从正文删除，换成简短总结移入「已完成 Phase」区域
 
 ---
 
@@ -359,18 +213,4 @@
 
 ## 文档生命周期说明
 
-**本文档是临时文档**，用于指导实施过程。实施完成后，本文档将被删除。
-
-**临时文档 vs 持久化文档**：
-
-| 类型 | 文档 | 生命周期 | 目的 |
-|------|------|---------|------|
-| **临时文档** | `migration-plan.md`（本文档） | 实施完成后删除 | 指导执行、记录任务清单 |
-| **临时文档** | `architecture-decisions.md` | 实施完成后删除 | 记录决策理由、替代方案 |
-| **持久化文档** | `architecture.md` | 长期保留 | 描述系统架构、设计规范 |
-| **持久化文档** | `editor.md`、`gpui-app.md` 等 | 长期保留 | 描述子系统设计、接口定义 |
-
-**关键原则**：
-- 持久化文档只描述"是什么"和"怎么做"，不描述"为什么这么做"
-- "为什么这么做"在临时文档、代码注释、commit message 中记录
-- 实施完成后，临时文档删除，持久化文档保留并随系统演化更新
+**本文档是临时文档**，实施完成后删除。持久化文档（`architecture.md`、`gpui-app.md` 等）长期保留并随系统演化更新。

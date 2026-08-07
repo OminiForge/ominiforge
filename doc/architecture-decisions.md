@@ -46,26 +46,21 @@
 - 需要读 Zed 源码作为文档
 - 可以用 `gpui-component`（longbridge/gpui-component）作为组件库参考
 
-### 2. 编辑器：Neovim 嵌入（唯一后端）
+### 2. 编辑器：后置（原 Neovim 嵌入方案已否决）
 
-**决策**：嵌入 Neovim 作为唯一的编辑器后端，不做通用编辑器。
+**决策**：Editor 嵌入**明确后置**为高级功能（见 `migration-plan.md` Phase 7），不在当前架构主线。
 
-**理由**：
-- 完整的 vim 体验（normal/visual/insert、寄存器、宏、text objects）
-- Neovim --embed 模式成熟（Neovide 已验证）
-- 不需要自己实现 vim 逻辑（巨大工程量）
-- 用户是 vim 核心玩家，这是核心需求
+**原方案已否决**：依赖系统 nvim 的 `nvim --embed` 子进程方案，因「非自包含、与产品定位冲突」被否决。详细调研见 `editor_embed_report.agent.final.md`：
+- libnvim 静态库嵌入：官方不支持，唯一生产用户 VimR 已放弃
+- zed editor crate：技术耦合（~40 内部 crate）+ GPL 双否决
+- `nvim --embed` 子进程：需用户预装 neovim，非自包含
 
-**替代方案**：
-- Zed 的 editor crate：功能完整，但依赖几十个 Zed 内部 crates，无法独立使用
-- 自建编辑器（ropey + syntect）：工作量中等，但需要维护两套（vim + 通用）
-- Zed 的 vim crate：Zed 自研 vim 引擎，但 GPL 且依赖 Zed 生态
+**当前方向**（启动条件满足后再细化，现在不展开）：
+- 组件底座倾向 gpui-component CodeEditor（tree-sitter + ropey + LSP）
+- vim 键位层倾向 hjkl-engine 或自研模态引擎
+- 验收规格：red VIM_COMPATIBILITY.md；对测：headless nvim golden-file
 
-**关键认知**：
-- Neovim Grid 协议是字符网格，不是"终端风格"
-- Grid 只是数据来源，视觉渲染完全自由（字体、动画、颜色）
-- 可以接管 nvim 的 popup menu、tabline、statusline，用 GPUI 画现代化 UI
-- IME 支持是关键挑战，需要在 GPUI 层桥接
+**关键认知**：vim 键位手感是需求，完整 vim 插件生态不是。Editor 与 agent 核心解耦，后置不影响 agent 对话、session、监控等核心功能先行。
 
 ### 3. 全局 vim 键绑定：GPUI Keymap 系统
 
@@ -141,15 +136,16 @@ ConnectionManager
 - Web 前端：HTTP/SSE（过渡期保留，最终移除）
 - Gateway 需要添加 WebSocket endpoint（与 HTTP/SSE 并存）
 
-### 6. 配置系统：Lua + 图形界面
+### 6. 配置系统：图形界面为主，Lua 后置
 
-**决策**：使用 Lua 作为统一配置语言（Neovim 配置 + 系统配置），提供图形界面。
+**决策**：配置以**图形界面为主入口**，Lua 配置作为**高级可选项后置**（非必须）。
 
 **理由**：
-- Lua 是 Neovim 的标准配置语言
-- 配置即代码，表达能力最强
-- 可以写逻辑（if/else、循环、函数）
-- 统一 Neovim 配置和系统配置
+- 图形界面是普通用户的主要入口
+- Lua 配置与 Neovim 嵌入强相关（Neovim 后置，Lua 随之置后）
+- 初期用图形界面 + 简单格式即可满足需求
+
+**延后**：Lua 作为统一配置语言（Neovim 配置 + 系统配置）的完整方案，见 `config-lua.md`，待 Editor 嵌入启动时一并评估。
 
 **架构**：
 ```
@@ -183,13 +179,14 @@ LSP 支持（类型定义文件 ominiforge.d.lua）
 ```
 crates/
   ominiforge-core/      # 核心：agent、session、event、tool、lsp、parsing、format
-  ominiforge-editor/    # Editor Service：EditorBackend trait + NeovimBackend
-  ominiforge-config/    # Config Service：ConfigStore trait + LocalFile/P2PSync
-  ominiforge-net/       # Network Service：Connection trait + Direct/Tunnel/P2P
+  ominiforge-config/    # Config Service（Phase 5 建）
+  ominiforge-net/       # Network Service（Phase 3.3 建）：ClientProtocol + 传输
   ominiforge-ui/        # UI 组件库：theme、components、panels
   ominiforge-app/       # GPUI 桌面应用（组合所有模块）
-  ominiforge-cli/       # CLI 工具（只有 serve 子命令）
+  ominiforge-cli/       # CLI 工具（只有 serve 子命令，后续拆出）
 ```
+
+**注**：`ominiforge-editor` 已随 Editor 后置移除，启动时重建。
 
 **关键认知**：
 - Core 无 GUI 依赖，可以独立编译和测试

@@ -1,5 +1,9 @@
 # 配置系统（Lua）
 
+> **状态：Lua 部分为高级可选项，后置**。配置系统以图形界面为主入口（见 `architecture.md` §24）。
+> 本文的 Lua 统一配置语言方案与 Neovim 嵌入强相关，随 Editor 后置（`migration-plan.md` Phase 7）
+> 一并评估。
+
 配置系统使用 Lua 作为统一配置语言，提供图形界面和 LSP 支持。
 
 ## 1. 设计目标

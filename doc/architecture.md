@@ -62,7 +62,7 @@ ominiforge eval <suite>     # 跑 eval 套件（高级 feature，预留）
 CLI 应保持可组合、可脚本化、输出结构清晰。
 
 **已移除的子命令**：
-- `init`：配置通过 Lua 配置文件 + GPUI 图形界面管理（见 §23）
+- `init`：配置通过 GPUI 图形界面管理（见 §24）
 - `inspect`：session 分析通过 GPUI 客户端的监控面板（见 [`gpui-app.md`](./gpui-app.md)）
 
 ### 3.2 GPUI 客户端（唯一 UI）
@@ -71,12 +71,11 @@ GPUI 客户端是唯一的用户界面，替代了原计划的 Web 前端和 Tau
 
 **核心特性**：
 - 基于 GPUI 框架（Zed 的 UI 框架，Apache-2.0）
-- 嵌入 Neovim 作为编辑器（完整 vim 体验）
-- 全局 vim 键绑定（GPUI Keymap 系统）
+- Agent 对话、session 管理、监控面板为核心功能
 - 多机连接（Direct/Tunnel/P2P，自动切换）
 - 本地模式（直接链接 core，零网络开销）和远程模式（连接远程 Gateway）
 
-详见 [`gpui-app.md`](./gpui-app.md) 和 [`editor.md`](./editor.md)。
+Editor 嵌入（vim 编辑体验）为后置的高级功能，见 §22 与 [`migration-plan.md`](./migration-plan.md) Phase 7。详见 [`gpui-app.md`](./gpui-app.md)。
 
 ### 3.3 Web 前端（过渡期保留，最终移除）
 
@@ -162,9 +161,6 @@ crates/
   ominiforge-core/         # 核心：agent、session、event、tool、lsp、parsing、format
                            # 无 GUI 依赖，可独立编译和测试
   
-  ominiforge-editor/       # Editor Service
-                           # trait EditorBackend + NeovimBackend 实现
-  
   ominiforge-config/       # Config Service
                            # trait ConfigStore + LocalFile/P2PSync 实现
   
@@ -185,7 +181,6 @@ crates/
 
 ```text
 ominiforge-app → ominiforge-ui → gpui
-ominiforge-app → ominiforge-editor → ominiforge-core
 ominiforge-app → ominiforge-config → ominiforge-core
 ominiforge-app → ominiforge-net → ominiforge-core
 ominiforge-cli → ominiforge-core
@@ -989,28 +984,9 @@ assemble（每次会话冷启动 / resume；CLI 与 gateway 同一入口）
 - **boxlite 沙箱后端不应用 env overlay**：overlay 值是宿主路径（如 `/nix/store/...`），guest 里没有挂载点了无意义——待 [`sandbox.md`](./sandbox.md) 的 `/nix/store` 挂载设计落地后再接。passthrough（默认后端）正常。
 - env 求值的是**宿主**环境；服务器类子进程（MCP/LSP）本就跑在宿主，与 sandbox 内的 shell 共享同一份 overlay。
 
-## 22. Editor 系统
+## 22. Editor 系统（后置）
 
-Editor 系统是 GPUI 客户端的核心组件，提供完整的 vim 编辑体验。
-
-### 22.1 EditorBackend trait
-
-所有编辑器后端实现统一的 `EditorBackend` trait：渲染编辑器内容、处理输入、管理文件状态、暴露 vim 模式与光标位置。签名以代码为准（`ominiforge-editor` crate），职责定义见 [`editor.md`](./editor.md) §2.1。
-
-### 22.2 NeovimBackend（唯一实现）
-
-当前唯一实现是 `NeovimBackend`，通过 `nvim --embed` 嵌入 Neovim：
-
-- **完整 vim 体验**：normal/visual/insert 模式、寄存器、宏、text objects
-- **Grid 渲染**：Neovim 的 grid 协议 → GPUI 文本渲染
-- **IME 桥接**：GPUI IME 事件 → Neovim 输入
-- **键路由**：GPUI 键盘事件 → Neovim 输入（编辑器面板有焦点时）
-
-详见 [`editor.md`](./editor.md)。
-
-### 22.3 全局 vim 键绑定
-
-使用 GPUI 的 Keymap/KeyContext 系统实现全局 vim 键绑定（编辑器面板内转发给 Neovim、面板外由应用的 modal 引擎处理）。机制定义见 [`editor.md`](./editor.md) §4，面板侧布局见 [`gpui-app.md`](./gpui-app.md)。
+Editor 嵌入是**后置的高级功能**，不在当前架构主线（见 [`migration-plan.md`](./migration-plan.md) Phase 7）。原 Neovim `nvim --embed` 子进程方案已否决（非自包含、与产品定位冲突），详细调研与候选路线见 `editor_embed_report.agent.final.md`。启动条件与选型待 Phase 7 重新评估。
 
 ## 23. 通信协议
 
@@ -1020,7 +996,7 @@ GPUI 客户端与 Core 之间的通信通过统一的 `ClientProtocol` trait 抽
 
 ## 24. 配置系统
 
-配置系统使用 Lua 作为统一配置语言（`ominiforge.lua`），配套 `lua-language-server` 类型定义（补全/校验/文档）、GPUI Settings 面板图形化编辑（双向同步）、以及多机配置同步（Last-Write-Wins + 字段级合并）。格式、分层、界面与同步的定义见 [`config-lua.md`](./config-lua.md)。
+配置系统以 **GPUI Settings 面板图形化编辑为主入口**，配套多机配置同步（Last-Write-Wins + 字段级合并）。Lua 作为统一配置语言的完整方案（`ominiforge.lua` + `lua-language-server` 类型定义 + 双向同步）为**高级可选项后置**，与 Editor 嵌入一并评估（见 [`migration-plan.md`](./migration-plan.md) Phase 5、Phase 7）。界面与同步的定义见 [`config-lua.md`](./config-lua.md)。
 
 ## 25. 多机连接
 

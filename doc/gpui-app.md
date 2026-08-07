@@ -4,8 +4,8 @@ GPUI 应用是 ominiforge 的唯一用户界面，提供完整的 Agent 工作�
 
 ## 1. 设计目标
 
-- **极致编辑体验**：Neovim 嵌入，完整 vim 功能
-- **全局 vim 键绑定**：统一的 modal 操作
+- **Agent 对话为核心**：流式对话、工具调用可视化
+- **全局键位绑定**：统一的键盘操作（GPUI Keymap 系统）
 - **高性能**：GPU 加速渲染，平台原生文本光栅化
 - **多机连接**：本地模式和远程模式，自动切换
 - **模块化**：UI 组件库，可组合，可替换
@@ -17,12 +17,12 @@ GPUI 应用是 ominiforge 的唯一用户界面，提供完整的 Agent 工作�
 GPUI 应用采用面板布局，主要面板包括：
 
 - **文件树面板**：浏览文件，打开文件到编辑器
-- **编辑器面板**：Neovim 嵌入，编辑文件
+- **编辑器面板**：（后置，见 `migration-plan.md` Phase 7）
 - **对话面板**：Agent 对话，发送消息，查看响应
 - **Session 列表面板**：管理 session（列表、创建、fork、删除）
 - **监控面板**：查看 usage、cost、trace
 - **设置面板**：配置管理（Lua + 图形界面）
-- **状态栏**：显示 vim 模式、session 状态、连接状态
+- **状态栏**：显示 session 状态、连接状态（vim 模式显示属 Editor 后置功能）
 
 ### 2.2 面板管理
 
@@ -34,7 +34,7 @@ GPUI 应用采用面板布局，主要面板包括：
 
 ### 2.3 全局 vim 键绑定
 
-全局 vim 键绑定在 GPUI 的 Keymap/KeyContext 系统中实现（编辑器面板内转发给 Neovim、面板外由应用的 modal 引擎处理、状态栏显示当前模式）。机制定义见 [`editor.md`](./editor.md) §4。
+全局键位绑定在 GPUI 的 Keymap/KeyContext 系统中实现，面板各自处理自己的导航键（文件树 j/k、对话面板滚动等），面板切换用统一快捷键。Editor 面板内的 vim 键位属后置功能（见 [`editor.md`](./editor.md) 与 `migration-plan.md` Phase 7）。
 
 ## 3. UI 组件库
 
@@ -69,7 +69,7 @@ GPUI 应用采用面板布局，主要面板包括：
 面板组件是应用的核心 UI：
 
 - FileTree：文件树面板
-- Editor：编辑器面板（NeovimBackend）
+- Editor：编辑器面板（后置，见 `migration-plan.md` Phase 7）
 - Chat：对话面板
 - SessionList：Session 列表面板
 - Monitor：监控面板

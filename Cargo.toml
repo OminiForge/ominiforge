@@ -3,7 +3,6 @@ resolver = "2"
 members = [
   "crates/ominiforge-app",
   "crates/ominiforge-core",
-  "crates/ominiforge-editor",
   "crates/ominiforge-ui",
 ]
 
