@@ -26,8 +26,9 @@
 已完成：
 - workspace 拆分（`crates/ominiforge-core` / `-ui` / `-app`），`[workspace.package]` + `[workspace.lints]` 统一
 - gpui 0.2 依赖接入，`test-support` 无头测试链打通
-- 第一个组件 `StatusBar` + 行为/布局测试模式确立（`simulate_keystrokes` + `debug_bounds`）
-- `ominiforge-app` 最小窗口入口 + Tab 键位路由验证
+- 组件测试模式确立（`simulate_keystrokes` 行为断言 + `debug_bounds` 布局断言，无像素 diff）
+
+**注**：曾有的 `StatusBar` 组件是 editor 残留（围绕 vim 模式），随 editor 后置一并移除。
 
 ---
 
