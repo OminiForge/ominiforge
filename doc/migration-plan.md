@@ -160,7 +160,7 @@
 **启动条件**（届时才评估，现在不展开）：
 - Agent 核心功能完整且稳定
 - 重新评估 vim 完备度目标（键位手感 vs 完整 vim）
-- 基于 `editor_embed_report.agent.final.md` 的结论选型
+- 基于 `doc/research/editor_embed_report.agent.final.md` 的结论选型
 
 **已否决的路线**（调研结论，见该报告）：
 - libnvim 静态库嵌入（官方不支持，唯一生产用户已放弃）

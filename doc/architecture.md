@@ -986,7 +986,7 @@ assemble（每次会话冷启动 / resume；CLI 与 gateway 同一入口）
 
 ## 22. Editor 系统（后置）
 
-Editor 嵌入是**后置的高级功能**，不在当前架构主线（见 [`migration-plan.md`](./migration-plan.md) Phase 7）。原 Neovim `nvim --embed` 子进程方案已否决（非自包含、与产品定位冲突），详细调研与候选路线见 `editor_embed_report.agent.final.md`。启动条件与选型待 Phase 7 重新评估。
+Editor 嵌入是**后置的高级功能**，不在当前架构主线（见 [`migration-plan.md`](./migration-plan.md) Phase 7）。原 Neovim `nvim --embed` 子进程方案已否决（非自包含、与产品定位冲突），详细调研与候选路线见 `doc/research/editor_embed_report.agent.final.md`。启动条件与选型待 Phase 7 重新评估。
 
 ## 23. 通信协议
 

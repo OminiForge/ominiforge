@@ -50,7 +50,7 @@
 
 **决策**：Editor 嵌入**明确后置**为高级功能（见 `migration-plan.md` Phase 7），不在当前架构主线。
 
-**原方案已否决**：依赖系统 nvim 的 `nvim --embed` 子进程方案，因「非自包含、与产品定位冲突」被否决。详细调研见 `editor_embed_report.agent.final.md`：
+**原方案已否决**：依赖系统 nvim 的 `nvim --embed` 子进程方案，因「非自包含、与产品定位冲突」被否决。详细调研见 `doc/research/editor_embed_report.agent.final.md`：
 - libnvim 静态库嵌入：官方不支持，唯一生产用户 VimR 已放弃
 - zed editor crate：技术耦合（~40 内部 crate）+ GPL 双否决
 - `nvim --embed` 子进程：需用户预装 neovim，非自包含

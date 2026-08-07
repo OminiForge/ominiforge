@@ -2,7 +2,7 @@
 
 > **状态：后置的高级功能**（`migration-plan.md` Phase 7）。本文描述的 Neovim `nvim --embed`
 > 子进程方案已否决（非自包含、与产品定位冲突），内容仅作历史参考。启动条件与选型以
-> `editor_embed_report.agent.final.md` 为准重新评估。详见 `architecture.md` §22。
+> `doc/research/editor_embed_report.agent.final.md` 为准重新评估。详见 `architecture.md` §22。
 
 Editor 系统是 GPUI 客户端的核心组件，提供完整的 vim 编辑体验。
 
