@@ -40,14 +40,14 @@ GPUI 应用采用面板布局，主要面板包括：
 
 ### 3.1 主题系统
 
-主题系统定义颜色、字体、间距等设计 tokens。
+主题系统定义颜色、字体、间距等设计 tokens，是全部视觉**值**的单一事实源（`crates/ominiforge-ui/src/theme.rs` 的 `Theme`，进程级 gpui global）。设计**原则与语义**见 [`gpui-design.md`](./gpui-design.md)——本文档不重复其 token 表，只定结构。
 
 **主题结构**：
 
-- 颜色：语义化命名（surface_base、text_primary、accent 等）
-- 字体：字体家族、大小、行高、字重
-- 间距：标准化的间距值（space_xs、space_sm、space_md 等）
-- 圆角：标准化的圆角值（radius_sm、radius_md 等）
+- 颜色：语义化角色（canvas ladder、text ladder、accent、state 三态等）
+- 字体：sans / chinese / mono 三族语义
+- 间距：基于 4px 网格的命名梯度
+- 圆角：标准化分级
 
 **主题实现**：
 

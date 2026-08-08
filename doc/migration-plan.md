@@ -2,7 +2,7 @@
 
 本文档定义从当前架构（Web 前端 + Gateway）到新架构（GPUI 客户端 + 多机分布式）的完整实施计划。
 
-**当前进度**：Phase 0-3.3 ✅ | Phase 3.4（Agent 对话面板）⏳ 待开始
+**当前进度**：Phase 0-3.3 ✅ | Phase 3.4 主体完成（对话面板已实现，2 项延后）⏳ | Phase 3.5（Session 面板）待开始
 
 **核心原则**：
 - 文档先行：先更新文档定义清楚，再按文档执行
@@ -48,19 +48,30 @@
 
 **目标**：GPUI 客户端能完成完整的 agent 对话闭环（连接 core、发消息、收流式响应、工具调用可视化），不依赖任何 editor。
 
-### 3.4 Agent 对话面板
+### 3.4 Agent 对话面板 ✅ 主体完成
 
 **按 `doc/gpui-app.md` §3.3 定义**
 
+**状态**：核心对话闭环已实现并有单测；余 2 项延后（见下）。
+
 **任务**：
-- [ ] 对话 UI 组件（消息列表、输入框）
-- [ ] 通过 `ClientProtocol` 发送消息
-- [ ] 渲染流式响应（text delta、tool call、tool result）
-- [ ] 工具调用可视化
-- [ ] 键位绑定（j/k 滚动、q 关闭、Enter 发送）
+- [x] 对话 UI 组件（消息列表、输入框）— `Chat` 视图 + `ChatState` 纯折叠模型
+- [x] 通过 `ClientProtocol` 发送消息 — `send_message`，视图经 trait 调用
+- [x] 渲染流式响应（text delta、reasoning）— `Delta` 折叠进 `streaming` 块，`ReplayEnd` 前的历史 delta 忽略
+- [x] 工具调用可视化 — `Row::Tool`（✓/✗/… 状态 + summary），live `ToolCall`/`ToolEvent` 经 seq 配对
+- [x] 乐观发送 + seq 对账（pending→committed/失败标红）+ 订阅错误 → UI notice
+- [x] 键位绑定（j/k 滚动、q 关闭、Enter 发送）— `bind_keys` + `on_action`（键位语义待定稿，见 gpui-app.md §2.3）
+- [x] `visible_rows` 借用迭代（去每帧全量拷贝）
+- [ ] 消息列表虚拟滚动（`list`，可变高）— 当前全量渲染；长对话性能优化，延后
+- [ ] 键位/窗口的 `#[gpui::test]` 无头断言（`simulate_keystrokes` + `debug_bounds`）— 待键位语义定稿后补
+
+**链接库说明**：gpui 在 Linux 同时编译 Wayland 与 X11 后端，故链接期需能解析 X11 客户端库（libxcb/libxkbcommon/libxkbcommon-x11）——即便 Wayland 会话运行时不加载它们。nix 不提供默认链接路径，已在 `flake.nix` 经 `RUSTFLAGS -L` 指向，`cargo nextest run -p ominiforge-ui` 通过。
+
+**架构说明**：面板拆为 `ChatState`（纯事件折叠，无 gpui 依赖、可脱离窗口单测）+ `Chat` 视图（异步协议驱动 + 键位 + 布局），遵循「规则全在 state、view 是薄壳」。纯逻辑单测覆盖：打开折叠 committed view、Delta 仅在 ReplayEnd 后折叠、reasoning/text 分流、乐观 user 行的 committed 对账、live 工具卡开启/落账。
 
 **文件**：
-- `crates/ominiforge-ui/src/panels/chat.rs`
+- `crates/ominiforge-ui/src/panels/chat.rs`、`crates/ominiforge-ui/src/theme.rs`、`crates/ominiforge-ui/src/panels/mod.rs`
+- `flake.nix`（X11 链接库）
 
 ### 3.5 Session 管理面板
 
@@ -174,13 +185,16 @@
 | Phase 0-2: 文档/清理/Core 重构 | 干净的代码库 + Service traits | ✅ 已完成 |
 | Phase 3.1-3.2: Workspace + GPUI 基础 | 组件测试模式 + 最小窗口 | ✅ 已完成 |
 | Phase 3.3: ClientProtocol 本地模式 | `ominiforge-net` + `LocalProtocol` | ✅ 已完成 |
-| Phase 3.4+: Agent 对话核心 | 可用的 agent 对话客户端 | ⏳ 当前 |
+| Phase 3.4: Agent 对话面板 | Chat 面板（消息/流式/工具卡/乐观对账） | ✅ 主体完成（虚拟滚动、窗口键位测试延后） |
+| Phase 3.5-3.8: Session/监控/文件树面板 | 各面板 + 验证 | ⏳ 当前 |
 | Phase 4: 远程模式 + 多机 | 分布式连接 | ⏳ 待开始 |
 | Phase 5: 配置系统 | 图形化配置 | ⏳ 待开始 |
 | Phase 6: Web 前端退出 | 完成切换 | ⏳ 待开始 |
 | Phase 7: Editor 嵌入 | （后置，启动条件满足才排期） | 🔒 锁定 |
 
 **关键变化**：editor 从「Phase 3 核心」降级为「Phase 7 后置高级功能」，agent 对话核心提前为当前最高优先级。
+
+**2026-08-08 路线调整**：项目许可证转 **GPL-3.0-or-later**；gpui 来源切到 **zed git pin**（tag v1.14.2，wgpu 渲染器），不引 gpui-component（组件自研，聚焦 agent 领域）。调研与理由见 `architecture-decisions.md` §1/§9 与 `research/gpui_sustainability_report.md`。
 
 ---
 

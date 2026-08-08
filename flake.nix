@@ -83,6 +83,17 @@
       devShells.default = pkgs.mkShell {
         packages = rustTools ++ nixTools ++ nodeTools ++ miscTools;
 
+        # gpui compiles BOTH its Wayland and X11 backends on Linux (they are
+        # default features), so every UI test/app binary must RESOLVE the X11
+        # client libs at link time (libxcb, libxkbcommon, libxkbcommon-x11)
+        # even though a Wayland session never loads them at runtime. Nix does
+        # not put these on the default linker search path; without this,
+        # `cargo nextest run -p ominiforge-ui` fails at link with
+        # `unable to find library -lxcb -lxkbcommon -lxkbcommon-x11`. This is a
+        # link-path pointer only — it does NOT tie the app to X11; the runtime
+        # backend is chosen by the session (Wayland when WAYLAND_DISPLAY is set).
+        RUSTFLAGS = "-L ${pkgs.libxcb}/lib -L ${pkgs.libxkbcommon}/lib";
+
         RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
         PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig";
         # Point the screenshot tool (and playwright-core) at the nix Chromium and

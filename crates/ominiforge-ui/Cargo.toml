@@ -8,14 +8,17 @@ description = "GPUI component library (theme, components, panels)"
 publish = false
 
 [dependencies]
-# gpui 0.2.x 自 2025-10 起发布在 crates.io（Apache-2.0），见
-# doc/architecture-decisions.md §1。组件层自建（不用 gpui-component），
-# 框架本体是唯一 UI 依赖。
-gpui = "0.2"
+# 组件层自建（不用 gpui-component），框架本体是唯一 UI 依赖。
+gpui.workspace = true
+ominiforge-core = { path = "../ominiforge-core" }
+ominiforge-net = { path = "../ominiforge-net" }
+futures-lite = "2"
+anyhow = "1"
 
 [dev-dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # TestAppContext 无窗口测试（doc/gpui-app.md §8 验证矩阵 B）。
-gpui = { version = "0.2", features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

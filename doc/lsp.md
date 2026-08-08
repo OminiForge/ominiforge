@@ -87,7 +87,7 @@ extensions = ["py", "pyi"]
 - **给模型**：`src/agent/mod.rs` 的 `render_output` 把整个 `content` 数组扁平化进 tool_result 消息——诊断照常进入模型上下文。
 - **给用户**：前端 `conversation.ts` 的 `pairResult` 把 `content[0]`（主结果）与其后条目（诊断）分开：主结果进 `item.result`，诊断进 `item.diagnostics`，**只在 `RawArgs` 调试折叠区渲染**，标注「发送给模型」。诊断进了模型，但不污染主视图。
 
-> 前端的逻辑改动只有 `pairResult` 的结果拆分与 `Item.diagnostics` 新字段；未动状态机（`DESIGN.md` §7 铁律）。
+> 前端的逻辑改动只有 `pairResult` 的结果拆分与 `Item.diagnostics` 新字段；未动状态机（`gpui-design.md` §7 铁律）。
 
 ## 5.1 状态暴露（RuntimeInfo）
 

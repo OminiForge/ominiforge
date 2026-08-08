@@ -1,6 +1,8 @@
 //! Ominiforge UI — GPUI component library (theme, components, panels).
 //!
-//! See `doc/gpui-app.md`. Components land here as Phase 3.3+ builds out the
-//! agent panels (chat, session list, monitor, file tree).
+//! See `doc/gpui-app.md`. Panels are built against the `ominiforge-net`
+//! `ClientProtocol` trait so the same components run against a local
+//! in-process core or a remote transport.
 
-#![allow(missing_docs)]
+pub mod panels;
+pub mod theme;
