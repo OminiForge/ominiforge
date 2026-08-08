@@ -44,7 +44,12 @@
 **关键认知**：
 - GPUI 不是"产品化框架"，文档稀缺，API 不稳定
 - 需要读 Zed 源码作为文档
-- 可以用 `gpui-component`（longbridge/gpui-component）作为组件库参考
+- 组件层自建（不用 gpui-component，见下「来源与组件库」）
+
+**来源与组件库**（2026-08-08 调研后定，详见调研报告 `research/gpui_sustainability_report.md`）：
+- **来源 = zed git pin**（钉 release tag，月度 bump）。crates.io 0.2.2 已被官方放弃（2025-12 起停更、Linux 仍是已废弃的 Blade 渲染器、官方示例不兼容），属慢性失血；git 拿到 wgpu 渲染器 + 新 API + 生态轨道，实测 API 漂移温和（同类项目 10 个月仅几处一行改动）
+- **不引 gpui-component**：其生产级编辑器虽强，但满足 Phase 7 的 vim 需求需改其 `InputState` 底层源码——"为改底层而引入依赖"不成立；通用组件（VirtualList/TextView/Tree/DataTable 等）的提速不值绑 git 轨道 + bus factor≈2。组件自研，聚焦 agent 领域特定组件（消息列表/工具卡/流式块）。markdown 正文渲染不从零写解析器——用独立小 crate（comrak/pulldown-cmark 类）映射为 gpui 元素
+- 风险对冲：core/net 保持零 GPUI 依赖，UI 依赖收敛在 ui/app 两 crate，触发条件命中（见调研报告 §6.2 重估信号）时迁移面可控
 
 ### 2. 编辑器：后置（原 Neovim 嵌入方案已否决）
 
@@ -224,21 +229,22 @@ Agent  → LspService
 - 两者不同，都需要
 - Neovim 的 LSP 可以通过 ominiforge-core 的 LspService 桥接（统一连接）
 
-### 9. 许可证：MIT OR Apache-2.0（主代码）
+### 9. 许可证：GPL-3.0-or-later（主代码）
 
-**决策**：主代码保持 MIT OR Apache-2.0 双许可证，不链接 Zed 的 GPL crates。
+**决策**（2026-08-08 修订，原为 MIT OR Apache-2.0）：主代码采用 GPL-3.0-or-later。
 
 **理由**：
-- MIT OR Apache-2.0 是 Rust 生态标准
-- 对商业友好
-- 可以架构参考 Zed，但代码自己写
+- 单人长期个人项目，无商业化/闭源分发诉求，不介意他人闭源复用的门槛（作者判断：非大公司、无竞争顾虑）
+- **解锁 zed git 版 gpui**：其经 `sum_tree → ztracing/zlog/ztracing_macro`（GPL-3.0-or-later）传染；项目本身为 GPL 后这些依赖合法，无需 vendor+patch 切断
+- **解锁 zed GPL crate 复用的评估空间**（editor/language/lsp 等，原为 GPL 否决）——为 Phase 7 编辑器路线留门（是否实际复用，届时单独评估）
 
 **关键认知**：
-- GPL 传染性：链接 GPL 库 → 整个项目必须 GPL
-- 可以读 GPL 代码学习架构，但不能复制代码
-- Zed 的 gpui 是 Apache-2.0，可以直接用
-- Zed 的 editor/language/lsp 等是 GPL，不能链接
-- 用许可证兼容的独立 crates（ropey、syntect、lsp-types、tree-sitter）
+- GPL 传染性对**下游分发者**生效，不约束唯一版权持有者本人；可双重授权
+- **一旦有外部 GPL 贡献即被锁死**：此后无法转回宽松许可证（除非逐贡献者征得同意或签 CLA）。本项目默认单人主导，外部贡献需签 CLA
+- zed 的 gpui 本体是 Apache-2.0，但其 git 版拖入的 ztracing/zlog 是 GPL-3.0-or-later——转 GPL 前需 patch 切断，转 GPL 后合法
+- `deny.toml` 的 licenses allow 已含 `GPL-3.0-or-later`（附注：仅在项目本身为 GPL 时成立）
+
+**变更记录**：2026-08-08 由 MIT OR Apache-2.0 改为 GPL-3.0-or-later。同日 gpui 来源从 crates.io 0.2.2（冻结、Linux 旧 Blade 渲染器）切到 zed git pin（tag v1.14.2，wgpu 渲染器 + 新 API + 生态轨道）。
 
 ### 10. Sandbox：Feature Request（预留）
 

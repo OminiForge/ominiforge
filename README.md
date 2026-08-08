@@ -70,4 +70,4 @@ CI 会运行格式检查、cargo check、clippy、nextest、audit、deny、mache
 
 ## License
 
-MIT OR Apache-2.0
+GPL-3.0-or-later

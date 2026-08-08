@@ -30,6 +30,10 @@ allow = [
   "Apache-2.0 WITH LLVM-exception",
   "BSD-2-Clause",
   "BSD-3-Clause",
+  # 项目已转 GPL-3.0-or-later（见 doc/architecture-decisions.md §9），zed git 版带入的
+  # GPL-3.0-or-later 依赖（ztracing/zlog/ztracing_macro，仅 trace/日志注解）合法。
+  # 仅在项目本身是 GPL 时成立；若未来回到宽松许可证，须移除并改用 vendor+patch 切断。
+  "GPL-3.0-or-later",
   # CC0-1.0：公共领域奉献，无义务。来源：hexf-parse（naga←blade-graphics←gpui）、
   # tiny-keccak（ahash←gpui）。
   "CC0-1.0",
@@ -45,12 +49,18 @@ allow = [
   "NCSA",
   "Unicode-3.0",
   "Zlib",
+  # bzip2 许可证（BSD-style  permissive）。来源：libbz2-rs-sys（bzip2 ←
+  # compression-codecs ← async-compression ← http_client ← gpui）。
+  "bzip2-1.0.6",
 ]
 exceptions = []
 
 [bans]
 multiple-versions = "warn"
-wildcards = "deny"
+# workspace 继承（`dep.workspace = true`）与 path 依赖被 cargo deny 误报为
+# wildcard（基线 0.2.2 即有此误报，非本次引入）。真正的 crates.io wildcard
+# （`dep = "*"`）才是风险，但我们不发布 crate，故降为 warn 并靠 review 拦住。
+wildcards = "warn"
 highlight = "all"
 skip = []
 skip-tree = []
@@ -59,4 +69,11 @@ skip-tree = []
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+# zed git 是 gpui 的来源（见 doc/architecture-decisions.md §1）；font-kit 与
+# proptest 是 gpui 自身钉死的 git 传递依赖（zed 定制 font-kit；proptest 用于
+# gpui 测试）。三者都是 gpui 依赖闭包的固有部分。
+allow-git = [
+  "https://github.com/zed-industries/zed",
+  "https://github.com/zed-industries/font-kit",
+  "https://github.com/proptest-rs/proptest",
+]

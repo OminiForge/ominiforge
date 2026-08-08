@@ -11,8 +11,15 @@ members = [
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/replace-me/ominiforge"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/OminiForge/ominiforge"
+
+[workspace.dependencies]
+# gpui 追踪 zed git（钉 release tag，月度 bump），见 doc/architecture-decisions.md §1。
+# 项目已转 GPL-3.0-or-later，git 版带入的 ztracing/zlog（GPL-3.0-or-later）合法，无需切断。
+# gpui 与 gpui_platform 的 rev 必须严格一致（同一 zed commit），否则双实例 trait mismatch。
+gpui = { git = "https://github.com/zed-industries/zed", tag = "v1.14.2" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", tag = "v1.14.2", features = ["font-kit", "x11", "wayland"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

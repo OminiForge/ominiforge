@@ -70,7 +70,7 @@ CLI 应保持可组合、可脚本化、输出结构清晰。
 GPUI 客户端是唯一的用户界面，替代了原计划的 Web 前端和 Tauri 桌面壳。
 
 **核心特性**：
-- 基于 GPUI 框架（Zed 的 UI 框架，Apache-2.0）
+- 基于 GPUI 框架（Zed 的 UI 框架；本体 Apache-2.0，我们经 **zed git pin** 使用，其带入的 ztracing/zlog 为 GPL-3.0-or-later——本项目已转 GPL-3.0-or-later，合法，见 `architecture-decisions.md` §1/§9）
 - Agent 对话、session 管理、监控面板为核心功能
 - 多机连接（Direct/Tunnel/P2P，自动切换）
 - 本地模式（直接链接 core，零网络开销）和远程模式（连接远程 Gateway）
