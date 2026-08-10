@@ -10,6 +10,8 @@
 
 [workspace]
 changelog_update = true
+# 关闭 cargo-semver-checks：首发无已发布基线可对比，且在 gpui 这种大依赖项目上编译极慢。
+semver_check = false
 # 更新 Cargo.lock 依赖钉。
 dependencies_update = true
 # 默认不打 tag、不建 Release（各 crate 仅发 crates.io）。
