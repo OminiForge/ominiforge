@@ -18,7 +18,7 @@ jobs:
       # "Release PR" up to date: accumulating changes, generating CHANGELOG,
       # bumping the Cargo.toml version. Merging it tags + creates the GitHub
       # Release. No manual version edits needed.
-      - uses: googleapis/release-please-action@v4
+      - uses: googleapis/release-please-action@v5
         id: release
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
