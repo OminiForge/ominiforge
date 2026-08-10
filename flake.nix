@@ -198,7 +198,10 @@
             # 取其 hash，否则 vendoring 时报 'No hash was found'。
             allowBuiltinFetchGit = true;
           };
-          doCheck = true;
+          # 只验证离线编译。测试（尤其 LSP 集成测试需要真实语言服务器进程）在
+          # hermetic sandbox 里跑不了——交由 CI 的 cargo test/nextest（devShell 提供
+          # 语言服务器）覆盖，不在 nix 离线环境跑。
+          doCheck = false;
         };
       };
     });
