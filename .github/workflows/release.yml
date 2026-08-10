@@ -3,6 +3,7 @@ name: Release
 on:
   push:
     branches: [master]
+  workflow_dispatch:
 
 # release-plz 驱动发布：解析 Conventional Commits 维护一个 Release PR（bump 版本 +
 # 生成 CHANGELOG）；合并后打 tag、建 GitHub Release、按拓扑序发布可发布的 crate
