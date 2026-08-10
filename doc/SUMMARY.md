@@ -27,6 +27,7 @@
 
 - [Eval](./operation/eval.md)
 - [发布流程](./operation/release.md)
+- [供应链安全维护](./operation/supply-chain.md)
 - [MSRV 政策](./operation/msrv.md)
 - [GitHub App 备忘](./operation/github-app.md)
 - [迁移计划](./operation/migration-plan.md)
