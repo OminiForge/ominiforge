@@ -137,9 +137,41 @@ pub struct ChatState {
     streaming: Option<(bool, String)>,
     /// The draft input text.
     pub input: String,
+    /// The in-progress edit of a committed user turn (`doc/gpui-design.md`
+    /// §4.2 edit-as-fork): `Some((seq, original))` while a settled user row is
+    /// loaded in the input box for editing. `seq` is that turn's committed
+    /// fork point; `original` is its committed text (restored on cancel).
+    /// `None` in the normal compose state. Per the resolved semantics, an
+    /// editing send ALWAYS forks (no unchanged-text special case).
+    pub editing: Option<(u64, String)>,
     /// A subscription/transport problem to surface (offline, dead stream).
     /// `None` when healthy.
     pub notice: Option<String>,
+}
+
+/// What a send resolves to, decided by [`ChatState::resolve_send`] (the single
+/// place the compose-vs-fork rule lives, so the view stays a thin shell).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendAction {
+    /// Empty input or no open session: nothing to do.
+    Noop,
+    /// A normal send into the current session.
+    Compose {
+        /// The session to send into.
+        session: SessionId,
+        /// The message text.
+        text: String,
+    },
+    /// An editing send: fork the current session at `fork_seq`, then send
+    /// `text` into the new branch.
+    EditFork {
+        /// The session being branched.
+        session: SessionId,
+        /// The committed user-turn seq to fork at.
+        fork_seq: u64,
+        /// The (edited) message text to send into the branch.
+        text: String,
+    },
 }
 
 impl ChatState {
@@ -314,6 +346,76 @@ impl ChatState {
         }
     }
 
+    // ---- Edit-as-fork (doc/gpui-design.md §4.2) ----
+
+    /// Begin editing a committed user turn: load its text into the input box
+    /// and remember the fork point + original text. The first settled user
+    /// turn is excluded (forking an empty prefix is a no-op — §4.2), as is a
+    /// pending/unknown seq. No-op unless the seq names a settled user row.
+    pub fn begin_edit(&mut self, seq: u64) {
+        if self.first_settled_user_seq() == Some(seq) {
+            return;
+        }
+        for row in &self.rows {
+            if let Row::User {
+                text,
+                seq: Some(s),
+                pending: PendingState::Settled,
+            } = row
+                && *s == seq
+            {
+                self.editing = Some((seq, text.clone()));
+                self.input = text.clone();
+                return;
+            }
+        }
+    }
+
+    /// The seq of the first settled (committed) user turn, if any.
+    fn first_settled_user_seq(&self) -> Option<u64> {
+        self.rows.iter().find_map(|r| match r {
+            Row::User {
+                seq: Some(s),
+                pending: PendingState::Settled,
+                ..
+            } => Some(*s),
+            _ => None,
+        })
+    }
+
+    /// Cancel the edit: clear the input and leave edit mode. The committed row
+    /// is untouched (the log is immutable).
+    pub fn cancel_edit(&mut self) {
+        if self.editing.take().is_some() {
+            self.input.clear();
+        }
+    }
+
+    /// Decide what a send does, consuming the draft. Pure: the view performs
+    /// the returned effect. An editing send resolves to [`SendAction::EditFork`]
+    /// unconditionally (sending the edited turn always forks — no
+    /// unchanged-text diff), and clears the edit state. On a no-op the draft
+    /// is restored (nothing consumed).
+    pub fn resolve_send(&mut self) -> SendAction {
+        let text = std::mem::take(&mut self.input);
+        let Some(session) = self.session.clone() else {
+            self.input = text;
+            return SendAction::Noop;
+        };
+        if text.trim().is_empty() {
+            self.input = text;
+            return SendAction::Noop;
+        }
+        if let Some((fork_seq, _original)) = self.editing.take() {
+            return SendAction::EditFork {
+                session,
+                fork_seq,
+                text,
+            };
+        }
+        SendAction::Compose { session, text }
+    }
+
     /// Iterate the rows to render: settled rows plus the in-flight streaming
     /// block, by reference (no per-frame clone).
     pub fn visible_rows(&self) -> impl Iterator<Item = RowRef<'_>> {
@@ -383,6 +485,13 @@ impl<'a> From<&'a Row> for RowRef<'a> {
 /// Emitted when the user asks to close the panel (q). A struct now; promote
 /// to an enum when a second panel event exists (YAGNI).
 pub struct ChatClosed;
+
+/// Emitted when an editing send forks the session: carries the new branch id
+/// so the workspace can switch to it (doc/gpui-design.md §4.2 edit-as-fork).
+pub struct SessionSelected {
+    /// The session to open.
+    pub session_id: SessionId,
+}
 
 /// The chat panel view: protocol plumbing + keyboard + layout over
 /// [`ChatState`].
@@ -471,15 +580,25 @@ impl Chat {
     }
 
     fn send(&mut self, _: &Send, _window: &mut Window, cx: &mut Context<Self>) {
-        let text = std::mem::take(&mut self.state.input);
-        if text.trim().is_empty() {
-            return;
+        match self.state.resolve_send() {
+            SendAction::Noop => {}
+            SendAction::Compose { session, text } => self.compose_send(&session, text, cx),
+            SendAction::EditFork {
+                session,
+                fork_seq,
+                text,
+            } => self.edit_fork_send(&session, fork_seq, text, cx),
         }
-        let Some(session) = self.state.session.clone() else {
-            return;
-        };
-        // Optimistic render (doc/gpui-design.md §4): show immediately, then
-        // confirm against the committed `TurnEvent::Started` or mark failed.
+        cx.notify();
+    }
+
+    /// A normal send into the current session: optimistic render, then confirm
+    /// against the committed `TurnEvent::Started` or mark failed
+    /// (doc/gpui-design.md §4).
+    // `&mut self`/`cx` are used via `cx.spawn`/`cx.listener`; clippy's
+    // needless_pass_by_ref_mut misses that capture. Same allowance as below.
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    fn compose_send(&mut self, session: &SessionId, text: String, cx: &mut Context<Self>) {
         self.state.rows.push(Row::User {
             text: text.clone(),
             seq: None,
@@ -487,6 +606,7 @@ impl Chat {
         });
         self.state.turn_running = true;
         let client = Arc::clone(&self.client);
+        let session = session.clone();
         cx.spawn(async move |this, cx| {
             if let Err(e) = client.send_message(&session, text, None, None).await {
                 let _ = this.update(cx, |chat, cx| {
@@ -497,6 +617,50 @@ impl Chat {
             }
         })
         .detach();
+    }
+
+    /// An editing send: fork at the edited turn's seq, send the edited text
+    /// into the new branch, then emit [`SessionSelected`] so the workspace
+    /// switches to it. No optimistic row here — the branch is a fresh session
+    /// the workspace opens; the original session's log is untouched.
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    fn edit_fork_send(
+        &mut self,
+        session: &SessionId,
+        fork_seq: u64,
+        text: String,
+        cx: &mut Context<Self>,
+    ) {
+        let client = Arc::clone(&self.client);
+        let session = session.clone();
+        cx.spawn(async move |this, cx| {
+            let result = async {
+                let new_id = client.fork_session(&session, fork_seq).await?;
+                client.send_message(&new_id, text, None, None).await?;
+                anyhow::Ok(new_id)
+            }
+            .await;
+            let _ = this.update(cx, |chat, cx| match result {
+                Ok(new_id) => cx.emit(SessionSelected { session_id: new_id }),
+                Err(e) => {
+                    chat.state.notice = Some(format!("fork failed: {e:#}"));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Begin editing the committed user turn at `seq` (hover affordance).
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    fn begin_edit(&mut self, seq: u64, cx: &mut Context<Self>) {
+        self.state.begin_edit(seq);
+        cx.notify();
+    }
+
+    /// Exit edit mode (the input-region cancel affordance).
+    fn cancel_edit(&mut self, cx: &mut Context<Self>) {
+        self.state.cancel_edit();
         cx.notify();
     }
 
@@ -533,6 +697,7 @@ impl ChatState {
 }
 
 impl EventEmitter<ChatClosed> for Chat {}
+impl EventEmitter<SessionSelected> for Chat {}
 
 impl Focusable for Chat {
     fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
@@ -541,15 +706,33 @@ impl Focusable for Chat {
 }
 
 impl Render for Chat {
+    #[allow(clippy::too_many_lines)]
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         let connected = self.client.connection_state() != ConnectionState::Disconnected;
+
+        // The first settled user turn has no edit affordance (forking an empty
+        // prefix is a no-op — §4.2). Computed once for the whole list.
+        let first_user_seq = self.state.rows.iter().find_map(|r| match r {
+            Row::User {
+                seq: Some(s),
+                pending: PendingState::Settled,
+                ..
+            } => Some(*s),
+            _ => None,
+        });
+        let editing_seq = self.state.editing.as_ref().map(|(seq, _)| *seq);
 
         let list = self
             .state
             .visible_rows()
             .skip(self.scroll)
-            .map(|row| render_row(&row, &theme))
+            .map(|row| match row {
+                RowRef::User { text, seq, pending } => {
+                    render_user_row(text, seq, pending, first_user_seq, editing_seq, &theme, cx)
+                }
+                other => render_row(&other, &theme),
+            })
             .collect::<Vec<_>>();
 
         let mut root = div()
@@ -595,32 +778,152 @@ impl Render for Chat {
                 .bg(theme.canvas_raised)
                 .border_t_1()
                 .border_color(theme.border_default)
-                .child(if connected {
-                    self.state.input.clone()
-                } else {
-                    "(disconnected)".to_owned()
-                }),
+                // Edit-mode banner (§4.2): marks that a send will branch, with a
+                // cancel affordance. Absent in the normal compose state.
+                .when_some(
+                    self.state.editing.as_ref().map(|(seq, _)| *seq),
+                    |el, seq| {
+                        el.child(
+                            div()
+                                .id("chat-editing")
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .pb_1()
+                                .child(
+                                    div()
+                                        .text_color(theme.text_tertiary)
+                                        .child(format!("editing turn #{seq} — send branches")),
+                                )
+                                .child(
+                                    div()
+                                        .id("chat-edit-cancel")
+                                        .cursor_pointer()
+                                        .text_color(theme.text_disabled)
+                                        .hover(|s| s.text_color(theme.text_secondary))
+                                        .child("esc")
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.cancel_edit(cx)),
+                                        ),
+                                ),
+                        )
+                    },
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(div().flex_1().child(if connected {
+                            self.state.input.clone()
+                        } else {
+                            "(disconnected)".to_owned()
+                        }))
+                        .child(self.send_button(&theme, connected, cx)),
+                ),
         )
     }
 }
 
+/// The send affordance. In edit mode it carries a branch glyph (`⤦`) to
+/// hint the send forks (without the word "fork"); in compose mode a plain
+/// arrow. The accent marks it the screen's single primary action.
+impl Chat {
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    fn send_button(
+        &self,
+        theme: &Theme,
+        connected: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let editing = self.state.editing.is_some();
+        let glyph = if editing { "⤦" } else { "→" };
+        let mut el = div()
+            .id("chat-send")
+            .text_color(if connected {
+                theme.accent
+            } else {
+                theme.text_disabled
+            })
+            .child(glyph);
+        if connected {
+            el = el
+                .cursor_pointer()
+                .hover(|s| s.text_color(theme.accent_hover))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.send(&Send, window, cx);
+                }));
+        }
+        el.into_any_element()
+    }
+}
+
+/// Render a user row with its edit affordance. The entry is near-invisible
+/// (`text_disabled`) until the row is hovered (`group_hover` lifts it one
+/// step), and clicking it enters edit mode — but never on the first settled
+/// user turn, a pending row, or a failed row (§4.2). The row being edited is
+/// accent-tinted to show which turn is loaded in the input.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::needless_pass_by_ref_mut)]
+fn render_user_row(
+    text: &str,
+    seq: Option<u64>,
+    pending: PendingState,
+    first_user_seq: Option<u64>,
+    editing_seq: Option<u64>,
+    theme: &Theme,
+    cx: &mut Context<Chat>,
+) -> gpui::AnyElement {
+    let marker = match pending {
+        PendingState::Settled => ">",
+        PendingState::Pending => "…",
+        PendingState::Failed => "✗",
+    };
+    let is_editing = editing_seq.is_some() && seq == editing_seq;
+    let color = if is_editing {
+        theme.accent_ink
+    } else {
+        match pending {
+            PendingState::Failed => theme.state_error,
+            _ => theme.user_text,
+        }
+    };
+    // Editable only when settled and not the first user turn.
+    let editable = pending == PendingState::Settled && seq.is_some() && seq != first_user_seq;
+
+    let mut row = div()
+        .id(("user-row", seq.unwrap_or(0)))
+        .group("user-turn")
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .text_color(color)
+        .child(format!("{marker} {text}"));
+
+    if editable {
+        let seq = seq.unwrap_or(0);
+        row = row.child(
+            div()
+                .id(("user-edit", seq))
+                .cursor_pointer()
+                .text_color(theme.text_disabled)
+                .opacity(0.0)
+                .group_hover("user-turn", |s| {
+                    s.opacity(1.0).text_color(theme.text_secondary)
+                })
+                .child("✎")
+                .on_click(cx.listener(move |this, _, _, cx| this.begin_edit(seq, cx))),
+        );
+    }
+    row.into_any_element()
+}
+
 fn render_row(row: &RowRef<'_>, theme: &Theme) -> gpui::AnyElement {
     match row {
-        RowRef::User { text, pending, .. } => {
-            let marker = match pending {
-                PendingState::Settled => ">",
-                PendingState::Pending => "…",
-                PendingState::Failed => "✗",
-            };
-            let color = match pending {
-                PendingState::Failed => theme.state_error,
-                _ => theme.user_text,
-            };
-            div()
-                .text_color(color)
-                .child(format!("{marker} {text}"))
-                .into_any_element()
-        }
+        // User rows are rendered inline by `Chat::render` (they need `cx` for
+        // the edit affordance); this arm is unreachable.
+        RowRef::User { .. } => div().into_any_element(),
         RowRef::Text(text) => div().child((*text).to_owned()).into_any_element(),
         RowRef::Reasoning(text) => div()
             .text_color(theme.reasoning_text)
@@ -805,6 +1108,102 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // ---- Edit-as-fork (state fold) ----
+
+    fn two_user_turns_state() -> ChatState {
+        let mut state = ChatState::default();
+        state.open(
+            SessionId("s".into()),
+            &view_with(
+                vec![
+                    ViewItem::User {
+                        id: 1,
+                        text: "first".into(),
+                        seq: 1,
+                    },
+                    ViewItem::Text {
+                        id: 2,
+                        text: "reply".into(),
+                    },
+                    ViewItem::User {
+                        id: 3,
+                        text: "second".into(),
+                        seq: 5,
+                    },
+                ],
+                false,
+            ),
+        );
+        state
+    }
+
+    /// Entering edit mode loads the committed turn's text into the input and
+    /// records the fork point; the first user turn is not editable.
+    #[test]
+    fn begin_edit_loads_turn_and_skips_first() {
+        let mut state = two_user_turns_state();
+        // The first user turn (seq 1) is excluded.
+        state.begin_edit(1);
+        assert!(state.editing.is_none());
+        assert!(state.input.is_empty());
+        // A later turn (seq 5) enters edit mode with its text loaded.
+        state.begin_edit(5);
+        assert_eq!(state.editing, Some((5, "second".to_owned())));
+        assert_eq!(state.input, "second");
+    }
+
+    /// Cancelling an edit clears the input and leaves the committed row
+    /// untouched (the log is immutable).
+    #[test]
+    fn cancel_edit_restores_without_touching_rows() {
+        let mut state = two_user_turns_state();
+        state.begin_edit(5);
+        state.input = "edited draft".into();
+        state.cancel_edit();
+        assert!(state.editing.is_none());
+        assert!(state.input.is_empty());
+        // The committed row still reads "second".
+        assert!(
+            state
+                .rows
+                .iter()
+                .any(|r| matches!(r, Row::User { text, seq: Some(5), .. } if text == "second"))
+        );
+    }
+
+    /// An editing send resolves to `EditFork` at the edited turn's seq, carrying
+    /// the (edited) text — always, even if the text is unchanged (no diff).
+    /// A normal send resolves to Compose.
+    #[test]
+    fn resolve_send_editing_always_forks_else_composes() {
+        let mut state = two_user_turns_state();
+        // Normal compose.
+        state.input = "fresh message".into();
+        assert_eq!(
+            state.resolve_send(),
+            SendAction::Compose {
+                session: SessionId("s".into()),
+                text: "fresh message".into()
+            }
+        );
+        // Editing send — even with UNCHANGED text — forks at seq 5.
+        state.begin_edit(5);
+        assert_eq!(state.input, "second");
+        assert_eq!(
+            state.resolve_send(),
+            SendAction::EditFork {
+                session: SessionId("s".into()),
+                fork_seq: 5,
+                text: "second".into()
+            }
+        );
+        assert!(state.editing.is_none(), "send clears edit mode");
+        // An empty send is a no-op and restores the draft.
+        state.input = "   ".into();
+        assert_eq!(state.resolve_send(), SendAction::Noop);
+        assert_eq!(state.input, "   ");
     }
 
     // -- helpers: build committed `GatewayEvent::Event` frames --
