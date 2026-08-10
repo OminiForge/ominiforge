@@ -1,13 +1,24 @@
 version: 2
+# Strategy: batch non-breaking upgrades (minor/patch) into a single PR per
+# ecosystem to cut noise and Cargo.lock conflicts; breaking major upgrades still
+# open individually so each can be evaluated on its own.
 updates:
   - package-ecosystem: cargo
     directory: /
     schedule:
       interval: weekly
     open-pull-requests-limit: 10
+    groups:
+      # All cargo minor+patch upgrades in one PR (review once, merge once, one lock change).
+      minor-patch:
+        update-types: ["minor", "patch"]
+    # Majors stay ungrouped and open individually — they may need code changes, so
+    # they must not be merged blindly.
 
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
-    open-pull-requests-limit: 10
+      interval: monthly # action upgrades don't need weekly chasing
+    groups:
+      all-actions:
+        update-types: ["minor", "patch"]
