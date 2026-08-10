@@ -1,0 +1,25 @@
+[package]
+name = "ominiforge-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Ominiforge desktop app: the full `ominiforge` CLI plus a GPUI graphical interface"
+# Never published to crates.io: the GUI depends on gpui via a git dependency, which
+# crates.io forbids. Distributed as desktop packages via GitHub Release instead.
+publish = false
+
+# The desktop binary is also named `ominiforge` — it is a superset of the CLI: the same
+# command surface (reused from the `ominiforge-cli` library) plus a GUI entry point.
+[[bin]]
+name = "ominiforge"
+path = "src/main.rs"
+
+[dependencies]
+ominiforge-cli = { path = "../ominiforge-cli", version = "0.1" }
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

@@ -10,10 +10,11 @@ publish = false
 [dependencies]
 # 组件层自建（不用 gpui-component），框架本体是唯一 UI 依赖。
 gpui.workspace = true
-ominiforge-core = { path = "../ominiforge-core" }
-ominiforge-net = { path = "../ominiforge-net" }
+ominiforge = { path = "../ominiforge", version = "0.1" }
+ominiforge-net = { path = "../ominiforge-net", version = "0.1" }
 futures-lite = "2"
 anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

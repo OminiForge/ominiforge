@@ -3829,15 +3829,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ominiforge-app"
-version = "0.1.0"
-dependencies = [
- "gpui",
- "ominiforge-ui",
-]
-
-[[package]]
-name = "ominiforge-core"
+name = "ominiforge"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -3846,7 +3838,6 @@ dependencies = [
  "boxlite",
  "bytes",
  "chrono",
- "clap",
  "dom_smoothie",
  "dotenvy",
  "encoding_rs",
@@ -3876,13 +3867,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "ominiforge-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ominiforge",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "ominiforge-gui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ominiforge-cli",
+ "tokio",
+]
+
+[[package]]
 name = "ominiforge-net"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "futures-core",
- "ominiforge-core",
+ "ominiforge",
  "tokio",
  "tokio-stream",
 ]
@@ -3895,7 +3907,7 @@ dependencies = [
  "chrono",
  "futures-lite",
  "gpui",
- "ominiforge-core",
+ "ominiforge",
  "ominiforge-net",
 ]
 

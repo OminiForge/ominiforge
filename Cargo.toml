@@ -1,8 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-  "crates/ominiforge-app",
-  "crates/ominiforge-core",
+  "crates/ominiforge",
+  "crates/ominiforge-cli",
+  "crates/ominiforge-gui",
   "crates/ominiforge-net",
   "crates/ominiforge-ui",
 ]

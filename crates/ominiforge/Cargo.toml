@@ -1,22 +1,18 @@
 [package]
-name = "ominiforge-core"
+name = "ominiforge"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "a multi agent app"
+description = "Ominiforge core: the UI-agnostic agent runtime (library)"
 
-# The library keeps the historical crate name `ominiforge` so every module
-# path in the moved sources (`crate::…` internally, `ominiforge::…` in the
-# integration tests) stays valid without rewriting imports.
+# The core is a pure library. The CLI lives in `ominiforge-cli`; the GPUI desktop
+# app in `ominiforge-gui`. The lib name matches the crate name, so downstream code
+# uses `ominiforge::…`.
 [lib]
 name = "ominiforge"
 path = "src/lib.rs"
-
-[[bin]]
-name = "ominiforge"
-path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
@@ -26,7 +22,6 @@ chrono = { version = "0.4", default-features = false, features = [
   "serde",
   "clock",
 ] }
-clap = { version = "4", features = ["derive"] }
 dotenvy = "0.15"
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = [

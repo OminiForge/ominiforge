@@ -1,0 +1,30 @@
+[package]
+name = "ominiforge-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Ominiforge command-line interface: `ominiforge` binary (serve, future TUI)"
+
+# The CLI is both a library (the command logic, reused by `ominiforge-gui`) and the
+# `ominiforge` binary (a thin shell). Keeping the logic in the lib lets the desktop
+# app expose the exact same command surface without duplication.
+[lib]
+name = "ominiforge_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ominiforge"
+path = "src/main.rs"
+
+[dependencies]
+ominiforge = { path = "../ominiforge", version = "0.1" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints]
+workspace = true

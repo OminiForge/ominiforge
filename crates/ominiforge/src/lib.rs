@@ -16,7 +16,6 @@ pub mod core;
 pub mod agent;
 pub mod agents_md;
 pub mod app;
-pub mod cli;
 pub mod config;
 pub mod context;
 pub mod env;
