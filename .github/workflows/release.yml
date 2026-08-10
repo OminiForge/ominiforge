@@ -1,0 +1,78 @@
+name: Release
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      # release-please parses the Conventional Commits on master and keeps a
+      # "Release PR" up to date: accumulating changes, generating CHANGELOG,
+      # bumping the Cargo.toml version. Merging it tags + creates the GitHub
+      # Release. No manual version edits needed.
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  # When release-please actually cuts a release, build the Linux binary and
+  # upload it to that Release.
+  build-assets:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v16
+      - name: Build release binary
+        run: nix develop --command cargo build --release --locked
+      - name: Upload binary to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          tar -C target/release -czf ominiforge-linux-x86_64.tar.gz ominiforge
+          gh release upload "$TAG" ominiforge-linux-x86_64.tar.gz --clobber
+
+  # On every push to master (including releases) rebuild the multi-version doc
+  # site and deploy to GitHub Pages. One doc set per release tag + dev(master),
+  # so readers can switch versions.
+  docs:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full tag history is needed to build each version's docs
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v16
+      - name: Build multi-version doc site
+        run: nix develop --command doc/build-all-versions.sh doc/site
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: doc/site
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
