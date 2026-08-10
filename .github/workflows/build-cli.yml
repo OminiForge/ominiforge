@@ -7,7 +7,7 @@ name: Build CLI binaries
 on:
   push:
     tags:
-      - "ominiforge-cli-v*"
+      - "v*"
 
 permissions:
   contents: write

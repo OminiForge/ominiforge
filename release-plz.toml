@@ -1,22 +1,37 @@
-# release-plz: per-crate changelogs plus an aggregated root changelog.
+# release-plz：统一版本 + 单 tag + 单 Release + 汇总 changelog。
 #
-# Two release surfaces: the pure-CLI build and the GUI build (the GUI is a
-# placeholder until the GPUI client matures). Both share the workspace version.
+# 发布哲学：对**用户**而言只有一个产品 ominiforge、一个版本号、一个 tag（v0.x.0）。
+# 该 tag 的 GitHub Release 正文是汇总 changelog，并挂载两类二进制（纯 CLI、以及未来的
+# GUI+CLI），每类覆盖 Linux/macOS/Windows，用户按系统下载。
+# 对 **crates.io** 仍是 per-crate 发布（ominiforge / ominiforge-net / ominiforge-cli），
+# 与 git tag/release 相互独立。
 
 [workspace]
 changelog_update = true
-# Update Cargo.lock dependency pins as part of the release PR.
+# 更新 Cargo.lock 依赖钉。
 dependencies_update = true
+# 单一 tag：v{version}（不带 crate 前缀）。
+git_tag_name = "v{{ version }}"
+# 单 tag 对应的 GitHub Release 名。
+git_release_name = "v{{ version }}"
+# Release 正文 = 该版本的 changelog（汇总自根 CHANGELOG，见下）。
+git_release_body = "{{ changelog }}"
 
-# The pure-CLI crate is the user-facing `ominiforge` product. Point its changelog at
-# the repository root and fold in the core and net changes, so the root CHANGELOG.md
-# is the aggregated, product-level history while each crate still keeps its own
-# fine-grained changelog.
+# 统一版本：三个可发布 crate 绑为一组，同号演进。
+[[package]]
+name = "ominiforge"
+version_group = "product"
+
+[[package]]
+name = "ominiforge-net"
+version_group = "product"
+
+# ominiforge-cli 是面向用户的主产物。它的 changelog 指向仓库根，并聚合 core/net，
+# 因此根 CHANGELOG.md 是产品级汇总历史，同时作为单 Release 的正文来源。
 [[package]]
 name = "ominiforge-cli"
+version_group = "product"
 changelog_path = "CHANGELOG.md"
 changelog_include = ["ominiforge", "ominiforge-net"]
 
-# ominiforge, ominiforge-net, ominiforge-cli keep their default per-crate CHANGELOG.md.
-# ominiforge-ui / ominiforge-gui are publish = false, so release-plz skips publishing
-# them; the git release body defaults to the changelog, so each tag shows what changed.
+# ominiforge-ui / ominiforge-gui 为 publish = false，不发布到 crates.io，也不单独打 tag。
