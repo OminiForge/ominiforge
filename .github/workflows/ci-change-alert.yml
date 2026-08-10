@@ -31,18 +31,31 @@ jobs:
             echo "hit=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Label and warn (severity depends on author)
+      - name: Label and warn once (severity depends on author)
         if: steps.detect.outputs.hit == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR: ${{ github.event.pull_request.number }}
           AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
+          set -euo pipefail
+          # Label is idempotent and silent (no notification spam).
           gh pr label "$PR" --add ci-config 2>/dev/null || true
+
+          # Only comment ONCE per PR: skip if we already posted the alert (the
+          # marker <!-- ci-config-alert --> identifies our own prior comment).
+          # Without this, every synchronize (rebase / new commit) re-comments and
+          # spams notifications.
+          MARKER="ci-config-alert"
+          if gh pr view "$PR" --json comments --jq '.[].body' 2>/dev/null | grep -q "$MARKER"; then
+            echo "alert already posted for this PR; skipping comment"
+            exit 0
+          fi
 
           if [ "$AUTHOR" = "dependabot[bot]" ]; then
             # Trusted-bot dependency update: downgrade to a "give it a quick scan" note.
             gh pr comment "$PR" --body "$(cat <<'EOF'
+          <!-- ci-config-alert -->
           ℹ️ **Dependency update touches build/CI config**
 
           This automated update modifies build or CI files (`Cargo.*`, workflow
@@ -52,8 +65,9 @@ jobs:
           EOF
           )"
           else
-            # Human change: strong warning — @duskgrow must review carefully.
+            # Human change: strong warning, reviewed carefully.
             gh pr comment "$PR" --body "$(cat <<'EOF'
+          <!-- ci-config-alert -->
           ## ⚠️ Build / CI / supply-chain files changed
 
           This PR modifies files that control **how code is built, checked, or
@@ -61,12 +75,12 @@ jobs:
           a change here can alter which checks run on this very PR — including
           weakening them.
 
-          @duskgrow please review these diffs with extra care. Verify that:
+          Please review these diffs with extra care. Verify that:
           - no required check was removed, renamed, or made non-blocking;
           - no dependency / license / audit gate was loosened;
           - secrets or tokens are not exposed to PR-code execution.
 
-          _Posted automatically because build/CI config changed._
+          _Posted automatically because build/CI config changed (only once per PR)._
           EOF
           )"
           fi
