@@ -1,14 +1,22 @@
-# release-plz 配置：全 workspace 统一版本，自动 Release PR + CHANGELOG + 发布。
-# 约定：crate 的发布与否由各自 Cargo.toml 的 `publish` 字段控制
-#（ominiforge-ui / ominiforge-gui 标了 publish = false，不会被发到 crates.io）。
+# release-plz: per-crate changelogs plus an aggregated root changelog.
+#
+# Two release surfaces: the pure-CLI build and the GUI build (the GUI is a
+# placeholder until the GPUI client matures). Both share the workspace version.
 
 [workspace]
-# 全 workspace 共享一个版本号（[workspace.package].version），任何 feat/fix
-# 触发统一 bump，两种产物（CLI/GUI）同号发布。
-# 0.x 阶段：breaking 变更只 bump minor。
 changelog_update = true
+# Update Cargo.lock dependency pins as part of the release PR.
 dependencies_update = true
 
-# 只为可发布的 crate 生成 git tag；ui/gui 不参与发布。
-# release-plz 默认按依赖拓扑序 publish（ominiforge → ominiforge-net → ominiforge-cli），
-# 并在每个 crate publish 前用剥离 path 的版本重编译校验。
+# The pure-CLI crate is the user-facing `ominiforge` product. Point its changelog at
+# the repository root and fold in the core and net changes, so the root CHANGELOG.md
+# is the aggregated, product-level history while each crate still keeps its own
+# fine-grained changelog.
+[[package]]
+name = "ominiforge-cli"
+changelog_path = "CHANGELOG.md"
+changelog_include = ["ominiforge", "ominiforge-net"]
+
+# ominiforge, ominiforge-net, ominiforge-cli keep their default per-crate CHANGELOG.md.
+# ominiforge-ui / ominiforge-gui are publish = false, so release-plz skips publishing
+# them; the git release body defaults to the changelog, so each tag shows what changed.
