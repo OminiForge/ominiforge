@@ -4,54 +4,41 @@ on:
   push:
     branches: [master]
 
-jobs:
-  release-please:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
-    outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
-    steps:
-      # release-please parses the Conventional Commits on master and keeps a
-      # "Release PR" up to date: accumulating changes, generating CHANGELOG,
-      # bumping the Cargo.toml version. Merging it tags + creates the GitHub
-      # Release. No manual version edits needed.
-      - uses: googleapis/release-please-action@v4
-        id: release
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          config-file: release-please-config.json
-          manifest-file: .release-please-manifest.json
+# release-plz 驱动发布：解析 Conventional Commits 维护一个 Release PR（bump 版本 +
+# 生成 CHANGELOG）；合并后打 tag、建 GitHub Release、按拓扑序发布可发布的 crate
+#（ominiforge → ominiforge-net → ominiforge-cli）到 crates.io。
+# 全程无需人手改版本号。GUI 桌面包在 GPUI 客户端成熟后接入（当前占位）。
 
-  # When release-please actually cuts a release, build the Linux binary and
-  # upload it to that Release.
-  build-assets:
-    needs: release-please
-    if: needs.release-please.outputs.release_created == 'true'
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-plz:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@v16
-      - name: Build release binary
-        run: nix develop --command cargo build --release --locked
-      - name: Upload binary to release
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      # release-pr：维护/更新 Release PR；release：合并后发布（tag + Release + publish）。
+      - name: Run release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.release-please.outputs.tag_name }}
-        run: |
-          tar -C target/release -czf ominiforge-linux-x86_64.tar.gz ominiforge
-          gh release upload "$TAG" ominiforge-linux-x86_64.tar.gz --clobber
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Release (tag + GitHub Release + crates.io publish)
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-  # On every push to master (including releases) rebuild the multi-version doc
-  # site and deploy to GitHub Pages. One doc set per release tag + dev(master),
-  # so readers can switch versions.
+  # 每次 push 到 master（含发布）重建全版本文档站并部署到 GitHub Pages。
   docs:
     runs-on: ubuntu-latest
     permissions:
