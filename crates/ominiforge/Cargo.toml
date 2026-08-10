@@ -42,7 +42,7 @@ dom_smoothie = "0.18"
 htmd = "0.5"
 url = "2"
 ipnet = "2"
-sha2 = "0.10"
+sha2 = "0.11"
 encoding_rs = "0.8"
 # SQLite-backed secret store for provider API keys (src/secrets.rs). `bundled`
 # compiles SQLite from vendored C source: no system libsqlite dependency, so the
