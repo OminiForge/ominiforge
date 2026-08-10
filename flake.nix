@@ -50,7 +50,7 @@
         statix
       ];
 
-      # Frontend toolchain (doc/frontend.md §7). pnpm-in-nix sandboxed builds
+      # Frontend toolchain. pnpm-in-nix sandboxed builds
       # are a known hard point; initially we just provide the tools in the
       # devShell and run the frontend build inside the shell (non-sandboxed).
       # `chromium` drives the offline UI screenshot tool (frontend/scripts/shot.mjs)
@@ -60,7 +60,7 @@
         pnpm
         chromium
         # Language servers consumed by ominiforge's own LSP integration
-        # (doc/lsp.md), which routes by file extension to a specific binary.
+        # (doc/design/lsp.md), which routes by file extension to a specific binary.
         # svelteserver handles .svelte; typescript-language-server handles
         # .ts/.js. They are independent processes — svelteserver cannot cover
         # standalone .ts files (it only syntax-parses them, no type-checking),
@@ -73,11 +73,12 @@
         openssl
         # protoc for boxlite: boxlite-shared's build.rs compiles its gRPC/proto
         # definitions via tonic-build, which needs protoc >= 3.12 at build time
-        # (doc/sandbox.md §4). Build-time tool, so it belongs in the devShell,
+        # (doc/design/sandbox.md §4). Build-time tool, so it belongs in the devShell,
         # not Cargo.toml.
         protobuf
         python3
         taplo
+        mdbook
       ];
     in {
       devShells.default = pkgs.mkShell {
@@ -112,7 +113,7 @@
 
       formatter = pkgs.alejandra;
 
-      # Production build (`doc/sandbox.md` §8): the gateway with the
+      # Production build (`doc/design/sandbox.md` §8): the gateway with the
       # `sandbox-boxlite` microVM backend compiled in.
       #
       # boxlite's crates.io build.rs enters "stub" mode (it detects the packaged
@@ -127,7 +128,7 @@
       #
       # NOTE: boxlite runtime needs KVM on the host. The default `gateway.toml`
       # selects `passthrough`, so a deploy runs everywhere out of the box;
-      # `boxlite`/`auto` are opt-in (`doc/gateway.md` §7).
+      # `boxlite`/`auto` are opt-in (`doc/design/gateway.md` §7).
       packages = let
         # Runtime libraries boxlite links/loads (nixpkgs-owned, not vendored).
         boxliteLibs = with pkgs; [libkrun libkrunfw];

@@ -30,3 +30,7 @@
 
 # UI design exploration scratch (HTML mockups, screenshots, node_modules symlink)
 design-demos/
+# mdbook build output (doc/book.toml build-dir)
+/doc/book/
+# multi-version doc site output (doc/build-all-versions.sh)
+/doc/site/

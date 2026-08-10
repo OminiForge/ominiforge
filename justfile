@@ -26,9 +26,10 @@ deny:
 machete:
     cargo machete
 
-# 设计铁律的机器强制（doc/gpui-design.md §2）：theme.rs 是唯一允许出现字面色值
-# 的文件；ui crate 其余任何文件出现 rgb()/rgba()/hsla() 字面构造即失败。这逼着
-# 「用到颜色」时回 theme.rs 加语义 token，而不是随手写魔法值。
+# Enforces the design rule (doc/design/gpui-design.md §2): theme.rs is the only
+# file allowed to hold literal color values. Any rgb()/rgba()/hsla() literal in
+# the rest of the ui crate fails the build — forcing "need a color" to become a
+# semantic token in theme.rs rather than a scattered magic value.
 design-lint:
     ! grep -rnE '\b(rgb|rgba|hsla)\s*\(' crates/ominiforge-ui/src --include='*.rs' | grep -v 'src/theme.rs'
 
@@ -36,3 +37,12 @@ nix-check:
     nix flake check
 
 ci: fmt-check check clippy test audit deny machete design-lint nix-check
+# Preview the documentation site locally (mdbook).
+doc:
+    mdbook serve doc --open
+# Build the static documentation site into doc/book/.
+doc-build:
+    mdbook build doc
+# Build the FULL multi-version doc site (every release tag + dev) into doc/site/.
+doc-site:
+    doc/build-all-versions.sh
