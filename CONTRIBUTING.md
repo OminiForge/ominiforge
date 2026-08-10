@@ -60,6 +60,8 @@ Intermediate commits inside your branch are free-form.
 
 ## Code conventions
 
+- **Language**: everything except prose docs under `doc/` is written in English —
+  code, comments, config, templates, CI (see [AGENTS.md](AGENTS.md) §14).
 - Workspace lints (`Cargo.toml`): `unsafe_code` forbidden; clippy `pedantic`/`nursery`/
   `unwrap_used`/`expect_used` are warnings (CI denies warnings).
 - UI colors come only from semantic tokens in `crates/ominiforge-ui/src/theme.rs`

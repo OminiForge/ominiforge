@@ -75,6 +75,15 @@ similar) already exists before building it. Low coupling between modules.
 `doc/` holds framework- and design-level guidance, never implementation detail
 (specific interfaces, classes, function signatures — those live in code and
 comments). Keeping detail out of docs avoids two drifting sources.
+## 14. English for everything except prose docs
+This project collaborates internationally. The rule:
+- **English** — code, comments, commit messages, PR/issue templates, config
+  files, CI/workflow definitions, changelog, and any text a tool parses or a
+  global contributor must read. Comments in code are always English.
+- **Either language** — long-form prose documentation under `doc/`, where the
+  goal is to be read, not parsed. It currently stays primarily Chinese; new
+  doc may add an English version over time.
+When in doubt: if it isn't narrative documentation, write it in English.
 
 ---
 
