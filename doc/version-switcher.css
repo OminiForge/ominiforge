@@ -1,0 +1,18 @@
+/* Version switcher dropdown, injected by version-switcher.js. */
+#version-switcher {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35em;
+  margin-left: auto;
+  padding: 0 0.6em;
+  font-size: 0.85em;
+  color: var(--fg);
+}
+#version-switcher select {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--table-border-color, currentColor);
+  border-radius: 4px;
+  padding: 0.1em 0.3em;
+  font: inherit;
+}

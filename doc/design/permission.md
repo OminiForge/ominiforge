@@ -1,3 +1,6 @@
+<!-- status: current -->
+<!-- owner: @OminiForge -->
+
 # Ominiforge 权限门控（Permission Gating）
 
 本文档定义工具调用的权限门控系统：在工具执行前，由**代码**（而非模型）决定每次调用

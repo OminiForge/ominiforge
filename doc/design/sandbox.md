@@ -1,3 +1,6 @@
+<!-- status: current -->
+<!-- owner: @OminiForge -->
+
 # Sandbox 设计
 
 本文档定义 Ominiforge 的沙箱抽象、实现策略、和快照/fork 语义。

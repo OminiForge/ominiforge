@@ -1,3 +1,6 @@
+<!-- status: current -->
+<!-- owner: @OminiForge -->
+
 # Eval 系统设计
 
 代码入口：[`src/eval/`](../crates/ominiforge-core/src/eval/)。本文讲设计意图与各层契约，实现细节以代码及其注释为准。

@@ -1,3 +1,6 @@
+<!-- status: current -->
+<!-- owner: @OminiForge -->
+
 # Ominiforge Core Event Schema
 
 定义内部统一事件协议。所有 UI、gateway、session log、monitor、replay 依赖该协议。

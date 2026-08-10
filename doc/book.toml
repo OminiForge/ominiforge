@@ -1,0 +1,27 @@
+# mdbook 配置：把 doc/ 导出为可浏览的静态文档站。
+# 用法： `just doc` 本地预览；`just doc-build` 构建当前 master 文档；
+#        `just doc-site` 构建**全版本**站点（每个 release tag + dev，含版本切换器）。
+# 注意：SUMMARY.md 是唯一导航索引，新增文档必须在此登记（见 README.md）。
+
+# 产物输出目录（已 gitignore）；build-dir 属于 [build] 表。
+[build]
+build-dir = "book"
+
+[book]
+title = "Ominiforge Documentation"
+language = "zh"
+src = "."
+
+[output.html]
+default-theme = "light"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/OminiForge/ominiforge"
+edit-url-template = "https://github.com/OminiForge/ominiforge/edit/master/doc/{path}"
+# 版本切换器（多版本站点由 build-all-versions.sh 生成；本地单版本构建时自动隐藏）。
+additional-js = ["version-switcher.js"]
+additional-css = ["version-switcher.css"]
+
+# 折叠式侧边导航，适合多层级 design/operation/decisions/research。
+[output.html.fold]
+enable = true
+level = 1

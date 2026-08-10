@@ -1,3 +1,6 @@
+<!-- status: current -->
+<!-- owner: @OminiForge -->
+
 # Monitor Trace Model
 
 代码：`Monitor`、`SessionSummary`、`summarize` 见 [`src/monitor.rs`](../crates/ominiforge-core/src/monitor.rs)。

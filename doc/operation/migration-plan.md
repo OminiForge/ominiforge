@@ -1,8 +1,11 @@
+<!-- status: current -->
+<!-- owner: @OminiForge -->
+
 # Ominiforge 架构转型实施规划
 
 本文档定义从当前架构（Web 前端 + Gateway）到新架构（GPUI 客户端 + 多机分布式）的完整实施计划。
 
-**当前进度**：Phase 0-3.3 ✅ | Phase 3.4 主体完成（对话面板已实现，2 项延后）⏳ | Phase 3.5（Session 面板）待开始
+**当前进度**：Phase 0-3.4 ✅ | Phase 3.5（Session 面板 + 编辑即 fork）✅ | Phase 3.6（监控面板）待开始
 
 **核心原则**：
 - 文档先行：先更新文档定义清楚，再按文档执行
@@ -73,15 +76,23 @@
 - `crates/ominiforge-ui/src/panels/chat.rs`、`crates/ominiforge-ui/src/theme.rs`、`crates/ominiforge-ui/src/panels/mod.rs`
 - `flake.nix`（X11 链接库）
 
-### 3.5 Session 管理面板
+### 3.5 Session 管理面板 ✅
+
+**状态**：已实现并有单测；余 1 项延后（键位无头断言，随键位定稿补）。
 
 **任务**：
-- [ ] Session 列表 UI
-- [ ] 创建 / 切换 / 删除 session
-- [ ] Fork session
+- [x] Session 列表 UI — `SessionListState` 纯折叠（metas + statuses + acked → 行：标题=first_user_input 否则短 id、排序=last_user_message_at ?? created_at、origin badge）+ `SessionList` 视图
+- [x] 创建 / 切换 / 删除 — 创建 emit `SessionChosen`、切换 markSeen + emit、archive/delete 两段式行内确认（不引入 Modal）
+- [x] 状态图标 running/awaiting/unseen/seen — `subscribe_status` snapshot+live；seen/unseen 按内存 acked_seq 折叠（持久化留 Phase 5）
+- [x] Fork —— 落地为**编辑即 fork**（Chat 面板，非列表行）：hover 用户消息→编辑入口→载入输入框（编辑态标记 + 区分发送图标 `⤦`/`→`）→发送即 `fork_session(parent, 该轮seq)`+发新文本+emit `SessionSelected`；首轮用户消息无入口；B 语义（只要发送就 fork，无逐字 diff）
+- [x] archived 折叠区（只读行 + delete）
+- [ ] 键位 / 无头断言（`simulate_keystrokes` + `debug_bounds`）— 本期不注册 Keymap（键位语义待定稿，同 3.4 延后项）
+
+**架构说明**：两面板均沿用「规则全在 state、view 是薄壳」分层。SessionList 的纯逻辑单测覆盖：标题/排序折叠、unseen/seen ack 折叠、origin badge、remove；Chat 的编辑态单测覆盖：begin_edit 载入并跳过首轮、cancel 恢复且不动 committed 行、resolve_send 编辑必 fork/否则 compose/空为 noop。Chat 经 emit `SessionSelected` 把导航交给 workspace 层（薄壳不管导航）。
 
 **文件**：
-- `crates/ominiforge-ui/src/panels/session_list.rs`
+- `crates/ominiforge-ui/src/panels/session_list.rs`、`crates/ominiforge-ui/src/panels/chat.rs`（编辑即 fork）、`crates/ominiforge-ui/src/panels/mod.rs`
+- `crates/ominiforge-ui/Cargo.toml`（chrono 提为正式依赖——SessionRow 排序键用 DateTime）
 
 ### 3.6 监控面板
 
@@ -186,7 +197,8 @@
 | Phase 3.1-3.2: Workspace + GPUI 基础 | 组件测试模式 + 最小窗口 | ✅ 已完成 |
 | Phase 3.3: ClientProtocol 本地模式 | `ominiforge-net` + `LocalProtocol` | ✅ 已完成 |
 | Phase 3.4: Agent 对话面板 | Chat 面板（消息/流式/工具卡/乐观对账） | ✅ 主体完成（虚拟滚动、窗口键位测试延后） |
-| Phase 3.5-3.8: Session/监控/文件树面板 | 各面板 + 验证 | ⏳ 当前 |
+| Phase 3.5: Session 面板 + 编辑即 fork | Session 列表/生命周期 + Chat 编辑即 fork | ✅ 完成（键位无头断言随键位定稿补） |
+| Phase 3.6-3.8: 监控/文件树面板 + 验证 | 各面板 + 验证 | ⏳ 当前 |
 | Phase 4: 远程模式 + 多机 | 分布式连接 | ⏳ 待开始 |
 | Phase 5: 配置系统 | 图形化配置 | ⏳ 待开始 |
 | Phase 6: Web 前端退出 | 完成切换 | ⏳ 待开始 |

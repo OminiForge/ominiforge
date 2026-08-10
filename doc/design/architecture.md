@@ -1,3 +1,6 @@
+<!-- status: current -->
+<!-- owner: @OminiForge -->
+
 # Ominiforge 架构设计
 
 ## 1. 项目目标
@@ -75,7 +78,7 @@ GPUI 客户端是唯一的用户界面，替代了原计划的 Web 前端和 Tau
 - 多机连接（Direct/Tunnel/P2P，自动切换）
 - 本地模式（直接链接 core，零网络开销）和远程模式（连接远程 Gateway）
 
-Editor 嵌入（vim 编辑体验）为后置的高级功能，见 §22 与 [`migration-plan.md`](./migration-plan.md) Phase 7。详见 [`gpui-app.md`](./gpui-app.md)。
+Editor 嵌入（vim 编辑体验）为后置的高级功能，见 §22 与 [`migration-plan.md`](../operation/migration-plan.md) Phase 7。详见 [`gpui-app.md`](./gpui-app.md)。
 
 ### 3.3 Web 前端（过渡期保留，最终移除）
 
@@ -86,7 +89,7 @@ Web 前端（SvelteKit）在过渡期保留，用于在 GPUI 客户端完成前�
 - GPUI 客户端功能完备后，Web 前端停止新功能开发，标记为 deprecated
 - 最终移除或保留为只读/轻量入口
 
-详见 [`migration-plan.md`](./migration-plan.md) Phase 6。
+详见 [`migration-plan.md`](../operation/migration-plan.md) Phase 6。
 
 ### 3.4 Mobile（后续）
 
@@ -94,7 +97,7 @@ Web 前端（SvelteKit）在过渡期保留，用于在 GPUI 客户端完成前�
 
 主要负责：审批操作、监控查看、通知接收。
 
-详见 [`architecture-decisions.md`](./architecture-decisions.md) §Feature Request。
+详见 [`architecture-decisions.md`](../decisions/architecture-decisions.md) §Feature Request。
 
 ## 4. 总体分层
 
@@ -986,7 +989,7 @@ assemble（每次会话冷启动 / resume；CLI 与 gateway 同一入口）
 
 ## 22. Editor 系统（后置）
 
-Editor 嵌入是**后置的高级功能**，不在当前架构主线（见 [`migration-plan.md`](./migration-plan.md) Phase 7）。原 Neovim `nvim --embed` 子进程方案已否决（非自包含、与产品定位冲突），详细调研与候选路线见 `doc/research/editor_embed_report.agent.final.md`。启动条件与选型待 Phase 7 重新评估。
+Editor 嵌入是**后置的高级功能**，不在当前架构主线（见 [`migration-plan.md`](../operation/migration-plan.md) Phase 7）。原 Neovim `nvim --embed` 子进程方案已否决（非自包含、与产品定位冲突），详细调研与候选路线见 `doc/research/editor_embed_report.agent.final.md`。启动条件与选型待 Phase 7 重新评估。
 
 ## 23. 通信协议
 
@@ -996,7 +999,7 @@ GPUI 客户端与 Core 之间的通信通过统一的 `ClientProtocol` trait 抽
 
 ## 24. 配置系统
 
-配置系统以 **GPUI Settings 面板图形化编辑为主入口**，配套多机配置同步（Last-Write-Wins + 字段级合并）。Lua 作为统一配置语言的完整方案（`ominiforge.lua` + `lua-language-server` 类型定义 + 双向同步）为**高级可选项后置**，与 Editor 嵌入一并评估（见 [`migration-plan.md`](./migration-plan.md) Phase 5、Phase 7）。界面与同步的定义见 [`config-lua.md`](./config-lua.md)。
+配置系统以 **GPUI Settings 面板图形化编辑为主入口**，配套多机配置同步（Last-Write-Wins + 字段级合并）。Lua 作为统一配置语言的完整方案（`ominiforge.lua` + `lua-language-server` 类型定义 + 双向同步）为**高级可选项后置**，与 Editor 嵌入一并评估（见 [`migration-plan.md`](../operation/migration-plan.md) Phase 5、Phase 7）。界面与同步的定义见 [`config-lua.md`](./config-lua.md)。
 
 ## 25. 多机连接
 

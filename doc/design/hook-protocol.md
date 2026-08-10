@@ -1,3 +1,6 @@
+<!-- status: current -->
+<!-- owner: @OminiForge -->
+
 # Ominiforge Hook Protocol
 
 本文档定义 hook 的触发、执行和响应协议。Hook 用于在特定 pipeline 位置拦截或观察事件。

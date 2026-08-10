@@ -1,3 +1,6 @@
+<!-- status: current -->
+<!-- owner: @OminiForge -->
+
 # Gateway 系统
 
 Gateway 是 GPUI 客户端远程模式的后端（`doc/architecture.md` §18）。Gateway 不实现 agent 逻辑——它是

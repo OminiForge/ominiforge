@@ -1,3 +1,6 @@
+<!-- status: current -->
+<!-- owner: @OminiForge -->
+
 # Ominiforge 架构决策记录
 
 本文档记录 2026-08-06 架构讨论的核心决策，作为后续设计和实施的基础。
@@ -133,7 +136,7 @@ ConnectionManager
 - 未来优化（QUIC）：更高性能，更低延迟
 - 统一接口，可演化
 
-**架构**：定义统一的 `ClientProtocol` trait，多个实现可插拔——`LocalProtocol`（直接调用 core）、`WebSocketProtocol`（远程，第一阶段）、`QuicProtocol`（QUIC，未来优化）。签名以代码为准，详见 [`network.md`](./network.md) §2。
+**架构**：定义统一的 `ClientProtocol` trait，多个实现可插拔——`LocalProtocol`（直接调用 core）、`WebSocketProtocol`（远程，第一阶段）、`QuicProtocol`（QUIC，未来优化）。签名以代码为准，详见 [`network.md`](../design/network.md) §2。
 
 **关键认知**：
 - 本地模式：GPUI App 直接链接 ominiforge-core 作为库，无网络

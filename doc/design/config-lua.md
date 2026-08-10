@@ -1,3 +1,6 @@
+<!-- status: current -->
+<!-- owner: @OminiForge -->
+
 # 配置系统（Lua）
 
 > **状态：Lua 部分为高级可选项，后置**。配置系统以图形界面为主入口（见 `architecture.md` §24）。

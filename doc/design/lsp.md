@@ -1,3 +1,6 @@
+<!-- status: current -->
+<!-- owner: @OminiForge -->
+
 # Ominiforge LSP 集成
 
 本文档描述 LSP（Language Server Protocol）集成。Phase 1 把语言服务器的**诊断（diagnostics）**作为 `edit`/`write` 的辅助信息返回给模型。它不是模型直接调用的工具——`doc/tool-protocol.md` §2 里 `lsp` 作为 built-in 工具类目是给后续阶段预留的。

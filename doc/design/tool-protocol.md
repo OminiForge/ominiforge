@@ -1,3 +1,6 @@
+<!-- status: current -->
+<!-- owner: @OminiForge -->
+
 # Ominiforge Tool Protocol
 
 本文档定义 Tool 的分类、注册、调用协议和错误处理。

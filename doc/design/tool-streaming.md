@@ -1,3 +1,6 @@
+<!-- status: current -->
+<!-- owner: @OminiForge -->
+
 # Tool Streaming：工具调用的流式渲染管线
 
 定义 tool call 从「模型开始吐 args」到「结果定稿」之间，后端如何向前端提供**可渲染的

@@ -1,3 +1,6 @@
+<!-- status: current -->
+<!-- owner: @OminiForge -->
+
 # Editor 系统
 
 > **状态：后置的高级功能**（`migration-plan.md` Phase 7）。本文描述的 Neovim `nvim --embed`

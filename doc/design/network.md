@@ -1,3 +1,6 @@
+<!-- status: current -->
+<!-- owner: @OminiForge -->
+
 # 网络通信
 
 网络通信系统负责 GPUI 客户端与 Core 之间的通信，以及多机之间的连接。

@@ -1,3 +1,6 @@
+<!-- status: current -->
+<!-- owner: @OminiForge -->
+
 # GPUI 应用
 
 GPUI 应用是 ominiforge 的唯一用户界面，提供完整的 Agent 工作台体验。
