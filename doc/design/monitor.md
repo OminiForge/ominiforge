@@ -3,7 +3,7 @@
 
 # Monitor Trace Model
 
-代码：`Monitor`、`SessionSummary`、`summarize` 见 [`src/monitor.rs`](../crates/ominiforge-core/src/monitor.rs)。
+代码：`Monitor`、`SessionSummary`、`summarize` 见 [`src/monitor.rs`](../crates/ominiforge/src/monitor.rs)。
 本文讲设计意图与配置契约，聚合字段细节以代码为准。
 
 ## 1. 设计原则
@@ -30,7 +30,7 @@
 
 ## 3. Cache 命中率标准化
 
-不同 provider 返回格式不同，monitor 统一为 `Usage` 中的 cache read/write 两个计数（`read_tokens` = 命中 prefix cache 读取的 tokens，`write_tokens` = 本次写入 cache 的 tokens）。结构定义见 [`src/core/payload.rs`](../crates/ominiforge-core/src/core/payload.rs) 的 `Usage`。
+不同 provider 返回格式不同，monitor 统一为 `Usage` 中的 cache read/write 两个计数（`read_tokens` = 命中 prefix cache 读取的 tokens，`write_tokens` = 本次写入 cache 的 tokens）。结构定义见 [`src/core/payload.rs`](../crates/ominiforge/src/core/payload.rs) 的 `Usage`。
 
 Provider 映射：
 

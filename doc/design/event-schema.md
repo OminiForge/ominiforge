@@ -5,8 +5,8 @@
 
 定义内部统一事件协议。所有 UI、gateway、session log、monitor、replay 依赖该协议。
 
-**精确类型定义在代码**：envelope 见 [`src/core/envelope.rs`](../crates/ominiforge-core/src/core/envelope.rs)（`CoreEvent`、
-`EventSource`、`SourceKind`）；payload 见 [`src/core/payload.rs`](../crates/ominiforge-core/src/core/payload.rs)
+**精确类型定义在代码**：envelope 见 [`src/core/envelope.rs`](../crates/ominiforge/src/core/envelope.rs)（`CoreEvent`、
+`EventSource`、`SourceKind`）；payload 见 [`src/core/payload.rs`](../crates/ominiforge/src/core/payload.rs)
 （`EventPayload` 及各分域 enum、`Usage`、`ErrorDetail` 等）。本文只讲设计意图与不可变契约，
 字段级细节以代码及其注释为准。
 

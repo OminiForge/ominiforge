@@ -59,14 +59,14 @@ Session 的原始历史应采用 append-only 模型保存。任何压缩、fork�
 
 ```text
 ominiforge serve            # 起 Gateway（GPUI 客户端远程模式的后端）
-ominiforge eval <suite>     # 跑 eval 套件（高级 feature，预留）
 ```
 
-CLI 应保持可组合、可脚本化、输出结构清晰。
+CLI 应保持可组合、可脚本化、输出结构清晰。未来会在同一二进制中加入 TUI（对话界面），与 `serve` 并列。
 
 **已移除的子命令**：
 - `init`：配置通过 GPUI 图形界面管理（见 §24）
 - `inspect`：session 分析通过 GPUI 客户端的监控面板（见 [`gpui-app.md`](./gpui-app.md)）
+- `eval`：eval 能力仍在 core（`src/eval/`），但 CLI 入口已移除，未来经 TUI/GUI 暴露
 
 ### 3.2 GPUI 客户端（唯一 UI）
 
@@ -161,40 +161,38 @@ Infrastructure Layer
 
 ```text
 crates/
-  ominiforge-core/         # 核心：agent、session、event、tool、lsp、parsing、format
-                           # 无 GUI 依赖，可独立编译和测试
+  ominiforge/              # core lib：agent、session、event、tool、lsp、format、
+                           # gateway、eval 等。纯库，无 GUI 依赖，可独立编译和测试。
+                           # crates.io 上发布为 `ominiforge`。
   
-  ominiforge-config/       # Config Service
-                           # trait ConfigStore + LocalFile/P2PSync 实现
+  ominiforge-net/          # ClientProtocol 抽象：LocalProtocol（直链 core）/
+                           # WebSocketProtocol（连远程 Gateway）。前端连 core 的统一接口。
   
-  ominiforge-net/          # Network Service
-                           # trait Connection + Direct/Tunnel/P2P 实现
+  ominiforge-ui/           # UI 组件库（依赖 gpui）：theme、components、panels。
+                           # 含 gpui git 依赖，不发 crates.io。
   
-  ominiforge-ui/           # UI 组件库（依赖 gpui）
-                           # theme、components、panels
+  ominiforge-cli/          # CLI（lib+bin `ominiforge`）：serve 子命令，未来 TUI。
+                           # 依赖 core+net；发 crates.io + GitHub Release。
   
-  ominiforge-app/          # GPUI 桌面应用（组合所有模块）
-                           # 唯一 UI，最终形态
-  
-  ominiforge-cli/          # CLI 工具（只依赖 core）
-                           # serve 子命令（启动 Gateway）
+  ominiforge-gui/          # GPUI 桌面应用（bin `ominiforge`，占位）：复用 cli 的
+                           # 命令面 + GPUI 界面，最终唯一 UI。publish=false，
+                           # 只走 GitHub Release 桌面安装包。
 ```
 
 **依赖方向**：
 
 ```text
-ominiforge-app → ominiforge-ui → gpui
-ominiforge-app → ominiforge-config → ominiforge-core
-ominiforge-app → ominiforge-net → ominiforge-core
-ominiforge-cli → ominiforge-core
+ominiforge-gui → ominiforge-cli → ominiforge-net → ominiforge
+ominiforge-gui → ominiforge-ui → gpui
+ominiforge-ui → ominiforge-net → ominiforge
 
-ominiforge-core 不依赖任何上层 crate
+ominiforge（core）不依赖任何上层 crate
 ```
 
 **Core 内部 module 布局**：
 
 ```text
-crates/ominiforge-core/src/
+crates/ominiforge/src/
 ├── core/          # event schema, state machine, core traits
 ├── session/       # storage, fork, DAG
 ├── context/       # compaction, injection, prefix cache
@@ -222,7 +220,6 @@ crates/ominiforge-core/src/
 | `provider-openai`  | OpenAI provider | on   |
 | `provider-xiaomi`  | Xiaomi MiMo provider | on   |
 | `sandbox-boxlite`  | microVM 沙箱后端（Linux + Apple Silicon） | off |
-| `eval`             | Eval 系统（高级 feature） | off |
 
 Gateway（axum 栈）是无条件编译的——`ominiforge-cli` 的主用途就是 `serve`。
 
@@ -995,7 +992,7 @@ Editor 嵌入是**后置的高级功能**，不在当前架构主线（见 [`mig
 
 GPUI 客户端与 Core 之间的通信通过统一的 `ClientProtocol` trait 抽象。
 
-底层传输可插拔：本地模式（`LocalProtocol`，直接链接 `ominiforge-core`，零网络开销）与远程模式（`WebSocketProtocol`，连接远程 Gateway；QUIC 传输为未来优化）。操作集与协议定义见 [`network.md`](./network.md) §2-§4。
+底层传输可插拔：本地模式（`LocalProtocol`，直接链接 `ominiforge`（core），零网络开销）与远程模式（`WebSocketProtocol`，连接远程 Gateway；QUIC 传输为未来优化）。操作集与协议定义见 [`network.md`](./network.md) §2-§4。
 
 ## 24. 配置系统
 

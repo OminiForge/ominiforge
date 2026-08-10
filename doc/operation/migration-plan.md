@@ -27,7 +27,7 @@
 ### Phase 3.1-3.2: Workspace + GPUI 基础 ✅
 
 已完成：
-- workspace 拆分（`crates/ominiforge-core` / `-ui` / `-app`），`[workspace.package]` + `[workspace.lints]` 统一
+- workspace 拆分（`crates/ominiforge` / `-ui` / `-app`），`[workspace.package]` + `[workspace.lints]` 统一
 - gpui 0.2 依赖接入，`test-support` 无头测试链打通
 - 组件测试模式确立（`simulate_keystrokes` 行为断言 + `debug_bounds` 布局断言，无像素 diff）
 

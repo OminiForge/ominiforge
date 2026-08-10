@@ -58,10 +58,11 @@ These are the load-bearing ideas; the full rationale lives in
 
 | Crate | Responsibility |
 | ----- | -------------- |
-| [`crates/ominiforge-core`](crates/ominiforge-core) | The agent runtime: tools, providers, sessions, gateway, LSP/MCP integration, and the `ominiforge` binary. |
-| [`crates/ominiforge-ui`](crates/ominiforge-ui) | The GPUI client and theme system. |
-| [`crates/ominiforge-net`](crates/ominiforge-net) | The client/server protocol layer connecting the UI to local or remote cores. |
-| [`crates/ominiforge-app`](crates/ominiforge-app) | The application shell wiring core, net, and UI together. |
+| [`crates/ominiforge`](crates/ominiforge) | The core: the UI-agnostic agent runtime — tools, providers, sessions, gateway, LSP/MCP integration. A pure library, published to crates.io as `ominiforge`. |
+| [`crates/ominiforge-net`](crates/ominiforge-net) | The client protocol abstraction (`ClientProtocol`) connecting any front-end to a local or remote core. |
+| [`crates/ominiforge-cli`](crates/ominiforge-cli) | The `ominiforge` command line — `serve` today, a TUI later. Published to crates.io and as binaries on GitHub Releases. |
+| [`crates/ominiforge-ui`](crates/ominiforge-ui) | The GPUI component library and theme system. |
+| [`crates/ominiforge-gui`](crates/ominiforge-gui) | The GPUI desktop app — the full `ominiforge` CLI plus a graphical interface. Ships as desktop packages on GitHub Releases (placeholder while the UI matures). |
 
 ## Getting started
 

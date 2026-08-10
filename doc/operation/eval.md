@@ -3,11 +3,13 @@
 
 # Eval 系统设计
 
-代码入口：[`src/eval/`](../crates/ominiforge-core/src/eval/)。本文讲设计意图与各层契约，实现细节以代码及其注释为准。
+代码入口：[`src/eval/`](../crates/ominiforge/src/eval/)。本文讲设计意图与各层契约，实现细节以代码及其注释为准。
+
+> **注意**：eval 能力保留在 core 库中，但 `ominiforge eval` **CLI 子命令已随 CLI 拆出 core 而移除**。后续将通过 TUI/GUI 或重新设计的入口暴露。本文的调用方式描述以历史设计为准。
 
 ## 1. 设计原则
 
-- **集成在二进制里，不额外启动进程**。`ominiforge eval` 子命令直接调 `app::assemble` + `Agent::run_turn`。
+- **集成在二进制里，不额外启动进程**。eval 逻辑直接调 `app::assemble` + `Agent::run_turn`（原 `ominiforge eval` 子命令，现入口已移除）。
 - **判定 ≠ 描述**。Monitor 问"发生了什么"（描述性，无期望），Eval 问"做对了吗"（规范性，需要 ground truth）。二者使用同一条 event stream，但数据模型正交，不合并。
 - **Deterministic 优先**。能用代码断言的不上 LLM judge。judge 有真实校准成本，是后期选项，不是默认路径。
 - **Score 是一等数据**。每次 eval run 的 per-case 分必须持久化，因为分析层（run 间 diff、回归检测）必须跨 run 查询；`events.jsonl` 是 per-session 的，兜不住这一层。
@@ -83,8 +85,8 @@ Skip`）、可复盘的解释、以及 scorer 自定义的附加数据。
 Provider（这也是 `score` 为 async 的原因）。runner 未接入前 `messages` /
 `workspace` 为 `Option`（`None`），需要它们的 scorer 返回 `Skip`。
 
-精确签名与字段可空性以代码及其注释为准：[`src/eval/scorer.rs`](../crates/ominiforge-core/src/eval/scorer.rs)
-（`Scorer`）、[`src/eval/score.rs`](../crates/ominiforge-core/src/eval/score.rs)（`EvalContext` / `Score`）。
+精确签名与字段可空性以代码及其注释为准：[`src/eval/scorer.rs`](../crates/ominiforge/src/eval/scorer.rs)
+（`Scorer`）、[`src/eval/score.rs`](../crates/ominiforge/src/eval/score.rs)（`EvalContext` / `Score`）。
 
 scorer 与 metric 分离：scorer 出**每样本**的分，metric 做**跨样本**聚合（pass_rate / pass_at_k / pass_hat_k）。一个 case 可挂多个 scorer，各自独立出分（对标 HELM 多维度，不压成单一数字）。
 

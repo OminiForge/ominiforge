@@ -194,6 +194,11 @@ crates/
   ominiforge-cli/       # CLI 工具（只有 serve 子命令，后续拆出）
 ```
 
+> **更新（2026-08）**：上述拆分已实施。`ominiforge-core` 更名为 `ominiforge`（纯 lib），
+> CLI 拆为 `ominiforge-cli`（lib+bin `ominiforge`，含 serve，已删 eval 子命令），
+> `ominiforge-app` 由 `ominiforge-gui`（bin `ominiforge`，占位）取代。`ominiforge-config`
+> 未建——配置内嵌于 core 的 `config` 模块。依赖为 path+version 双写，统一 workspace 版本。
+
 **注**：`ominiforge-editor` 已随 Editor 后置移除，启动时重建。
 
 **关键认知**：

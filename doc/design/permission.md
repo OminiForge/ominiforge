@@ -22,7 +22,7 @@ allow / deny / ask。核心原则——安全不能靠信任模型，要靠代�
 
 ## 2. 策略模型
 
-`PermissionPolicy`（精确字段见 [`src/permission/mod.rs`](../crates/ominiforge-core/src/permission/mod.rs)）持有**三个有序规则列表**：
+`PermissionPolicy`（精确字段见 [`src/permission/mod.rs`](../crates/ominiforge/src/permission/mod.rs)）持有**三个有序规则列表**：
 
 - `deny`：命中即阻断，最高优先级。
 - `allow`：命中且无 deny 命中 → 直接放行（固化的批准，§5.1），压过 ask。
@@ -164,7 +164,7 @@ CLI 运行只经过 profile 层（gateway/workspace 两层都是 gateway 侧，C
 
 ## 5. Ask 闭环（ApprovalGate）
 
-`ApprovalGate`（精确签名见 [`src/agent/approval.rs`](../crates/ominiforge-core/src/agent/approval.rs)）是前端无关的注入点，同 `StreamSink`。两个方法：`request(req) -> ApprovalOutcome` 挂起等决定——三态 `Approved | RejectedByUser | AutoDenied` 区分「人拒绝」与「无人应答的兜底拒绝」，让审计不撒谎（M2）；返回值同时携带人选择的作用域（§5.1），无人决定时为 `None`。`supports_concurrent_requests()` 声明能否并发受理多个 request：gateway 为 true（走共享表路由），启用 §5.2 的两阶段并行分发；CLI/NullGate 为 false，保持逐条串行。
+`ApprovalGate`（精确签名见 [`src/agent/approval.rs`](../crates/ominiforge/src/agent/approval.rs)）是前端无关的注入点，同 `StreamSink`。两个方法：`request(req) -> ApprovalOutcome` 挂起等决定——三态 `Approved | RejectedByUser | AutoDenied` 区分「人拒绝」与「无人应答的兜底拒绝」，让审计不撒谎（M2）；返回值同时携带人选择的作用域（§5.1），无人决定时为 `None`。`supports_concurrent_requests()` 声明能否并发受理多个 request：gateway 为 true（走共享表路由），启用 §5.2 的两阶段并行分发；CLI/NullGate 为 false，保持逐条串行。
 
 `ApprovalResolution` 三态映射到审计 `decided_by`：`Approved`/`RejectedByUser` = 人做了决定（`"user"`）；`AutoDenied` = 没人应答的 fail-closed 兜底（`"gate"`），绝不记成用户拒绝。
 
