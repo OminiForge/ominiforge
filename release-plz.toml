@@ -1,21 +1,20 @@
 # release-plz：统一版本 + 单 tag + 单 Release + 汇总 changelog。
 #
-# 发布哲学：对**用户**而言只有一个产品 ominiforge、一个版本号、一个 tag（v0.x.0）。
-# 该 tag 的 GitHub Release 正文是汇总 changelog，并挂载两类二进制（纯 CLI、以及未来的
-# GUI+CLI），每类覆盖 Linux/macOS/Windows，用户按系统下载。
-# 对 **crates.io** 仍是 per-crate 发布（ominiforge / ominiforge-net / ominiforge-cli），
+# 对**用户**只有一个产品 ominiforge、一个版本号、一个 tag（v0.x.0）。该 tag 的 GitHub
+# Release 正文是汇总 changelog，并挂载两类二进制（纯 CLI、未来的 GUI+CLI），各覆盖
+# Linux/macOS/Windows。对 **crates.io** 仍 per-crate 发布（core/net/cli 各自 publish），
 # 与 git tag/release 相互独立。
+#
+# 单 tag 的正确做法（release-plz 官方）：默认关闭所有 crate 的 git tag/release，
+# 只给主 crate ominiforge-cli 开启。
 
 [workspace]
 changelog_update = true
 # 更新 Cargo.lock 依赖钉。
 dependencies_update = true
-# 单一 tag：v{version}（不带 crate 前缀）。
-git_tag_name = "v{{ version }}"
-# 单 tag 对应的 GitHub Release 名。
-git_release_name = "v{{ version }}"
-# Release 正文 = 该版本的 changelog（汇总自根 CHANGELOG，见下）。
-git_release_body = "{{ changelog }}"
+# 默认不打 tag、不建 Release（各 crate 仅发 crates.io）。
+git_tag_enable = false
+git_release_enable = false
 
 # 统一版本：三个可发布 crate 绑为一组，同号演进。
 [[package]]
@@ -26,12 +25,18 @@ version_group = "product"
 name = "ominiforge-net"
 version_group = "product"
 
-# ominiforge-cli 是面向用户的主产物。它的 changelog 指向仓库根，并聚合 core/net，
-# 因此根 CHANGELOG.md 是产品级汇总历史，同时作为单 Release 的正文来源。
+# ominiforge-cli 是面向用户的主产物：
+# - 唯一的 tag/Release 由它产生，tag 名为 v<version>（去 crate 前缀）。
+# - 它的 changelog 指向仓库根并聚合 core/net，作为该单 Release 的正文来源。
 [[package]]
 name = "ominiforge-cli"
 version_group = "product"
+git_tag_enable = true
+git_release_enable = true
+git_tag_name = "v{{ version }}"
+git_release_name = "v{{ version }}"
+git_release_body = "{{ changelog }}"
 changelog_path = "CHANGELOG.md"
 changelog_include = ["ominiforge", "ominiforge-net"]
 
-# ominiforge-ui / ominiforge-gui 为 publish = false，不发布到 crates.io，也不单独打 tag。
+# ominiforge-ui / ominiforge-gui 为 publish = false，不发 crates.io，也不打 tag。
