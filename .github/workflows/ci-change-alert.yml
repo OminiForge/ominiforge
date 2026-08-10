@@ -47,7 +47,7 @@ jobs:
           # Without this, every synchronize (rebase / new commit) re-comments and
           # spams notifications.
           MARKER="ci-config-alert"
-          if gh pr view "$PR" --json comments --jq '.[].body' 2>/dev/null | grep -q "$MARKER"; then
+          if gh pr view "$PR" --json comments --jq '.comments[].body' 2>/dev/null | grep -q "$MARKER"; then
             echo "alert already posted for this PR; skipping comment"
             exit 0
           fi
