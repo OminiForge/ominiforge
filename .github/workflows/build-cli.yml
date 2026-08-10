@@ -5,9 +5,10 @@ name: Build CLI binaries
 # boxlite 默认关闭），直接用 cargo 跨平台编译，无需 Nix。GUI 桌面包另行处理（占位）。
 
 on:
-  push:
-    tags:
-      - "v*"
+  # release-plz 用 GITHUB_TOKEN 打的 tag 不会触发 push 事件（GitHub 防递归限制），
+  # 但它创建的 GitHub Release 会发出 release: published 事件——用它来触发构建。
+  release:
+    types: [published]
 
 permissions:
   contents: write
@@ -30,6 +31,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
       - name: Install Rust target
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -52,5 +55,5 @@ jobs:
       - name: Upload to GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ github.event.release.tag_name }}
         run: gh release upload "$TAG" "${{ matrix.name }}" --clobber
