@@ -95,7 +95,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 # view (`GET /sessions/{id}/view`) is multi-MB of highly compressible JSON;
 # over a relayed link (SSH forward / reverse proxy) compression is the
 # difference between a 10s and a 1s session open.
-tower-http = { version = "0.6", features = [
+tower-http = { version = "0.7", features = [
   "compression-gzip",
   "compression-br",
   "fs",
