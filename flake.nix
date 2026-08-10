@@ -144,7 +144,10 @@
             in
               !(builtins.elem baseName [".direnv" ".git" "target" "result"]);
           };
-          cargoLock.lockFile = ./Cargo.lock;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            allowBuiltinFetchGit = true; # gpui git 依赖的 vendoring hash
+          };
 
           buildFeatures = ["sandbox-boxlite"];
           # protoc (boxlite-shared build.rs) + pkg-config/openssl, mirroring the
@@ -189,7 +192,12 @@
             in
               !(builtins.elem baseName [".direnv" ".git" "target" "result"]);
           };
-          cargoLock.lockFile = ./Cargo.lock;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            # gpui 是 git 依赖，带入 zed 的 git crates（如 collections）。用内建 fetchGit
+            # 取其 hash，否则 vendoring 时报 'No hash was found'。
+            allowBuiltinFetchGit = true;
+          };
           doCheck = true;
         };
       };
