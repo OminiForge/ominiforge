@@ -1,0 +1,105 @@
+name: gpui bump
+
+# 全自动 gpui 升级：gpui 是 zed 的 git 依赖，钉在 release tag（doc/decisions/
+# architecture-decisions.md §1），dependabot 不管 git 依赖，故用此 workflow 月度自动
+# bump。流程：检查 zed 最新 tag → 若落后则更新 Cargo.toml + cargo update → just ci 验证
+# → 按 doc/operation/supply-chain.md 复查 audit 豁免 → 开 PR 供人 review。
+# 人的参与只有最后一步「review 并合并 PR」。
+
+on:
+  schedule:
+    - cron: "0 2 1 * *" # 每月 1 号 02:00 UTC
+  workflow_dispatch: # 允许手动触发
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare pinned tag with latest zed release
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          CURRENT=$(grep -oE 'zed-industries/zed", tag = "v[0-9.]+"' Cargo.toml | grep -oE 'v[0-9.]+' | head -1)
+          LATEST=$(gh api repos/zed-industries/zed/releases/latest --jq .tag_name)
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+          if [ "$CURRENT" = "$LATEST" ]; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+            echo "gpui is up to date ($CURRENT); nothing to do"
+          else
+            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+            echo "bump available: $CURRENT -> $LATEST"
+          fi
+
+      - name: Install Nix
+        if: steps.check.outputs.up_to_date == 'false'
+        uses: DeterminateSystems/nix-installer-action@v16
+
+      - name: Apply bump and verify with just ci
+        if: steps.check.outputs.up_to_date == 'false'
+        env:
+          LATEST: ${{ steps.check.outputs.latest }}
+        run: |
+          set -euo pipefail
+          # Pin both gpui and gpui_platform to the new tag (must share a zed commit).
+          sed -i -E "s#(zed-industries/zed\", tag = \")v[0-9.]+#\\1$LATEST#g" Cargo.toml
+          nix develop --command cargo update -p gpui -p gpui_platform
+          # Full local verification before opening the PR.
+          nix develop --command just ci
+
+      - name: Review advisory exemptions (clear + re-audit)
+        if: steps.check.outputs.up_to_date == 'false'
+        run: |
+          set -euo pipefail
+          # Per supply-chain.md: a gpui bump triggers an exemption review. Clear the
+          # cargo-audit ignore list and re-audit; the output goes into the PR body so
+          # the human decides which exemptions to keep (this workflow does not
+          # auto-rewrite the ignore list).
+          python3 - <<'PY'
+          import re
+          p = ".cargo/audit.toml"
+          s = open(p).read()
+          s = re.sub(r"ignore = \[[^\]]*\]", "ignore = []", s)
+          open(p, "w").write(s)
+          PY
+          nix develop --command cargo audit > /tmp/reaudit.txt 2>&1 || true
+
+      - name: Open the bump PR
+        if: steps.check.outputs.up_to_date == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURRENT: ${{ steps.check.outputs.current }}
+          LATEST: ${{ steps.check.outputs.latest }}
+        run: |
+          set -euo pipefail
+          BRANCH="gpui-bump/$LATEST"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add Cargo.toml Cargo.lock .cargo/audit.toml
+          git commit -m "chore(deps): bump gpui from $CURRENT to $LATEST"
+          git push origin "$BRANCH"
+
+          # Build the PR body via a file to avoid nested-heredoc quoting issues.
+          {
+            printf 'Automated monthly gpui bump: `%s` -> `%s`.\n\n' "$CURRENT" "$LATEST"
+            printf '`just ci` passes on this branch.\n\n'
+            printf '## Advisory-exemption review (per doc/operation/supply-chain.md)\n\n'
+            printf 'The audit ignore list was cleared and `cargo audit` re-run. Output below;\n'
+            printf 'keep the exemptions that still fire, drop those this bump fixed upstream:\n\n'
+            printf '```\n'
+            cat /tmp/reaudit.txt 2>/dev/null || printf '(no output)\n'
+            printf '```\n'
+          } > /tmp/pr-body.md
+
+          gh pr create \
+            --title "chore(deps): bump gpui from $CURRENT to $LATEST" \
+            --body-file /tmp/pr-body.md
