@@ -1,0 +1,37 @@
+name: PR title
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+jobs:
+  conventional:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      # Validate the PR title: Conventional Commits, lowercase type/scope, and a
+      # printable-ASCII (English) subject. Squash-merge makes the title the commit
+      # on master, so gating here keeps master history parseable by release-please.
+      - uses: amannn/action-semantic-pull-request@v5
+        with:
+          types: |
+            feat
+            fix
+            perf
+            refactor
+            docs
+            test
+            build
+            ci
+            chore
+            style
+            revert
+          requireScope: false
+          # subject must be printable ASCII only (English title); body is unrestricted.
+          subjectPattern: ^[\x20-\x7E]+$
+          subjectPatternError: |
+            The subject must use printable ASCII characters only (English).
+            Non-ASCII text (e.g. Chinese) belongs in the commit body, not the title.
+          ignoreLabels: |
+            skip-title-check

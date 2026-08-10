@@ -1,0 +1,30 @@
+# CODEOWNERS: PRs automatically request review from the matching owner.
+# Syntax:  <pattern>  <owner...>   (later lines take precedence)
+#
+# @duskgrow owns everything under the OminiForge org. As modules gain dedicated
+# owners (e.g. TUI), append a line below and set its owner — no other line
+# needs to change.
+
+# Default: the whole repository
+*                          @duskgrow
+
+# Build / CI / release / supply-chain config: changes here alter how code is
+# built, checked, and released — or can weaken the very gates that protect
+# master. These MUST always be reviewed by @duskgrow, regardless of any future
+# module ownership below. Treat every diff to these paths as high-risk:
+#   a PR that edits CI can change which checks run on its own PR.
+/.github/                  @duskgrow
+/justfile                  @duskgrow
+/flake.nix                 @duskgrow
+/flake.lock                @duskgrow
+/Cargo.toml                @duskgrow
+/Cargo.lock                @duskgrow
+/deny.toml                 @duskgrow
+/clippy.toml               @duskgrow
+/rust-toolchain.toml       @duskgrow
+/rustfmt.toml              @duskgrow
+
+# --- Reserved module splits (examples; replace owner when activated) ---
+# /crates/ominiforge-ui/    @duskgrow @tui-owner
+# /crates/ominiforge-core/  @duskgrow @core-owner
+# /doc/                     @duskgrow

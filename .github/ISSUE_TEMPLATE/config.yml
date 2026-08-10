@@ -1,0 +1,10 @@
+# Route people to the right place: bugs/features use the forms; questions and
+# discussions go to Discussions; vulnerabilities are reported privately.
+blank_issues_enabled: false
+contact_links:
+  - name: Question / Discussion
+    url: https://github.com/OminiForge/ominiforge/discussions
+    about: Usage questions, ideas, RFCs. Please don't open an Issue for these.
+  - name: Security vulnerability
+    url: https://github.com/OminiForge/ominiforge/security/advisories/new
+    about: Report vulnerabilities privately — never publicly. See SECURITY.md.

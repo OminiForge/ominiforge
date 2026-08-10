@@ -1,0 +1,72 @@
+name: CI config change alert
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  flag-ci-changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write # gh pr comment/label go through the issues permission
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect build/CI/supply-chain changes
+        id: detect
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git fetch origin master --quiet
+          CHANGED=$(git diff --name-only origin/master...HEAD)
+          # Any hit on these high-risk paths counts as a build/CI change.
+          if echo "$CHANGED" | grep -qE '^\.github/|^(justfile|flake\.nix|flake\.lock|Cargo\.toml|Cargo\.lock|deny\.toml|clippy\.toml|rust-toolchain\.toml|rustfmt\.toml)$'; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Label and warn (severity depends on author)
+        if: steps.detect.outputs.hit == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          gh pr label "$PR" --add ci-config 2>/dev/null || true
+
+          if [ "$AUTHOR" = "dependabot[bot]" ]; then
+            # Trusted-bot dependency update: downgrade to a "give it a quick scan" note.
+            gh pr comment "$PR" --body "$(cat <<'EOF'
+          ℹ️ **Dependency update touches build/CI config**
+
+          This automated update modifies build or CI files (`Cargo.*`, workflow
+          pins, etc.). Dependabot is a trusted, GitHub-verified bot, so this is
+          routine — but because these files gate what runs on master, give the
+          diff a quick scan before merging (especially any workflow change).
+          EOF
+          )"
+          else
+            # Human change: strong warning — @duskgrow must review carefully.
+            gh pr comment "$PR" --body "$(cat <<'EOF'
+          ## ⚠️ Build / CI / supply-chain files changed
+
+          This PR modifies files that control **how code is built, checked, or
+          released**. Because a PR runs the workflow defined *in its own branch*,
+          a change here can alter which checks run on this very PR — including
+          weakening them.
+
+          @duskgrow please review these diffs with extra care. Verify that:
+          - no required check was removed, renamed, or made non-blocking;
+          - no dependency / license / audit gate was loosened;
+          - secrets or tokens are not exposed to PR-code execution.
+
+          _Posted automatically because build/CI config changed._
+          EOF
+          )"
+          fi

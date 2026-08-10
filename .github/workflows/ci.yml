@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
   workflow_dispatch:
 
@@ -19,7 +19,7 @@ jobs:
         run: nix flake check --print-build-logs
 
   cargo:
-    name: Cargo checks
+    name: Cargo build & test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
