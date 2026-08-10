@@ -1,73 +1,113 @@
-# ominiforge
+<div align="center">
 
-a multi-agent coding assistant with tool-augmented LLM interaction
+# Ominiforge
 
-## 开发环境
+**A high-performance, extensible agent platform built in Rust.**
 
-本项目使用 Nix flake 管理 Rust toolchain、开发工具和验证工具。
+[![CI](https://github.com/OminiForge/ominiforge/actions/workflows/ci.yml/badge.svg)](https://github.com/OminiForge/ominiforge/actions/workflows/ci.yml)
+[![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
 
-首次进入仓库：
+[Documentation](https://ominiforge.github.io/ominiforge/) ·
+[Architecture](doc/design/architecture.md) ·
+[Contributing](CONTRIBUTING.md) ·
+[Discussions](https://github.com/OminiForge/ominiforge/discussions)
+
+</div>
+
+---
+
+Ominiforge is a platform for building capable, long-running agents. Through
+extension it can serve as a coding agent, a personal research assistant, or an
+automation assistant, integrating into software development, knowledge
+management, and collaboration with external applications.
+
+The core runtime is UI-agnostic and event-driven; the single user interface is a
+GPUI client that runs either locally (linked directly against the core) or
+remotely (connected to a Gateway). The command line is operator tooling
+(`serve`, `eval`), not the conversational entry point.
+
+> **Status:** early development (`0.x`). The platform is under active design and
+> breaking changes between minor releases are expected.
+
+## Design principles
+
+These are the load-bearing ideas; the full rationale lives in
+[doc/design/architecture.md](doc/design/architecture.md).
+
+- **UI-agnostic core.** The agent runtime executes tasks, manages state, and
+  emits events without any UI dependency, so the same core powers both local and
+  remote modes.
+- **Immutable history.** Session history is append-only. Compaction, forking,
+  correction, and summarization produce new nodes or views — they never rewrite
+  the original record. This enables replay, audit, failure analysis, and
+  branching from any point.
+- **Extension over MCP.** External tools plug in through the Model Context
+  Protocol, an industry standard with a mature ecosystem. Built-in tools are
+  written in Rust with no protocol overhead.
+- **Readable history first, database as index.** The machine-readable event log
+  (`events.jsonl`) is the source of truth; the index database is rebuildable
+  from it at any time.
+- **Event-driven execution.** Every step — text deltas, tool calls, results,
+  usage, state changes, errors — is a typed event in one shared stream consumed
+  by the UI, gateway, and monitoring.
+- **Evolution by proposal only.** The system can analyze its own history and
+  propose optimizations, skill drafts, or patches, but every change that affects
+  behavior requires explicit user approval before it is applied.
+
+## Repository layout
+
+| Crate | Responsibility |
+| ----- | -------------- |
+| [`crates/ominiforge-core`](crates/ominiforge-core) | The agent runtime: tools, providers, sessions, gateway, LSP/MCP integration, and the `ominiforge` binary. |
+| [`crates/ominiforge-ui`](crates/ominiforge-ui) | The GPUI client and theme system. |
+| [`crates/ominiforge-net`](crates/ominiforge-net) | The client/server protocol layer connecting the UI to local or remote cores. |
+| [`crates/ominiforge-app`](crates/ominiforge-app) | The application shell wiring core, net, and UI together. |
+
+## Getting started
+
+Prerequisites: [Nix](https://nixos.org/) with flakes enabled;
+[direnv](https://direnv.net/) is recommended.
 
 ```sh
-direnv allow
+direnv allow     # enter the dev shell (or: nix develop)
 ```
 
-或手动进入环境：
+The Nix flake provides the Rust toolchain, all developer tools, and the language
+servers the project's own LSP integration consumes. `rust-toolchain.toml` is the
+single source of truth for the toolchain channel.
+
+Common tasks:
 
 ```sh
-nix develop
+just ci          # run the full local check suite (fmt, clippy, test, audit, ...)
+just doc         # preview the documentation site locally
 ```
 
-## Rust toolchain
+See `just --list` for every available task.
 
-`rust-toolchain.toml` 是 Rust channel/components 的单一来源。`flake.nix` 通过 oxalica rust-overlay 读取它：
+## Documentation
 
-```nix
-rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-```
+Design contracts, operational runbooks, and decision records live under
+[`doc/`](doc/README.md) and are published as a versioned site at
+<https://ominiforge.github.io/ominiforge/>. The rendered site lets you read the
+docs for a specific release; start with
+[doc/design/architecture.md](doc/design/architecture.md).
 
-默认组件：
+## Contributing
 
-- rust-src
-- rust-analyzer
-- rustfmt
-- clippy
+Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) for
+the workflow, [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for expected behavior,
+and [AGENTS.md](AGENTS.md) for the working agreements that apply to both human
+and AI contributors.
 
-## 常用命令
+- Questions and ideas → [Discussions](https://github.com/OminiForge/ominiforge/discussions)
+- Bug reports and feature requests → [Issues](https://github.com/OminiForge/ominiforge/issues)
+- Security vulnerabilities → report privately, see [SECURITY.md](SECURITY.md)
 
-```sh
-just fmt        # 格式化 Rust/Nix/TOML
-just fmt-check  # 检查格式
-just check      # cargo check
-just clippy     # clippy -D warnings
-just test       # cargo nextest run
-just audit      # cargo audit
-just deny       # cargo deny check
-just machete    # cargo machete
-just nix-check  # nix flake check
-just ci         # 本地完整检查
-```
-
-## Zed
-
-Zed 使用项目内 wrapper 启动 flake 环境里的 rust-analyzer：
-
-```text
-.zed/rust-analyzer.sh
-```
-
-这样 Zed、终端、CI 使用同一套 Rust toolchain 和依赖环境。
-
-## CI
-
-GitHub Actions 位于：
-
-```text
-.github/workflows/ci.yml
-```
-
-CI 会运行格式检查、cargo check、clippy、nextest、audit、deny、machete 和 nix flake check。
+Commits follow [Conventional Commits](https://www.conventionalcommits.org/) with
+an English subject line. Releases are fully automated with release-please —
+merging to `master` is all it takes.
 
 ## License
 
-GPL-3.0-or-later
+Ominiforge is licensed under [GPL-3.0-or-later](LICENSE).
