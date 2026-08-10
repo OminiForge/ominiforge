@@ -74,7 +74,6 @@ toml = "0.8"
 # stay in `events.jsonl` — see doc/session-storage.md. Env-filtered, off
 # unless RUST_LOG asks for more; default level is set in cli::run.
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ulid = "1"
 
 # Sandbox backend (feature `sandbox-boxlite`, doc/sandbox.md §4): libkrun microVM

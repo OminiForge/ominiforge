@@ -12,7 +12,6 @@ ominiforge = { path = "../ominiforge", version = "0.1" }
 anyhow = "1"
 async-trait = "0.1"
 futures-core = "0.3"
-tokio = { version = "1", features = ["sync"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 
 [dev-dependencies]
