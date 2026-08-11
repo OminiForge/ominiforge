@@ -1,15 +1,23 @@
 name: Build CLI binaries
 
-# 当 release-plz 给 ominiforge-cli 打 tag（合并 Release PR 后）时，为三大平台构建
-# 纯 CLI 二进制并上传到对应的 GitHub Release。CLI 是纯 Rust 栈（rustls、无 build.rs、
-# boxlite 默认关闭），直接用 cargo 跨平台编译，无需 Nix。GUI 桌面包另行处理（占位）。
+# 发布流程：release-plz 给 ominiforge-cli 打 tag（合并 Release PR 后）→ 建 GitHub Release
+# → 本 workflow 为三大平台构建纯 CLI 二进制并上传到该 Release。
+#
+# 结构：每个平台一个 job 只负责 build + package，产物存为 artifact；最后一个 Linux job
+# 统一下载所有 artifact 并上传到 Release。这样上传只在 Linux 上跑，绕开 Windows runner 上
+# gh release upload 的 shell/查找问题。
+#
+# 平台与依赖：
+# - Linux 用 musl 静态链接 → 二进制自包含，任何发行版直接跑，无 glibc 版本依赖。
+# - macOS / Windows 直接 cargo 编译，无额外系统依赖（rustls 纯 Rust、boxlite 默认关）。
+# CLI 是纯 Rust 栈（无 build.rs、无 openssl），故全程无需 Nix。
 
 on:
-  # release-plz 用 GITHUB_TOKEN 打的 tag 不会触发 push 事件（GitHub 防递归限制），
-  # 但它创建的 GitHub Release 会发出 release: published 事件——用它来触发构建。
+  # release-plz 用 GITHUB_TOKEN 打的 tag 不触发 push（防递归），但它建的 Release 会发出
+  # release: published 事件，用它触发。
   release:
     types: [published]
-  # 允许手动触发以补传/重传某版本的二进制（指定 tag）。
+  # 手动触发以补传/重传某版本的二进制（指定 tag）。
   workflow_dispatch:
     inputs:
       tag:
@@ -25,18 +33,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            name: ominiforge-linux-x86_64.tar.gz
+            asset: ominiforge-linux-x86_64.tar.gz
+            bin: ominiforge
           - target: aarch64-apple-darwin
             os: macos-latest
-            name: ominiforge-macos-aarch64.tar.gz
+            asset: ominiforge-macos-aarch64.tar.gz
+            bin: ominiforge
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            name: ominiforge-windows-x86_64.zip
+            asset: ominiforge-windows-x86_64.zip
+            bin: ominiforge.exe
     runs-on: ${{ matrix.os }}
     env:
-      # release 事件取 release.tag_name；手动 dispatch 取 inputs.tag。
       TAG: ${{ github.event.release.tag_name || inputs.tag }}
     steps:
       - uses: actions/checkout@v4
@@ -51,17 +61,31 @@ jobs:
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
-        run: |
-          BIN=target/${{ matrix.target }}/release/ominiforge
-          tar -czf ${{ matrix.name }} -C target/${{ matrix.target }}/release ominiforge
+        run: tar -czf ${{ matrix.asset }} -C target/${{ matrix.target }}/release ${{ matrix.bin }}
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: |
-          Compress-Archive -Path target/${{ matrix.target }}/release/ominiforge.exe `
-            -DestinationPath ${{ matrix.name }}
+        run: Compress-Archive -Path target/${{ matrix.target }}/release/${{ matrix.bin }} -DestinationPath ${{ matrix.asset }}
 
-      - name: Upload to GitHub Release
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: ${{ matrix.asset }}
+          retention-days: 1
+
+  upload:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          merge-multiple: true
+      - name: Upload every archive to the Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "$TAG" "${{ matrix.name }}" --clobber
+        run: gh release upload "$TAG" ./*.tar.gz ./*.zip --clobber
