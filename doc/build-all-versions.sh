@@ -34,6 +34,11 @@ build_one() {
   git --work-tree="$tmp" checkout --force --quiet "$ref" -- doc 2>/dev/null || {
     echo "   (no doc/ at $ref, skipping)"; rm -rf "$tmp"; return 0;
   }
+  # Always use the switcher from the current checkout, not the tag's snapshot.
+  # The tag may contain a broken or outdated version of these files.
+  for f in version-switcher.js version-switcher.css; do
+    [ -f "$ROOT/doc/$f" ] && cp "$ROOT/doc/$f" "$tmp/doc/$f"
+  done
   if [ -f "$tmp/doc/book.toml" ]; then
     mdbook build "$tmp/doc" --dest-dir "$dest" >/dev/null
   else
