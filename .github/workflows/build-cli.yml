@@ -3,8 +3,12 @@ name: Build CLI binaries
 # 发布流程：release-plz 给 ominiforge-cli 打 tag（合并 Release PR 后）→ 建 GitHub Release
 # → 本 workflow 为三大平台构建纯 CLI 二进制并上传到该 Release。
 #
-# 结构：每个平台一个 job 只负责 build + package，产物存为 artifact；最后一个 Linux job
-# 统一下载所有 artifact 并上传到 Release。这样上传只在 Linux 上跑，绕开 Windows runner 上
+# 产物是**裸可执行文件**（单文件，不打压缩包）：用户下载即用，Unix 上 `chmod +x` 即可。
+# 文件名带平台后缀用于区分；落地/装到 PATH 后统一叫 `ominiforge`（包管理器 cargo install
+# 出来的本就无后缀）。
+#
+# 结构：每个平台一个 job 只负责 build，二进制存为 artifact；最后一个 Linux job 统一下载
+# 所有 artifact 并上传到 Release。上传只在 Linux 上跑，绕开 Windows runner 上
 # gh release upload 的 shell/查找问题。
 #
 # 平台与依赖：
@@ -35,15 +39,15 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            asset: ominiforge-linux-x86_64.tar.gz
+            asset: ominiforge-linux-x86_64
             bin: ominiforge
           - target: aarch64-apple-darwin
             os: macos-latest
-            asset: ominiforge-macos-aarch64.tar.gz
+            asset: ominiforge-macos-aarch64
             bin: ominiforge
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            asset: ominiforge-windows-x86_64.zip
+            asset: ominiforge-windows-x86_64.exe
             bin: ominiforge.exe
     runs-on: ${{ matrix.os }}
     env:
@@ -62,13 +66,14 @@ jobs:
       - name: Build the CLI binary
         run: cargo build --release --locked -p ominiforge-cli --target ${{ matrix.target }}
 
-      - name: Package (Unix)
+      # 直接把二进制以「平台后缀名」存为 artifact（不压缩）。
+      - name: Stage artifact (Unix)
         if: runner.os != 'Windows'
-        run: tar -czf ${{ matrix.asset }} -C target/${{ matrix.target }}/release ${{ matrix.bin }}
-      - name: Package (Windows)
+        run: cp target/${{ matrix.target }}/release/${{ matrix.bin }} ${{ matrix.asset }}
+      - name: Stage artifact (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Compress-Archive -Path target/${{ matrix.target }}/release/${{ matrix.bin }} -DestinationPath ${{ matrix.asset }}
+        run: Copy-Item target/${{ matrix.target }}/release/${{ matrix.bin }} ${{ matrix.asset }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -88,9 +93,9 @@ jobs:
         with:
           pattern: bin-*
           merge-multiple: true
-      - name: Upload every archive to the Release
+      - name: Upload every binary to the Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # gh release upload 需知道目标仓库；无 checkout 时用 GH_REPO 显式指定。
           GH_REPO: ${{ github.repository }}
-        run: gh release upload "$TAG" ./*.tar.gz ./*.zip --clobber
+        run: gh release upload "$TAG" ./ominiforge-* --clobber
