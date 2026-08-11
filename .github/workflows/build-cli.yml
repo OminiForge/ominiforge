@@ -9,6 +9,12 @@ on:
   # 但它创建的 GitHub Release 会发出 release: published 事件——用它来触发构建。
   release:
     types: [published]
+  # 允许手动触发以补传/重传某版本的二进制（指定 tag）。
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build binaries for (e.g. v0.1.1)
+        required: true
 
 permissions:
   contents: write
@@ -29,10 +35,13 @@ jobs:
             os: windows-latest
             name: ominiforge-windows-x86_64.zip
     runs-on: ${{ matrix.os }}
+    env:
+      # release 事件取 release.tag_name；手动 dispatch 取 inputs.tag。
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
       - name: Install Rust target
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -55,5 +64,4 @@ jobs:
       - name: Upload to GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.event.release.tag_name }}
         run: gh release upload "$TAG" "${{ matrix.name }}" --clobber
