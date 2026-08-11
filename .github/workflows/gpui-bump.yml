@@ -1,15 +1,16 @@
 name: gpui bump
 
-# 全自动 gpui 升级：gpui 是 zed 的 git 依赖，钉在 release tag（doc/decisions/
-# architecture-decisions.md §1），dependabot 不管 git 依赖，故用此 workflow 月度自动
-# bump。流程：检查 zed 最新 tag → 若落后则更新 Cargo.toml + cargo update → just ci 验证
-# → 按 doc/operation/supply-chain.md 复查 audit 豁免 → 开 PR 供人 review。
-# 人的参与只有最后一步「review 并合并 PR」。
+# Fully automated gpui upgrade: gpui is a zed git dependency pinned to a release tag
+# (doc/decisions/architecture-decisions.md §1); dependabot does not handle git deps, so
+# this workflow bumps it monthly. Flow: check zed's latest tag -> if behind, update
+# Cargo.toml + cargo update -> verify with just ci -> re-review audit exemptions per
+# doc/operation/supply-chain.md -> open a PR for human review.
+# The only human step is the final "review and merge the PR".
 
 on:
   schedule:
-    - cron: "0 2 1 * *" # 每月 1 号 02:00 UTC
-  workflow_dispatch: # 允许手动触发
+    - cron: "0 2 1 * *" # 02:00 UTC on the 1st of each month
+  workflow_dispatch: # allow manual triggering
 
 permissions:
   contents: write

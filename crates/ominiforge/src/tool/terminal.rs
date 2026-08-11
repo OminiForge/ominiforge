@@ -229,8 +229,9 @@ mod tests {
 
     #[test]
     fn partial_utf8_across_chunks_decodes() {
-        let t = fed(&["caf", "é\n"]);
-        assert_eq!(t.screen(), "café");
+        // lint-english: allow — intentional non-ASCII input for split UTF-8 decode test.
+        let t = fed(&["caf", "é\n"]); // lint-english: allow
+        assert_eq!(t.screen(), "café"); // lint-english: allow
     }
 
     #[test]

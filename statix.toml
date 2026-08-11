@@ -1,0 +1,7 @@
+# manual_inherit (W03) is disabled globally, NOT because the rule is unwanted, but as a
+# temporary workaround: this statix version misfires on multi-line attrset call arguments
+# (e.g. `cargo-check = rustPlatform.buildRustPackage { ... }` in flake.nix), reading the
+# function-call RHS as an inheritable identifier. The current statix has no working
+# line-level suppression. Re-enable this rule once statix fixes the false positive, and
+# prefer per-site suppression over a global disable when it becomes available.
+disabled = ["manual_inherit"]

@@ -79,8 +79,41 @@
         python3
         taplo
         mdbook
+        # ripgrep drives `just lint-english` (its \p{L} is locale-independent, unlike GNU grep).
+        ripgrep
       ];
     in {
+      # CI-only shell: installs just the tools the cargo job steps (fmt/clippy/test/audit/
+      # deny/machete) actually use. Deliberately omits frontend/LSP/local-dev tools (chromium,
+      # node, pnpm, svelte/typescript language server, llvm-cov, bacon, cargo-watch, ...) —
+      # those serve local dev or frontend screenshot/LSP diagnostics, CI never runs them, and
+      # including them only slows every `nix develop` realize. Keep in sync with ci.yml's
+      # cargo job when this list changes.
+      devShells.ci = pkgs.mkShell {
+        packages = with pkgs; [
+          rustToolchain
+          cargo-audit
+          cargo-deny
+          cargo-machete
+          cargo-nextest
+          just
+          pkg-config
+          # for fmt-check: alejandra checks flake.nix, taplo checks Cargo.toml/rust-toolchain.toml.
+          alejandra
+          taplo
+          # boxlite-shared's build.rs needs protoc; openssl is for pkg-config discovery.
+          openssl
+          protobuf
+          # ripgrep drives `just lint-english` (its \p{L} is locale-independent, unlike GNU grep).
+          ripgrep
+        ];
+
+        # Same as the default shell: gpui compiles both Wayland+X11 backends on Linux, so test
+        # binaries must resolve the X11 client libs at link time (see the default shell's note).
+        RUSTFLAGS = "-L ${pkgs.libxcb}/lib -L ${pkgs.libxkbcommon}/lib";
+        PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig";
+      };
+
       devShells.default = pkgs.mkShell {
         packages = rustTools ++ nixTools ++ nodeTools ++ miscTools;
 
@@ -139,14 +172,15 @@
           version = "0.1.0";
           src = pkgs.lib.cleanSourceWith {
             src = ./.;
-            filter = path: type: let
+            # filter only matches on the file name; the type argument is unused (underscore-marked).
+            filter = path: _type: let
               baseName = builtins.baseNameOf path;
             in
               !(builtins.elem baseName [".direnv" ".git" "target" "result"]);
           };
           cargoLock = {
             lockFile = ./Cargo.lock;
-            allowBuiltinFetchGit = true; # gpui git 依赖的 vendoring hash
+            allowBuiltinFetchGit = true; # vendoring hash for the gpui git dependency
           };
 
           buildFeatures = ["sandbox-boxlite"];
@@ -182,25 +216,108 @@
           touch $out
         '';
 
+        # Nix style lint (the clippy of Nix). statix.toml disables manual_inherit — it misfires
+        # on `x = f { }` function calls. Fail-on-warning by default: a hard gate.
+        nix-lint =
+          pkgs.runCommand "nix-lint-check" {
+            nativeBuildInputs = [pkgs.statix];
+            # statix reads statix.toml at the repo root; copy flake.nix and the config into the sandbox.
+          } ''
+            cp ${./flake.nix} flake.nix
+            cp ${./statix.toml} statix.toml
+            statix check flake.nix
+            touch $out
+          '';
+
+        # Nix dead-code detection (unused let bindings / lambda args). --no-lambda-pattern-names
+        # exempts attrset pattern names (e.g. flake outputs' self) — those are framework-contract
+        # arguments that must not be deleted.
+        nix-dead = pkgs.runCommand "nix-dead-check" {nativeBuildInputs = [pkgs.deadnix];} ''
+          cp ${./flake.nix} flake.nix
+          deadnix -f --no-lambda-pattern-names flake.nix
+          touch $out
+        '';
+
+        # TOML format gate, alongside nix-format (which covers flake.nix).
+        toml-format = pkgs.runCommand "toml-format-check" {nativeBuildInputs = [pkgs.taplo];} ''
+          cp ${./Cargo.toml} Cargo.toml
+          cp ${./rust-toolchain.toml} rust-toolchain.toml
+          taplo fmt --check Cargo.toml rust-toolchain.toml
+          touch $out
+        '';
+
+        # Design constraint (hermetic twin of justfile design-lint): literal color values are
+        # allowed only in theme.rs. This rule previously never ran in CI; wiring it into checks
+        # is what actually enforces it.
+        design-lint =
+          pkgs.runCommand "design-lint-check" {
+            nativeBuildInputs = [pkgs.findutils pkgs.gnugrep];
+          } ''
+            cp -r ${./crates/ominiforge-ui/src} src
+            chmod -R u+w src
+            hits=$(grep -rnE '\b(rgb|rgba|hsla)\s*\(' \
+              $(find src -name '*.rs' -not -name 'theme.rs') || true)
+            if [ -n "$hits" ]; then
+              echo "design-lint: color literal outside theme.rs:" >&2
+              echo "$hits" >&2
+              exit 1
+            fi
+            touch $out
+          '';
+
+        # Hermetic twin of justfile lint-english (AGENTS.md §14): flag any non-ASCII letter
+        # (\p{L} outside a-z/A-Z) in code, comments, config, and CI. Punctuation/symbols are
+        # allowed. frontend/ is excluded (slated for removal, going i18n); doc/ prose may be any
+        # language. A line ending in `lint-english: allow` is skipped (intentional test data).
+        # Uses ripgrep: its Unicode class handling is locale-independent (no LC_ALL workaround
+        # needed, unlike GNU grep), and it treats recursed dirs and listed files uniformly.
+        lint-english =
+          pkgs.runCommand "lint-english-check" {
+            nativeBuildInputs = [pkgs.ripgrep];
+            src = pkgs.lib.cleanSourceWith {
+              src = ./.;
+              filter = path: _type: let
+                baseName = builtins.baseNameOf path;
+              in
+                !(builtins.elem baseName [".direnv" ".git" "target" "result" "frontend" "doc"]);
+            };
+          } ''
+            cp -r $src src
+            chmod -R u+w src
+            cd src
+            hits=$(rg --no-config -n '[\p{L}--\x{00}-\x{7F}]' \
+              -g '*.rs' -g '*.toml' -g '*.yml' -g '*.yaml' \
+              -g 'justfile' -g 'flake.nix' -g 'flake.lock' -g 'deny.toml' \
+              -g 'clippy.toml' -g 'rustfmt.toml' -g 'statix.toml' \
+              crates .github justfile flake.nix flake.lock deny.toml clippy.toml rustfmt.toml statix.toml \
+              2>/dev/null | rg -v 'lint-english: allow' || true)
+            if [ -n "$hits" ]; then
+              echo "lint-english: non-English letter found (AGENTS.md §14 requires English):" >&2
+              echo "$hits" >&2
+              exit 1
+            fi
+            touch $out
+          '';
+
         cargo-check = rustPlatform.buildRustPackage {
           pname = "ominiforge-check";
           version = "0.1.0";
           src = pkgs.lib.cleanSourceWith {
             src = ./.;
-            filter = path: type: let
+            filter = path: _type: let
               baseName = builtins.baseNameOf path;
             in
               !(builtins.elem baseName [".direnv" ".git" "target" "result"]);
           };
           cargoLock = {
             lockFile = ./Cargo.lock;
-            # gpui 是 git 依赖，带入 zed 的 git crates（如 collections）。用内建 fetchGit
-            # 取其 hash，否则 vendoring 时报 'No hash was found'。
+            # gpui is a git dependency and pulls in zed's git crates (e.g. collections). Use the
+            # builtin fetchGit for its hash, else vendoring fails with 'No hash was found'.
             allowBuiltinFetchGit = true;
           };
-          # 只验证离线编译。测试（尤其 LSP 集成测试需要真实语言服务器进程）在
-          # hermetic sandbox 里跑不了——交由 CI 的 cargo test/nextest（devShell 提供
-          # 语言服务器）覆盖，不在 nix 离线环境跑。
+          # Only verify the offline build. Tests (especially the LSP integration tests, which need
+          # real language-server processes) cannot run in the hermetic sandbox — they are covered by
+          # CI's cargo test/nextest (the devShell provides the language servers), not here.
           doCheck = false;
         };
       };

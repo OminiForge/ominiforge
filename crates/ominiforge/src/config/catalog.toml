@@ -36,7 +36,7 @@ api_key_env = "KIMI_CODE_API_KEY"
 id = "kimi-k3"
 context_window = 1048576
 # Official: `max_completion_tokens` defaults to 131072 (K3 quickstart,
-# "重要限制"); the request can raise it up to the 1M context.
+# "Important limitations"); the request can raise it up to the 1M context.
 max_output_tokens = 131072
 default_temperature = 1.0
 thinking = "always"

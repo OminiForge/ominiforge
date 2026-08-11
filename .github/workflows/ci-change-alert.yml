@@ -56,7 +56,7 @@ jobs:
             # Trusted-bot dependency update: downgrade to a "give it a quick scan" note.
             gh pr comment "$PR" --body "$(cat <<'EOF'
           <!-- ci-config-alert -->
-          ℹ️ **Dependency update touches build/CI config**
+          **Dependency update touches build/CI config**
 
           This automated update modifies build or CI files (`Cargo.*`, workflow
           pins, etc.). Dependabot is a trusted, GitHub-verified bot, so this is

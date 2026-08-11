@@ -424,8 +424,8 @@ mod tests {
 
     #[test]
     fn unicode_escape_decoded_when_complete() {
-        let p = PartialArgs::new(r#"{"content": "aAé"}"#);
-        assert_eq!(p.streaming_string("content"), Some("aAé".to_owned()));
+        let p = PartialArgs::new(r#"{"content": "aAé"}"#); // lint-english: allow — Unicode decode test input
+        assert_eq!(p.streaming_string("content"), Some("aAé".to_owned())); // lint-english: allow
     }
 
     #[test]

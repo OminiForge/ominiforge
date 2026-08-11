@@ -6,18 +6,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+# nix flake check lives in ci-nix.yml (it alone has a paths filter: the expensive sandboxed
+# offline full build runs only when dependency/toolchain/CI definitions change). This file
+# keeps only the cargo job — it must run on every PR.
 jobs:
-  nix:
-    name: Nix flake check
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@v16
-      - name: Nix flake check
-        run: nix flake check --print-build-logs
-
   cargo:
     name: Cargo build & test
     runs-on: ubuntu-latest
@@ -26,17 +18,28 @@ jobs:
         uses: actions/checkout@v4
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v16
+      - name: Use Cachix
+        uses: cachix/cachix-action@v15
+        with:
+          name: ominiforge
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      # clippy/test target is reused across runs; the sandboxed cargo-check (ci-nix.yml) solely
+      # owns the `check` duty, so `just check` is not run here (avoids compiling the same
+      # dependency tree twice).
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: cargo-job
+      # Use the slim devShells.ci (flake.nix): no frontend/LSP/local-dev tools, faster to realize.
       - name: Format
-        run: nix develop --command just fmt-check
-      - name: Check
-        run: nix develop --command just check
+        run: nix develop .#ci --command just fmt-check
       - name: Clippy
-        run: nix develop --command just clippy
+        run: nix develop .#ci --command just clippy
       - name: Test
-        run: nix develop --command just test
+        run: nix develop .#ci --command just test
       - name: Audit
-        run: nix develop --command just audit
+        run: nix develop .#ci --command just audit
       - name: Deny
-        run: nix develop --command just deny
+        run: nix develop .#ci --command just deny
       - name: Machete
-        run: nix develop --command just machete
+        run: nix develop .#ci --command just machete

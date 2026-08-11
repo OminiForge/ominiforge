@@ -10,12 +10,12 @@
 //! [`Theme::set_global`], read anywhere with `cx.global::<Theme>()`. Panels
 //! never own a copy.
 //!
-//! 🔴 **铁律（doc/gpui-design.md §2）**：组件代码**禁止出现字面色值**
-//! （`rgb(...)` / `rgba(...)` / `hsla(...)` / `#...`）。需要一个颜色时，先在这里
-//! 加一个**语义命名字段**（说明它是什么角色），再通过字段引用——绝不许在
-//! 面板/组件里写字面值。这条由 CI 的 grep 检查强制（见 justfile `design-lint`），
-//! 不靠自觉。新增 token 时遵循语义命名（角色而非外观），并在 `doc/gpui-design.md`
-//! §2 的速查表里登记用法。
+//! 🔴 **Iron rule (doc/gpui-design.md §2)**: component code must **never contain literal
+//! color values** (`rgb(...)` / `rgba(...)` / `hsla(...)` / `#...`). When a color is
+//! needed, first add a **semantically-named field** here (describing its role), then
+//! reference the field — never write a literal in a panel/component. This is enforced by
+//! a CI grep check (`just design-lint`), not by convention. Name new tokens by role (not
+//! appearance) and register their usage in the `doc/gpui-design.md` §2 cheat sheet.
 
 use gpui::{App, Global, Hsla, rgba};
 

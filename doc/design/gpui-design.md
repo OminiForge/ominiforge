@@ -31,7 +31,7 @@ ominiforge 客户端是**开发者每天盯 8 小时的 agent 生产工具**。�
 🔴 **铁律：组件里禁止 hardcode 颜色值 / 字号 / 间距。只能用 `theme.rs` 的语义 token。需要新值 → 先进 `theme.rs`，再用。**
 原因：值集中在 `theme.rs` 才能换肤、调对比度、保持一致；一旦组件里散落魔法值，几轮迭代必回退成 slop。
 
-**这条由机器强制，不靠自觉**：CI 的 `design-lint`（见 justfile）扫 `crates/ominiforge-ui/src/**`，禁止 `theme.rs` 以外任何文件出现字面色值构造（`rgb(0x` / `rgba(0x` / `hsla(` 等）。「用到某个颜色却发现没有 token」时，lint 拦下字面值、逼你回 `theme.rs` 加语义字段——这就是「用到再补」不会漂的保证。
+**这条由机器强制，不靠自觉**：CI 与本地 `just ci` 都会拦下 `theme.rs` 以外任何文件里的字面色值构造（`rgb(0x` / `rgba(0x` / `hsla(` 等）。「用到某个颜色却发现没有 token」时，lint 拦下字面值、逼你回 `theme.rs` 加语义字段——这就是「用到再补」不会漂的保证。
 
 > **值在哪**：以下每个语义 token 的具体颜色/字号/圆角，以 `theme.rs` 的字段为准。这里只定**语义与用法**。
 

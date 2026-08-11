@@ -1,0 +1,50 @@
+name: CI (nix)
+
+# nix flake check's sandboxed cargo-check compiles the whole dependency tree offline
+# (including the dozens of crates gpui/zed pulls in) — the single most expensive step in CI.
+# It verifies "the project compiles reproducibly in a network-free, pure-Nix env" — only
+# dependency/toolchain/build-definition changes can affect that, not a pure-Rust-source PR.
+# Hence it lives in this dedicated workflow with a paths filter: runs only when these change.
+#
+# Cachix makes unchanged dependency trees hit the store path directly (near-instant); the hit
+# is reused between the same version's PR and master CI runs (PR pushes to the cache, the
+# master run right after pulls it).
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "flake.nix"
+      - "flake.lock"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "crates/**/Cargo.toml"
+      - ".github/workflows/ci-nix.yml"
+  pull_request:
+    paths:
+      - "flake.nix"
+      - "flake.lock"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "crates/**/Cargo.toml"
+      - ".github/workflows/ci-nix.yml"
+  workflow_dispatch:
+
+jobs:
+  nix:
+    name: Nix flake check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v16
+      - name: Use Cachix
+        uses: cachix/cachix-action@v15
+        with:
+          name: ominiforge
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - name: Nix flake check
+        run: nix flake check --print-build-logs
