@@ -91,4 +91,6 @@ jobs:
       - name: Upload every archive to the Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # gh release upload 需知道目标仓库；无 checkout 时用 GH_REPO 显式指定。
+          GH_REPO: ${{ github.repository }}
         run: gh release upload "$TAG" ./*.tar.gz ./*.zip --clobber
