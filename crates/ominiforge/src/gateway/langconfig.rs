@@ -12,7 +12,7 @@
 //!
 //! - **Global** (`*_config_view` / `save_*_config`): the gateway's config root
 //!   chain alone (explicit `--config-dir` → launch cwd → user home), for the
-//!   settings page's 全局设置 tab. Writes land on the primary root. Install
+//!   settings page's global-settings tab. Writes land on the primary root. Install
 //!   probes run against the gateway's own PATH.
 //! - **Workspace-local** (`*_for` / `save_*_for`): a specific workspace's
 //!   `.omini` layered over the gateway chain, for the workspace config dialog.

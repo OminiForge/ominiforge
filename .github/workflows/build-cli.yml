@@ -1,27 +1,28 @@
 name: Build CLI binaries
 
-# 发布流程：release-plz 给 ominiforge-cli 打 tag（合并 Release PR 后）→ 建 GitHub Release
-# → 本 workflow 为三大平台构建纯 CLI 二进制并上传到该 Release。
+# Release flow: release-plz tags ominiforge-cli (after the Release PR merges) -> creates a
+# GitHub Release -> this workflow builds pure-CLI binaries for the three platforms and uploads
+# them to that Release.
 #
-# 产物是**裸可执行文件**（单文件，不打压缩包）：用户下载即用，Unix 上 `chmod +x` 即可。
-# 文件名带平台后缀用于区分；落地/装到 PATH 后统一叫 `ominiforge`（包管理器 cargo install
-# 出来的本就无后缀）。
+# The artifacts are **bare executables** (single file, no archive): download and run, `chmod +x`
+# on Unix. Filenames carry a platform suffix to tell them apart; once installed on PATH they are
+# all called `ominiforge` (a package manager / cargo install produces no suffix anyway).
 #
-# 结构：每个平台一个 job 只负责 build，二进制存为 artifact；最后一个 Linux job 统一下载
-# 所有 artifact 并上传到 Release。上传只在 Linux 上跑，绕开 Windows runner 上
-# gh release upload 的 shell/查找问题。
+# Structure: one job per platform only builds, storing the binary as an artifact; a final Linux
+# job downloads all artifacts and uploads them to the Release. Upload runs only on Linux,
+# sidestepping gh release upload shell/glob issues on the Windows runner.
 #
-# 平台与依赖：
-# - Linux 用 musl 静态链接 → 二进制自包含，任何发行版直接跑，无 glibc 版本依赖。
-# - macOS / Windows 直接 cargo 编译，无额外系统依赖（rustls 纯 Rust、boxlite 默认关）。
-# CLI 是纯 Rust 栈（无 build.rs、无 openssl），故全程无需 Nix。
+# Platforms & dependencies:
+# - Linux uses musl static linking -> self-contained binary, runs on any distro, no glibc version dependency.
+# - macOS / Windows build with plain cargo, no extra system deps (rustls is pure Rust, boxlite off by default).
+# The CLI is a pure-Rust stack (no build.rs, no openssl), so Nix is not needed anywhere.
 
 on:
-  # release-plz 用 GITHUB_TOKEN 打的 tag 不触发 push（防递归），但它建的 Release 会发出
-  # release: published 事件，用它触发。
+  # Tags pushed by release-plz with GITHUB_TOKEN do not trigger push (recursion guard), but the
+  # Release it creates emits a release: published event — we trigger on that.
   release:
     types: [published]
-  # 手动触发以补传/重传某版本的二进制（指定 tag）。
+  # Manual trigger to (re)upload a given version's binaries (specify the tag).
   workflow_dispatch:
     inputs:
       tag:
@@ -60,13 +61,18 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      # Reuse the release target across runs; isolate the key per target so the three platforms don't clobber each other.
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: build-cli-${{ matrix.target }}
       - name: Install musl cross toolchain (Linux musl only)
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build the CLI binary
         run: cargo build --release --locked -p ominiforge-cli --target ${{ matrix.target }}
 
-      # 直接把二进制以「平台后缀名」存为 artifact（不压缩）。
+      # Store the binary directly as an artifact under its platform-suffixed name (no archive).
       - name: Stage artifact (Unix)
         if: runner.os != 'Windows'
         run: cp target/${{ matrix.target }}/release/${{ matrix.bin }} ${{ matrix.asset }}
@@ -96,6 +102,6 @@ jobs:
       - name: Upload every binary to the Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # gh release upload 需知道目标仓库；无 checkout 时用 GH_REPO 显式指定。
+          # gh release upload needs the target repo; with no checkout, set GH_REPO explicitly.
           GH_REPO: ${{ github.repository }}
         run: gh release upload "$TAG" ./ominiforge-* --clobber

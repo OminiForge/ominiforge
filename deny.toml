@@ -3,8 +3,9 @@ db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 version = 2
 yanked = "warn"
-# 全部是 gpui（doc/architecture-decisions.md §1）的传递依赖，上游停维但无
-# 已知漏洞、无替代品；待 gpui 升级解除。逐条来源见各条目注释。
+# All are transitive deps of gpui (doc/architecture-decisions.md §1): unmaintained
+# upstream but with no known vulnerabilities and no replacements; lifted once gpui
+# upgrades. Per-entry provenance is noted on each entry.
 ignore = [
   # async-std ← zed-async-tar ← gpui_http_client ← gpui
   "RUSTSEC-2025-0052",
@@ -30,36 +31,39 @@ allow = [
   "Apache-2.0 WITH LLVM-exception",
   "BSD-2-Clause",
   "BSD-3-Clause",
-  # 项目已转 GPL-3.0-or-later（见 doc/architecture-decisions.md §9），zed git 版带入的
-  # GPL-3.0-or-later 依赖（ztracing/zlog/ztracing_macro，仅 trace/日志注解）合法。
-  # 仅在项目本身是 GPL 时成立；若未来回到宽松许可证，须移除并改用 vendor+patch 切断。
+  # The project moved to GPL-3.0-or-later (see doc/architecture-decisions.md §9), so the
+  # GPL-3.0-or-later deps pulled in by the zed git version (ztracing/zlog/ztracing_macro,
+  # trace/logging annotations only) are legal. This holds only while the project itself is
+  # GPL; if it ever returns to a permissive license, remove this and cut via vendor+patch.
   "GPL-3.0-or-later",
-  # CC0-1.0：公共领域奉献，无义务。来源：hexf-parse（naga←blade-graphics←gpui）、
-  # tiny-keccak（ahash←gpui）。
+  # CC0-1.0: public-domain dedication, no obligations. From hexf-parse
+  # (naga<-blade-graphics<-gpui) and tiny-keccak (ahash<-gpui).
   "CC0-1.0",
   "CDLA-Permissive-2.0",
   "ISC",
   "MIT",
-  # MPL-2.0: weak copyleft（file-level），静态链接 Rust crate 无传染性，
-  # 仅修改 MPL 文件本身需公开。来源：cssparser/selectors/dtoa-short
-  # （dom_smoothie → web_fetch tool 的 Readability 提取链）。
+  # MPL-2.0: weak copyleft (file-level); statically linking a Rust crate is not
+  # infectious — only modifications to MPL files themselves must be published. From
+  # cssparser/selectors/dtoa-short (the Readability extraction chain of dom_smoothie ->
+  # the web_fetch tool).
   "MPL-2.0",
-  # NCSA： permissive（UIUC），与 MIT/BSD 同级。来源：libfuzzer-sys
-  # （rav1e←ravif←image←gpui，target=all 才出现），仅用于 fuzz 构建。
+  # NCSA: permissive (UIUC), on par with MIT/BSD. From libfuzzer-sys
+  # (rav1e<-ravif<-image<-gpui; only appears with target=all), used only for fuzz builds.
   "NCSA",
   "Unicode-3.0",
   "Zlib",
-  # bzip2 许可证（BSD-style  permissive）。来源：libbz2-rs-sys（bzip2 ←
-  # compression-codecs ← async-compression ← http_client ← gpui）。
+  # bzip2 license (BSD-style permissive). From libbz2-rs-sys (bzip2 <-
+  # compression-codecs <- async-compression <- http_client <- gpui).
   "bzip2-1.0.6",
 ]
 exceptions = []
 
 [bans]
 multiple-versions = "warn"
-# workspace 继承（`dep.workspace = true`）与 path 依赖被 cargo deny 误报为
-# wildcard（基线 0.2.2 即有此误报，非本次引入）。真正的 crates.io wildcard
-# （`dep = "*"`）才是风险，但我们不发布 crate，故降为 warn 并靠 review 拦住。
+# workspace inheritance (`dep.workspace = true`) and path deps are false-reported by
+# cargo deny as wildcards (present since baseline 0.2.2, not introduced here). A real
+# crates.io wildcard (`dep = "*"`) is the actual risk, but we do not publish crates, so
+# this is downgraded to warn and caught by review.
 wildcards = "warn"
 highlight = "all"
 skip = []
@@ -69,9 +73,9 @@ skip-tree = []
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# zed git 是 gpui 的来源（见 doc/architecture-decisions.md §1）；font-kit 与
-# proptest 是 gpui 自身钉死的 git 传递依赖（zed 定制 font-kit；proptest 用于
-# gpui 测试）。三者都是 gpui 依赖闭包的固有部分。
+# zed git is the source of gpui (see doc/architecture-decisions.md §1); font-kit and
+# proptest are git transitive deps pinned by gpui itself (zed's custom font-kit; proptest
+# for gpui's tests). All three are inherent parts of gpui's dependency closure.
 allow-git = [
   "https://github.com/zed-industries/zed",
   "https://github.com/zed-industries/font-kit",

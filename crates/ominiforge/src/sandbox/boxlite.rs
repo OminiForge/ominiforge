@@ -530,7 +530,7 @@ mod tests {
 
     // ── Integration tests: need a real KVM host + image pull (network), so they
     // are #[ignore]d and run manually on a supported host (doc/sandbox.md §7,
-    // "手动测试"). Run with:
+    // "manual testing"). Run with:
     //   cargo test --features sandbox-boxlite -- --ignored
     #[tokio::test]
     #[ignore = "needs KVM + image pull; run manually on a supported host"]

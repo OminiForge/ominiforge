@@ -4,15 +4,17 @@ on:
   push:
     branches: [master]
   workflow_dispatch:
-  # 每周一 02:00 UTC 自动更新 Release PR（版本/ changelog 就绪），
-  # 是否合并发版仍由你决定。想改成两周/一月，调 cron 即可。
+  # Every Monday 02:00 UTC, auto-refresh the Release PR (version/changelog ready);
+  # whether to merge and release is still your call. To make it biweekly/monthly, adjust cron.
   schedule:
     - cron: "0 2 * * 1"
 
-# release-plz 驱动发布：解析 Conventional Commits 维护一个 Release PR（bump 版本 +
-# 生成 CHANGELOG）；合并后打 tag、建 GitHub Release、按拓扑序发布可发布的 crate
-#（ominiforge → ominiforge-net → ominiforge-cli）到 crates.io。
-# 全程无需人手改版本号。GUI 桌面包在 GPUI 客户端成熟后接入（当前占位）。
+# release-plz drives releases: it parses Conventional Commits to maintain a Release PR
+# (bump version + generate CHANGELOG); on merge it tags, creates a GitHub Release, and
+# publishes the publishable crates to crates.io in topological order
+# (ominiforge -> ominiforge-net -> ominiforge-cli).
+# No manual version edits needed. The GUI desktop package is wired in once the GPUI client
+# matures (placeholder for now).
 
 permissions:
   contents: write
@@ -27,7 +29,7 @@ jobs:
           fetch-depth: 0
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-      # release-pr：维护/更新 Release PR。push / 定时 / 手动 都跑，保持 PR 最新。
+      # release-pr: maintain/refresh the Release PR. Runs on push / schedule / manual to keep it current.
       - name: Run release-plz
         uses: release-plz/action@v0.5
         with:
@@ -35,8 +37,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      # release：真正打 tag + 发 crates.io + 建 Release。**只在 push（合并 Release PR）时跑**，
-      # 定时/手动触发绝不执行——否则定时到点会未经合并就自动发版。
+      # release: actually tag + publish to crates.io + create the Release. **Runs only on push
+      # (merging the Release PR)** — never on schedule/manual, or a scheduled tick would publish
+      # without a merge.
       - name: Release (tag + GitHub Release + crates.io publish)
         if: github.event_name == 'push'
         uses: release-plz/action@v0.5
@@ -46,8 +49,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-  # 每次 push 到 master（含发布）重建全版本文档站并部署到 GitHub Pages。
-  # 定时/手动触发不重新部署（文档只在代码实际变更后更新）。
+  # Rebuild the full-version doc site and deploy to GitHub Pages on every push to master
+  # (including releases). Schedule/manual triggers do not redeploy (docs update only after code
+  # actually changes).
   docs:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest

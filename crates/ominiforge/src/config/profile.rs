@@ -242,7 +242,7 @@ pub struct NetworkSection {
 
 impl Profile {
     /// The built-in default profile used when no profile file exists and none
-    /// is inherited (`doc/profile.md` §4: "无 `extends` 时使用硬编码默认值").
+    /// is inherited (`doc/profile.md` §4: "hardcoded defaults when no `extends`").
     ///
     /// It has no model — that must come from a profile file or `--model`, since
     /// the right model depends on the user's configured providers.

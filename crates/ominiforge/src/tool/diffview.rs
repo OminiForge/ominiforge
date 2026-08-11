@@ -178,7 +178,7 @@ pub fn write_diff_json(
 }
 
 /// Count the number of distinct change regions (hunks) between two texts —
-/// used for the "N 处调整" in the `formatted by` annotation, where a region
+/// used for the "N adjustments" in the `formatted by` annotation, where a region
 /// (not a line) is the natural unit of "the formatter touched this spot".
 /// A maximal run of non-equal lines is one region.
 #[must_use]

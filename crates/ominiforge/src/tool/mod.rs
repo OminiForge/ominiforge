@@ -223,7 +223,7 @@ pub struct ToolDescriptor {
 pub struct ToolInfo {
     /// The tool name a [`crate::permission::Rule`] targets (its `tool` field).
     pub name: String,
-    /// A short human label for the card header (e.g. "运行命令"). Falls back to
+    /// A short human label for the card header (e.g. "Run command"). Falls back to
     /// `name` when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
@@ -241,7 +241,7 @@ pub struct ToolInfo {
 pub struct ToolField {
     /// The JSON key a rule's `field` targets (e.g. `"command"`, `"path"`).
     pub key: String,
-    /// A human label for the field in the dropdown (e.g. "命令", "路径").
+    /// A human label for the field in the dropdown (e.g. "Command", "Path").
     pub label: String,
     /// Whether this field holds a filesystem path — the UI offers prefix
     /// (directory allow/deny-list) controls for it, not just substring.
@@ -259,75 +259,79 @@ pub struct ToolField {
 pub fn builtin_catalog() -> Vec<ToolInfo> {
     let path_field = |desc: &str| ToolField {
         key: "path".to_owned(),
-        label: format!("路径（{desc}）"),
+        label: format!("Path ({desc})"),
         is_path: true,
     };
     vec![
         ToolInfo {
             name: "find".to_owned(),
-            label: Some("找文件".to_owned()),
-            description: Some("按 glob 通配符查找工作区内的文件（遵循 .gitignore）".to_owned()),
+            label: Some("Find files".to_owned()),
+            description: Some(
+                "Find files in the workspace by glob pattern (respects .gitignore)".to_owned(),
+            ),
             fields: vec![ToolField {
                 key: "patterns".to_owned(),
-                label: "通配符".to_owned(),
+                label: "Patterns".to_owned(),
                 is_path: false,
             }],
         },
         ToolInfo {
             name: "search".to_owned(),
-            label: Some("搜内容".to_owned()),
+            label: Some("Search content".to_owned()),
             description: Some(
-                "按正则搜索工作区内文件的文本内容（遵循 .gitignore，跳过二进制）".to_owned(),
+                "Search file text in the workspace by regex (respects .gitignore, skips binary)"
+                    .to_owned(),
             ),
             fields: vec![
                 ToolField {
                     key: "patterns".to_owned(),
-                    label: "正则".to_owned(),
+                    label: "Regex".to_owned(),
                     is_path: false,
                 },
-                path_field("限定的目录"),
+                path_field("Directory to scope to"),
             ],
         },
         ToolInfo {
             name: "read".to_owned(),
-            label: Some("读文件".to_owned()),
-            description: Some("读取工作区内的文本文件或列目录".to_owned()),
-            fields: vec![path_field("读取的文件")],
+            label: Some("Read file".to_owned()),
+            description: Some("Read a text file in the workspace or list a directory".to_owned()),
+            fields: vec![path_field("File to read")],
         },
         ToolInfo {
             name: "write".to_owned(),
-            label: Some("写文件".to_owned()),
-            description: Some("写入（覆盖）工作区内的文本文件".to_owned()),
+            label: Some("Write file".to_owned()),
+            description: Some("Write (overwrite) a text file in the workspace".to_owned()),
             fields: vec![
-                path_field("写入的文件"),
+                path_field("File to write"),
                 ToolField {
                     key: "content".to_owned(),
-                    label: "内容".to_owned(),
+                    label: "Content".to_owned(),
                     is_path: false,
                 },
             ],
         },
         ToolInfo {
             name: "edit".to_owned(),
-            label: Some("改文件".to_owned()),
-            description: Some("按行编辑工作区内的文件".to_owned()),
-            fields: vec![path_field("编辑的文件")],
+            label: Some("Edit file".to_owned()),
+            description: Some("Edit a file in the workspace line by line".to_owned()),
+            fields: vec![path_field("File to edit")],
         },
         ToolInfo {
             name: "shell".to_owned(),
-            label: Some("运行命令".to_owned()),
-            description: Some("在工作区目录执行 shell 命令".to_owned()),
+            label: Some("Run command".to_owned()),
+            description: Some("Run a shell command in the workspace directory".to_owned()),
             fields: vec![ToolField {
                 key: "command".to_owned(),
-                label: "命令".to_owned(),
+                label: "Command".to_owned(),
                 is_path: false,
             }],
         },
         ToolInfo {
             name: "web_fetch".to_owned(),
-            label: Some("抓网页".to_owned()),
+            label: Some("Fetch web page".to_owned()),
             description: Some(
-                "抓取 URL 并提取正文为 markdown（出网访问，SSRF 防护内置）".to_owned(),
+                "Fetch a URL and extract the body as markdown (egress; SSRF guard built in)"
+                    .to_owned(),
             ),
             fields: vec![ToolField {
                 key: "url".to_owned(),
@@ -526,7 +530,8 @@ mod tests {
         // Regression: `&s[..80]` panicked when byte 80 fell inside a CJK char
         // ("end byte index 80 is not a char boundary"). The summary is a
         // human-facing label; it must degrade gracefully, not kill the task.
-        let input = serde_json::json!({ "steps": "测试测试测试测试测试测试测试测试测试测试测试测试测试测试测试测试测试测试测试测试" });
+        // lint-english: allow — long CJK string is intentional streaming test input.
+        let input = serde_json::json!({ "steps": "测试测试测试测试测试测试测试测试测试测试测试测试测试测试测试测试测试测试测试测试" }); // lint-english: allow
         let summary = summarize_by_name("todo", &input);
         assert!(summary.len() <= 80 + '…'.len_utf8());
         assert!(summary.ends_with('…'));

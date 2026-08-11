@@ -53,7 +53,8 @@ Intermediate commits inside your branch are free-form.
 ## Pull request flow
 
 1. Branch off `master` and do **one thing** (keep PRs small and single-purpose).
-2. Make sure `just ci` is green locally, then push and open a PR; fill in the template.
+2. Make sure `just ci` is green locally before pushing — it runs the same checks CI
+   does. Then open a PR and fill in the template.
 3. CI runs checks, auto-labels the PR by touched paths, and validates the title.
 4. After approval, squash-merge. For architectural changes, also update `doc/design/`
    and record the decision in `doc/decisions/architecture-decisions.md`.

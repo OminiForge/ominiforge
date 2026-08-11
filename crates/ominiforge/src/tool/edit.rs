@@ -333,7 +333,7 @@ struct WrittenFile {
     final_text: String,
     replacement_count: usize,
     /// The formatter that changed the text plus how many change regions it
-    /// made (drives `formatted_by` / the "N 处调整" annotation).
+    /// made (drives `formatted_by` / the "N adjustments" annotation).
     formatter: Option<(String, usize)>,
     /// Carried from [`PlannedWrite`]: whether CRLF adaptation was surfaced.
     crlf_adapted: bool,

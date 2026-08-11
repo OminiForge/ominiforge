@@ -80,7 +80,7 @@ single source of truth for the toolchain channel.
 Common tasks:
 
 ```sh
-just ci          # run the full local check suite (fmt, clippy, test, audit, ...)
+just ci          # run the full local check suite — the same set CI runs; green here means green CI
 just doc         # preview the documentation site locally
 ```
 
