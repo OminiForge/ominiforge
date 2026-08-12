@@ -47,7 +47,8 @@ fix(agent): fold orphaned todo steps on resume
 Suggested scopes: `core`, `ui`, `net`, `app`, `agent`, `lsp`, `gateway`, `mcp`, …
 
 **Only the PR title must comply** (CI checks it): after squash-merge it becomes the
-commit on `master`, and release-please parses it to build the CHANGELOG and version.
+commit on `master`, and release-plz parses it to build the CHANGELOG and version (see
+[release.md](doc/operation/release.md)).
 Intermediate commits inside your branch are free-form.
 
 ## Pull request flow
@@ -58,6 +59,9 @@ Intermediate commits inside your branch are free-form.
 3. CI runs checks, auto-labels the PR by touched paths, and validates the title.
 4. After approval, squash-merge. For architectural changes, also update `doc/design/`
    and record the decision in `doc/decisions/architecture-decisions.md`.
+5. Clean up afterwards with `just clean-branches`: the repo auto-deletes the remote
+   branch on merge, and this command fast-forwards your local `master`, prunes stale
+   remotes, and deletes your local branches whose PR was merged.
 
 ## Code conventions
 

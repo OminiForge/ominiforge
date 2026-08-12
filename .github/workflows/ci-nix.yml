@@ -4,7 +4,13 @@ name: CI (nix)
 # (including the dozens of crates gpui/zed pulls in) — the single most expensive step in CI.
 # It verifies "the project compiles reproducibly in a network-free, pure-Nix env" — only
 # dependency/toolchain/build-definition changes can affect that, not a pure-Rust-source PR.
-# Hence it lives in this dedicated workflow with a paths filter: runs only when these change.
+#
+# The real check therefore runs ONLY when a build/dependency file changes. The filter lives
+# INSIDE the job, not in a trigger `paths:` block: master branch protection marks this job
+# required, and a trigger-level filter would skip the whole workflow, leaving the required
+# check stuck at "Expected — waiting for status" on docs-only PRs and blocking merge. Running
+# the job unconditionally (a fast path-detection pass, then either the real check or a no-op
+# pass) lets the required check always resolve green.
 #
 # Cachix makes unchanged dependency trees hit the store path directly (near-instant); the hit
 # is reused between the same version's PR and master CI runs (PR pushes to the cache, the
@@ -13,23 +19,7 @@ name: CI (nix)
 on:
   push:
     branches: [master]
-    paths:
-      - "flake.nix"
-      - "flake.lock"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - "crates/**/Cargo.toml"
-      - ".github/workflows/ci-nix.yml"
   pull_request:
-    paths:
-      - "flake.nix"
-      - "flake.lock"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - "crates/**/Cargo.toml"
-      - ".github/workflows/ci-nix.yml"
   workflow_dispatch:
 
 jobs:
@@ -37,14 +27,56 @@ jobs:
     name: Nix flake check
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth 0 so dorny/paths-filter (PRs) and the git-diff fallback (pushes) have
+      # the history they need to diff against.
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Manual dispatch has no meaningful diff — always run the real check.
+      - name: Force run on manual dispatch
+        if: github.event_name == 'workflow_dispatch'
+        id: manual
+        run: echo "run=true" >> "$GITHUB_OUTPUT"
+      # PRs: diff against the merge base.
+      - name: Detect build/dependency changes (PR)
+        if: github.event_name == 'pull_request'
+        id: filter-pr
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            build:
+              - "flake.nix"
+              - "flake.lock"
+              - "Cargo.toml"
+              - "Cargo.lock"
+              - "rust-toolchain.toml"
+              - "crates/**/Cargo.toml"
+              - ".github/workflows/ci-nix.yml"
+      # Pushes to master: dorny's base is unreliable there, so diff against the parent commit.
+      - name: Detect build/dependency changes (push)
+        if: github.event_name == 'push'
+        id: filter-push
+        run: |
+          if git diff --name-only HEAD^ HEAD | grep -qE '^(flake\.(nix|lock)|Cargo\.(toml|lock)|rust-toolchain\.toml|crates/.*/Cargo\.toml|\.github/workflows/ci-nix\.yml)$'; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Install Nix
+        if: steps.manual.outputs.run == 'true' || steps.filter-pr.outputs.build == 'true' || steps.filter-push.outputs.build == 'true'
         uses: DeterminateSystems/nix-installer-action@v16
       - name: Use Cachix
+        if: steps.manual.outputs.run == 'true' || steps.filter-pr.outputs.build == 'true' || steps.filter-push.outputs.build == 'true'
         uses: cachix/cachix-action@v15
         with:
           name: ominiforge
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - name: Nix flake check
+        if: steps.manual.outputs.run == 'true' || steps.filter-pr.outputs.build == 'true' || steps.filter-push.outputs.build == 'true'
         run: nix flake check --print-build-logs
+      - name: No build/dependency changes — skipping real check
+        if: steps.manual.outputs.run != 'true' && steps.filter-pr.outputs.build != 'true' && steps.filter-push.outputs.build != 'true'
+        run: >-
+          echo "nix flake check skipped: no flake/Cargo/toolchain/workflow file changed
+          (job passes so the required check resolves)."
