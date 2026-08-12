@@ -84,10 +84,15 @@ nix-lint:
     deadnix -f --no-lambda-pattern-names flake.nix
     alejandra --check flake.nix
 
-# Delete local branches whose PR was merged and prune stale remotes. Merged-ness is judged
-# by PR state, NOT `git branch --merged`: this repo squash-merges only, so a merged PR's
-# branch tip never lands on master and `--merged` always misses it. `gh pr list --author @me`
-# covers only your own PRs; branches from others' PRs are left alone (delete by hand).
+# Delete local branches whose PR was merged, and prune stale remotes. A local branch is
+# deleted ONLY when BOTH hold: a same-named branch exists on origin AND a merged PR has that
+# exact head branch. This double condition keeps un-pushed local branches safe by construction
+# — a branch that exists only locally has neither a remote twin nor a merged PR under its
+# name, so it can never qualify. Merged-ness is judged by PR state, NOT `git branch --merged`:
+# this repo squash-merges only, so a merged PR's tip never lands on master and `--merged`
+# always misses it. Each local branch is queried individually (`gh pr list --head <branch>`),
+# not via `--author @me`, so merged PRs opened by bots (release-plz, github-actions) are
+# caught too. If the current branch is itself deleted, we stay on master instead of jumping back.
 clean-branches:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -99,21 +104,22 @@ clean-branches:
     git checkout -q master
     git pull -q --ff-only
     git fetch -q --prune
-    to_delete=$(
-      comm -12 \
-        <(git for-each-ref --format='%(refname:short)' refs/heads | rg -x -v '^master$' | sort) \
-        <(gh pr list --author @me --state merged --json headRefName --jq '.[].headRefName' | sort) \
-        | rg -x -v -F "$current" || true
-    )
-    if [ -z "$to_delete" ]; then
-      echo "clean-branches: nothing to delete"
-    else
-      # No `xargs -r` here: -r (--no-run-if-empty) is a GNU extension missing from the BSD
-      # xargs on macOS; the [ -z ] guard above already covers the empty case. rg (not grep)
-      # is the repo's search tool, already in the dev shell via flake.nix; -x anchors to a
-      # full line and -F reads the branch name literally (dots not treated as regex).
-      echo "$to_delete" | xargs git branch -D
-    fi
+    # Snapshot origin's branch names once; a local branch with no remote twin is never a
+    # candidate, no matter its PR state.
+    remote_branches=$(git for-each-ref --format='%(refname:strip=3)' refs/remotes/origin | rg -x -v '^HEAD$' || true)
+    deleted_any=0
+    while IFS= read -r branch; do
+      [ "$branch" = "master" ] && continue
+      # Require a same-named branch on origin (skip local-only branches).
+      printf '%s\n' "$remote_branches" | rg -x -q -F "$branch" || continue
+      # Require a merged PR whose head branch is exactly this name (any author, bots included).
+      if [ -n "$(gh pr list --head "$branch" --state merged --json number --jq '.[0].number' 2>/dev/null || true)" ]; then
+        git branch -D "$branch"
+        deleted_any=1
+      fi
+    done < <(git for-each-ref --format='%(refname:short)' refs/heads)
+    [ "$deleted_any" = 0 ] && echo "clean-branches: nothing to delete"
+    # Jump back to the original branch only if it still exists (it may have been merged+deleted).
     if [ "$current" != "master" ] && git show-ref --verify --quiet "refs/heads/$current"; then
       git checkout -q "$current"
     fi
