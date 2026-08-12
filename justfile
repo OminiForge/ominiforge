@@ -101,14 +101,17 @@ clean-branches:
     git fetch -q --prune
     to_delete=$(
       comm -12 \
-        <(git for-each-ref --format='%(refname:short)' refs/heads | grep -vx master | sort) \
+        <(git for-each-ref --format='%(refname:short)' refs/heads | grep -Fvx master | sort) \
         <(gh pr list --author @me --state merged --json headRefName --jq '.[].headRefName' | sort) \
-        | grep -vx "$current" || true
+        | grep -Fvx "$current" || true
     )
     if [ -z "$to_delete" ]; then
       echo "clean-branches: nothing to delete"
     else
-      echo "$to_delete" | xargs -r git branch -D
+      # No `xargs -r` here: -r (--no-run-if-empty) is a GNU extension missing from the BSD
+      # xargs on macOS; the [ -z ] guard above already covers the empty case. -F (fixed
+      # string) on the greps keeps branch-name dots from being read as regex.
+      echo "$to_delete" | xargs git branch -D
     fi
     if [ "$current" != "master" ] && git show-ref --verify --quiet "refs/heads/$current"; then
       git checkout -q "$current"
