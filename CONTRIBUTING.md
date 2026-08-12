@@ -47,7 +47,8 @@ fix(agent): fold orphaned todo steps on resume
 Suggested scopes: `core`, `ui`, `net`, `app`, `agent`, `lsp`, `gateway`, `mcp`, …
 
 **Only the PR title must comply** (CI checks it): after squash-merge it becomes the
-commit on `master`, and release-please parses it to build the CHANGELOG and version.
+commit on `master`, and release-plz parses it to build the CHANGELOG and version (see
+[release.md](doc/operation/release.md)).
 Intermediate commits inside your branch are free-form.
 
 ## Pull request flow

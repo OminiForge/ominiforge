@@ -106,7 +106,7 @@ and AI contributors.
 - Security vulnerabilities → report privately, see [SECURITY.md](SECURITY.md)
 
 Commits follow [Conventional Commits](https://www.conventionalcommits.org/) with
-an English subject line. Releases are fully automated with release-please —
+an English subject line. Releases are fully automated with release-plz —
 merging to `master` is all it takes.
 
 ## License

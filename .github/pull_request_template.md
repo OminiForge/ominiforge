@@ -1,6 +1,6 @@
 <!--
 The PR title must follow Conventional Commits (see CONTRIBUTING.md) — it becomes the
-squash-merge commit message and is parsed by release-please for the CHANGELOG.
+squash-merge commit message and is parsed by release-plz for the CHANGELOG.
 Example: feat(ui): add chat panel theme tokens
 -->
 
