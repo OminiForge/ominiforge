@@ -84,6 +84,36 @@ nix-lint:
     deadnix -f --no-lambda-pattern-names flake.nix
     alejandra --check flake.nix
 
+# Delete local branches whose PR was merged and prune stale remotes. Merged-ness is judged
+# by PR state, NOT `git branch --merged`: this repo squash-merges only, so a merged PR's
+# branch tip never lands on master and `--merged` always misses it. `gh pr list --author @me`
+# covers only your own PRs; branches from others' PRs are left alone (delete by hand).
+clean-branches:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -n "$(git status --porcelain)" ]; then
+      echo "clean-branches: working tree is dirty; commit or stash first" >&2
+      exit 1
+    fi
+    current=$(git branch --show-current)
+    git checkout -q master
+    git pull -q --ff-only
+    git fetch -q --prune
+    to_delete=$(
+      comm -12 \
+        <(git for-each-ref --format='%(refname:short)' refs/heads | grep -vx master | sort) \
+        <(gh pr list --author @me --state merged --json headRefName --jq '.[].headRefName' | sort) \
+        | grep -vx "$current" || true
+    )
+    if [ -z "$to_delete" ]; then
+      echo "clean-branches: nothing to delete"
+    else
+      echo "$to_delete" | xargs -r git branch -D
+    fi
+    if [ "$current" != "master" ] && git show-ref --verify --quiet "refs/heads/$current"; then
+      git checkout -q "$current"
+    fi
+
 # The single full check suite — run this before pushing. Static lints (format, nix-lint,
 # toml-format, design-lint, lint-english) and the sandboxed cargo-check are all covered by
 # `nix flake check`; the compile-type checks (clippy/test) and supply-chain gates
