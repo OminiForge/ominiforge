@@ -18,6 +18,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+serde_json = "1"
 # TestAppContext windowless tests (doc/gpui-app.md §8 verification matrix B).
 gpui = { workspace = true, features = ["test-support"] }
 

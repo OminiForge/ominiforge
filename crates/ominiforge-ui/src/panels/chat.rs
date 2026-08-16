@@ -416,8 +416,16 @@ impl ChatState {
         SendAction::Compose { session, text }
     }
 
-    /// Iterate the rows to render: settled rows plus the in-flight streaming
-    /// block, by reference (no per-frame clone).
+    /// The rows to render, as one lazy sequence: the settled rows followed by
+    /// the in-flight streaming block (which always renders last). This fold
+    /// rule — committed rows then the streaming tail — lives here in the state
+    /// so the view stays a thin shell over a single render path.
+    ///
+    /// Items are borrowed (`RowRef`) so iterating and `.skip(scroll)`-ing the
+    /// list does not clone every row up front. This is about *lazy traversal*,
+    /// not zero-copy rendering: each item is still copied into an owned
+    /// `String` when it becomes a child element, because gpui's element tree
+    /// requires `'static` content.
     pub fn visible_rows(&self) -> impl Iterator<Item = RowRef<'_>> {
         let streaming = self.streaming.as_ref().map(|(reasoning, text)| {
             if *reasoning {
@@ -430,8 +438,13 @@ impl ChatState {
     }
 }
 
-/// A borrowed view of a [`Row`] for rendering — avoids cloning the row vec
-/// every frame (`doc/gpui-design.md` §3, performance-as-design).
+/// A borrowed projection of a [`Row`] used while rendering.
+///
+/// It exists to keep list traversal lazy (no eager clone of rows the current
+/// frame skips), and to let the streaming tail share the settled rows' render
+/// path. It is **not** a zero-copy render: each item is copied into an owned
+/// `String` at the point it becomes a child element, since gpui's element tree
+/// holds `'static` content. Do not read the `Ref` name as a performance claim.
 #[derive(Debug, Clone, Copy)]
 pub enum RowRef<'a> {
     /// A user turn.

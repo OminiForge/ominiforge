@@ -5,7 +5,7 @@
 
 本文档定义从当前架构（Web 前端 + Gateway）到新架构（GPUI 客户端 + 多机分布式）的完整实施计划。
 
-**当前进度**：Phase 0-3.4 ✅ | Phase 3.5（Session 面板 + 编辑即 fork）✅ | Phase 3.6（监控面板）待开始
+**当前进度**：Phase 0-3.5 ✅ | Phase 3.6（监控面板）✅ | Phase 3.7（文件树面板）待开始
 
 **核心原则**：
 - 文档先行：先更新文档定义清楚，再按文档执行
@@ -94,14 +94,21 @@
 - `crates/ominiforge-ui/src/panels/session_list.rs`、`crates/ominiforge-ui/src/panels/chat.rs`（编辑即 fork）、`crates/ominiforge-ui/src/panels/mod.rs`
 - `crates/ominiforge-ui/Cargo.toml`（chrono 提为正式依赖——SessionRow 排序键用 DateTime）
 
-### 3.6 监控面板
+### 3.6 监控面板 ✅
 
-**任务**：
-- [ ] Usage / Cost 统计展示
-- [ ] Trace 查看
+**状态**：已实现并有单测。
+
+**已完成**：
+- Usage 统计展示 — `MonitorState` 以持久化 `SessionSummary` 为基线，折叠 live `GatewayEvent` 持续累加（turns / requests / tool calls / in+out+cache tokens / cache 命中率 / context 占用），turn 中途实时刷新，不重拉快照
+- Trace 查看 — 按 `turn_id` 分组、`seq` 排序重建瀑布（doc/monitor.md §5）：trace 折叠**全部**事件（含历史回放，已结束的 session 也能看到瀑布），usage 只折 live 增量（回放段已在持久化 summary 中计数，双套折叠共用一条事件流但严格分离）；`RequestStarted/Completed/Failed` 与 `ToolEvent::Started/Completed/Failed` 各自配对出时长与成败（tool 经 `tool_call_event_id.seq` 配对），未落账的条目保持 running 状态
+- Top tools 条形图（按调用数排序、相对本组最大值缩放，镜像 Web 端 `topTools`）
+- Cost 展示刻意缺席 — 成本估算已从 core summary 移除（doc/monitor.md §6），token `usage` 是持久化事实
+
+**架构说明**：沿用「规则全在 state、view 是薄壳」。`MonitorState` 纯折叠（无 gpui/异步），usage 与 trace 双套折叠共用一条事件流但严格分离。单测覆盖：回放建 trace 但不计 usage（防与持久化 summary 双算）、request/tool 配对折叠 usage+trace、按 `turn_id` 分组、无 `turn_id` 事件计 usage 但不进 trace（不产生幻影空 turn）、live 折叠从 seed summary 续算、top_tools 排序缩放、未落账 tool 保持 running。
 
 **文件**：
-- `crates/ominiforge-ui/src/panels/monitor.rs`
+- `crates/ominiforge-ui/src/panels/monitor.rs`、`crates/ominiforge-ui/src/panels/mod.rs`
+- `crates/ominiforge-ui/Cargo.toml`（serde_json dev-dependency，测试构造 tool input）
 
 ### 3.7 文件树面板（只读浏览）
 
@@ -198,7 +205,8 @@
 | Phase 3.3: ClientProtocol 本地模式 | `ominiforge-net` + `LocalProtocol` | ✅ 已完成 |
 | Phase 3.4: Agent 对话面板 | Chat 面板（消息/流式/工具卡/乐观对账） | ✅ 主体完成（虚拟滚动、窗口键位测试延后） |
 | Phase 3.5: Session 面板 + 编辑即 fork | Session 列表/生命周期 + Chat 编辑即 fork | ✅ 完成（键位无头断言随键位定稿补） |
-| Phase 3.6-3.8: 监控/文件树面板 + 验证 | 各面板 + 验证 | ⏳ 当前 |
+| Phase 3.6: 监控面板 | Usage 统计 + Trace 瀑布 | ✅ 完成 |
+| Phase 3.7-3.8: 文件树面板 + 验证 | 文件树 + 验证 | ⏳ 当前 |
 | Phase 4: 远程模式 + 多机 | 分布式连接 | ⏳ 待开始 |
 | Phase 5: 配置系统 | 图形化配置 | ⏳ 待开始 |
 | Phase 6: Web 前端退出 | 完成切换 | ⏳ 待开始 |
