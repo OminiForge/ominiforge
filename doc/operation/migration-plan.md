@@ -5,7 +5,7 @@
 
 本文档定义从当前架构（Web 前端 + Gateway）到新架构（GPUI 客户端 + 多机分布式）的完整实施计划。
 
-**当前进度**：Phase 0-3.5 ✅ | Phase 3.6（监控面板）✅ | Phase 3.7（文件树面板）待开始
+**当前进度**：Phase 0-3.6 ✅ | Phase 3.7（文件树面板）✅ | Phase 3.8（验证）待开始
 
 **核心原则**：
 - 文档先行：先更新文档定义清楚，再按文档执行
@@ -110,19 +110,39 @@
 - `crates/ominiforge-ui/src/panels/monitor.rs`、`crates/ominiforge-ui/src/panels/mod.rs`
 - `crates/ominiforge-ui/Cargo.toml`（serde_json dev-dependency，测试构造 tool input）
 
-### 3.7 文件树面板（只读浏览）
+### 3.7 文件树面板（只读浏览）✅
 
-**任务**：
-- [ ] 文件树 UI
-- [ ] 浏览、选择、预览（只读，不编辑）
-- [ ] 键位绑定（j/k 导航、/ 搜索）
+**状态**：已实现并有单测；键位绑定（j/k 导航、/ 搜索）随全局键位定稿后补（同 3.4/3.5 延后项）。
+
+**已完成**：
+- 文件树 UI — `FileTreeState` 纯折叠（目录懒加载 + 展开/折叠 + 选择 → 预览 → 缩进可见行）+ `FileTree` 视图。目录优先+字母序由协议层保证，折叠隐藏子树但保留已加载数据（再展开免重拉）
+- 浏览、选择、预览（只读，不编辑）— 点击目录懒加载/切换展开，点击文件选中并拉取只读预览（面板底部预览区，binary/超限拒绝并 surfac 到 notice）
+- `ClientProtocol` 新增只读文件浏览面：`workspace_root` / `list_dir` / `read_file` + `DirEntry` / `FilePreview`；`LocalProtocol` 直读文件系统。浏览锚定 gateway 工作区根（不跟随单个 session 的可选 workspace），`..`/绝对路径/逃逸一律词法拒绝
+
+**架构说明**：沿用「规则全在 state、view 是薄壳」。core 侧 `SessionRegistry` 补 `workspace_root()` getter（最小面）。单测覆盖：展开深度优先折叠、折叠保留已加载数据、per-dir expanded 态、选择清旧预览、预览落账、错误 surfac。
 
 **文件**：
-- `crates/ominiforge-ui/src/panels/file_tree.rs`
+- `crates/ominiforge-ui/src/panels/file_tree.rs`、`crates/ominiforge-ui/src/panels/mod.rs`
+- `crates/ominiforge-net/src/{lib,local}.rs`（文件浏览面）、`crates/ominiforge/src/gateway/registry.rs`（`workspace_root`）
 
 ### 3.8 验证
 
-**任务**：
+**决策动因**：本步拆分引入的三个决策（无头测试优先 / Dock 自研 / Provider 注入式）及被否方案，记录于 `decisions/architecture-decisions.md` §11。
+
+**状态**：进行中。验证以**无头集成测试为主**（`#[gpui::test]` + `TestAppContext`），自动化兕底，避免依赖人工过一遍；真实窗口手工确认手感留给有桌面环境时另行做。
+
+**技术约束（已查明）**：
+- Dock 系统**自研**，不复用 zed 的 `workspace` crate——它依赖 40+ 个 zed 内部 crate（`client`/`db`/`project`/`settings`/`ui`…），不在 crates.io，引入即拖进半个 zed（与否决 zed editor crate 同因，见 Phase 7）。在 `ominiforge-ui` 内参考其 `Dock`/`Panel` 设计自研精简版（停靠位置/拖拽调整大小/显隐/焦点）。
+- `#[gpui::test]` 用 GPUI 自己的 executor（`ForegroundExecutor.block_test`），**不建立 tokio runtime**；而 core 多处直接 `tokio::spawn`（`actor.rs`/`registry.rs` 等），靠 ambient reactor。共存方案（**已验证可行**，见共存实验）：测试内手动建 `tokio::runtime::Runtime` 提供 ambient reactor，core spawn 落上去，GPUI 断言照常在 `TestAppContext`——**不改 core**。
+
+**子步骤**（自底向上，每步独立验证）：
+- [x] Provider 注入式重构 — `app::ProviderSource`（`Configured`/`Injected`）把 provider 来源与装配解耦；`SessionRegistry::new_with_provider` / `LocalProtocol::new_with_provider` 注入；`llm::ScriptedProvider` 提为公开可复用（原 core `#[cfg(test)]` 私有）。契约见 `architecture.md` §9a
+- [x] GPUI×tokio 共存实验 — `crates/ominiforge-ui/tests/integration.rs`：core 在独立 OS 线程的 `Runtime::block_on` 里跑（`tokio::spawn` 有 reactor），GPUI 线程经 channel 收结果。已验证手动 runtime 方案可行，无需改 core
+- [ ] 自研 Dock 容器（`crates/ominiforge-ui`）— 左/右/底停靠 + 拖拽调整 + 显隐 + 焦点
+- [ ] 组装 Workspace — 四面板装进 Dock，串起 `SessionChosen`→Chat/Monitor、文件树选中→预览，注册键位
+- [ ] 集成测试 — 建 session → 发消息（ScriptedProvider 回放文本+工具调用）→ 断言 Chat 行、Monitor 落账、文件树预览
+
+**验收**（原五条，经集成测试断言）：
 - [ ] 本地模式连上 core，发起一轮完整 agent 对话
 - [ ] 流式响应实时渲染
 - [ ] 工具调用可见
@@ -206,7 +226,8 @@
 | Phase 3.4: Agent 对话面板 | Chat 面板（消息/流式/工具卡/乐观对账） | ✅ 主体完成（虚拟滚动、窗口键位测试延后） |
 | Phase 3.5: Session 面板 + 编辑即 fork | Session 列表/生命周期 + Chat 编辑即 fork | ✅ 完成（键位无头断言随键位定稿补） |
 | Phase 3.6: 监控面板 | Usage 统计 + Trace 瀑布 | ✅ 完成 |
-| Phase 3.7-3.8: 文件树面板 + 验证 | 文件树 + 验证 | ⏳ 当前 |
+| Phase 3.7: 文件树面板 | 只读文件树（懒加载 + 预览） | ✅ 完成（键位随键位定稿补） |
+| Phase 3.8: 验证 | 无头集成测试 + 自研 Dock + Workspace 组装 | ⏳ 进行中（provider 注入 ✅，共存实验/Dock/组装/集成测试待做） |
 | Phase 4: 远程模式 + 多机 | 分布式连接 | ⏳ 待开始 |
 | Phase 5: 配置系统 | 图形化配置 | ⏳ 待开始 |
 | Phase 6: Web 前端退出 | 完成切换 | ⏳ 待开始 |

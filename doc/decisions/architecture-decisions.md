@@ -269,6 +269,26 @@ Agent  → LspService
 - 与 Nix 理念一致（声明式、可复现）
 - 需要在架构中预留位置
 
+### 11. Phase 3.8 验证：无头集成测试 + 自研 Dock + Provider 注入
+
+Phase 3.8（本地模式全链路验证）在实施前做了进一步拆分，引入了三个相互独立但同源的设计决策。记录于此，供后续跨 session 协作理解动因。
+
+**决策 1：验证以无头集成测试为主，不靠人工过一遍。**
+
+理由：验证需要可重复、CI 可跑的自动化兕底（`#[gpui::test]` + `TestAppContext`），人的精力有限、手工验证不可重复。真实窗口手工确认手感留给有桌面环境时另行做，不作为验收依据。
+
+**决策 2：Dock 系统自研，不复用 zed 的 `workspace` crate。**
+
+理由：zed 的 `workspace` crate（含 `Dock`/`Panel`/`Pane`）依赖 40+ 个 zed 内部 crate（`client`/`db`/`project`/`settings`/`ui`…），全部在 zed workspace、不在 crates.io。引入它等于把半个 zed 拖进依赖树——与否决 zed editor crate 是同一个「技术耦合」理由（§2）。因此在 `ominiforge-ui` 内参考其 `Dock`/`Panel` 设计自研精简版：停靠位置（左/右/底）、拖拽调整大小、显隐、焦点管理。这同时符合「组件层自研、聚焦 agent 领域」（§1 来源与组件库）。
+
+**决策 3：Provider 装配改为注入式（`ProviderSource`），为测试开合成 provider 入口。**
+
+理由：「连上真 core 发一轮完整对话」的端到端验证要求测试能驱动一个不连真实网络的 provider。原实现把 provider 构建深埋在 `app::assemble` 内部且强制 `providers.toml` 非空——装配与 provider 来源耦合，测试无法注入合成 provider。重构引入 `app::ProviderSource`（`Configured`/`Injected`）把来源决策显式化：装配逻辑（工具/沙箱/环境/LSP）对两种来源一视同仁；注入路径经 `SessionRegistry::new_with_provider` / `LocalProtocol::new_with_provider` + 公开的 `llm::ScriptedProvider`（原 core `#[cfg(test)]` 私有基建提为可复用）驱动一轮零网络的完整对话。
+
+**替代方案**：集成测试改用 in-memory mock `ClientProtocol`（不动 core）。被否——那样验不到 core 那一半，而 3.8 的本意正是「本地模式连上 core」的端到端兕底。
+
+**关联技术约束**（实现层面，详见 `migration-plan.md` Phase 3.8）：`#[gpui::test]` 不建立 tokio runtime，而 core 多处直接 `tokio::spawn` 靠 ambient reactor。共存方案优先「测试内手动建 tokio runtime」（不改 core）；zed 自己的做法是抽一个可注入 `Executor`（test 时换 `BackgroundExecutor`），仅当手动 runtime 不可行才引入（那是更大的 core 改动，需单独决策）。
+
 ---
 
 ## 关键设计原则

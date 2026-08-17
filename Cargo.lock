@@ -3946,6 +3946,8 @@ dependencies = [
  "ominiforge",
  "ominiforge-net",
  "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
