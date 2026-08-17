@@ -22,6 +22,7 @@ use anyhow::{Context, Result, bail};
 use crate::agent::{Agent, AgentConfig};
 use crate::config::{ConfigStore, ResolvedModel};
 use crate::context::DEFAULT_COMPACTION_THRESHOLD;
+use crate::llm::Provider;
 use crate::session::SessionStore;
 use crate::tool::{EditTool, FindTool, ReadTool, SearchTool, ShellTool, ToolRegistry, WriteTool};
 
@@ -31,6 +32,27 @@ pub const SESSIONS_SUBDIR: &str = ".omini/sessions";
 pub const SKILLS_SUBDIR: &str = ".omini/skills";
 /// The profile used when none is named.
 pub const DEFAULT_PROFILE: &str = "default";
+
+/// Where a session's model provider comes from.
+///
+/// The assembly is decoupled from provider *sourcing*: the normal path resolves
+/// `providers.toml` and builds an adapter; tests and local synthetic runs inject
+/// a ready-made provider, bypassing the config file (and its api-key/base-url
+/// requirements) entirely.
+#[derive(Clone)]
+pub enum ProviderSource {
+    /// Resolve `providers.toml` and build the adapter (`provider::build`).
+    Configured,
+    /// Use an already-built provider. `resolved` still drives `AgentConfig`
+    /// (model id, context window, temperature, output cap, think effort); its
+    /// credential/endpoint fields are inert because no adapter is built from it.
+    Injected {
+        /// The provider the agent loop streams from.
+        provider: Arc<dyn Provider>,
+        /// The model identity + tuning surfaced to the agent and session meta.
+        resolved: ResolvedModel,
+    },
+}
 
 /// What a model selection resolves to: the agent and the surrounding bits a
 /// front-end needs to start sessions and render identity.
@@ -142,6 +164,7 @@ pub async fn assemble(
     profile_name: &str,
     model: Option<&str>,
     temperature: Option<f32>,
+    provider_source: ProviderSource,
     no_dotenv: bool,
     sandbox_backend: Arc<dyn crate::sandbox::SandboxBackend>,
     injected_sandbox: Option<(
@@ -186,25 +209,35 @@ pub async fn assemble(
     };
 
     let assemble_started = std::time::Instant::now();
-    let providers = store
-        .load_providers()
-        .context("failed to load providers.toml")?;
-    if providers.providers.is_empty() {
-        bail!(
-            "no providers configured. Create .omini/config/providers.toml \
-             (see doc/profile.md §2), then set the model's api_key_env."
-        );
-    }
     let profile = store
         .load_profile(profile_name)
         .with_context(|| format!("failed to load profile `{profile_name}`"))?;
 
-    let resolved = store
-        .resolve(&providers, &profile, model, temperature)
-        .context("failed to resolve model selection")?;
-
-    let provider = crate::provider::build(&resolved)
-        .context("provider type has no adapter (only openai-chat is wired)")?;
+    // Provider sourcing is decoupled from assembly: the normal path loads
+    // `providers.toml` and builds the adapter; an injected provider skips the
+    // config file entirely (tests / local synthetic runs need no credentials).
+    // `providers` is only populated on the configured path — the compaction
+    // override below reuses it, so it is likewise configured-path only.
+    let (provider, resolved, providers) = match provider_source {
+        ProviderSource::Injected { provider, resolved } => (provider, resolved, None),
+        ProviderSource::Configured => {
+            let providers = store
+                .load_providers()
+                .context("failed to load providers.toml")?;
+            if providers.providers.is_empty() {
+                bail!(
+                    "no providers configured. Create .omini/config/providers.toml \
+                     (see doc/profile.md §2), then set the model's api_key_env."
+                );
+            }
+            let resolved = store
+                .resolve(&providers, &profile, model, temperature)
+                .context("failed to resolve model selection")?;
+            let provider = crate::provider::build(&resolved)
+                .context("provider type has no adapter (only openai-chat is wired)")?;
+            (provider, resolved, Some(providers))
+        }
+    };
 
     let mut tools = ToolRegistry::new();
 
@@ -328,10 +361,14 @@ pub async fn assemble(
 
     // Optional dedicated compaction model (`doc/architecture.md`). It
     // may name a different provider, so resolve and build it independently; a bad
-    // reference is fatal (the user asked for it explicitly).
-    if let Some(model_ref) = profile.context.compaction_model.as_deref() {
+    // reference is fatal (the user asked for it explicitly). Configured-path only:
+    // an injected provider carries no providers.toml to resolve a second model
+    // against, so the agent falls back to compacting on its own provider.
+    if let (Some(model_ref), Some(providers)) =
+        (profile.context.compaction_model.as_deref(), &providers)
+    {
         let resolved_compaction = store
-            .resolve(&providers, &profile, Some(model_ref), None)
+            .resolve(providers, &profile, Some(model_ref), None)
             .with_context(|| format!("failed to resolve compaction_model `{model_ref}`"))?;
         let compaction_provider = crate::provider::build(&resolved_compaction)
             .context("compaction_model provider type has no adapter")?;

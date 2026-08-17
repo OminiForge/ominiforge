@@ -65,6 +65,7 @@ pub async fn run_case(case: &EvalCase, config: &RunConfig<'_>) -> Result<CaseRes
         config.profile,
         config.model,
         config.temperature,
+        app::ProviderSource::Configured,
         false,
         std::sync::Arc::new(crate::sandbox::passthrough::PassthroughBackend::new()),
         None,

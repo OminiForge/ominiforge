@@ -696,6 +696,8 @@ External provider response
 
 这样可以避免 agent loop 依赖某个 provider 的 JSON shape，也便于新增 provider。
 
+**Provider 来源与装配解耦**：session 装配（`app::assemble`）不绑定 provider 的*来源*。`ProviderSource` 把「provider 从哪来」显式化——`Configured`（正常路径：解析 `providers.toml` 并 `provider::build` 构建适配器）或 `Injected`（注入一个已构建的 `Arc<dyn Provider>`，跳过配置文件与凭证要求）。注入路径服务于集成测试与本地合成运行：经 `SessionRegistry::new_with_provider` / `LocalProtocol::new_with_provider` 注入 `llm::ScriptedProvider`（按脚本回放 `StreamEvent`，零网络），即可驱动一轮完整 agent 对话做端到端验证。装配本身（工具/沙箱/环境/LSP）对两种来源一视同仁。
+
 ## 10. Skill 系统
 
 Skill 是对高频任务、最佳实践、工具组合、提示词流程和执行策略的封装。Skill 应支持创建、更新、失效检测和优化。

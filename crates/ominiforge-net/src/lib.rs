@@ -17,6 +17,7 @@ mod local;
 
 pub use local::LocalProtocol;
 
+use std::path::PathBuf;
 use std::pin::Pin;
 
 use anyhow::Result;
@@ -31,6 +32,33 @@ use ominiforge::session::SessionMeta;
 
 /// A boxed, sendable stream of protocol events — what a UI panel consumes.
 pub type EventStream<T> = Pin<Box<dyn Stream<Item = T> + Send>>;
+
+/// One entry of a directory listing (read-only file browsing).
+///
+/// Directories sort before files, then by name — the fold in the UI relies on
+/// this ordering to interleave children into the visible rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirEntry {
+    /// Entry name within its parent directory (not a path).
+    pub name: String,
+    /// `true` for a directory (expandable), `false` for a file (previewable).
+    pub is_dir: bool,
+}
+
+/// A file's preview content (read-only file browsing).
+///
+/// The payload is best-effort UTF-8; binary or oversized files are refused at
+/// the protocol layer (the UI shows the error), never silently truncated into
+/// mojibake.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilePreview {
+    /// The workspace-relative path that was read (echo of the request).
+    pub path: String,
+    /// UTF-8 text content, capped by the implementation.
+    pub content: String,
+    /// `true` when the content was cut at the implementation's cap.
+    pub truncated: bool,
+}
 
 /// How a client is currently attached to Core.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +129,23 @@ pub trait ClientProtocol: Send + Sync {
         decision: ApprovalDecision,
         scope: ApprovalScope,
     ) -> Result<()>;
+
+    // ---- File browsing (read-only) ----
+
+    /// The workspace root the file tree is scoped to. Read-only browsing is
+    /// bound to the gateway's workspace — not to any one session's optional
+    /// workspace — so the tree shows "the project", independent of session
+    /// selection.
+    async fn workspace_root(&self) -> Result<PathBuf>;
+
+    /// List one directory's entries, `rel` a workspace-relative path (`""` =
+    /// the root). Directories first, then files, each sorted by name. `..`,
+    /// absolute paths, and any escape above the workspace root are refused.
+    async fn list_dir(&self, rel: &str) -> Result<Vec<DirEntry>>;
+
+    /// Read a file's preview content, `rel` a workspace-relative path. Binary
+    /// and oversized files are refused (the error surfaces in the UI).
+    async fn read_file(&self, rel: &str) -> Result<FilePreview>;
 
     // ---- Event subscription ----
 

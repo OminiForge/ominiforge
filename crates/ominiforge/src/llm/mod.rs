@@ -66,6 +66,50 @@ pub enum StreamEvent {
     },
 }
 
+/// A provider that replays one scripted batch of [`StreamEvent`]s per call.
+///
+/// Each [`stream`](Provider::stream) call pops the next batch, so a turn runs
+/// deterministically with no network; calling more times than scripted fails the
+/// request. Used by integration tests and local synthetic runs (via an
+/// [`crate::app::ProviderSource::Injected`]) to drive a full agent loop — text,
+/// tool calls, usage — without standing up a real backend.
+pub struct ScriptedProvider {
+    /// Remaining rounds, one batch per `stream()` call, consumed in order.
+    rounds: std::sync::Mutex<std::collections::VecDeque<Vec<StreamEvent>>>,
+}
+
+impl ScriptedProvider {
+    /// A provider that serves `rounds` in order, one batch per turn.
+    #[must_use]
+    pub fn new(rounds: Vec<Vec<StreamEvent>>) -> Self {
+        Self {
+            rounds: std::sync::Mutex::new(rounds.into_iter().collect()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for ScriptedProvider {
+    // The `Provider::name` signature forces `&str`; the value is a literal.
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn name(&self) -> &str {
+        "scripted"
+    }
+
+    async fn stream(&self, _request: ModelRequest) -> Result<EventStream, LlmError> {
+        let batch = self
+            .rounds
+            .lock()
+            .map_err(|_| LlmError::Decode("scripted provider lock poisoned".to_owned()))?
+            .pop_front()
+            .ok_or_else(|| {
+                LlmError::Decode("provider called more times than scripted".to_owned())
+            })?;
+        let items: Vec<Result<StreamEvent, LlmError>> = batch.into_iter().map(Ok).collect();
+        Ok(Box::pin(futures_util::stream::iter(items)))
+    }
+}
+
 /// An error from a model provider.
 #[derive(Debug, thiserror::Error)]
 pub enum LlmError {

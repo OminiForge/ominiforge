@@ -251,6 +251,9 @@ async fn active_roots(inner: &RegistryInner) -> std::collections::HashSet<PathBu
 struct RegistryInner {
     defaults: SessionDefaults,
     idle_timeout: std::time::Duration,
+    /// Where each session's model provider comes from (`doc/architecture.md`):
+    /// `Configured` in production, `Injected` for tests / local synthetic runs.
+    provider_source: crate::app::ProviderSource,
     /// Session id → live actor handle. Guarded by an async mutex because spawning
     /// (which assembles an agent and connects MCP) is async and must not race two
     /// callers into two actors for the same session.
@@ -399,6 +402,35 @@ impl SessionRegistry {
     /// start on this host (`doc/sandbox.md` §3.2) — an explicit isolation
     /// request must not silently degrade.
     pub fn new(defaults: SessionDefaults, config: &GatewayConfig) -> Result<Self> {
+        Self::with_provider_source(defaults, config, app::ProviderSource::Configured)
+    }
+
+    /// Like [`new`](Self::new) but with an injected model provider, so tests and
+    /// local synthetic runs drive sessions without `providers.toml` or a network.
+    /// The same provider instance backs every session this registry spawns.
+    ///
+    /// # Errors
+    /// Same as [`new`](Self::new) — sandbox backend initialization and config
+    /// failures.
+    pub fn new_with_provider(
+        defaults: SessionDefaults,
+        config: &GatewayConfig,
+        provider: Arc<dyn crate::llm::Provider>,
+        resolved: crate::config::ResolvedModel,
+    ) -> Result<Self> {
+        Self::with_provider_source(
+            defaults,
+            config,
+            app::ProviderSource::Injected { provider, resolved },
+        )
+    }
+
+    /// Shared constructor: everything but the provider source is identical.
+    fn with_provider_source(
+        defaults: SessionDefaults,
+        config: &GatewayConfig,
+        provider_source: app::ProviderSource,
+    ) -> Result<Self> {
         // The workspace map + per-workspace config dir live beside the session
         // store, under `.omini` (the gateway's trusted config root, not the
         // agent-writable project dir — `doc/gateway.md`).
@@ -424,6 +456,7 @@ impl SessionRegistry {
             inner: Arc::new(RegistryInner {
                 defaults,
                 idle_timeout: config.idle_timeout(),
+                provider_source,
                 actors: Mutex::new(HashMap::new()),
                 workspaces,
                 status_hub: StatusHub::new(),
@@ -479,6 +512,13 @@ impl SessionRegistry {
                 }
             }
         });
+    }
+
+    /// The workspace root the gateway assembles sessions in. The GPUI file
+    /// tree scopes its read-only browsing to this root.
+    #[must_use]
+    pub fn workspace_root(&self) -> &Path {
+        &self.inner.defaults.workspace
     }
 
     /// The session store rooted at the configured workspace.
@@ -1687,6 +1727,7 @@ impl SessionRegistry {
             profile,
             model,
             None,
+            self.inner.provider_source.clone(),
             d.no_dotenv,
             self.inner.sandbox_manager.backend(),
             injected_sandbox,

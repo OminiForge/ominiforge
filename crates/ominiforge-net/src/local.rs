@@ -13,7 +13,10 @@
 //! subscriber that races the replay sees each committed event exactly once (the
 //! UI dedups by `seq`, as the web client does).
 
-use anyhow::{Context, Result, anyhow};
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+
+use anyhow::{Context, Result, anyhow, bail};
 use ominiforge::agent::{ApprovalDecision, ApprovalScope};
 use ominiforge::config::{ModelSummary, ProfileSummary, ProvidersFile};
 use ominiforge::context::{bytes_to_tokens, message_bytes};
@@ -27,7 +30,7 @@ use ominiforge::session::SessionMeta;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
-use crate::{ClientProtocol, ConnectionState, EventStream};
+use crate::{ClientProtocol, ConnectionState, DirEntry, EventStream, FilePreview};
 
 /// The local, in-process `ClientProtocol`: wraps a [`SessionRegistry`].
 ///
@@ -48,6 +51,23 @@ impl LocalProtocol {
     pub fn new(defaults: SessionDefaults, config: &GatewayConfig) -> Result<Self> {
         Ok(Self {
             registry: SessionRegistry::new(defaults, config)?,
+        })
+    }
+
+    /// Like [`new`](Self::new) but with an injected model provider, so tests and
+    /// local synthetic runs drive full sessions over a scripted provider with no
+    /// `providers.toml` and no network.
+    ///
+    /// # Errors
+    /// Propagates [`SessionRegistry::new_with_provider`] failures.
+    pub fn new_with_provider(
+        defaults: SessionDefaults,
+        config: &GatewayConfig,
+        provider: Arc<dyn ominiforge::llm::Provider>,
+        resolved: ominiforge::config::ResolvedModel,
+    ) -> Result<Self> {
+        Ok(Self {
+            registry: SessionRegistry::new_with_provider(defaults, config, provider, resolved)?,
         })
     }
 
@@ -161,6 +181,50 @@ impl ClientProtocol for LocalProtocol {
             .map_err(|_| anyhow!("session actor is unavailable"))
     }
 
+    // ---- File browsing (read-only) ----
+
+    async fn workspace_root(&self) -> Result<PathBuf> {
+        Ok(self.registry.workspace_root().to_path_buf())
+    }
+
+    async fn list_dir(&self, rel: &str) -> Result<Vec<DirEntry>> {
+        let abs = resolve_in_workspace(self.registry.workspace_root(), rel)?;
+        let read =
+            std::fs::read_dir(&abs).with_context(|| format!("failed to list directory `{rel}`"))?;
+        let mut entries = Vec::new();
+        for entry in read {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+            entries.push(DirEntry { name, is_dir });
+        }
+        // Directories first, then files, each by name; the UI's fold relies on
+        // this order to interleave children into the visible rows.
+        entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+        Ok(entries)
+    }
+
+    async fn read_file(&self, rel: &str) -> Result<FilePreview> {
+        // Preview payload cap: large enough to inspect most source files, small
+        // enough to keep the panel snappy. Anything past it is cut + flagged.
+        const PREVIEW_CAP: usize = 64 * 1024;
+        let abs = resolve_in_workspace(self.registry.workspace_root(), rel)?;
+        let bytes = std::fs::read(&abs).with_context(|| format!("failed to read file `{rel}`"))?;
+        let truncated = bytes.len() > PREVIEW_CAP;
+        let head = if truncated {
+            &bytes[..PREVIEW_CAP]
+        } else {
+            &bytes
+        };
+        let content = String::from_utf8(head.to_vec())
+            .map_err(|_| anyhow!("`{rel}` is not UTF-8 text (binary preview unsupported)"))?;
+        Ok(FilePreview {
+            path: rel.to_owned(),
+            content,
+            truncated,
+        })
+    }
+
     // ---- Event subscription ----
 
     async fn subscribe_session(&self, id: &SessionId) -> Result<EventStream<GatewayEvent>> {
@@ -262,4 +326,31 @@ fn replay_events(registry: &SessionRegistry, id: &SessionId) -> Vec<GatewayEvent
             event: Box::new(event),
         })
         .collect()
+}
+
+// Resolve a workspace-relative path against the root, refusing any escape
+// (lexical, no filesystem touch — works for paths that do not exist yet).
+// Mirrors the file tools' guard rail: `..` that climbs above the root, and
+// absolute paths, are rejected before any read.
+fn resolve_in_workspace(workspace: &Path, rel: &str) -> Result<PathBuf> {
+    if Path::new(rel).is_absolute() {
+        bail!("absolute path not allowed: `{rel}`");
+    }
+    let joined = workspace.join(rel);
+    let mut normalized = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    bail!("path escapes workspace: `{rel}`");
+                }
+            }
+            Component::CurDir => {}
+            other => normalized.push(other),
+        }
+    }
+    if !normalized.starts_with(workspace) {
+        bail!("path escapes workspace: `{rel}`");
+    }
+    Ok(normalized)
 }
