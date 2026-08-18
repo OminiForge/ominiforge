@@ -3,25 +3,9 @@ db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 version = 2
 yanked = "warn"
-# All are transitive deps of gpui (doc/architecture-decisions.md §1): unmaintained
-# upstream but with no known vulnerabilities and no replacements; lifted once gpui
-# upgrades. Per-entry provenance is noted on each entry.
-ignore = [
-  # async-std ← zed-async-tar ← gpui_http_client ← gpui
-  "RUSTSEC-2025-0052",
-  # proc-macro-error2 ← stacksafe ← gpui
-  "RUSTSEC-2026-0173",
-  # ttf-parser ← rustybuzz ← cosmic-text ← gpui
-  "RUSTSEC-2026-0192",
-  # rustybuzz ← cosmic-text ← gpui
-  "RUSTSEC-2026-0206",
-  # instant ← fastrand ← futures-lite ← gpui_util ← gpui
-  "RUSTSEC-2024-0384",
-  # paste ← pulp ← exr ← image ← gpui
-  "RUSTSEC-2024-0436",
-  # rustls-pemfile ← zed-reqwest ← gpui_http_client ← gpui
-  "RUSTSEC-2025-0134",
-]
+# (The gpui transitive-dep advisory ignores were removed in the zero-UI pivot:
+# gpui and its zed dependency closure are no longer in the tree.)
+ignore = []
 
 [licenses]
 version = 2
@@ -31,14 +15,6 @@ allow = [
   "Apache-2.0 WITH LLVM-exception",
   "BSD-2-Clause",
   "BSD-3-Clause",
-  # The project moved to GPL-3.0-or-later (see doc/architecture-decisions.md §9), so the
-  # GPL-3.0-or-later deps pulled in by the zed git version (ztracing/zlog/ztracing_macro,
-  # trace/logging annotations only) are legal. This holds only while the project itself is
-  # GPL; if it ever returns to a permissive license, remove this and cut via vendor+patch.
-  "GPL-3.0-or-later",
-  # CC0-1.0: public-domain dedication, no obligations. From hexf-parse
-  # (naga<-blade-graphics<-gpui) and tiny-keccak (ahash<-gpui).
-  "CC0-1.0",
   "CDLA-Permissive-2.0",
   "ISC",
   "MIT",
@@ -47,14 +23,8 @@ allow = [
   # cssparser/selectors/dtoa-short (the Readability extraction chain of dom_smoothie ->
   # the web_fetch tool).
   "MPL-2.0",
-  # NCSA: permissive (UIUC), on par with MIT/BSD. From libfuzzer-sys
-  # (rav1e<-ravif<-image<-gpui; only appears with target=all), used only for fuzz builds.
-  "NCSA",
   "Unicode-3.0",
   "Zlib",
-  # bzip2 license (BSD-style permissive). From libbz2-rs-sys (bzip2 <-
-  # compression-codecs <- async-compression <- http_client <- gpui).
-  "bzip2-1.0.6",
 ]
 exceptions = []
 
@@ -73,11 +43,5 @@ skip-tree = []
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# zed git is the source of gpui (see doc/architecture-decisions.md §1); font-kit and
-# proptest are git transitive deps pinned by gpui itself (zed's custom font-kit; proptest
-# for gpui's tests). All three are inherent parts of gpui's dependency closure.
-allow-git = [
-  "https://github.com/zed-industries/zed",
-  "https://github.com/zed-industries/font-kit",
-  "https://github.com/proptest-rs/proptest",
-]
+# No git dependencies remain (the zed git pin for gpui was removed in the zero-UI pivot).
+allow-git = []

@@ -5,7 +5,7 @@
 **A high-performance, extensible agent platform built in Rust.**
 
 [![CI](https://github.com/OminiForge/ominiforge/actions/workflows/ci.yml/badge.svg)](https://github.com/OminiForge/ominiforge/actions/workflows/ci.yml)
-[![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 [Documentation](https://ominiforge.github.io/ominiforge/) ·
 [Architecture](doc/design/architecture.md) ·
@@ -111,4 +111,5 @@ merging to `master` is all it takes.
 
 ## License
 
-Ominiforge is licensed under [GPL-3.0-or-later](LICENSE).
+Ominiforge is licensed under either of [Apache License, Version 2.0](LICENSE-APACHE)
+or [MIT license](LICENSE-MIT), at your option.
