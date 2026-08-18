@@ -27,7 +27,7 @@
 - **edition 2024 已在 stable**（1.85+），无需 nightly feature。
 
 因此：**不要用 nightly**。除非确需某个 nightly-only feature，此时应先在
-`decisions/architecture-decisions.md` 记录决策，而不是悄悄切到 nightly。
+架构决策记录（`decisions/`）记录此类决策，而不是悄悄切到 nightly。
 
 ## 何时 bump
 

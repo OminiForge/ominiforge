@@ -12,12 +12,12 @@
 | ---- | ---- | --------- | -------------- |
 | 核心库 `ominiforge` | 纯 lib（core） | ✅ | — |
 | 纯 CLI 版 | `ominiforge` 二进制（serve，未来 TUI），无图形依赖 | ✅（crate `ominiforge-cli`） | ✅ 多平台压缩包 |
-| GUI 版 | `ominiforge` 二进制（CLI 全部功能 + GPUI 界面） | ❌（含 gpui git 依赖） | ✅ 桌面安装包 |
 
-- **统一版本**：所有 crate 继承 `[workspace.package].version`，两种产物同号发布。
-  v0.2.0 的 release 同时出 CLI 包与 GUI 包，用户看到的是「ominiforge v0.2.0 有两个包」。
-- **crates.io 边界**：只有无 git 依赖的 crate 可发（gpui 是 git 依赖，故 ui/gui 不发）。
-  发布面 = `ominiforge` + `ominiforge-net` + `ominiforge-cli`。
+（零 UI 转向后不再有 GUI 桌面产物； ominiforge 不自带界面，UI 由门面承接，见
+[`decisions/architecture-direction.md`](../decisions/architecture-direction.md)。）
+
+- **统一版本**：所有 crate 继承 `[workspace.package].version`，同号发布。
+- **crates.io 边界**：发布面 = `ominiforge` + `ominiforge-net` + `ominiforge-cli`。
 - **内部依赖**：一律 `path + version` 双写——本地开发用 path（即时联动），
   `cargo publish` 时用 version（path 被剥离）。同步正确性由三层机制保证，不靠人工：
   cargo publish 硬校验上游版本存在、release-plz 按拓扑序发布、`cargo package` 剥离
@@ -33,8 +33,7 @@
 2. **自动维护一个 Release PR**：累加变更、生成 CHANGELOG、bump workspace 版本。
 3. **合并 Release PR** → 打 git tag + 创建 GitHub Release + 按拓扑序 `cargo publish`
    可发布的 crate（core → net → cli）。
-4. **构建产物**：tag 推送后构建多平台 CLI 二进制并上传 Release；GUI 桌面包在 GPUI
-   客户端成熟后接入（当前为占位）。
+4. **构建产物**：tag 推送后构建多平台 CLI 二进制并上传 Release。
 
 维护者唯一动作：**审阅并合并 Release PR**。
 

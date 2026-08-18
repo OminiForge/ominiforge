@@ -69,14 +69,14 @@ interrupted`。设计要点：
 ### 3.3 Tool
 
 `source` 区分 Builtin / MCP（按 server 聚合监控）。`file_changes`（pre/post diff）为 Phase 2
-能力，初期不记录，见 [`sandbox.md`](./sandbox.md) §2.2。单次 tool 指标随 event 落盘；聚合指标
+能力，初期不记录，见 [`runtime-architecture.md`](./runtime-architecture.md) §5。单次 tool 指标随 event 落盘；聚合指标
 （p95、失败率）由 monitor 内存维护。
 
 ### 3.4 Session
 
 首条事件 `Created` 记录初始 config 快照（profile、tool list、workspace），使 replay 自包含；
 快照内容随实现以追加字段扩展。另有 `Forked` / `Paused` / `Resumed` / `Ended`。详见
-[`architecture.md`](./architecture.md) §6.2。
+[`session.md`](./session.md)。
 
 ### 3.5 Artifact
 
@@ -86,9 +86,9 @@ interrupted`。设计要点：
 
 记录动态注入，用于 replay 还原每轮 model 实际所见的 context。来源：Memory / RAG / ACP / Hook /
 **Runtime** / **ProjectGuidance**。`Runtime` 用于 agent loop 自身注入的提醒（完成度门、卡死警告），见
-[`architecture.md`](./architecture.md) §8，文本用 `<reminder>...</reminder>` 包裹，作为真实消息永久留在
+[`todo.md`](./todo.md)，文本用 `<reminder>...</reminder>` 包裹，作为真实消息永久留在
 context 历史中（保 prefix cache）。`ProjectGuidance` 用于子目录 `AGENTS.md`/`CLAUDE.md` 懒加载注入
-（`<project-guidance path="...">...`），见 [`architecture.md`](./architecture.md) §20。Compaction 时历史
+（`<project-guidance path="...">...`），见 [`agents-md.md`](./agents-md.md)。Compaction 时历史
 injection 被摘要浓缩。
 
 ### 3.7 Hook

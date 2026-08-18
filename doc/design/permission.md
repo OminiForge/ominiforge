@@ -8,7 +8,7 @@ allow / deny / ask。核心原则——安全不能靠信任模型，要靠代�
 
 > ⚠️ **威胁模型边界**：当前规则用**子串匹配**（§2）。它防的是"手滑/误触/模型无意中调用危险工具"，
 > **不是**对抗一个主动规避的恶意模型——子串可被双空格、`base64`、命令分片、`printf` 拼接等平凡手段绕过，
-> 且只搜 JSON value 不搜 key。把它当作"护栏"而非"防弹墙"。对抗性场景应叠加沙箱（`doc/sandbox.md`）
+> 且只搜 JSON value 不搜 key。把它当作"护栏"而非"防弹墙"。对抗性场景应叠加沙箱（`runtime-architecture.md` §5）
 > 与网络策略，不要单靠门控。`prefix`/`field`/`negate` 已实现；glob/regex 是后续工作（§9）。
 
 ## 1. 设计原则
@@ -110,7 +110,7 @@ gateway default_permission （gateway.toml，最低基线）
 
 解析函数 `app::resolve_permission(workspace, profile, gateway)`，等价于 `workspace.layer_over(profile.layer_over(gateway))`。
 
-三层都是 **gateway 可信或部署方拥有**的配置——**没有一层**读自 agent 可写的项目目录，所以 workspace 层加 `deny` 是安全的（见 `doc/gateway.md`「为何在 gateway 侧」）。
+三层都是 **gateway 可信或部署方拥有**的配置——**没有一层**读自 agent 可写的项目目录，所以 workspace 层加 `deny` 是安全的（见 `runtime-architecture.md` §7）。
 
 gateway 基线（`gateway.toml`）：
 
@@ -130,11 +130,11 @@ contains = ["git push"]       # 仅此 workspace 追加禁令
 
 CLI 运行只经过 profile 层（gateway/workspace 两层都是 gateway 侧，CLI 传空策略）。
 
-### 3.2 工具目录与配置 UI（增量规则列表）
+### 3.2 工具目录（供门面呈现配置界面）
 
-用户配置门控时**不手输工具名/字段名**。`GET /tools` 返回内置工具目录（`crate::tool::builtin_catalog`：read/write/edit/shell 的友好标签 + 可作为 `field` 的输入字段列表 + 字段是否为路径）。前端配置界面是**增量规则列表**（`PermissionRulesEditor.svelte`）：每层只渲染用户真正添加的规则，空层 = 一行说明 +「添加规则」按钮，绝不预渲染全量工具列表。规则行折叠态是大白话摘要（「拒绝 运行命令：当 命令 包含 rm -rf」），展开后才出现决策 seg、工具下拉（目录 +「任意工具 (*)」）与条件区（field/mode/白名单/值，默认折叠）；无条件规则即该工具在本层的默认裁决。gateway 层额外提供折叠的**工具默认表**（每目录工具一行三态 seg），编辑的同样是 bare rules。
+门面呈现配置界面时**不让用户手输工具名/字段名**。`GET /tools` 返回内置工具目录（`crate::tool::builtin_catalog`：read/write/edit/shell 的友好标签 + 可作为 `field` 的输入字段列表 + 字段是否为路径）。门面的推荐交互是**增量规则列表**：每层只渲染用户真正添加的规则，空层 = 一行说明 +「添加规则」入口，不预渲染全量工具列表；无条件规则即该工具在本层的默认裁决。gateway 层可额外提供「工具默认表」（每目录工具一行三态裁决）。
 
-- 磁盘 = 机器读，结构化/规范化（`Rule` 全字段）；用户层 = 规则行，简单零负担。二者转换是纯函数（`permission-rules.ts` 的 `toRows`/`fromRows`）。
+- 磁盘 = 机器读，结构化/规范化（`Rule` 全字段）；门面层 = 规则行，简单零负担。二者转换是纯函数映射（由门面实现）。
 - **三层各归其位**（不再是单页三层并列）：gateway 基线在 Settings → **全局设置** tab（含工具默认表）；profile 层在 Settings → **Profiles** tab 随该 profile 编辑；workspace 层在工作区 `WorkspaceConfigDialog`（与 network 并列）。曾经的「生效结果视图」已删除——它只是按来源层罗列规则、并不做真实裁决计算，名不副实；将来若需要，应在能凑齐三层的 workspace 侧重写为真求值。
 - 内置 4 种工具目录是静态的（无需子进程），故 profile 层与 gateway 层配置界面都能用（`GET /tools`）。
 - MCP 动态工具按 workspace best-effort 列举：`GET /workspaces/{id}/tools` 起 MCP 子进程读 `tools/list`，失败则跳过该 server、仍返回内置项（不报错）。仅 workspace 层用它（gateway/profile 层无具体 workspace 上下文）。MCP 工具无字段元数据，条件退化为「任意输入」，仍可门控。
@@ -240,14 +240,16 @@ gate 的 `supports_concurrent_requests()` 为 true（gateway）时，一轮里�
 - 幂等：未知/已决 call_id 被 actor 忽略。
 - ts 绑定：`PermissionEvent.ts` / `PermissionOutcome.ts` / `PermissionPolicy.ts` / `Rule.ts` / `ApprovalScope.ts`，改 wire 类型后跑 `just ts-export`。
 
-## 8. 用户界面（GPUI 客户端）
+## 8. 审批与配置的门面呈现
 
-权限审批和配置在 GPUI 客户端中实现：
+零 UI 转向后，权限审批与配置不由自带 UI 呈现，而是经**门面**完成（见
+[`runtime-architecture.md`](./runtime-architecture.md) §7）：
 
-- **审批界面**：tool 调用的审批在对话面板中进行，等待批准时显示审批按钮（批准/拒绝，含作用域选择）
-- **配置界面**：三层配置在设置面板中进行（gateway 基线、profile 层、workspace 层）
-
-GPUI 客户端的权限界面实现见代码。
+- **审批**：`ask` 挂起即落 events.jsonl（一等公民审批注册表，见 [`runtime-architecture.md`](./runtime-architecture.md) §4），
+  任一已连接门面（编辑器 ACP 的 `session/request_permission`、IM 的按钮回调、TUI 弹窗、手机）都可
+  应答「批准/拒绝 × 作用域」，核心统一裁决并广播 resolved。
+- **配置**：三层配置（gateway 基线、profile 层、workspace 层）以结构化配置文件为主，经门面或直接
+  编辑文件完成。
 
 ## 9. 实现状态与待完善
 

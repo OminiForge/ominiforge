@@ -7,21 +7,22 @@
 
 # 设计（目标结构 · 长期契约）
 
-- [架构设计](./design/architecture.md)
+- [运行时架构](./design/runtime-architecture.md)
 - [事件协议](./design/event-schema.md)
+- [Session](./design/session.md)
+- [上下文管理](./design/context.md)
+- [Todo 系统](./design/todo.md)
 - [Tool 协议](./design/tool-protocol.md)
 - [Tool 流式输出](./design/tool-streaming.md)
 - [Hook 协议](./design/hook-protocol.md)
-- [Gateway](./design/gateway.md)
+- [Provider](./design/provider.md)
 - [权限模型](./design/permission.md)
-- [Sandbox](./design/sandbox.md)
+- [Memory](./design/memory.md)
+- [Profile](./design/profile.md)
 - [LSP](./design/lsp.md)
-- [网络](./design/network.md)
-- [GPUI 应用](./design/gpui-app.md)
-- [GPUI 设计](./design/gpui-design.md)
-- [编辑器](./design/editor.md)
 - [Monitor](./design/monitor.md)
-- [配置 (Lua)](./design/config-lua.md)
+- [AGENTS.md 项目指引](./design/agents-md.md)
+- [环境集成 · direnv](./design/env-direnv.md)
 
 # 运维（怎么操作 · 会变化）
 
@@ -30,11 +31,10 @@
 - [供应链安全维护](./operation/supply-chain.md)
 - [MSRV 政策](./operation/msrv.md)
 - [GitHub App 备忘](./operation/github-app.md)
-- [迁移计划](./operation/migration-plan.md)
 
 # 决策（为什么这么定 · 追加不删改）
 
-- [架构决策记录](./decisions/architecture-decisions.md)
+- [架构方向](./decisions/architecture-direction.md)
 - [Profile](./decisions/profile.md)
 
 # 研究（临时参考 · 可丢弃）

@@ -199,11 +199,11 @@ tool = "write"
 | skills.* | ✗ | 默认全部可用 |
 | memory.* | ✗ | 默认 scopes=["user","project"], auto_write=true |
 | budget.session_max_usd | ✗ | 金钱预算；默认无限制 |
-| budget.max_rounds | ✗ | 单 turn 模型轮次绝对硬顶；默认 1000。见 `doc/architecture.md` §7 |
-| budget.round_budget_threshold | ✗ | 每步软 round 预算；默认 20，`0` 禁用。见 `doc/architecture.md` §8.6 |
+| budget.max_rounds | ✗ | 单 turn 模型轮次绝对硬顶；默认 1000。见 `context.md` |
+| budget.round_budget_threshold | ✗ | 每步软 round 预算；默认 20，`0` 禁用。见 `todo.md` |
 | budget.round_budget_warn_pct | ✗ | 软预算首次提醒比例；默认 0.8 |
 | hooks.* | ✗ | 默认无额外 hook |
-| network.policy | ✗ | 沙箱网络策略 `isolated`/`allowlist`/`open`；缺省继承 gateway `default_network`（兜底 = `open`）。见 `doc/sandbox.md` §6.2 |
+| network.policy | ✗ | 沙箱网络策略 `isolated`/`allowlist`/`open`；缺省继承 gateway `default_network`（兜底 = `open`）。见 `design/runtime-architecture.md` §5 |
 | network.allow | ✗ | `allowlist` 下的可达主机；其他策略忽略 |
 | permission.deny | ✗ | 门控 deny 规则表（`{tool, contains}`）；命中即阻断。见 `doc/permission.md` |
 | permission.ask | ✗ | 门控 ask 规则表；命中需人工审批。缺省 = 空策略 = 全 allow |
@@ -286,7 +286,7 @@ session_max_usd = 10.00  # 覆盖
 | tool set | Profile | agent 能力 |
 | skill set | Profile | agent 能力 |
 | memory scope | Profile | agent 知识范围 |
-| network policy | Profile（workspace 覆盖 / gateway 兜底） | agent 能力（能否联网、可达哪些主机）；解析链见 `doc/sandbox.md` §6.2 |
+| network policy | Profile（workspace 覆盖 / gateway 兜底） | agent 能力（能否联网、可达哪些主机）；解析链见 `design/runtime-architecture.md` §5 |
 
 ## 8. 文件系统布局
 

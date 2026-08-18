@@ -40,7 +40,7 @@
 workspace 配置  .omini/config/lsp.toml      项目级覆盖 / 新增自定义服务器（最高层）
 ```
 
-- **内置注册表**为常见语言提供 `command` + `args` + `extensions`。用户什么都不写，碰到对应扩展名即用（二进制经 PATH / direnv env-overlay 解析，见 `doc/architecture.md`）。
+- **内置注册表**为常见语言提供 `command` + `args` + `extensions`。用户什么都不写，碰到对应扩展名即用（二进制经 PATH / direnv env-overlay 解析，见 `env-direnv.md`）。
 - **`enabled`（墓碑语义）**：高优先级层写一条同名 `enabled = false`，使该服务器在合并结果中**整条消失**——这是"关闭某个内置默认"的方式，不是新增一个缺 `command` 的畸形条目。
 - 内置条目里的 `command`/`extensions`/`args` 可被更高层同名字段覆盖。
 
@@ -88,9 +88,7 @@ extensions = ["py", "pyi"]
 诊断作为**独立的 `Content` 条目**追加到 `ToolOutput.content`（主结果为 `content[0]`，诊断为其后条目）。**多服务器时聚合为一个块**，每条诊断标注来源服务器（`via pyright` / `via ruff`），统一受渲染上限截断（不是每个服务器各一份）：
 
 - **给模型**：`src/agent/mod.rs` 的 `render_output` 把整个 `content` 数组扁平化进 tool_result 消息——诊断照常进入模型上下文。
-- **给用户**：前端 `conversation.ts` 的 `pairResult` 把 `content[0]`（主结果）与其后条目（诊断）分开：主结果进 `item.result`，诊断进 `item.diagnostics`，**只在 `RawArgs` 调试折叠区渲染**，标注「发送给模型」。诊断进了模型，但不污染主视图。
-
-> 前端的逻辑改动只有 `pairResult` 的结果拆分与 `Item.diagnostics` 新字段；未动状态机（`gpui-design.md` §7 铁律）。
+- **给用户（门面）**：门面把 `content[0]`（主结果）与其后条目（诊断）分开呈现：主结果为主视图，诊断进调试折叠区，标注「发送给模型」。诊断进了模型，但不污染主视图。具体渲染由门面（编辑器/TUI）决定。
 
 ## 5.1 状态暴露（RuntimeInfo）
 
@@ -156,20 +154,19 @@ state = "starting" | "running" | "failed"
 - `languageId` 映射：内置常见扩展名→`languageId` 映射（`src/lsp/mod.rs` 的 `language_id_for`），可按需并入注册表。
 - profile/UI 层暴露 LSP 总开关与超时配置。
 
-## 8. 配置编辑器（GPUI 客户端）
+## 8. 配置编辑
 
-LSP 配置的图形化编辑在 GPUI 客户端的设置面板中实现。配置分两层（对应 §3 的分层）：
+LSP 配置的编辑零 UI 转向后以**结构化配置文件**为主，经门面的查看/编辑能力（编辑器门面、TUI）或
+直接编辑文件完成。配置分两层（对应 §3 的分层）：
 
 - **全局默认**：Gateway 配置 root 链的 `lsp.toml`
 - **项目覆盖**：`<workspace>/.omini/config/lsp.toml`（最高层）
 
-**配置端点**（Gateway API）：
+**配置端点**（Gateway API，供门面调用）：
 - 全局：`GET/PUT /api/config/lsp`
 - 项目：`GET/PUT /api/workspaces/{id}/config/lsp`
 
 **写语义**：`PUT` 携带完整清单，整体重写目标层文件，写后重新 `load` 验证生效。
-
-GPUI 客户端的配置编辑器实现见代码。
 
 ## 9. 自动格式化（format）
 
@@ -246,12 +243,10 @@ edit/write 产出模型的目标文本（内存中）
 
 **diff 与 diagnostic 是同一完整文本的两个独立产物**：diff 是「编辑前 vs 完整文本」的呈现，diagnostic 是对完整文本的语义分析（LSP/tree-sitter 需要全文解析，给它 diff 无意义）。两者输入都是完整文件，互不依赖。
 
-### 9.8 配置编辑器（GPUI 客户端）
+### 9.8 配置编辑
 
-Format 配置的图形化编辑与 LSP 同构（§8）：顶部 `mode` 选择（file/edit/off）+ formatter 固定清单（内置全列出、墓碑标灰、来源层 + 安装探测徽章、未安装不可改 command）。
+Format 配置的编辑与 LSP 同构（§8）：`mode` 选择（file/edit/off）+ formatter 清单（内置条目、墓碑禁用、来源层标注）。零 UI 转向后以结构化配置文件为主，经门面或直接编辑文件完成。
 
-**配置端点**（Gateway API）：
+**配置端点**（Gateway API，供门面调用）：
 - 全局：`GET/PUT /api/config/format`
 - 项目：`GET/PUT /api/workspaces/{id}/config/format`
-
-GPUI 客户端的配置编辑器实现见代码。

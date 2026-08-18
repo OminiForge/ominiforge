@@ -144,9 +144,18 @@ EventBus (tokio broadcast channel)
 
 Monitor 是 EventBus 的一个 subscriber，纯 observe，不修改任何 event。
 
-## 10. 待后续完善
+## 10. 透明性出口（零 UI 转向后提升为一等职责）
 
-- Trace 可视化格式（导出为 Chrome Trace JSON 或其他格式）。
+零 UI 转向后，monitor 不再服务自带监控面板，而是系统的**透明性出口**（见
+[`runtime-architecture.md`](./runtime-architecture.md) §8）：
+
+- **可查询**：session/thread 列表、状态、用量、审批注册表经结构化接口暴露（协议语义层）。
+- **可导出**：trace（按 turn 分组、按 seq 排序的事件瀑布）导出为标准格式（Chrome Trace JSON /
+  OpenTelemetry），供 Perfetto 等现成工具可视化。核心不做展示，只做出口。
+
+待后续完善：
+
+- Trace 导出格式落地（Chrome Trace JSON / OpenTelemetry）。
 - 告警规则配置（连续 N 次失败、latency 超阈值）。
 - 历史数据保留和清理策略。
 - 跨 session 聚合报告（周报、月报）。

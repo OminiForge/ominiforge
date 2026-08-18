@@ -352,7 +352,7 @@ UI 需要的 diff **不再由前端构建**，而是后端在执行时（握着�
 
 WASM Component + WIT 扩展方案已废弃，统一改用 MCP（任意语言进程，JSON-RPC over
 stdio/SSE，完整 OS 能力，无需 ominiforge-sdk）。废弃理由见
-[`architecture.md`](./architecture.md) §2.3。
+[`runtime-architecture.md`](./runtime-architecture.md) §3。
 
 ## 12. 待后续完善
 

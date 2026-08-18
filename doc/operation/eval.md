@@ -315,7 +315,7 @@ SWE-bench 官方 Docker 舰队不需要搬——只采纳其**格式**（钉 com
 
 ## 9. 与 Evolution 的双向闭环
 
-`architecture.md §19` 的进化生命周期：
+[`decisions/architecture-direction.md`](../decisions/architecture-direction.md) 的演进生命周期：
 
 ```
 observed → proposed → approved → applied → evaluated
