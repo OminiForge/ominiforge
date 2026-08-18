@@ -159,16 +159,9 @@ fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .nest("/api", protected)
-        // Serve the built SPA (frontend/build) when the directory exists.
-        // This makes `ominiforge serve` a single binary that can be frozen
-        // and distributed without a separate frontend deployment.
-        .fallback_service(
-            tower_http::services::ServeDir::new("frontend/build")
-                .append_index_html_on_directories(true)
-                .fallback(tower_http::services::ServeFile::new(
-                    "frontend/build/index.html",
-                )),
-        )
+        // Zero-UI pivot: the gateway no longer serves a built frontend SPA.
+        // Presentation is delegated to facades (editors/IM/TUI) over the protocol;
+        // this gateway exposes only the API + event streams + webhook endpoints.
         // Compress responses (gzip/br) when the client accepts it: the folded
         // conversation view is multi-MB JSON, and over a relayed link (SSH
         // forward / reverse proxy) the transfer — not the fold — dominates
@@ -1175,7 +1168,7 @@ async fn fork_preview(
 /// `GET /sessions/{id}/runtime` — the config-layer provider/model the gateway
 /// resolves for this session (the RUNTIME panel's display source). Derived from
 /// the session's profile via config, not from the live event stream, so it
-/// stays stable across subagent/fork model switches (`doc/gpui-app.md`, B1).
+/// stays stable across subagent/fork model switches (`doc/design/monitor.md`, B1).
 async fn session_runtime(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let sid = SessionId(id);
     // Establish the session exists (404 otherwise), then read its configured

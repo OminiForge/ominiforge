@@ -1,7 +1,7 @@
 name: CI (nix)
 
-# nix flake check's sandboxed cargo-check compiles the whole dependency tree offline
-# (including the dozens of crates gpui/zed pulls in) — the single most expensive step in CI.
+# nix flake check's sandboxed cargo-check compiles the whole dependency tree offline —
+# the single most expensive step in CI.
 # It verifies "the project compiles reproducibly in a network-free, pure-Nix env" — only
 # dependency/toolchain/build-definition changes can affect that, not a pure-Rust-source PR.
 #

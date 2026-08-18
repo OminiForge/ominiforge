@@ -26,24 +26,6 @@ deny:
 machete:
     cargo machete
 
-# Enforces the design rule (doc/design/gpui-design.md §2): theme.rs is the only
-# file allowed to hold literal color values. Any rgb()/rgba()/hsla() literal in
-# the rest of the ui crate fails the build — forcing "need a color" to become a
-# semantic token in theme.rs rather than a scattered magic value.
-design-lint:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    # Exclude theme.rs itself exactly (by filename, not path substring — the old
-    # `grep -v 'src/theme.rs'` would also exclude theme.rsx / sub/theme.rs). Any hit
-    # yields non-empty output -> fail.
-    hits=$(grep -rnE '\b(rgb|rgba|hsla)\s*\(' \
-      $(find crates/ominiforge-ui/src -name '*.rs' -not -name 'theme.rs') || true)
-    if [ -n "$hits" ]; then
-      echo "design-lint: color literal outside theme.rs:" >&2
-      echo "$hits" >&2
-      exit 1
-    fi
-
 nix-check:
     nix flake check
 
@@ -51,8 +33,7 @@ nix-check:
 # English. Flags any non-ASCII *letter* (\p{L} outside a-z/A-Z) in code, comments,
 # config, and CI — CJK, Cyrillic, Arabic, accented Latin, etc. Punctuation/symbols
 # (§, →, —, ×) are allowed: they are not prose. Scope covers Rust sources, config, and
-# CI; frontend/ is excluded (it is slated for removal and will go i18n later), and doc/
-# prose may be any language per §14.
+# CI (frontend/ was removed in the zero-UI pivot); doc/ prose may be any language per §14.
 # Exemption: a line ending in `lint-english: allow` is skipped — for intentional non-ASCII
 # *data*, e.g. tests feeding accented or CJK strings to verify Unicode handling. Never use
 # it to excuse prose comments.
@@ -125,7 +106,7 @@ clean-branches:
     fi
 
 # The single full check suite — run this before pushing. Static lints (format, nix-lint,
-# toml-format, design-lint, lint-english) and the sandboxed cargo-check are all covered by
+# toml-format, lint-english) and the sandboxed cargo-check are all covered by
 # `nix flake check`; the compile-type checks (clippy/test) and supply-chain gates
 # (audit/deny/machete) run in the dev shell. Same set CI runs, so a green local `ci` means
 # a green CI.

@@ -91,7 +91,7 @@ pub struct SessionDefaults {
 
 /// The config-layer model identity for a session: the provider and model.
 ///
-/// This is what the gateway resolves for the session (`doc/gpui-app.md`,
+/// This is what the gateway resolves for the session (`doc/design/monitor.md`,
 /// RUNTIME panel) — the *configured* selection, stable for the session's
 /// lifetime — not whatever a given model request happened to use
 /// (subagents/forks may differ; that divergence is a runtime-validation
@@ -112,7 +112,7 @@ pub struct RuntimeInfo {
     /// Environment labels detected from the activated session environment (e.g.
     /// `["dev shell: impure (nix-shell-env)"]` or `["venv: .venv"]`). Empty
     /// when no activation signal is present — the RUNTIME panel only shows the
-    /// row when non-empty ("detected, therefore shown"; `doc/gpui-app.md`, B2).
+    /// row when non-empty ("detected, therefore shown"; `doc/design/monitor.md`, B2).
     pub env: Vec<String>,
     /// Reasoning-effort tiers the session's model declares (raw provider
     /// strings). Drives the per-turn effort picker; empty = the model offers

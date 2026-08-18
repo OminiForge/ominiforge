@@ -50,22 +50,11 @@
         statix
       ];
 
-      # Frontend toolchain. pnpm-in-nix sandboxed builds
-      # are a known hard point; initially we just provide the tools in the
-      # devShell and run the frontend build inside the shell (non-sandboxed).
-      # `chromium` drives the offline UI screenshot tool (frontend/scripts/shot.mjs)
-      # via playwright-core, so no Playwright browser download is needed.
+      # Language servers consumed by ominiforge's own LSP integration
+      # (doc/design/lsp.md), which routes by file extension to a specific binary.
+      # typescript-language-server handles .ts/.js. (The frontend toolchain and its
+      # svelte/chromium tooling were removed in the zero-UI pivot.)
       nodeTools = with pkgs; [
-        nodejs_22
-        pnpm
-        chromium
-        # Language servers consumed by ominiforge's own LSP integration
-        # (doc/design/lsp.md), which routes by file extension to a specific binary.
-        # svelteserver handles .svelte; typescript-language-server handles
-        # .ts/.js. They are independent processes — svelteserver cannot cover
-        # standalone .ts files (it only syntax-parses them, no type-checking),
-        # so both are required for frontend diagnostics.
-        svelte-language-server
         typescript-language-server
       ];
 
@@ -84,11 +73,10 @@
       ];
     in {
       # CI-only shell: installs just the tools the cargo job steps (fmt/clippy/test/audit/
-      # deny/machete) actually use. Deliberately omits frontend/LSP/local-dev tools (chromium,
-      # node, pnpm, svelte/typescript language server, llvm-cov, bacon, cargo-watch, ...) —
-      # those serve local dev or frontend screenshot/LSP diagnostics, CI never runs them, and
-      # including them only slows every `nix develop` realize. Keep in sync with ci.yml's
-      # cargo job when this list changes.
+      # deny/machete) actually use. Deliberately omits LSP/local-dev tools (llvm-cov, bacon,
+      # cargo-watch, typescript-language-server, ...) — those serve local dev or LSP
+      # diagnostics, CI never runs them, and including them only slows every `nix develop`
+      # realize. Keep in sync with ci.yml's cargo job when this list changes.
       devShells.ci = pkgs.mkShell {
         packages = with pkgs; [
           rustToolchain
@@ -108,32 +96,14 @@
           ripgrep
         ];
 
-        # Same as the default shell: gpui compiles both Wayland+X11 backends on Linux, so test
-        # binaries must resolve the X11 client libs at link time (see the default shell's note).
-        RUSTFLAGS = "-L ${pkgs.libxcb}/lib -L ${pkgs.libxkbcommon}/lib";
         PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig";
       };
 
       devShells.default = pkgs.mkShell {
         packages = rustTools ++ nixTools ++ nodeTools ++ miscTools;
 
-        # gpui compiles BOTH its Wayland and X11 backends on Linux (they are
-        # default features), so every UI test/app binary must RESOLVE the X11
-        # client libs at link time (libxcb, libxkbcommon, libxkbcommon-x11)
-        # even though a Wayland session never loads them at runtime. Nix does
-        # not put these on the default linker search path; without this,
-        # `cargo nextest run -p ominiforge-ui` fails at link with
-        # `unable to find library -lxcb -lxkbcommon -lxkbcommon-x11`. This is a
-        # link-path pointer only — it does NOT tie the app to X11; the runtime
-        # backend is chosen by the session (Wayland when WAYLAND_DISPLAY is set).
-        RUSTFLAGS = "-L ${pkgs.libxcb}/lib -L ${pkgs.libxkbcommon}/lib";
-
         RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
         PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig";
-        # Point the screenshot tool (and playwright-core) at the nix Chromium and
-        # stop Playwright trying to download its own browser.
-        CHROMIUM_BIN = "${pkgs.chromium}/bin/chromium";
-        PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
 
         shellHook = ''
           export CARGO_HOME="''${CARGO_HOME:-$HOME/.cargo}"
@@ -246,25 +216,6 @@
           touch $out
         '';
 
-        # Design constraint (hermetic twin of justfile design-lint): literal color values are
-        # allowed only in theme.rs. This rule previously never ran in CI; wiring it into checks
-        # is what actually enforces it.
-        design-lint =
-          pkgs.runCommand "design-lint-check" {
-            nativeBuildInputs = [pkgs.findutils pkgs.gnugrep];
-          } ''
-            cp -r ${./crates/ominiforge-ui/src} src
-            chmod -R u+w src
-            hits=$(grep -rnE '\b(rgb|rgba|hsla)\s*\(' \
-              $(find src -name '*.rs' -not -name 'theme.rs') || true)
-            if [ -n "$hits" ]; then
-              echo "design-lint: color literal outside theme.rs:" >&2
-              echo "$hits" >&2
-              exit 1
-            fi
-            touch $out
-          '';
-
         # Hermetic twin of justfile lint-english (AGENTS.md §14): flag any non-ASCII letter
         # (\p{L} outside a-z/A-Z) in code, comments, config, and CI. Punctuation/symbols are
         # allowed. frontend/ is excluded (slated for removal, going i18n); doc/ prose may be any
@@ -279,7 +230,7 @@
               filter = path: _type: let
                 baseName = builtins.baseNameOf path;
               in
-                !(builtins.elem baseName [".direnv" ".git" "target" "result" "frontend" "doc"]);
+                !(builtins.elem baseName [".direnv" ".git" "target" "result" "doc"]);
             };
           } ''
             cp -r $src src

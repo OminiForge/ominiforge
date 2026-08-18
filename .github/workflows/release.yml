@@ -13,8 +13,8 @@ on:
 # (bump version + generate CHANGELOG); on merge it tags, creates a GitHub Release, and
 # publishes the publishable crates to crates.io in topological order
 # (ominiforge -> ominiforge-net -> ominiforge-cli).
-# No manual version edits needed. The GUI desktop package is wired in once the GPUI client
-# matures (placeholder for now).
+# No manual version edits needed. (The GPUI GUI desktop package was removed in the zero-UI
+# pivot; only the CLI ships binaries.)
 
 permissions:
   contents: write

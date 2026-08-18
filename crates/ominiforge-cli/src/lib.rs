@@ -3,8 +3,8 @@
 //! The command line is the operator's entry point, not a chat front-end:
 //! `ominiforge serve` runs the gateway (the single backend every interactive
 //! front-end talks to). Configuration is managed via Lua config files + the GPUI
-//! settings panel (see `doc/config-lua.md`); session analysis happens in the GPUI
-//! monitor panel (see `doc/gpui-app.md`). API keys are never stored in config: a
+//! settings (see `doc/design/architecture.md` §24); session analysis happens in the GPUI
+//! monitor panel (see `doc/design/monitor.md`). API keys are never stored in config: a
 //! provider names an env var via `api_key_env`, and the key is read from the
 //! environment. See `doc/architecture.md` §3.1, §15.
 

@@ -1,14 +1,7 @@
 # cargo audit 的豁免配置（just audit 跑 cargo audit，读这里；与 deny.toml 的
 # cargo-deny ignore 是两个独立机制）。
 #
-# 以下全部是 gpui 的传递依赖漏洞，只存在于 GUI 链（ominiforge-ui → gpui → …），
-# CLI 不依赖 gpui、运行时不受影响。上游 zed 锁定了旧版本，需待 gpui 升级解除。
+# 零 UI 转向后 gpui 及其依赖闭包已移除，此前的 gpui 传递依赖豁免随之失效。
+# 新增豁免的规则见 doc/operation/supply-chain.md。
 [advisories]
-ignore = [
-  # quick-xml ← xcb ← zed-scap ← gpui
-  "RUSTSEC-2026-0194",
-  # quick-xml ← xcb ← zed-scap ← gpui
-  "RUSTSEC-2026-0195",
-  # quinn-proto ← quinn ← zed 协作/网络栈 ← gpui
-  "RUSTSEC-2026-0185",
-]
+ignore = []
