@@ -1,8 +1,8 @@
-//! Per-workspace sandbox configuration (`doc/gateway.md`).
+//! Per-workspace sandbox configuration (`doc/design/runtime-architecture.md`).
 //!
 //! A workspace-level override layer for sandbox policy, sitting between the
 //! profile and the gateway default in the resolution chain
-//! (`doc/sandbox.md` §6.2):
+//! (`doc/design/runtime-architecture.md` §6.2):
 //!
 //! ```text
 //! workspace.toml  >  profile [network]  >  gateway default_network  >  Open
@@ -12,7 +12,7 @@
 //!
 //! These files live under the **gateway's** `.omini/workspaces/`, keyed by an
 //! opaque [`WorkspaceId`] hash of the workspace path — deliberately *not* in the
-//! project directory. The project directory is agent-writable (`doc/sandbox.md`
+//! project directory. The project directory is agent-writable (`doc/design/runtime-architecture.md`
 //! §3.3: "app treats the workspace as an ordinary directory"), so reading a
 //! security policy from there would let an agent widen its own network/permission
 //! grants — a privilege escalation against the secret-store threat model. The
@@ -43,7 +43,7 @@ use super::workspace::{WorkspaceId, WorkspaceRegistry};
 ///
 /// `[network]`, `[[mounts]]`, and `[permission]` are defined today; the record
 /// stays open for further sections (e.g. workspace memory,
-/// `doc/gateway.md`) without a schema change forcing every file to be
+/// `doc/design/runtime-architecture.md`) without a schema change forcing every file to be
 /// rewritten. Unknown keys are ignored for forward compatibility.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -52,7 +52,7 @@ pub struct WorkspaceConfig {
     /// (section absent) falls through to the profile / gateway default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkSection>,
-    /// Auxiliary sandbox mounts (`doc/sandbox.md` §3.7): each binds a named
+    /// Auxiliary sandbox mounts (`doc/design/runtime-architecture.md` §3.7): each binds a named
     /// anchor's host directory into the guest. Empty (section absent) = only the
     /// workspace mount (§3.3).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -75,7 +75,7 @@ pub struct WorkspaceConfig {
 }
 
 /// One entry in a workspace's `[[mounts]]`: bind a named anchor's host directory
-/// into the guest (`doc/sandbox.md` §3.7). The anchor names a *sharing scope*
+/// into the guest (`doc/design/runtime-architecture.md` §3.7). The anchor names a *sharing scope*
 /// (session-private / workspace-shared / gateway-global) rather than a fixed
 /// purpose — the user composes what to put there.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

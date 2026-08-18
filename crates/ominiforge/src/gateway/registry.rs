@@ -251,7 +251,7 @@ async fn active_roots(inner: &RegistryInner) -> std::collections::HashSet<PathBu
 struct RegistryInner {
     defaults: SessionDefaults,
     idle_timeout: std::time::Duration,
-    /// Where each session's model provider comes from (`doc/architecture.md`):
+    /// Where each session's model provider comes from (`doc/design/runtime-architecture.md`):
     /// `Configured` in production, `Injected` for tests / local synthetic runs.
     provider_source: crate::app::ProviderSource,
     /// Session id → live actor handle. Guarded by an async mutex because spawning
@@ -264,7 +264,7 @@ struct RegistryInner {
     /// Process-wide session activity status, fanned out to the session list. Every
     /// spawned actor gets a clone so it can publish its running/idle transitions.
     status_hub: StatusHub,
-    /// Per-session sandboxes (`doc/sandbox.md` §3.2): owns each session's
+    /// Per-session sandboxes (`doc/design/runtime-architecture.md` §3.2): owns each session's
     /// execution environment, decoupled from the (ephemeral) actor that drives
     /// it. Backend is chosen once here as a deployment property.
     sandbox_manager: crate::sandbox::manager::SandboxManager,
@@ -273,7 +273,7 @@ struct RegistryInner {
     /// the root. Handed to each assembly so the tools reach shared clients.
     lsp_service: Arc<dyn crate::lsp::LspRouter>,
     /// Fallback sandbox network policy for sessions whose profile does not set
-    /// one (`doc/sandbox.md` §6.2). Resolved once from `gateway.toml` at boot so
+    /// one (`doc/design/runtime-architecture.md` §6.2). Resolved once from `gateway.toml` at boot so
     /// a malformed default fails loud here, not per session.
     default_network: crate::sandbox::NetworkPolicy,
     /// Gateway-wide baseline tool-call gate (`doc/permission.md` §3), the bottom
@@ -286,11 +286,11 @@ struct RegistryInner {
     /// rather than captured once. A security control that silently required a
     /// restart to take effect would be a fail-silent trap (Karpathy §12).
     default_permission: RwLock<crate::permission::PermissionPolicy>,
-    /// Per-workspace sandbox config overrides (`doc/gateway.md`), keyed
+    /// Per-workspace sandbox config overrides (`doc/design/runtime-architecture.md`), keyed
     /// by workspace path hash, read from the gateway's trusted `.omini/workspaces/`
     /// — the top tier of the network resolution chain.
     workspace_config: super::workspace_config::WorkspaceConfigStore,
-    /// Resolves `[[mounts]]` anchors (`doc/sandbox.md` §3.7) to host directories
+    /// Resolves `[[mounts]]` anchors (`doc/design/runtime-architecture.md` §3.7) to host directories
     /// under the gateway's trusted `.omini` tree.
     mount_anchors: MountAnchors,
     /// Serializes every profile/gateway config read-modify-write
@@ -302,7 +302,7 @@ struct RegistryInner {
     config_write_lock: Mutex<()>,
 }
 
-/// Resolves a workspace's named mount anchors (`doc/sandbox.md` §3.7) into
+/// Resolves a workspace's named mount anchors (`doc/design/runtime-architecture.md` §3.7) into
 /// concrete [`VolumeMount`]s. An anchor names a *sharing scope* rooted under the
 /// gateway's trusted `.omini` tree — never the agent-writable project dir:
 ///
@@ -325,7 +325,7 @@ impl MountAnchors {
     /// anchors.
     ///
     /// # Errors
-    /// Fails loud (`doc/sandbox.md` §3.7, Karpathy §12) on: an unknown anchor
+    /// Fails loud (`doc/design/runtime-architecture.md` §3.7, Karpathy §12) on: an unknown anchor
     /// name, a `path` that escapes its anchor root (`..` / absolute), a non-absolute
     /// `guest` mount point, or a host-directory creation failure — a misdeclared
     /// mount must break the session, not silently bind the wrong directory.
@@ -399,7 +399,7 @@ impl SessionRegistry {
     ///
     /// # Errors
     /// Fails if the configured sandbox backend is `boxlite` but boxlite cannot
-    /// start on this host (`doc/sandbox.md` §3.2) — an explicit isolation
+    /// start on this host (`doc/design/runtime-architecture.md` §3.2) — an explicit isolation
     /// request must not silently degrade.
     pub fn new(defaults: SessionDefaults, config: &GatewayConfig) -> Result<Self> {
         Self::with_provider_source(defaults, config, app::ProviderSource::Configured)
@@ -433,7 +433,7 @@ impl SessionRegistry {
     ) -> Result<Self> {
         // The workspace map + per-workspace config dir live beside the session
         // store, under `.omini` (the gateway's trusted config root, not the
-        // agent-writable project dir — `doc/gateway.md`).
+        // agent-writable project dir — `doc/design/runtime-architecture.md`).
         let omini_dir = defaults
             .workspace
             .join(app::SESSIONS_SUBDIR)
@@ -603,7 +603,7 @@ impl SessionRegistry {
         let canonical = ws.path_for(&id);
         drop(ws);
         // Prepare the workspace's direnv environment in the background
-        // (`doc/architecture.md`): the first session here then finds a warm snapshot
+        // (`doc/design/runtime-architecture.md`): the first session here then finds a warm snapshot
         // and never pays the (possibly minutes-long) evaluation cost.
         if !self.inner.defaults.no_dotenv
             && let Some(canonical) = canonical
@@ -640,7 +640,7 @@ impl SessionRegistry {
     }
 
     /// List per-workspace configs whose workspace path no longer resolves
-    /// (`doc/gateway.md` GC). Read-only — surfaces orphans for an
+    /// (`doc/design/runtime-architecture.md` GC). Read-only — surfaces orphans for an
     /// explicit [`delete_workspace_config`](Self::delete_workspace_config); never
     /// deletes on its own. Each orphan carries the path it *was* for, when known.
     #[must_use]
@@ -654,7 +654,7 @@ impl SessionRegistry {
         )
     }
 
-    /// Delete one per-workspace config by id (`doc/gateway.md` GC).
+    /// Delete one per-workspace config by id (`doc/design/runtime-architecture.md` GC).
     /// Idempotent: a missing config is `Ok`. This is the only path that removes a
     /// config file — GC is always explicit.
     ///
@@ -666,7 +666,7 @@ impl SessionRegistry {
             .delete(id)
             .with_context(|| format!("failed to delete workspace config `{}`", id.0))?;
         // The workspace's env snapshot shares the config's lifecycle
-        // (`doc/architecture.md` §4). Best-effort: an unresolvable path or a missing
+        // (`doc/design/runtime-architecture.md` §4). Best-effort: an unresolvable path or a missing
         // file is not a deletion failure.
         if let Some(path) = self.resolve_or_seed_workspace_id(id)
             && let Some(root) = self.inner.defaults.config.roots().first()
@@ -1124,8 +1124,8 @@ impl SessionRegistry {
     }
 
     /// Archive `id`: retire it from the active session list while keeping its
-    /// files for later inspection (`doc/architecture.md` §9). This is the
-    /// **release trigger** for the sandbox lifecycle (`doc/sandbox.md` §9 Q5) —
+    /// files for later inspection (`doc/design/runtime-architecture.md` §9). This is the
+    /// **release trigger** for the sandbox lifecycle (`doc/design/runtime-architecture.md` §9 Q5) —
     /// the first path that actually ends a session:
     ///
     /// 1. refuse if a turn is running (surfaced as a 409 to the caller);
@@ -1164,7 +1164,7 @@ impl SessionRegistry {
             .with_context(|| format!("failed to archive session `{}`", id.0))
     }
 
-    /// Permanently delete `id`'s files (`doc/architecture.md` §9).
+    /// Permanently delete `id`'s files (`doc/design/runtime-architecture.md` §9).
     /// **Irreversible.** Requires the session to be **archived first** — that
     /// two-step is the confirmation gate; a non-archived session is refused
     /// (surfaced as a 409). Since archiving already stopped the actor and released
@@ -1288,7 +1288,7 @@ impl SessionRegistry {
     // exactly that race.
     #[allow(clippy::significant_drop_tightening)]
     pub async fn get_or_spawn(&self, id: &SessionId) -> Result<ActorHandle> {
-        // Archived sessions are retired for good (`doc/architecture.md` §9):
+        // Archived sessions are retired for good (`doc/design/runtime-architecture.md` §9):
         // refuse to bring one back to run. Every run/stream path routes through
         // here, so this single gate covers them all; read-only paths (`meta`,
         // `read_events`) bypass it, keeping the session inspectable. Checked
@@ -1337,7 +1337,7 @@ impl SessionRegistry {
         // Register the (freshly assembled) sandbox so `fork` can reach a resumed
         // session by id. With passthrough this fresh host sandbox is equivalent
         // to the original; re-attaching a *stateful* backend's environment from
-        // the persisted descriptor lands when boxlite is wired (`doc/sandbox.md`
+        // the persisted descriptor lands when boxlite is wired (`doc/design/runtime-architecture.md`
         // §3.5, Step 4 boxlite / Step 5).
         self.inner
             .sandbox_manager
@@ -1393,7 +1393,7 @@ impl SessionRegistry {
     ) -> Result<(SessionId, ActorHandle)> {
         // Mint the id up front so the sandbox (assembled before the session row
         // exists) can resolve a `session`-anchored mount to `sessions/<id>/`
-        // (`doc/sandbox.md` §3.7); the same id is then persisted below.
+        // (`doc/design/runtime-architecture.md` §3.7); the same id is then persisted below.
         let id = self.store().mint_id();
         let assemble_started = std::time::Instant::now();
         let assembled = self
@@ -1428,7 +1428,7 @@ impl SessionRegistry {
         debug_assert_eq!(writer.session_id(), &id);
         // Bind the session to its sandbox: persist the descriptor for restart
         // re-attach, and register the live handle so `fork` can reach it by id
-        // (`doc/sandbox.md` §3.2).
+        // (`doc/design/runtime-architecture.md` §3.2).
         self.store()
             .bind_sandbox(&id, assembled.sandbox_descriptor.clone())
             .context("failed to persist sandbox descriptor")?;
@@ -1462,13 +1462,13 @@ impl SessionRegistry {
 
     /// Fork `parent` at `at_seq` into a new self-contained session, spawn its
     /// actor, and return `(new_id, handle)`. The fork's context is the parent's
-    /// conversation rebuilt up to `at_seq` (`doc/architecture.md` §6.1).
+    /// conversation rebuilt up to `at_seq` (`doc/design/runtime-architecture.md` §6.1).
     ///
     /// # Errors
     /// Parent not found/unreadable, or agent assembly / fork-creation failure.
     pub async fn fork(&self, parent: &SessionId, at_seq: u64) -> Result<(SessionId, ActorHandle)> {
         // Fork the parent's sandbox up front so it can be injected into the child
-        // agent (`doc/sandbox.md` §4.2). A snapshot-capable backend yields an
+        // agent (`doc/design/runtime-architecture.md` §4.2). A snapshot-capable backend yields an
         // isolated CoW child; passthrough cannot snapshot, so `fork_from` returns
         // `Unsupported` and the child falls back to a fresh sandbox on the
         // inherited workspace (assemble builds it when `injected` is `None`).
@@ -1525,7 +1525,7 @@ impl SessionRegistry {
 
         // Register and persist the child's sandbox — the injected CoW fork on a
         // snapshot-capable backend, or the freshly assembled fallback sandbox on
-        // passthrough. Uniform either way (`doc/sandbox.md` §3.2, §4.2).
+        // passthrough. Uniform either way (`doc/design/runtime-architecture.md` §3.2, §4.2).
         self.inner
             .sandbox_manager
             .register(&id, Arc::clone(&assembled.sandbox))
@@ -1581,7 +1581,7 @@ impl SessionRegistry {
         let meta = self.meta(parent)?;
         // The reconfigured session runs in the parent's workspace (immutable);
         // only profile/model change. Mint the id up front for `session`-anchored
-        // mount resolution (`doc/sandbox.md` §3.7).
+        // mount resolution (`doc/design/runtime-architecture.md` §3.7).
         let id = self.store().mint_id();
         let assembled = self
             .assemble_with(&id, profile, model, meta.workspace.clone(), None)

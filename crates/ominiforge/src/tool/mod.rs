@@ -376,7 +376,7 @@ impl std::fmt::Debug for ToolInput {
 ///
 /// [`descriptors`](Self::descriptors) returns them sorted by name so the tool
 /// schema block sent to the model is stable, preserving prefix-cache hits
-/// (`doc/architecture.md` §3).
+/// (`doc/design/runtime-architecture.md` §3).
 #[derive(Clone, Default)]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
@@ -448,7 +448,7 @@ impl std::fmt::Debug for ToolRegistry {
 /// Resolve a model-supplied path against the workspace, refusing anything that
 /// escapes it.
 ///
-/// Phase 1 has no OS sandbox (`doc/sandbox.md`), so this lexical check is the
+/// Phase 1 has no OS sandbox (`doc/design/runtime-architecture.md`), so this lexical check is the
 /// guard rail for the file tools: components are normalized without touching
 /// the filesystem (so it works for not-yet-created files), and any `..` that
 /// would climb above the workspace root is rejected.

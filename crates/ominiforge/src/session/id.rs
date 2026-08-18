@@ -8,7 +8,7 @@ use crate::core::SessionId;
 
 /// Mint a fresh session id: a ULID (time-sortable prefix + random suffix,
 /// 26 Crockford-base32 chars), so `ls` lists session directories in creation
-/// order. See `doc/architecture.md` §1.
+/// order. See `doc/design/runtime-architecture.md` §1.
 #[must_use]
 pub fn generate() -> SessionId {
     SessionId(ulid::Ulid::new().to_string())

@@ -5,12 +5,12 @@
 //! provider, registers tools (built-in + MCP + skills), and attaches hooks. The
 //! gateway (one assembly per live session) and the eval runner both call
 //! [`assemble`] so every entry point gets the *same* agent — the core stays
-//! UI-agnostic (`doc/architecture.md` §2.1).
+//! UI-agnostic (`doc/design/runtime-architecture.md` §2.1).
 //!
 //! The only thing kept out is *what to do with the result*: one turn, an
 //! interactive loop, or a network session. Operator diagnostics (a skipped MCP
 //! server, a loaded `.env`) go through `tracing`; business/agent events stay in
-//! the session's `events.jsonl` (doc/architecture.md).
+//! the session's `events.jsonl` (doc/design/runtime-architecture.md).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -73,7 +73,7 @@ pub struct Assembled {
     /// Canonical workspace path (tool sandbox root).
     pub workspace: PathBuf,
     /// The session's sandbox (its shell execution environment). The `shell` tool
-    /// runs in it; the session layer owns its lifecycle (`doc/sandbox.md` §3.2).
+    /// runs in it; the session layer owns its lifecycle (`doc/design/runtime-architecture.md` §3.2).
     pub sandbox: Arc<dyn crate::sandbox::Sandbox>,
     /// The sandbox's persisted descriptor (backend + durable id), stamped on the
     /// session's meta so its environment can be re-attached after a restart.
@@ -89,7 +89,7 @@ pub struct Assembled {
 }
 
 /// Resolve a session's sandbox network policy from the precedence chain
-/// (`doc/sandbox.md` §6.2, `doc/profile.md` §7):
+/// (`doc/design/runtime-architecture.md` §6.2, `doc/profile.md` §7):
 ///
 /// ```text
 /// workspace override  >  profile [network]  >  gateway fallback
@@ -134,7 +134,7 @@ fn resolve_network(
 ///
 /// All three tiers are gateway-trusted or deployer-owned config — none is read
 /// from the agent-writable project dir — so the workspace tier widening `deny`
-/// is safe (`doc/gateway.md`, "Why gateway-side").
+/// is safe (`doc/design/runtime-architecture.md`, "Why gateway-side").
 fn resolve_permission(
     workspace: crate::permission::PermissionPolicy,
     profile: crate::permission::PermissionPolicy,
@@ -190,7 +190,7 @@ pub async fn assemble(
     // overlay is passed to subprocesses (shell/MCP/LSP) so commands run inside
     // the workspace's development environment without requiring `direnv exec`.
     // Assembly never blocks on a slow direnv evaluation: a fast export, else
-    // the last snapshot while a background refresh re-warms (`doc/architecture.md`).
+    // the last snapshot while a background refresh re-warms (`doc/design/runtime-architecture.md`).
     let env_overlay = if no_dotenv {
         BTreeMap::new()
     } else {
@@ -242,7 +242,7 @@ pub async fn assemble(
     let mut tools = ToolRegistry::new();
 
     // The session's sandbox: either injected (a fork's CoW child of its parent's
-    // sandbox — `doc/sandbox.md` §4.2) or freshly built from the selected backend,
+    // sandbox — `doc/design/runtime-architecture.md` §4.2) or freshly built from the selected backend,
     // honouring the workspace (as cwd) and the activated env overlay (§3.2). The
     // same handle is wired into `shell` and returned for the session layer to own
     // (register into the SandboxManager, persist its descriptor).
@@ -250,7 +250,7 @@ pub async fn assemble(
         pair
     } else {
         // Resolve the session's network egress along the precedence chain
-        // (`doc/sandbox.md` §6.2): workspace override > profile [network] >
+        // (`doc/design/runtime-architecture.md` §6.2): workspace override > profile [network] >
         // gateway default. A malformed profile policy name fails loud rather than
         // silently opening or isolating the sandbox (Karpathy §12).
         let network = resolve_network(workspace_network, &profile.network, default_network)
@@ -331,7 +331,7 @@ pub async fn assemble(
 
     // Project guidance: the workspace-root `AGENTS.md` (or `CLAUDE.md` fallback)
     // is always-on context, appended to the system prompt where it stays in the
-    // prefix cache (`doc/architecture.md`). Nested sub-directory files are loaded
+    // prefix cache (`doc/design/runtime-architecture.md`). Nested sub-directory files are loaded
     // lazily by the agent loop as their subtrees are touched.
     let root_guidance = crate::agents_md::read_root(&workspace)
         .map(|g| format!("\n\n{}", crate::agents_md::wrap(&g.label, &g.body)))
@@ -359,7 +359,7 @@ pub async fn assemble(
         },
     );
 
-    // Optional dedicated compaction model (`doc/architecture.md`). It
+    // Optional dedicated compaction model (`doc/design/runtime-architecture.md`). It
     // may name a different provider, so resolve and build it independently; a bad
     // reference is fatal (the user asked for it explicitly). Configured-path only:
     // an injected provider carries no providers.toml to resolve a second model
@@ -424,7 +424,7 @@ pub async fn assemble(
 
 /// Register the built-in filesystem/shell tools the profile allows. The
 /// filesystem tools are rooted at `workspace`; `shell` runs in the session's
-/// `sandbox` (`doc/sandbox.md` §3.2).
+/// `sandbox` (`doc/design/runtime-architecture.md` §3.2).
 fn register_profile_tools(
     registry: &mut ToolRegistry,
     profile: &crate::config::Profile,
@@ -656,7 +656,7 @@ mod tests {
         assert_eq!(names, vec!["read", "write"]);
     }
 
-    /// Network precedence (`doc/sandbox.md` §6.2): workspace override > profile >
+    /// Network precedence (`doc/design/runtime-architecture.md` §6.2): workspace override > profile >
     /// gateway fallback. The test pins the *override direction* at each tier — a
     /// regression that ignored a higher tier would pass a weaker "is it a valid
     /// policy" check but fail this one.

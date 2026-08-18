@@ -3,13 +3,13 @@
 //! Resuming a session means reconstructing exactly what the model last saw: the
 //! conversation view (`Vec<Message>`) and the working todo list. Both are derived
 //! from `events.jsonl` — the source of truth — so a session picked up in a new
-//! process continues as if it never stopped (`doc/architecture.md` §6,
-//! `doc/architecture.md` §6.2).
+//! process continues as if it never stopped (`doc/design/runtime-architecture.md` §6,
+//! `doc/design/runtime-architecture.md` §6.2).
 //!
 //! This module is pure: it takes already-read events and returns state, with no
 //! I/O. The caller (the chat loop) reads the events, seeds the system message
 //! from the profile — the system prompt is *not* in the event log
-//! (`doc/architecture.md` §2) — and hands both here.
+//! (`doc/design/runtime-architecture.md` §2) — and hands both here.
 //!
 //! ## How events map back to messages
 //!
@@ -40,7 +40,7 @@
 //! when the model only wants to ask the user something. [`rebuild_runtime`]
 //! therefore folds those steps to `Blocked` and injects one synthetic reminder
 //! naming them, so the model sees the collapsed state and re-plans, restarts, or
-//! cancels them itself (`doc/architecture.md` §10).
+//! cancels them itself (`doc/design/runtime-architecture.md` §10).
 
 use std::collections::{HashMap, HashSet};
 
@@ -63,7 +63,7 @@ use super::{SessionRuntime, StepStatus, TodoItem, render_output};
 pub fn rebuild_runtime(events: &[CoreEvent], system: Vec<Message>) -> SessionRuntime {
     // Seed the ledger from the rebuilt context via `new`; resume carries no
     // authoritative token count forward, so the first request after resume
-    // recalibrates it from real usage (`doc/architecture.md`).
+    // recalibrates it from real usage (`doc/design/runtime-architecture.md`).
     let mut runtime = SessionRuntime::new(rebuild_context(events, system));
     runtime.todo = rebuild_todo(events, log_ends_abnormal(events));
     if let Some(reminder) = interrupted_todo_reminder(&runtime.todo) {
@@ -416,7 +416,7 @@ fn rebuild_todo(events: &[CoreEvent], ends_abnormal: bool) -> Vec<TodoItem> {
 /// Rebuild the set of nested project-guidance files already injected, so a
 /// resumed session does not re-inject one whose subtree it touches again. The
 /// label is recovered from each `ProjectGuidance` injection's wrapper
-/// (`doc/architecture.md`); the injected text itself is replayed into the context
+/// (`doc/design/runtime-architecture.md`); the injected text itself is replayed into the context
 /// view by [`ContextRebuilder`] like any other injection.
 fn rebuild_loaded_guidance(events: &[CoreEvent]) -> HashSet<String> {
     events
@@ -886,7 +886,7 @@ mod tests {
     /// open — the model may simply want to ask the user something. Resume folds
     /// them to `blocked` with a reason, and injects one reminder naming them so
     /// the model (which is never re-shown the list otherwise) re-plans,
-    /// restarts, or cancels them (`doc/architecture.md` §10).
+    /// restarts, or cancels them (`doc/design/runtime-architecture.md` §10).
     #[test]
     fn interrupted_turn_folds_non_terminal_steps_to_blocked() {
         let events = vec![

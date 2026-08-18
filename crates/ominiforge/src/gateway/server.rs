@@ -2,9 +2,9 @@
 //!
 //! Control plane is REST; the live event stream is SSE (`GET …/events`). All
 //! routes except `/healthz` require a bearer token when one is configured
-//! (`doc/gateway.md`). TLS is *not* handled here — the gateway binds loopback
+//! (`doc/design/runtime-architecture.md`). TLS is *not* handled here — the gateway binds loopback
 //! and a reverse proxy terminates TLS for public exposure
-//! (`doc/architecture.md` §18.1).
+//! (`doc/design/runtime-architecture.md` §18.1).
 //!
 //! ### Reconnect / resume
 //!
@@ -81,7 +81,7 @@ pub async fn serve(registry: SessionRegistry, config: &GatewayConfig) -> Result<
 ///
 /// The session API is nested under `/api/*` so it never collides with the
 /// SPA's own client-side routes (which share names like `/sessions`) when the
-/// gateway serves the static frontend from the same origin (`doc/gateway.md`).
+/// gateway serves the static frontend from the same origin (`doc/design/runtime-architecture.md`).
 fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/workspaces", get(list_workspaces).post(create_workspace))
@@ -238,7 +238,7 @@ async fn list_workspace_sessions(
 }
 
 /// `GET /workspaces/{id}/sessions/archived` — the workspace's **archived**
-/// sessions, newest first (`doc/architecture.md` §9). The archived section's
+/// sessions, newest first (`doc/design/runtime-architecture.md` §9). The archived section's
 /// read source: workspace-scoped like [`list_workspace_sessions`] (a panel only
 /// ever shows its own workspace's sessions, active or retired), and from here
 /// the only remaining action is a permanent `DELETE /sessions/{id}`. Returns
@@ -315,7 +315,7 @@ async fn create_workspace(
 }
 
 /// `GET /workspaces/config/orphans` — per-workspace configs whose workspace path
-/// no longer resolves (`doc/gateway.md` GC). Read-only: lists orphans a
+/// no longer resolves (`doc/design/runtime-architecture.md` GC). Read-only: lists orphans a
 /// human or ops tool can then explicitly delete; never removes anything. Each
 /// entry is `{ workspace_id, path }` (`path` null when it can't be recovered).
 async fn list_workspace_config_orphans(State(state): State<AppState>) -> Response {
@@ -329,7 +329,7 @@ async fn list_workspace_config_orphans(State(state): State<AppState>) -> Respons
 }
 
 /// `DELETE /workspaces/config/{id}` — remove one per-workspace config
-/// (`doc/gateway.md` GC). The only path that deletes a config file — GC
+/// (`doc/design/runtime-architecture.md` GC). The only path that deletes a config file — GC
 /// is always explicit. Idempotent: a missing config is still 204.
 async fn delete_workspace_config(
     State(state): State<AppState>,
@@ -342,7 +342,7 @@ async fn delete_workspace_config(
 }
 
 /// `GET /workspaces/{id}/config` — the per-workspace config (network + mounts +
-/// permission) for editing (`doc/gateway.md`, `doc/permission.md` §3.1,
+/// permission) for editing (`doc/design/runtime-architecture.md`, `doc/permission.md` §3.1,
 /// the top tier). Returns the default (all-absent) config when none is stored,
 /// so the editor always has a shape to bind. A malformed on-disk file is a 500
 /// (fail-loud), an unknown workspace id a 404.
@@ -360,7 +360,7 @@ async fn get_workspace_config(State(state): State<AppState>, Path(id): Path<Stri
 /// `PUT /workspaces/{id}/config` — overwrite the per-workspace config (full
 /// desired state). The file lives under the gateway's trusted
 /// `.omini/workspaces/`, never the agent-writable project dir, so a workspace
-/// widening its own `deny` floor is safe (`doc/gateway.md`).
+/// widening its own `deny` floor is safe (`doc/design/runtime-architecture.md`).
 async fn put_workspace_config(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1004,8 +1004,8 @@ async fn cancel_turn(State(state): State<AppState>, Path(id): Path<String>) -> R
 
 /// `POST /sessions/{id}/archive` — retire a session for good: drop it from the
 /// active list while keeping its files for read-only inspection
-/// (`doc/architecture.md` §9). Stops the actor and releases its sandbox
-/// (`doc/sandbox.md` §9 Q5). One-way — an archived session cannot be run again
+/// (`doc/design/runtime-architecture.md` §9). Stops the actor and releases its sandbox
+/// (`doc/design/runtime-architecture.md` §9 Q5). One-way — an archived session cannot be run again
 /// (its run paths return 410). A running turn is a 409 (cancel first); an unknown
 /// session is a 404.
 async fn archive_session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
@@ -1018,7 +1018,7 @@ async fn archive_session(State(state): State<AppState>, Path(id): Path<String>) 
 
 /// `DELETE /sessions/{id}` — permanently remove a session's files.
 /// **Irreversible.** Requires the session to be **archived first**
-/// (`doc/architecture.md` §9): a non-archived session is a 409 ("archive it
+/// (`doc/design/runtime-architecture.md` §9): a non-archived session is a 409 ("archive it
 /// first"), which is the deliberate two-step confirmation. An unknown session is
 /// a 404.
 async fn delete_session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
@@ -1113,7 +1113,7 @@ async fn session_view(State(state): State<AppState>, Path(id): Path<String>) -> 
 
 /// `GET /sessions/{id}/snapshot` — the inherited context a non-`new` session was
 /// seeded with: the `context_snapshot.json` (`Vec<Message>`) materialized at
-/// fork / compaction / reconfiguration (`doc/architecture.md` §6.1, §7). The
+/// fork / compaction / reconfiguration (`doc/design/runtime-architecture.md` §6.1, §7). The
 /// frontend renders it as dimmed history above the live conversation so a
 /// branched session shows what came before. A `new` session has no snapshot, so
 /// this is a 404 the client treats as "no inherited context" — not an error.
@@ -1213,7 +1213,7 @@ async fn sse_events(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok());
 
-    // An archived session has no actor to spawn (`doc/architecture.md` §9) —
+    // An archived session has no actor to spawn (`doc/design/runtime-architecture.md` §9) —
     // `get_or_spawn` would 410 it. Serve its committed history replay-only
     // instead, holding the connection open with keep-alives: the read-only view
     // renders the full history without a reconnect spin, and nothing live can
@@ -1342,14 +1342,14 @@ fn sse_from_gateway(gw: &GatewayEvent) -> SseEvent {
 
 /// Map a registry error to 410 (archived), 404 (not found) or 409 (locked)
 /// heuristically. An archived session is `Gone` — it existed but is retired for
-/// good (`doc/architecture.md` §9). The registry surfaces a "locked or
+/// good (`doc/design/runtime-architecture.md` §9). The registry surfaces a "locked or
 /// missing" context for `open` failures; a clean `NotFound` from metadata reads
 /// is a 404.
 /// Map a registry error to a status heuristically, from the messages in its
 /// whole source chain (the registry wraps the typed store error in an `anyhow`
 /// context, so the distinguishing phrase is often a *cause*, not the outermost
 /// message):
-/// - "not archived" → 409 (must `archive` before `DELETE`, `doc/architecture.md` §9);
+/// - "not archived" → 409 (must `archive` before `DELETE`, `doc/design/runtime-architecture.md` §9);
 /// - "archived" (retired) → 410 Gone — it existed but is retired for good;
 /// - "locked" → 409 (a turn is running / another writer holds it);
 /// - otherwise a clean `NotFound` → 404.
@@ -2224,8 +2224,8 @@ default = "openai-main/gpt-4o"
     /// Archive over HTTP: a session drops out of the active list on archive
     /// (204), stays readable by id (the analysis path), and — being retired for
     /// good — refuses to run again (410 on `POST .../message`). This is the
-    /// session-lifecycle close (`doc/architecture.md` §9) and the sandbox
-    /// `release` trigger (`doc/sandbox.md` §9 Q5).
+    /// session-lifecycle close (`doc/design/runtime-architecture.md` §9) and the sandbox
+    /// `release` trigger (`doc/design/runtime-architecture.md` §9 Q5).
     #[tokio::test]
     async fn archive_retires_session_one_way() {
         let (registry, _dir) = test_registry();
@@ -2337,7 +2337,7 @@ default = "openai-main/gpt-4o"
 
     /// Archiving a session whose turn is running is a 409, not a silent retire:
     /// tearing an actor down mid-turn would drop uncommitted work, so the guard
-    /// forces a `cancel` first (`doc/architecture.md` §9). We simulate the
+    /// forces a `cancel` first (`doc/design/runtime-architecture.md` §9). We simulate the
     /// running state by publishing `Running` to the shared status hub — the same
     /// signal a live turn raises — rather than driving a real model turn.
     #[tokio::test]
@@ -2387,7 +2387,7 @@ default = "openai-main/gpt-4o"
     /// Hard-delete over HTTP is gated on archive-first: a live session's `DELETE`
     /// is a 409 ("archive it first"), and only after archiving does `DELETE`
     /// remove it (204), after which it is gone entirely (a second `DELETE` is a
-    /// 404). This is the irreversible-op confirmation (`doc/architecture.md`
+    /// 404). This is the irreversible-op confirmation (`doc/design/runtime-architecture.md`
     /// §9) — a one-step delete of a live session must be impossible.
     #[tokio::test]
     async fn delete_requires_archive_first_then_removes() {
@@ -2470,7 +2470,7 @@ default = "openai-main/gpt-4o"
         assert!(body["session_id"].is_string());
     }
 
-    /// Workspace-config GC (`doc/gateway.md`): a config whose workspace
+    /// Workspace-config GC (`doc/design/runtime-architecture.md`): a config whose workspace
     /// path is gone lists as an orphan and can be explicitly deleted; the delete
     /// is idempotent. Pins the "never auto-delete, only explicit" contract.
     #[tokio::test]
@@ -2582,7 +2582,7 @@ default = "openai-main/gpt-4o"
 
     /// A `?workspace=` override pointing at a real directory with no `.omini`
     /// still SUCCEEDS (201): config is independent of the workspace
-    /// (`doc/architecture.md` §15) — it comes from the gateway's config store
+    /// (`doc/design/runtime-architecture.md` §15) — it comes from the gateway's config store
     /// (launch cwd / --config-dir / home), not the session's workspace. This is
     /// the regression guard for the bug where config discovery followed the
     /// workspace and a config-less workspace wrongly failed.

@@ -18,7 +18,7 @@ use super::config::FormatterConfig;
 /// placeholder is substituted with the touched file's name at spawn time.
 ///
 /// Only binaries resolved through `PATH` / the session's direnv env-overlay
-/// (`doc/architecture.md`). A missing binary fails the spawn and the formatter is
+/// (`doc/design/runtime-architecture.md`). A missing binary fails the spawn and the formatter is
 /// skipped (fail-closed) — it never blocks a file op.
 pub fn builtin_formatters() -> Vec<FormatterConfig> {
     let entry = |name: &str,

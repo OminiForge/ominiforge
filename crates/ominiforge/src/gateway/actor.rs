@@ -151,7 +151,7 @@ pub enum Command {
     /// stands; the runtime is rebuilt from the log.
     Cancel,
     /// Summarize and switch to a compaction session. `keep_last` keeps the last
-    /// N user turns verbatim (`doc/architecture.md` §4).
+    /// N user turns verbatim (`doc/design/runtime-architecture.md` §4).
     Compact { keep_last: Option<usize> },
     /// Deliver a human decision for a tool call the permission policy suspended
     /// (`doc/permission.md` §5). Routed to the parked waiter by `call_id`; an
@@ -252,7 +252,7 @@ pub struct SessionActor {
     /// Live MCP subprocess clients for this session. Held (never read) for the
     /// actor's lifetime: dropping a client kills its subprocess, and the agent's
     /// MCP tools dispatch through them. Per-session isolation means each actor
-    /// owns its own set (user's choice; `doc/gateway.md`).
+    /// owns its own set (user's choice; `doc/design/runtime-architecture.md`).
     _mcp_clients: Vec<Arc<crate::mcp::McpClient>>,
     /// Reasoning-effort tiers the session's model declares (from its resolved
     /// config). Guards per-turn effort overrides: only a listed tier is applied.

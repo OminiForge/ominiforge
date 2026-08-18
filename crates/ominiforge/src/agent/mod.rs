@@ -6,9 +6,9 @@
 //! dispatched (persisted as `ToolEvent`s) and its result fed back as a `Tool`
 //! message before the next round. The loop ends when the model stops without
 //! requesting tools **and** the working todo list (if any) has no non-terminal
-//! steps left — the completion gate (`doc/architecture.md` §6).
+//! steps left — the completion gate (`doc/design/runtime-architecture.md` §6).
 //!
-//! State has three homes by lifetime (`doc/architecture.md` §3):
+//! State has three homes by lifetime (`doc/design/runtime-architecture.md` §3):
 //! - turn-invariant deps (provider, tools, config) live on [`Agent`];
 //! - session-scoped state (the conversation view and the working todo list) lives in
 //!   [`SessionRuntime`], owned by the caller so it survives across turns;
@@ -61,11 +61,11 @@ use futures_util::{FutureExt, StreamExt};
 use todo::{TodoError, apply_todo_op};
 
 /// How many completion-gate nudges a turn tolerates before giving up: the model
-/// stopped without finishing the todo list this many times running (`doc/architecture.md` §6).
+/// stopped without finishing the todo list this many times running (`doc/design/runtime-architecture.md` §6).
 const MAX_GATE: u8 = 2;
 
 /// How many consecutive rounds a step may stay `in_progress` before the loop
-/// injects a one-shot stuck warning (`doc/architecture.md` §8.5).
+/// injects a one-shot stuck warning (`doc/design/runtime-architecture.md` §8.5).
 const STUCK_THRESHOLD: u32 = 5;
 
 /// Knobs for a turn that do not change between rounds.
@@ -88,7 +88,7 @@ pub struct AgentConfig {
     pub tool_timeout: Duration,
     /// Absolute safety net on model rounds in one turn. This is *not* the
     /// primary loop control — the round-budget reminder below, the completion
-    /// gate, and stuck detection (`doc/architecture.md` §6–§7) catch a misbehaving
+    /// gate, and stuck detection (`doc/design/runtime-architecture.md` §6–§7) catch a misbehaving
     /// turn far earlier and more cheaply. `max_rounds` only backstops a
     /// runaway that slips past all three; it is set generously so a legitimate
     /// long task (many files, many verifications) never hits it.
@@ -96,7 +96,7 @@ pub struct AgentConfig {
     /// Soft per-step round budget. Once the model has spent this many rounds
     /// since the last todo op (or turn start), every round injects a
     /// round-budget reminder until the todo list moves or the turn ends.
-    /// `0` disables the reminder entirely. See `doc/architecture.md` §8.6.
+    /// `0` disables the reminder entirely. See `doc/design/runtime-architecture.md` §8.6.
     pub round_budget_threshold: u32,
     /// Fraction of `round_budget_threshold` at which a one-shot soft warning
     /// fires (e.g. 0.8 = warn once when 80% of the budget is spent).
@@ -105,11 +105,11 @@ pub struct AgentConfig {
     /// limit. `0` means "unknown" (threshold tracking is skipped).
     pub context_window: u32,
     /// Fraction of the context window to stay under before compaction is due
-    /// (`doc/architecture.md` §7.4). Step 2 only warns at this threshold;
+    /// (`doc/design/runtime-architecture.md` §7.4). Step 2 only warns at this threshold;
     /// compaction itself lands in Step 3.
     pub compaction_threshold: f32,
     /// Canonical workspace root, used to discover project guidance files
-    /// (`AGENTS.md`/`CLAUDE.md`) for the paths tools touch (`doc/architecture.md`).
+    /// (`AGENTS.md`/`CLAUDE.md`) for the paths tools touch (`doc/design/runtime-architecture.md`).
     /// Empty disables nested-guidance discovery.
     pub workspace: PathBuf,
 }
@@ -138,7 +138,7 @@ impl Default for AgentConfig {
 /// Owned by the interactive loop / CLI and borrowed by each [`TurnState`].
 /// Rebuilt from `events.jsonl` when resuming a session (replay the todo ops and
 /// the conversation view, folding steps orphaned by an abnormally ended turn to
-/// `Blocked`; see `doc/architecture.md` §10). In the Phase 1
+/// `Blocked`; see `doc/design/runtime-architecture.md` §10). In the Phase 1
 /// single-turn CLI it is built fresh per `run` and discarded, the degenerate
 /// case of the same interface.
 #[derive(Debug, Clone, Default)]
@@ -146,15 +146,15 @@ pub struct SessionRuntime {
     /// Conversation view sent to the model; appended each turn.
     pub context: Vec<Message>,
     /// Working todo list; survives across turns until every item reaches a terminal
-    /// state or the model replaces it via `init` (`doc/architecture.md` §10).
+    /// state or the model replaces it via `init` (`doc/design/runtime-architecture.md` §10).
     pub todo: Vec<TodoItem>,
     /// Running input-token estimate for the context view, calibrated each round
-    /// from the provider's authoritative usage (`doc/architecture.md`).
+    /// from the provider's authoritative usage (`doc/design/runtime-architecture.md`).
     pub ledger: ContextLedger,
     /// Workspace-relative paths of nested project-guidance files
     /// (`AGENTS.md`/`CLAUDE.md`) already injected this session, so each is loaded
     /// at most once however many times its subtree is touched
-    /// (`doc/architecture.md`). The root file lives in the system prompt and is
+    /// (`doc/design/runtime-architecture.md`). The root file lives in the system prompt and is
     /// never tracked here. Rebuilt on resume from the injection log.
     pub loaded_guidance: HashSet<String>,
 }
@@ -199,7 +199,7 @@ pub struct TurnOutcome {
     /// `reason` on the persisted `TurnEvent::Failed`.
     pub incomplete: Option<TurnFailureReason>,
     /// Running input-token estimate for the context view at turn end, calibrated
-    /// from the provider's usage where available (`doc/architecture.md`).
+    /// from the provider's usage where available (`doc/design/runtime-architecture.md`).
     pub context_tokens: u32,
     /// The token budget the context should stay under (`threshold × window −
     /// max_output`), or `None` when the context window is unknown. `context_tokens`
@@ -213,7 +213,7 @@ pub struct Agent {
     tools: ToolRegistry,
     config: AgentConfig,
     /// Optional dedicated provider + model id for compaction summaries
-    /// (`doc/architecture.md`). `None` reuses the main provider/model.
+    /// (`doc/design/runtime-architecture.md`). `None` reuses the main provider/model.
     compaction: Option<(Arc<dyn Provider>, String)>,
     /// Hooks fired at fixed pipeline points (`doc/hook-protocol.md`). Empty by
     /// default — a no-op until the caller attaches a registry.
@@ -246,7 +246,7 @@ impl Agent {
     }
 
     /// Use a dedicated provider + model for compaction summaries instead of the
-    /// session's current model (`doc/architecture.md`).
+    /// session's current model (`doc/design/runtime-architecture.md`).
     #[must_use]
     pub fn with_compaction_model(mut self, provider: Arc<dyn Provider>, model: String) -> Self {
         self.compaction = Some((provider, model));
@@ -420,7 +420,7 @@ impl Agent {
     fn tool_schemas(&self) -> Vec<ToolSchema> {
         // Leaf-tool descriptors plus the `todo` control-tool descriptor, all
         // sorted by name so the schema block stays byte-stable for the prefix
-        // cache (`doc/architecture.md` §3, `doc/architecture.md` §5).
+        // cache (`doc/design/runtime-architecture.md` §3, `doc/design/runtime-architecture.md` §5).
         let mut schemas: Vec<ToolSchema> = self
             .tools
             .descriptors()
@@ -518,7 +518,7 @@ impl AgentConfig {
 /// counters and output accumulation, borrows the session-scoped [`SessionRuntime`]
 /// (context + todo list) plus the shared resources the turn drives. Turn-invariant
 /// deps stay on [`Agent`]; round-ephemeral values stay local to the round
-/// (`doc/architecture.md` §3).
+/// (`doc/design/runtime-architecture.md` §3).
 struct TurnState<'a> {
     // turn-invariant deps (provider, tools, config)
     agent: &'a Agent,
@@ -545,7 +545,7 @@ struct TurnState<'a> {
     /// Per-turn reasoning-effort override; `None` uses the config's effort.
     think_effort: Option<String>,
 
-    // Round-budget reminder state (doc/architecture.md §8.6). Reset every time the
+    // Round-budget reminder state (doc/design/runtime-architecture.md §8.6). Reset every time the
     // todo list moves (any successful todo op) and at turn start.
     /// Rounds spent since the last todo op (or turn start).
     round_budget_spent: u32,
@@ -856,7 +856,7 @@ impl TurnState<'_> {
             // succeeded with a non-error result. Todo ops and failed/errored
             // tools do not count, so a step that is genuinely working clears its
             // stuck counter while one that only spins keeps climbing toward the
-            // threshold (`doc/architecture.md` §8.5).
+            // threshold (`doc/design/runtime-architecture.md` §8.5).
             let mut progressed = false;
             let mut touched: Vec<String> = Vec::new();
             if self.agent.approval.supports_concurrent_requests() {
@@ -1028,10 +1028,10 @@ impl TurnState<'_> {
             // Load any nested project-guidance file the touched paths sit under,
             // once per session, *after* the round's tool results are in place so
             // the assistant→tool message pairing the provider expects is intact
-            // (`doc/architecture.md`).
+            // (`doc/design/runtime-architecture.md`).
             self.load_project_guidance(&touched)?;
             self.check_stuck(progressed)?;
-            // Round-budget reminder (`doc/architecture.md` §8.6): fired every round,
+            // Round-budget reminder (`doc/design/runtime-architecture.md` §8.6): fired every round,
             // after tool dispatch, so the injection never lands between an
             // assistant `tool_calls` message and its `tool` results — the
             // provider rejects that interleaving with a 400. When the model
@@ -1042,7 +1042,7 @@ impl TurnState<'_> {
 
         // The tool loop ran out of round budget. This is the absolute safety
         // net, not a crash: record why, then hand back the partial outcome so
-        // the caller keeps whatever work already landed (`doc/architecture.md` §8.5).
+        // the caller keeps whatever work already landed (`doc/design/runtime-architecture.md` §8.5).
         self.fail(
             TurnFailureReason::MaxRoundsExceeded {
                 max_rounds: self.agent.config.max_rounds,
@@ -1158,7 +1158,7 @@ impl TurnState<'_> {
     /// Decide whether the turn may exit now that the model stopped requesting
     /// tools. With no todo list, or all items terminal, the turn is done. Otherwise
     /// nudge the model (up to [`MAX_GATE`] times) to finish or mark the
-    /// remaining steps (`doc/architecture.md` §6).
+    /// remaining steps (`doc/design/runtime-architecture.md` §6).
     fn completion_gate(&mut self) -> Result<Gate, AgentError> {
         let incomplete = todo::render_incomplete(&self.runtime.todo);
         if incomplete.is_empty() {
@@ -1183,7 +1183,7 @@ impl TurnState<'_> {
     /// unproductive rounds gets a one-shot warning. Because progress resets the
     /// count, a step that stalls, recovers, then stalls again is warned each
     /// time it crosses the threshold afresh. Steps that left `in_progress` drop
-    /// out of the map entirely (`doc/architecture.md` §8.5).
+    /// out of the map entirely (`doc/design/runtime-architecture.md` §8.5).
     fn check_stuck(&mut self, progressed: bool) -> Result<(), AgentError> {
         let in_progress: Vec<(String, String)> = self
             .runtime
@@ -1223,14 +1223,14 @@ impl TurnState<'_> {
     }
 
     /// Push a runtime reminder into the context (kept permanently, for prefix
-    /// cache) and mirror it as an `InjectionEvent` (`doc/architecture.md` §8).
+    /// cache) and mirror it as an `InjectionEvent` (`doc/design/runtime-architecture.md` §8).
     fn inject_runtime(&mut self, content: String) -> Result<(), AgentError> {
         self.inject_with_source(InjectionSource::Runtime, content)
     }
 
     /// Same as [`inject_runtime`](Self::inject_runtime) but with an explicit
     /// injection source, so round-budget reminders surface distinctly in the
-    /// event log and the UI (`doc/architecture.md` §8.6).
+    /// event log and the UI (`doc/design/runtime-architecture.md` §8.6).
     fn inject_with_source(
         &mut self,
         source: InjectionSource,
@@ -1253,13 +1253,13 @@ impl TurnState<'_> {
 
     /// Reset the round-budget window. Called when a todo op lands — the model
     /// has declared fresh work (or restructured the list), so it gets a fresh
-    /// budget to execute it (`doc/architecture.md` §8.6).
+    /// budget to execute it (`doc/design/runtime-architecture.md` §8.6).
     const fn reset_round_budget(&mut self) {
         self.round_budget_spent = 0;
         self.round_budget_warned = false;
     }
 
-    /// Round-budget reminder (`doc/architecture.md` §8.6). Called after every model
+    /// Round-budget reminder (`doc/design/runtime-architecture.md` §8.6). Called after every model
     /// round; decides whether to inject a soft warning (once, at
     /// `round_budget_warn_pct`) or an exhausted reminder (every round past
     /// `round_budget_threshold`). The reminder text branches on whether an
@@ -1332,7 +1332,7 @@ impl TurnState<'_> {
     /// nested project-guidance file and inject it once per session. The dedup
     /// set is checked and updated synchronously, so several tool calls in one
     /// round that share a guidance directory load it a single time
-    /// (`doc/architecture.md`).
+    /// (`doc/design/runtime-architecture.md`).
     fn load_project_guidance(&mut self, touched: &[String]) -> Result<(), AgentError> {
         let workspace = &self.agent.config.workspace;
         if workspace.as_os_str().is_empty() {
@@ -1500,7 +1500,7 @@ impl TurnState<'_> {
 
         // Best pre-request estimate of the prefix we're about to send: the
         // ledger's running count, authoritative for everything measured so far
-        // plus a heuristic tail (`doc/architecture.md`).
+        // plus a heuristic tail (`doc/design/runtime-architecture.md`).
         let input_tokens_estimate = self.runtime.ledger.running();
 
         let max_retries = self.agent.config.retry.max_retries;
@@ -1595,11 +1595,11 @@ impl TurnState<'_> {
     /// Route one tool call: the `todo` control tool is intercepted and applied
     /// to the runtime todo list; every other name is a leaf tool dispatched to the
     /// registry. Both shapes emit the same `ToolEvent` bracket so replay and
-    /// monitoring need no special case (`doc/architecture.md` §5).
+    /// monitoring need no special case (`doc/design/runtime-architecture.md` §5).
     ///
     /// The returned `bool` is whether this call counts as *progress* for stuck
     /// detection: `true` only for a leaf tool that returned a non-error result.
-    /// Todo ops and failed/errored tools are `false` (`doc/architecture.md` §8.5).
+    /// Todo ops and failed/errored tools are `false` (`doc/design/runtime-architecture.md` §8.5).
     async fn dispatch(
         &mut self,
         call: &ToolCall,
@@ -1665,7 +1665,7 @@ impl TurnState<'_> {
 
         // A successful todo op resets the round-budget window: the model has
         // declared a fresh step (or restructured the list), so it gets a fresh
-        // budget to execute it (`doc/architecture.md` §8.6).
+        // budget to execute it (`doc/design/runtime-architecture.md` §8.6).
         if result.is_ok() {
             self.reset_round_budget();
         }
@@ -2276,7 +2276,7 @@ fn runtime_source() -> EventSource {
 
 /// Split the context view into three parts for compaction: leading system
 /// message(s), the middle to summarize, and a tail of `keep_last` user turns to
-/// preserve verbatim (`doc/architecture.md` §7.6).
+/// preserve verbatim (`doc/design/runtime-architecture.md` §7.6).
 ///
 /// "System" is the leading run of `System` messages (the stable prefix). The
 /// tail begins at the `keep_last`-th-from-last `User` message in the remainder,
@@ -2335,7 +2335,7 @@ fn assistant_tool_calls(message: &Message) -> Vec<ToolCall> {
 /// Workspace paths a built-in filesystem tool call targets, for nested
 /// project-guidance discovery. `read`/`write` target one `path`; `edit` targets
 /// the `path` of every entry in its `edits` array. Other tools have no single
-/// path and return none (`doc/architecture.md`).
+/// path and return none (`doc/design/runtime-architecture.md`).
 fn touched_paths(call: &ToolCall) -> Vec<String> {
     if !matches!(call.name.as_str(), "read" | "write" | "edit") {
         return Vec::new();
@@ -2999,7 +2999,7 @@ mod tests {
         assert_eq!(turn_completed_count(&events), 0);
     }
 
-    /// Round-budget reminders (`doc/architecture.md` §8.6): the loop warns once when
+    /// Round-budget reminders (`doc/design/runtime-architecture.md` §8.6): the loop warns once when
     /// the soft threshold's warn fraction is crossed, and reminds every round
     /// once the budget is exhausted. Resetting via a successful todo op gives
     /// a fresh window.
@@ -3409,7 +3409,7 @@ mod tests {
     /// A nested `AGENTS.md` is injected once per session: several tool calls in
     /// one round that touch its subtree load it a single time, a later round
     /// touching the same subtree does not reload it, and a different subtree
-    /// loads its own. This is the dedup guarantee (`doc/architecture.md`).
+    /// loads its own. This is the dedup guarantee (`doc/design/runtime-architecture.md`).
     #[tokio::test]
     async fn nested_project_guidance_injected_once_per_dir() {
         let dir = tempfile::tempdir().unwrap();

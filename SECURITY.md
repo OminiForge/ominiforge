@@ -49,7 +49,7 @@ permission and sandbox boundaries) are not vulnerabilities.
 The security issues we care about are **boundary violations**, for example:
 
 - Permission-model bypass (see `doc/design/permission.md`)
-- Sandbox escape (see `doc/design/sandbox.md`)
+- Sandbox escape (see `doc/design/runtime-architecture.md`)
 - Secret / credential leakage (see `crates/ominiforge-core/src/secrets.rs`)
 - Unauthorized access to a remote Gateway
 

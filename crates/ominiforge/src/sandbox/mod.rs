@@ -1,14 +1,14 @@
 //! The sandbox abstraction: an isolated execution environment (workspace
 //! filesystem + shell + network policy) behind a pluggable backend.
 //!
-//! This is Step 1 of `doc/sandbox.md` §7: the trait surface plus a
+//! This is Step 1 of `doc/design/runtime-architecture.md` §7: the trait surface plus a
 //! zero-isolation [`PassthroughSandbox`](passthrough::PassthroughSandbox) that
 //! runs commands directly against the host (today's `ShellTool` behaviour),
 //! validating the contract without committing to a real backend. Wiring the
 //! shell tool onto `exec` (Step 3) and session-fork onto snapshot/restore
 //! (Step 4) are later, independently-verifiable steps.
 //!
-//! ## Divergence from `doc/sandbox.md` §2
+//! ## Divergence from `doc/design/runtime-architecture.md` §2
 //!
 //! The doc sketches a single `trait Sandbox` whose `create`/`restore` return
 //! `Self` and whose `release` takes `self` by value. That shape is *not*
@@ -36,7 +36,7 @@ use std::time::Duration;
 /// Every method takes `&self` so the instance can be held as `Arc<dyn Sandbox>`
 /// and shared across the session that owns it. Snapshot/fork operations assume
 /// the sandbox is **quiescent** (no in-flight tool process; the shell is parked
-/// at its prompt) — see `doc/sandbox.md` §3.1.
+/// at its prompt) — see `doc/design/runtime-architecture.md` §3.1.
 #[async_trait::async_trait]
 pub trait Sandbox: Send + Sync {
     /// Execute a command line inside the sandbox, returning its captured
@@ -74,7 +74,7 @@ pub trait Sandbox: Send + Sync {
     ///
     /// **Contract**: decrements the reference count on any snapshot this
     /// sandbox was forked from; when a snapshot's count reaches zero the backend
-    /// may GC it (`doc/sandbox.md` §2, §3.3). Takes `&self` (not `self`) to stay
+    /// may GC it (`doc/design/runtime-architecture.md` §2, §3.3). Takes `&self` (not `self`) to stay
     /// object-safe; a released sandbox must not be used again.
     async fn release(&self) -> Result<(), SandboxError>;
 
@@ -102,7 +102,7 @@ pub trait SandboxBackend: Send + Sync {
     /// snapshot's filesystem state and is in a ready state; for a filesystem-only
     /// backend this is a cold start, for a memory-snapshot backend it may be a
     /// warm restore. Behaviour is equivalent, only performance differs
-    /// (`doc/sandbox.md` §2).
+    /// (`doc/design/runtime-architecture.md` §2).
     async fn restore(&self, id: &SnapshotId) -> Result<Arc<dyn Sandbox>, SandboxError>;
 
     /// The capabilities every sandbox this backend produces will report.
@@ -110,7 +110,7 @@ pub trait SandboxBackend: Send + Sync {
 }
 
 /// Fork a sandbox: snapshot `parent`, then restore that snapshot on `backend`
-/// into a fresh, independently-writable child (`doc/sandbox.md` §3.2, Step 4).
+/// into a fresh, independently-writable child (`doc/design/runtime-architecture.md` §3.2, Step 4).
 ///
 /// This is the mechanism a session fork uses to hand a branched session a
 /// copy-on-write child of its parent's filesystem, rather than a second handle
@@ -136,11 +136,11 @@ pub async fn fork_sandbox(
     backend.restore(&id).await
 }
 
-/// Configuration for cold-starting a sandbox (`doc/sandbox.md` §2).
+/// Configuration for cold-starting a sandbox (`doc/design/runtime-architecture.md` §2).
 #[derive(Debug, Clone, Default)]
 pub struct SandboxConfig {
     /// Workspace directory bound as the sandbox's working directory. This is the
-    /// primary — and currently only — mount (`doc/sandbox.md` §3.3), realized as
+    /// primary — and currently only — mount (`doc/design/runtime-architecture.md` §3.3), realized as
     /// `cwd` on every backend so relative paths behave identically. Auxiliary
     /// mounts (private tmp / delivery / shared) are a future feature (§3.7).
     pub workspace: std::path::PathBuf,
@@ -158,7 +158,7 @@ pub struct SandboxConfig {
     pub volumes: Vec<VolumeMount>,
 }
 
-/// Resource limits applied to a sandbox (`doc/sandbox.md` §5.2).
+/// Resource limits applied to a sandbox (`doc/design/runtime-architecture.md` §5.2).
 ///
 /// `None` means "backend default / unlimited"; the passthrough backend enforces
 /// none of these except the per-`exec` timeout its caller passes.
@@ -183,7 +183,7 @@ impl Default for ResourceLimits {
     }
 }
 
-/// Network egress policy for a sandbox (`doc/sandbox.md` §5.2).
+/// Network egress policy for a sandbox (`doc/design/runtime-architecture.md` §5.2).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum NetworkPolicy {
     /// No network (microVM gets no NIC).
@@ -198,7 +198,7 @@ pub enum NetworkPolicy {
 impl NetworkPolicy {
     /// Resolve a config-facing policy name (`isolated` | `allowlist` | `open`)
     /// plus its allow-list into a concrete policy. Shared by the profile
-    /// `[network]` section and the gateway default (`doc/sandbox.md` §6.2).
+    /// `[network]` section and the gateway default (`doc/design/runtime-architecture.md` §6.2).
     ///
     /// `allow` is only consumed by `allowlist`; it is ignored for the others.
     ///
@@ -234,7 +234,7 @@ pub struct VolumeMount {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SnapshotId(pub String);
 
-/// Optional-capability flags a backend advertises (`doc/sandbox.md` §2).
+/// Optional-capability flags a backend advertises (`doc/design/runtime-architecture.md` §2).
 ///
 /// The minimum contract is a filesystem snapshot in the quiescent state; every
 /// other flag is a bonus a specific backend may or may not offer. Upper layers

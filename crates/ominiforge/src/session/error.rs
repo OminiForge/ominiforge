@@ -13,7 +13,7 @@ pub enum SessionError {
     /// The session's `events.jsonl` is already locked by another writer.
     ///
     /// A session allows only one writer at a time; the lock is an advisory
-    /// `flock` held for the writer's lifetime. See `doc/architecture.md` §8.
+    /// `flock` held for the writer's lifetime. See `doc/design/runtime-architecture.md` §8.
     #[error("session is in use by another process: {path}")]
     Locked { path: PathBuf },
 
@@ -22,7 +22,7 @@ pub enum SessionError {
     NotFound(SessionId),
 
     /// The session exists but is not archived, so it cannot be hard-deleted.
-    /// Archive it first (`doc/architecture.md` §9) — the two-step
+    /// Archive it first (`doc/design/runtime-architecture.md` §9) — the two-step
     /// archive→delete is the deliberate confirmation for an irreversible op.
     #[error("session is not archived: {0} (archive it before deleting)")]
     NotArchived(SessionId),

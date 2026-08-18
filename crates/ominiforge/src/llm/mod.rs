@@ -4,7 +4,7 @@
 //! Events are provider-neutral: the agent loop wraps each one with envelope
 //! and timing data to produce a core `ModelEvent` (see `doc/event-schema.md`
 //! §5), so the loop never depends on any provider's JSON shape
-//! (`doc/architecture.md` §9). Concrete adapters live in `crate::provider`.
+//! (`doc/design/runtime-architecture.md` §9). Concrete adapters live in `crate::provider`.
 
 mod message;
 mod retry;

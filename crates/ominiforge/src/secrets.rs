@@ -8,7 +8,7 @@
 //! model-resolution time, never exported to a subprocess overlay) is what keeps
 //! it out of the model's reach.
 //!
-//! At-rest encryption is intentionally not done here (`doc/architecture.md`
+//! At-rest encryption is intentionally not done here (`doc/design/runtime-architecture.md`
 //! secret model): transport is protected by HTTPS and access by the planned
 //! login layer. The store lives at the config root, not the session workspace,
 //! so it is outside the directory the agent's tools operate in.

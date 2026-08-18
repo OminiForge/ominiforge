@@ -1,12 +1,12 @@
 //! CLI: command parsing and dispatch.
 //!
 //! The command line is the operator's entry point, not a chat front-end:
-//! `ominiforge serve` runs the gateway (the single backend every interactive
-//! front-end talks to). Configuration is managed via Lua config files + the GPUI
-//! settings (see `doc/design/architecture.md` §24); session analysis happens in the GPUI
-//! monitor panel (see `doc/design/monitor.md`). API keys are never stored in config: a
-//! provider names an env var via `api_key_env`, and the key is read from the
-//! environment. See `doc/architecture.md` §3.1, §15.
+//! `ominiforge serve` runs the node's long-running gateway (the transport host
+//! for local/LAN facades and webhook integrations). Configuration is managed via
+//! structured config files edited directly or through a facade; session analysis
+//! is queryable/exportable (see `doc/design/monitor.md`). API keys are never
+//! stored in config: a provider names an env var via `api_key_env`, and the key
+//! is read from the environment. See `doc/design/runtime-architecture.md`.
 
 use std::path::PathBuf;
 
@@ -29,7 +29,7 @@ pub struct Cli {
 
     /// Directory whose `.omini/` holds config (providers, profiles, mcp, hooks).
     /// Highest-priority config root: `--config-dir` → launch cwd → `~`. Config is
-    /// independent of a session's workspace (`doc/architecture.md` §15).
+    /// independent of a session's workspace (`doc/design/runtime-architecture.md` §15).
     #[arg(long, global = true)]
     config_dir: Option<PathBuf>,
 }
@@ -66,7 +66,7 @@ struct ServeArgs {
 /// Surfaces configuration, provider, and session errors to the process exit.
 pub async fn run() -> Result<()> {
     // Operator diagnostics to stderr. Business/agent events never go here —
-    // they belong to `events.jsonl` (doc/architecture.md). Default to
+    // they belong to `events.jsonl` (doc/design/runtime-architecture.md). Default to
     // `info` for our own crate; RUST_LOG overrides (e.g. `RUST_LOG=debug`).
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -90,7 +90,7 @@ pub async fn run() -> Result<()> {
     }
 }
 
-/// Run the gateway server in the foreground (`doc/architecture.md` §18.1). A
+/// Run the gateway server in the foreground (`doc/design/runtime-architecture.md` §18.1). A
 /// systemd user service wraps this; for development it runs directly.
 async fn serve_cmd(config_dir: Option<PathBuf>, args: ServeArgs) -> Result<()> {
     use ominiforge::gateway::{GatewayConfig, SessionDefaults, SessionRegistry, serve};
@@ -102,7 +102,7 @@ async fn serve_cmd(config_dir: Option<PathBuf>, args: ServeArgs) -> Result<()> {
     let workspace = app::resolve_workspace(&workspace)?;
 
     // Config roots come from --config-dir / launch cwd / home — NOT the
-    // workspace (`doc/architecture.md` §15). Launch cwd is the directory the
+    // workspace (`doc/design/runtime-architecture.md` §15). Launch cwd is the directory the
     // server was started in.
     let launch_cwd = std::env::current_dir().context("cannot determine current directory")?;
     let config_store = ConfigStore::discover_with(config_dir.as_deref(), &launch_cwd);
@@ -126,7 +126,7 @@ async fn serve_cmd(config_dir: Option<PathBuf>, args: ServeArgs) -> Result<()> {
     } else {
         tracing::warn!(
             "auth: DISABLED — no api_key_env configured. Only safe behind \
-             loopback + a trusted reverse proxy (doc/architecture.md §18)."
+             loopback + a trusted reverse proxy (doc/design/runtime-architecture.md §18)."
         );
     }
 

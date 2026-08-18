@@ -1,5 +1,5 @@
 //! [`SandboxManager`]: the per-session owner of sandbox instances
-//! (`doc/sandbox.md` §3.2).
+//! (`doc/design/runtime-architecture.md` §3.2).
 //!
 //! A session's sandbox is a first-class, session-scoped resource — it outlives
 //! the thread (actor) that drives the session and is only reclaimed when the
@@ -21,7 +21,7 @@ use super::{Sandbox, SandboxBackend, SandboxError, fork_sandbox};
 use crate::core::SessionId;
 use crate::session::SandboxDescriptor;
 
-/// Which sandbox backend a deployment wants (`doc/sandbox.md` §3.2, §8).
+/// Which sandbox backend a deployment wants (`doc/design/runtime-architecture.md` §3.2, §8).
 ///
 /// A host-level, OS-agnostic choice: the same config value means the same thing
 /// on every platform; whether boxlite can actually start is a property of the
@@ -51,7 +51,7 @@ pub struct SandboxManager {
 impl SandboxManager {
     /// Build a manager for a deployment's [`SandboxBackendChoice`], reporting
     /// non-fatal diagnostics (e.g. an `Auto` fallback) via `tracing`
-    /// (`doc/sandbox.md` §3.2). Backend selection is OS-agnostic here; host
+    /// (`doc/design/runtime-architecture.md` §3.2). Backend selection is OS-agnostic here; host
     /// specifics (KVM, jailer deps, image pulls) surface as a boxlite start
     /// error, which each variant handles per its contract.
     ///
@@ -130,7 +130,7 @@ impl SandboxManager {
     }
 
     /// Fork `parent`'s sandbox into a fresh, independently-writable child and
-    /// return the handle plus the descriptor to persist (`doc/sandbox.md` §4.2).
+    /// return the handle plus the descriptor to persist (`doc/design/runtime-architecture.md` §4.2).
     /// Does *not* register the child — the caller registers it once the child
     /// session id is minted (`register`).
     ///
@@ -158,11 +158,11 @@ impl SandboxManager {
         Ok((sandbox, descriptor))
     }
 
-    /// Release `session`'s sandbox and drop its handle (`doc/sandbox.md` §3.2).
+    /// Release `session`'s sandbox and drop its handle (`doc/design/runtime-architecture.md` §3.2).
     ///
     /// Bound to session *deletion*, not thread eviction. There is no deletion
     /// path yet, so nothing calls this — its trigger and the surrounding GC land
-    /// with Step 5 (`doc/sandbox.md` §8). A no-op if `session` has no registered
+    /// with Step 5 (`doc/design/runtime-architecture.md` §8). A no-op if `session` has no registered
     /// sandbox.
     ///
     /// # Errors
@@ -285,7 +285,7 @@ mod tests {
 
     // Real-hardware: `sandbox_backend = "boxlite"` config builds a working
     // boxlite manager that can exec. Needs KVM + image pull, so #[ignore]d
-    // (`doc/sandbox.md` §8). Run: cargo test --features sandbox-boxlite -- --ignored
+    // (`doc/design/runtime-architecture.md` §8). Run: cargo test --features sandbox-boxlite -- --ignored
     #[cfg(feature = "sandbox-boxlite")]
     #[tokio::test]
     #[ignore = "needs KVM + image pull; run manually on a supported host"]

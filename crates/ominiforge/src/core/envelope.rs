@@ -10,7 +10,7 @@ use super::payload::EventPayload;
 /// domain-specific [`EventPayload`]. See `doc/event-schema.md` §2.
 ///
 /// `session_id` is held in memory but omitted on disk (it is the session
-/// directory name); see `doc/architecture.md` §3.
+/// directory name); see `doc/design/runtime-architecture.md` §3.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CoreEvent {
     /// Protocol version, e.g. `"ominiforge.event.v1"`.

@@ -1,6 +1,6 @@
 //! Session storage: append-only event log plus `session.toml` metadata.
 //!
-//! Layout (see `doc/architecture.md`):
+//! Layout (see `doc/design/runtime-architecture.md`):
 //!
 //! ```text
 //! <root>/                      # e.g. .omini/sessions
@@ -38,7 +38,7 @@ use crate::core::{
 const META_FILE: &str = "session.toml";
 const EVENTS_FILE: &str = "events.jsonl";
 const SNAPSHOT_FILE: &str = "context_snapshot.json";
-/// Marker file that flags a session as archived (`doc/architecture.md` §9).
+/// Marker file that flags a session as archived (`doc/design/runtime-architecture.md` §9).
 /// A sidecar — not a `session.toml` field — deliberately keeps that metadata
 /// free of lifecycle state (its §2 "no status field" rule); archiving is an
 /// out-of-band retirement flag, not part of the session's identity. Its presence
@@ -105,7 +105,7 @@ impl SessionStore {
     /// Used when the id must be known *before* the session is created — the
     /// gateway mints it up front so a session's sandbox (assembled before the
     /// session row exists) can resolve a `session`-anchored mount to the right
-    /// `sessions/<id>/` directory (`doc/sandbox.md` §3.7). The id must be unique;
+    /// `sessions/<id>/` directory (`doc/design/runtime-architecture.md` §3.7). The id must be unique;
     /// reusing a live session's id corrupts its directory.
     ///
     /// # Errors
@@ -194,14 +194,14 @@ impl SessionStore {
     /// [`SessionError::Io`] if the store root cannot be read. Returns an empty
     /// vec when the root does not exist yet or holds no sessions.
     pub fn list(&self) -> Result<Vec<SessionId>> {
-        // An archived session (`doc/architecture.md` §9) is retired from the
+        // An archived session (`doc/design/runtime-architecture.md` §9) is retired from the
         // active list — every caller here (resume picker, workspace grouping)
         // wants live sessions. Its files stay put and are still readable by id.
         self.list_ids(false)
     }
 
     /// The archived session ids in this store, newest first — the complement of
-    /// [`list`](Self::list). These sessions are retired (`doc/architecture.md`
+    /// [`list`](Self::list). These sessions are retired (`doc/design/runtime-architecture.md`
     /// §9): absent from every active listing, but their files stay readable so an
     /// archived view can show them and permanently [`delete`](Self::delete) them.
     ///
@@ -269,7 +269,7 @@ impl SessionStore {
     }
 
     /// Persist `session`'s bound sandbox descriptor into its `session.toml`
-    /// (`doc/sandbox.md` §3.5), so the environment can be re-attached after a
+    /// (`doc/design/runtime-architecture.md` §3.5), so the environment can be re-attached after a
     /// restart. Read-modify-write of the meta; the session must already exist.
     ///
     /// # Errors
@@ -298,7 +298,7 @@ impl SessionStore {
         self.session_dir(session_id).join(ARCHIVED_MARKER)
     }
 
-    /// Whether `session_id` is archived (`doc/architecture.md` §9): retired —
+    /// Whether `session_id` is archived (`doc/design/runtime-architecture.md` §9): retired —
     /// permanently — from the active list. A pure existence check on the sidecar
     /// marker; a missing session reads as not archived (there is nothing to hide
     /// from a list that already omits it).
@@ -311,7 +311,7 @@ impl SessionStore {
     /// re-archiving an already-archived session is a no-op success. The session
     /// must exist; its files are untouched beyond the marker.
     ///
-    /// Archiving is **one-way** (`doc/architecture.md` §9): it retires the
+    /// Archiving is **one-way** (`doc/design/runtime-architecture.md` §9): it retires the
     /// session for good. The files stay for read-only inspection, but the session
     /// cannot be brought back to run — its sandbox environment was released and
     /// there is no path to reconstruct it. There is deliberately no `unarchive`.
@@ -330,7 +330,7 @@ impl SessionStore {
     /// Permanently delete `session_id`'s entire directory (`rm -rf`) — its
     /// `session.toml`, `events.jsonl`, snapshot, and artifacts. **Irreversible.**
     ///
-    /// Guarded: the session must **already be archived** (`doc/architecture.md`
+    /// Guarded: the session must **already be archived** (`doc/design/runtime-architecture.md`
     /// §9). That two-step (archive → delete) is the deliberate confirmation for
     /// this destructive op, and it also means an archived session has already had
     /// its actor stopped and sandbox released — so delete is a pure filesystem
@@ -416,9 +416,9 @@ impl SessionStore {
 
     /// Create a fork: branch a new session from `parent_id` at `fork_at_seq`,
     /// seeded with the conversation as it stood at that point
-    /// (`doc/architecture.md` §6.1). The fork is self-contained — it carries its
+    /// (`doc/design/runtime-architecture.md` §6.1). The fork is self-contained — it carries its
     /// own context snapshot — so the parent can later be deleted without
-    /// affecting it (`doc/architecture.md` §6.2).
+    /// affecting it (`doc/design/runtime-architecture.md` §6.2).
     ///
     /// `snapshot` is the rebuilt context view (system + messages) up to the fork
     /// point; the caller produces it from the parent's events (e.g. via
@@ -871,7 +871,7 @@ mod tests {
 
     /// Archiving hides a session from the active `list` yet leaves its files
     /// readable by id. This is the whole point of archive vs. delete
-    /// (`doc/architecture.md` §9): retire from view — permanently — without
+    /// (`doc/design/runtime-architecture.md` §9): retire from view — permanently — without
     /// losing the data, so a user or agent can still analyze it afterward.
     #[test]
     fn archive_hides_from_list_but_keeps_files_readable() {
@@ -960,7 +960,7 @@ mod tests {
     }
 
     /// Hard-delete requires the session to be archived first, then removes its
-    /// whole directory. This encodes the confirmation gate (`doc/architecture.md`
+    /// whole directory. This encodes the confirmation gate (`doc/design/runtime-architecture.md`
     /// §9): a live (non-archived) session must NOT be destroyable in one step, and
     /// a ghost is `NotFound` — so an errant delete can't nuke an active session or
     /// mask a typo'd id.

@@ -1,5 +1,5 @@
 //! [`LocalProtocol`]: the `ClientProtocol` implementation that links
-//! `ominiforge-core` directly as a library (`doc/network.md` §3).
+//! `ominiforge-core` directly as a library (`doc/design/runtime-architecture.md` §3).
 //!
 //! Zero network, zero serialization, compile-time type safety: every call is a
 //! direct invocation on the same [`SessionRegistry`] the HTTP/SSE gateway uses,

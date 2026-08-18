@@ -1,10 +1,10 @@
 //! HTTP/SSE/WebSocket gateway for Web, mobile, and external integrations.
-//! See `doc/architecture.md` §18 and `doc/gateway.md`.
+//! See `doc/design/runtime-architecture.md` §18 and `doc/design/runtime-architecture.md`.
 //!
 //! The gateway is the single backend for every interactive front-end. It runs
 //! as a user-level service (`ominiforge serve`); the core stays UI-agnostic —
 //! the gateway is a consumer of the same [`Agent`], [`SessionStore`], and
-//! event stream (`doc/architecture.md` §2.1).
+//! event stream (`doc/design/runtime-architecture.md` §2.1).
 //!
 //! ## Shape
 //!

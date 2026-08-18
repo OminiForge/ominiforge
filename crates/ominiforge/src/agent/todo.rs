@@ -4,13 +4,13 @@
 //! a turn from losing track of what it set out to do across many model rounds.
 //! It is *session-scoped* (lives in [`super::SessionRuntime`], survives across
 //! turns) but holds no I/O: this module is just the data model, the op-based
-//! mutation, and the rendering the model sees. See `doc/architecture.md`.
+//! mutation, and the rendering the model sees. See `doc/design/runtime-architecture.md`.
 //!
 //! `todo` is a *control* tool, not a leaf tool: it operates on the agent's own
 //! state rather than the outside world. So it does **not** implement [`Tool`]
 //! and is **not** in the [`ToolRegistry`] — the agent loop contributes its
 //! [`descriptor`] alongside the leaf-tool schemas and intercepts the call by
-//! name, applying [`apply_todo_op`] to the live todo list. See `doc/architecture.md`
+//! name, applying [`apply_todo_op`] to the live todo list. See `doc/design/runtime-architecture.md`
 //! §5.
 //!
 //! [`Tool`]: crate::tool::Tool
@@ -39,7 +39,7 @@ pub struct TodoItem {
 /// Lifecycle state of a [`TodoItem`].
 ///
 /// Terminal states are `Completed`/`Cancelled`/`Blocked`; `Pending`/`InProgress`
-/// are non-terminal and hold a turn open at the completion gate (`doc/architecture.md`
+/// are non-terminal and hold a turn open at the completion gate (`doc/design/runtime-architecture.md`
 /// §6). `Cancelled` means the step is *objectively* unreachable (no such tool,
 /// no permission); `Blocked` means it is reachable but needs the user (missing
 /// key, a decision). Neither may be used to dodge a merely hard step.
@@ -77,7 +77,7 @@ impl StepStatus {
 /// `{"ops": [...]}` mutates it — a single change is a one-element `ops` array,
 /// matching the batch-first shape of the other tools. `init` cannot appear
 /// inside `ops`: [`LeafOp`] has no such variant, so nesting is rejected at
-/// deserialization with no runtime check (`doc/architecture.md` §5).
+/// deserialization with no runtime check (`doc/design/runtime-architecture.md` §5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum TodoOp {
@@ -93,7 +93,7 @@ pub enum TodoOp {
 ///
 /// Externally tagged on `op`. Missing required fields (e.g. `reason` on
 /// `cancel`/`block`) fail to deserialize and surface as a tool error the model
-/// corrects next round (`doc/architecture.md` §5).
+/// corrects next round (`doc/design/runtime-architecture.md` §5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum LeafOp {
@@ -262,7 +262,7 @@ pub fn render(plan: &[TodoItem]) -> String {
 }
 
 /// Render only the non-terminal steps, for the completion-gate reminder
-/// (`doc/architecture.md` §6).
+/// (`doc/design/runtime-architecture.md` §6).
 #[must_use]
 pub fn render_incomplete(plan: &[TodoItem]) -> String {
     use std::fmt::Write;
@@ -283,7 +283,7 @@ pub fn render_incomplete(plan: &[TodoItem]) -> String {
 /// The `todo` tool descriptor the agent loop broadcasts alongside leaf tools.
 ///
 /// Behavioral guidance lives here in the `description` (not the profile's system
-/// prompt): tool usage is the tool's concern (`doc/architecture.md` §9). Structural
+/// prompt): tool usage is the tool's concern (`doc/design/runtime-architecture.md` §9). Structural
 /// facts (which ops exist, which fields each takes) belong to the schema alone
 /// — the description does not repeat them.
 #[must_use]

@@ -1,6 +1,6 @@
 //! Client protocol abstraction: the one trait every front-end (GPUI app, Web
 //! transition front-end, future remote clients) uses to talk to Core
-//! (`doc/network.md` §2).
+//! (`doc/design/runtime-architecture.md` §2).
 //!
 //! [`ClientProtocol`] defines the full client-facing operation surface —
 //! session lifecycle, messaging, event subscription, monitoring, config, and
@@ -71,7 +71,7 @@ pub enum ConnectionState {
     Disconnected,
 }
 
-/// The unified client ↔ Core interface (`doc/network.md` §2.1).
+/// The unified client ↔ Core interface (`doc/design/runtime-architecture.md` §2.1).
 ///
 /// Every interactive front-end drives Core exclusively through this trait, so
 /// the same UI code runs against an in-process core (`LocalProtocol`) or a
@@ -96,7 +96,7 @@ pub trait ClientProtocol: Send + Sync {
     async fn fork_session(&self, parent: &SessionId, at_seq: u64) -> Result<SessionId>;
 
     /// Archive a session (one-way retirement). The files stay for read-only
-    /// inspection; the session can no longer be run (`doc/architecture.md` §9).
+    /// inspection; the session can no longer be run (`doc/design/runtime-architecture.md` §9).
     async fn archive_session(&self, id: &SessionId) -> Result<()>;
 
     /// Permanently delete a session. Requires it to be archived first.

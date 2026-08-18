@@ -10,7 +10,7 @@ use super::config::LspServerConfig;
 /// it off via `enabled = false`).
 ///
 /// Only stdio servers whose binary is resolved through `PATH` / the session's
-/// direnv env-overlay (`doc/architecture.md`). An entry whose binary is absent fails to
+/// direnv env-overlay (`doc/design/runtime-architecture.md`). An entry whose binary is absent fails to
 /// spawn on first touch and is marked `not-installed` — it never blocks a
 /// file op.
 pub fn builtin_servers() -> Vec<LspServerConfig> {

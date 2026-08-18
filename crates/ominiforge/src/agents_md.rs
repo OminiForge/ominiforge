@@ -1,7 +1,7 @@
 //! Project guidance files (`AGENTS.md`) — per-directory instructions for the
 //! agent, discovered from the workspace tree and injected into context.
 //!
-//! Two tiers (`doc/architecture.md`):
+//! Two tiers (`doc/design/runtime-architecture.md`):
 //! - the **workspace-root** file is loaded once at assembly and appended to the
 //!   system prompt (static, prefix-cacheable);
 //! - a **nested** file in a sub-directory is loaded lazily the first time the

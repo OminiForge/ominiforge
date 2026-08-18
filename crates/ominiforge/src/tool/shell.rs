@@ -3,7 +3,7 @@
 //! The tool itself is backend-agnostic: it hands the command line to
 //! [`Sandbox::exec`] and renders the result. Which sandbox it runs in (host
 //! passthrough today, `BoxLite` microVM when enabled) is decided at
-//! construction (`doc/sandbox.md` §7, Step 3). Resource limits and network
+//! construction (`doc/design/runtime-architecture.md` §7, Step 3). Resource limits and network
 //! policy travel with the sandbox's `SandboxConfig`, not this tool.
 
 use std::sync::Arc;

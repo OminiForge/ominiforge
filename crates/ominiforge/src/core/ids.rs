@@ -1,6 +1,6 @@
 //! Identifier types for sessions, turns, events, and artifacts.
 //!
-//! `SessionId` is a ULID in practice (see `doc/architecture.md`), but the
+//! `SessionId` is a ULID in practice (see `doc/design/runtime-architecture.md`), but the
 //! core type stays a transparent string newtype — generation and validation
 //! belong to the `session` module, and keeping `core` free of an id-generation
 //! dependency preserves its position at the bottom of the dependency graph.

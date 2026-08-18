@@ -1,4 +1,4 @@
-//! [`PassthroughSandbox`]: the zero-isolation backend (`doc/sandbox.md` §7,
+//! [`PassthroughSandbox`]: the zero-isolation backend (`doc/design/runtime-architecture.md` §7,
 //! Step 1).
 //!
 //! It runs commands directly on the host via `sh -c` with the workspace as the

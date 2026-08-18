@@ -1,5 +1,5 @@
 //! [`BoxliteSandbox`]: the `BoxLite` (libkrun microVM) backend
-//! (`doc/sandbox.md` §4, Step 2).
+//! (`doc/design/runtime-architecture.md` §4, Step 2).
 //!
 //! This is the real isolating backend. Every `boxlite` dependency lives in this
 //! one file, behind [`Sandbox`]/[`SandboxBackend`] — if `BoxLite` churns or is
@@ -238,7 +238,7 @@ const fn normalize_exit_code(code: i32) -> Option<i32> {
     if code < 0 { None } else { Some(code) }
 }
 
-/// Guest mount point for the session workspace (`doc/sandbox.md` §3.3). A fixed,
+/// Guest mount point for the session workspace (`doc/design/runtime-architecture.md` §3.3). A fixed,
 /// portable absolute path so `cwd` behaves identically to the passthrough
 /// backend (where cwd *is* the host workspace); the host path itself does not
 /// exist inside the guest, so it cannot be reused verbatim.
@@ -322,7 +322,7 @@ fn box_options(config: &SandboxConfig) -> BoxOptions {
 }
 
 /// `BoxLite`'s host-side jailer cannot start a box on NixOS, for two distinct
-/// reasons (both verified on real hardware; see `doc/sandbox.md` §5.2):
+/// reasons (both verified on real hardware; see `doc/design/runtime-architecture.md` §5.2):
 ///
 /// 1. **libcap**: without a system `bwrap` on `PATH`, `BoxLite` falls back to
 ///    its bundled `bwrap`, which can't find `libcap.so.2` (NixOS has no FHS lib
@@ -345,7 +345,7 @@ fn box_options(config: &SandboxConfig) -> BoxOptions {
 /// dropped. `OMINI_BOXLITE_INSECURE=1` forces the same on any other affected
 /// host. Standard FHS deploys keep the full jailer. The real fix is upstream
 /// (`system_ca_paths` should not bind a dir *and* a file inside it); see
-/// `doc/sandbox.md` §5.2.
+/// `doc/design/runtime-architecture.md` §5.2.
 fn advanced_options() -> AdvancedBoxOptions {
     if jailer_unsupported_here() {
         AdvancedBoxOptions {
@@ -372,7 +372,7 @@ fn jailer_unsupported_here() -> bool {
             let why = if forced {
                 "OMINI_BOXLITE_INSECURE=1 is set"
             } else {
-                "this is NixOS (upstream boxlite jailer is incompatible, doc/sandbox.md §5.2)"
+                "this is NixOS (upstream boxlite jailer is incompatible, doc/design/runtime-architecture.md §5.2)"
             };
             tracing::warn!(
                 "boxlite: host-side jailer DISABLED because {why}. The guest is \
@@ -529,7 +529,7 @@ mod tests {
     }
 
     // ── Integration tests: need a real KVM host + image pull (network), so they
-    // are #[ignore]d and run manually on a supported host (doc/sandbox.md §7,
+    // are #[ignore]d and run manually on a supported host (doc/design/runtime-architecture.md §7,
     // "manual testing"). Run with:
     //   cargo test --features sandbox-boxlite -- --ignored
     #[tokio::test]
@@ -581,7 +581,7 @@ mod tests {
         parent.release().await.unwrap();
     }
 
-    // The session-scoped fork path (`doc/sandbox.md` §4.2): a parent registered
+    // The session-scoped fork path (`doc/design/runtime-architecture.md` §4.2): a parent registered
     // in the `SandboxManager` is forked through `fork_from`, yielding an isolated
     // CoW child. Verifies the manager wiring end-to-end on real hardware, not
     // just the backend primitive above.

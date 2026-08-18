@@ -3,7 +3,7 @@
 //! Mirrors the `mcp.toml` / `hooks.toml` loading pattern (multi-root merge,
 //! highest-priority root wins). Holds only network/lifecycle settings; agent
 //! identity stays in profiles (`doc/profile.md`), and the API key — like every
-//! secret — is named by env var, never stored inline (`doc/architecture.md`
+//! secret — is named by env var, never stored inline (`doc/design/runtime-architecture.md`
 //! §15).
 
 use std::path::PathBuf;
@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::ConfigError;
 
 /// Default bind address: loopback only. Public exposure is the reverse proxy's
-/// job (`doc/architecture.md` §18.1, TLS terminated upstream), so the gateway
+/// job (`doc/design/runtime-architecture.md` §18.1, TLS terminated upstream), so the gateway
 /// itself never listens on a public interface by default.
 const DEFAULT_BIND: &str = "127.0.0.1:5173";
 
@@ -32,7 +32,7 @@ const fn default_lsp_reclaim_grace_secs() -> u64 {
 /// Default sandbox network policy when neither the profile nor this file names
 /// one. `open` (unrestricted egress) so a fresh boxlite session can reach the
 /// package registries / APIs an agent normally needs; a deployment that wants a
-/// locked-down default sets `default_network` explicitly (`doc/sandbox.md` §6.2).
+/// locked-down default sets `default_network` explicitly (`doc/design/runtime-architecture.md` §6.2).
 const DEFAULT_NETWORK_POLICY: &str = "open";
 
 /// Parsed `gateway.toml`.
@@ -59,7 +59,7 @@ pub struct GatewayConfig {
     #[serde(default = "default_lsp_reclaim_grace_secs")]
     pub lsp_reclaim_grace_secs: u64,
 
-    /// Which sandbox backend sessions run in (`doc/sandbox.md` §3.2). A
+    /// Which sandbox backend sessions run in (`doc/design/runtime-architecture.md` §3.2). A
     /// host-level, OS-agnostic choice; `passthrough` (no isolation) by default so
     /// no deployment silently believes it is isolated. `boxlite` requires the
     /// microVM backend and fails loud if it cannot start; `auto` prefers boxlite
@@ -67,7 +67,7 @@ pub struct GatewayConfig {
     pub sandbox_backend: crate::sandbox::manager::SandboxBackendChoice,
 
     /// Fallback sandbox network policy for sessions whose profile does not set
-    /// `[network].policy` (`doc/sandbox.md` §6.2). One of `isolated` /
+    /// `[network].policy` (`doc/design/runtime-architecture.md` §6.2). One of `isolated` /
     /// `allowlist` / `open`; `open` by default. The profile always wins when it
     /// names a policy — this is only the bottom of the resolution chain.
     pub default_network: String,
@@ -158,7 +158,7 @@ impl GatewayConfig {
     }
 
     /// Resolve the fallback network policy sessions inherit when their profile
-    /// does not name one (`doc/sandbox.md` §6.2).
+    /// does not name one (`doc/design/runtime-architecture.md` §6.2).
     ///
     /// # Errors
     /// A malformed `default_network` name fails loud (Karpathy §12): the gateway
