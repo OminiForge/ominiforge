@@ -30,22 +30,6 @@ pub trait StreamSink: Send {
     /// Incremental reasoning/thinking text.
     fn on_reasoning(&mut self, _index: u32, _text: &str) {}
 
-    /// A render-ready snapshot of a tool call's live state (stage 2 of the
-    /// streaming tool-call pipeline, `doc/tool-streaming.md`). Two sources:
-    /// a tool's `StreamPresenter` renders its in-progress ARGS before
-    /// execution (`write`/`edit`); a result-streaming tool (`shell` output)
-    /// renders its in-progress RESULT during execution. Both carry `view` as
-    /// the same `TextView` envelope the settled result carries at stage 3, so
-    /// a front-end renders both with one code path — the snapshot grows until
-    /// the settled view replaces it.
-    ///
-    /// Snapshots are SELF-CONTAINED (the full view so far, not a delta), so a
-    /// transport may coalesce (drop stale, keep newest) and a late client
-    /// needs no history. Emitted under throttle, never per token. Default
-    /// no-op: tools that stream nothing emit nothing and the card jumps from
-    /// the block-start skeleton straight to the settled view.
-    fn on_tool_call_progress(&mut self, _index: u32, _view: &str) {}
-
     /// A content block closed.
     fn on_block_stop(&mut self, _index: u32) {}
 

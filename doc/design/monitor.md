@@ -14,7 +14,7 @@
 
 ## 2. Model Request 记录
 
-> **权威定义在 [`event-schema.md`](./event-schema.md) §5。** 本节描述 monitor 如何消费这些字段，字段集以 event-schema 为准（`RequestStarted` / `RequestCompleted` / `RequestFailed` + `Usage`）。下方片段为示意，若与 event-schema 冲突以 event-schema 为准。
+> **权威定义在 [`event-schema.md`](./event-schema.md) §3.2。** 本节描述 monitor 如何消费这些字段，字段集以 event-schema 为准（`RequestStarted` / `RequestCompleted` / `RequestFailed` + `Usage`）。下方片段为示意，若与 event-schema 冲突以 event-schema 为准。
 
 ### 2.1 RequestStarted
 

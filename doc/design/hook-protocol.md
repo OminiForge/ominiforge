@@ -203,7 +203,9 @@ Host EventBus 是 runtime 内部机制（tokio broadcast channel），用于 mon
 ## 12. 与旧方案对比
 
 旧 WASM Component hook 方案已废弃，改用 Rust trait（内置）+ shell command（用户扩展，
-stdin JSON 通信，完整 OS 能力）。废弃理由见 [`runtime-architecture.md`](./runtime-architecture.md) §3。
+stdin JSON 通信，完整 OS 能力）。这里废弃的是旧的「WASM hook/插件」方案；新架构
+[`runtime-architecture.md`](./runtime-architecture.md) §3 另将 wasm 列为拓展形态之一（属自拓展、
+仍待讨论细化），与本句的旧方案不是同一回事。
 
 ## 13. 实现状态与待后续完善
 

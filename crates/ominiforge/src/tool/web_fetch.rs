@@ -273,25 +273,8 @@ fn render_output(
         );
     }
 
-    let view = serde_json::json!({
-        "kind": "web",
-        "url": final_url.as_str(),
-        "format": format,
-        "extraction": extraction,
-        "length": total,
-        "cached": cache_path,
-        "truncated": truncated,
-    })
-    .to_string();
-
     ToolOutput {
-        content: vec![
-            Content::Text(text),
-            Content::TextView {
-                text: view,
-                audience: crate::core::payload::AUDIENCE_UI.to_owned(),
-            },
-        ],
+        content: vec![Content::Text(text)],
         is_error: false,
         error_code: None,
     }
@@ -321,7 +304,6 @@ mod tests {
             call_id: "c1".to_owned(),
             input: serde_json::json!({ "url": url }),
             timeout: Duration::from_secs(5),
-            progress: None,
         }
     }
 
@@ -383,7 +365,6 @@ mod tests {
                 call_id: "c1".to_owned(),
                 input: serde_json::json!({ "url": "https://example.com/", "format": "yaml" }),
                 timeout: Duration::from_secs(5),
-                progress: None,
             })
             .await
             .unwrap();

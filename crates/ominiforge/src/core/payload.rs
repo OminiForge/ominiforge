@@ -242,18 +242,6 @@ pub struct ToolOutput {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Content {
     Text(String),
-    /// A UI-only structured view of this call's result, produced by the tool
-    /// at execution time and persisted with the event. The front-end renders
-    /// it verbatim — it never rebuilds anything client-side (`doc/tool-streaming.md`).
-    /// NEVER fed to the model — `render_output` skips it. The `text` field is a
-    /// JSON envelope `{ kind, ... }` where `kind` is one of the closed variants
-    /// (`diff`/`code`/`terminal`/`listing`/`markdown`/`plain`); the front-end
-    /// dispatches on `kind` to the matching renderer. `audience` is `"ui"`
-    /// today; the field exists so a future audience does not need a new variant.
-    TextView {
-        text: String,
-        audience: String,
-    },
     Image {
         media_type: String,
         data: Vec<u8>,
@@ -263,9 +251,6 @@ pub enum Content {
         media_type: String,
     },
 }
-
-/// The [`Content::TextView`] audience the web/desktop front-end renders.
-pub const AUDIENCE_UI: &str = "ui";
 
 /// Session lifecycle. `Created` is always the first event and snapshots the
 /// initial config so replay is self-contained. See `doc/event-schema.md` §7

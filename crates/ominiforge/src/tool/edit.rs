@@ -203,16 +203,6 @@ path
         }
     }
 
-    /// Stage-2 streaming (`doc/tool-streaming.md`): a per-call presenter that
-    /// renders the entry the model is currently writing — the file read once
-    /// `path` closes, the anchor located once `old` closes, and the
-    /// replacement grown as `new` streams in.
-    fn stream_presenter(&self) -> Option<Box<dyn super::StreamPresenter>> {
-        Some(Box::new(super::edit_stream::EditStreamPresenter::new(
-            self.workspace.clone(),
-        )))
-    }
-
     async fn invoke(&self, input: ToolInput) -> ToolResult {
         let planned = match self.plan_all(input.input).await {
             Ok(planned) => planned,
@@ -238,21 +228,6 @@ path
                     text: plan.new_content.clone(),
                 },
             };
-            // Record the formatter only when it actually changed the text —
-            // an already-formatted file carries no annotation. The adjustment
-            // count is the formatter's OWN change regions (model text →
-            // formatted text), so the annotation attributes only its edits.
-            let formatter = match &outcome {
-                crate::format::FormatOutcome::Formatted { formatter, text }
-                    if *text != plan.new_content =>
-                {
-                    Some((
-                        formatter.clone(),
-                        super::diffview::change_region_count(&plan.new_content, text),
-                    ))
-                }
-                _ => None,
-            };
             let final_text = outcome.into_text();
             if let Err(e) = tokio::fs::write(&plan.abs_path, final_text.as_bytes()).await {
                 return Ok(business_error(
@@ -263,10 +238,8 @@ path
             written.push(WrittenFile {
                 abs_path: plan.abs_path,
                 rel_path: plan.rel_path,
-                old_content: plan.old_content,
                 final_text,
                 replacement_count: plan.replacement_count,
-                formatter,
                 crlf_adapted: plan.crlf_adapted,
             });
         }
@@ -296,20 +269,6 @@ path
             is_error: false,
             error_code: None,
         };
-        // The UI diff view rides as a `TextView` block after the model-facing
-        // summary: rendered by the front-end, skipped by `render_output`, so
-        // the model never pays tokens for a diff of its own arguments
-        // (`doc/tool-streaming.md`). The diff is `old_content → final_text` — when
-        // a formatter ran it includes the formatter's reflow, annotated with
-        // `formatted_by` so the reader knows part of the change is not the
-        // model's (`doc/lsp.md` §6).
-        let view_text = written_view(&written);
-        if !view_text.is_empty() {
-            output.content.push(Content::TextView {
-                text: view_text,
-                audience: crate::core::payload::AUDIENCE_UI.to_owned(),
-            });
-        }
         for w in &written {
             append_diagnostics(
                 self.lsp.as_ref(),
@@ -324,61 +283,15 @@ path
     }
 }
 
-/// One file that landed on disk: everything the diff view and diagnostics
+/// One file that landed on disk: everything diagnostics and the result brief
 /// need, anchored to the FINAL (possibly formatted) text.
 struct WrittenFile {
     abs_path: PathBuf,
     rel_path: String,
-    old_content: String,
     final_text: String,
     replacement_count: usize,
-    /// The formatter that changed the text plus how many change regions it
-    /// made (drives `formatted_by` / the "N adjustments" annotation).
-    formatter: Option<(String, usize)>,
     /// Carried from [`PlannedWrite`]: whether CRLF adaptation was surfaced.
     crlf_adapted: bool,
-}
-
-/// Render the written files' diff views into a JSON envelope
-/// `{ kind: "diff", files: [{ path, patch, formatted_by? }] }`. The diff is
-/// `old_content → final_text` (`doc/lsp.md` §6): when a formatter changed
-/// the text, the diff includes its reflow and the file entry carries a
-/// `formatted_by` annotation so the reader knows part of the change is not
-/// the model's. `render_hunks`'s splice-anchored render can't be used here
-/// because the formatter's edits aren't among the model's splices — so this
-/// runs a real line-level diff (`similar`, same as `write`).
-fn written_view(written: &[WrittenFile]) -> String {
-    let mut files: Vec<serde_json::Value> = Vec::new();
-    for w in written {
-        if w.old_content == w.final_text {
-            continue; // no change — no diff block
-        }
-        let patch = super::diffview::write_diff(
-            &w.old_content,
-            &w.final_text,
-            super::diffview::default_context(),
-        );
-        if patch.is_empty() {
-            continue;
-        }
-        let mut entry = serde_json::json!({
-            "path": w.rel_path,
-            "patch": patch,
-        });
-        if let Some((formatter, adjustments)) = &w.formatter {
-            entry["formatted_by"] = serde_json::Value::String(formatter.clone());
-            entry["format_adjustments"] = serde_json::json!(adjustments);
-        }
-        files.push(entry);
-    }
-    if files.is_empty() {
-        return String::new();
-    }
-    serde_json::json!({
-        "kind": "diff",
-        "files": files,
-    })
-    .to_string()
 }
 
 /// The two failure channels of [`EditTool::plan_all`]: a protocol error means
@@ -392,8 +305,7 @@ enum PlanErr {
 
 impl EditTool {
     /// Parse, validate, group and plan every entry — everything short of
-    /// writing. Shared by `invoke` (which then writes) and `preview` (which
-    /// only renders the would-be diff). Malformed input (bad JSON, empty
+    /// writing (which `invoke` then performs). Malformed input (bad JSON, empty
     /// `edits`, an invalid entry) is a PROTOCOL error; a content failure
     /// (no match, ambiguous, overlapping, invalid path) is a BUSINESS error
     /// the model reacts to.
@@ -468,9 +380,6 @@ struct Entry {
 struct PlannedWrite {
     abs_path: PathBuf,
     rel_path: String,
-    /// The file's content before the edit — the diff's "before" side and the
-    /// base for re-rendering after auto-format (`doc/lsp.md` §6).
-    old_content: String,
     new_content: String,
     replacement_count: usize,
     /// The 1-based inclusive line range the edits touched, for `mode = "edit"`
@@ -582,7 +491,6 @@ impl EditTool {
         Ok(PlannedWrite {
             abs_path: abs_path.to_path_buf(),
             rel_path: rel_path.to_owned(),
-            old_content: content,
             new_content,
             replacement_count,
             edited_lines: if changed { edited_lines } else { None },
@@ -988,7 +896,6 @@ mod tests {
             call_id: "c1".to_owned(),
             input: serde_json::json!({ "edits": edits }),
             timeout: Duration::from_secs(5),
-            progress: None,
         }
     }
 
@@ -997,92 +904,6 @@ mod tests {
             Content::Text(t) => t.clone(),
             other => panic!("expected text, got {other:?}"),
         }
-    }
-
-    /// The `TextView` block of a successful edit, if it produced one.
-    fn view(out: &ToolOutput) -> Option<&str> {
-        out.content.iter().find_map(|c| match c {
-            Content::TextView { text, audience } if audience == "ui" => Some(text.as_str()),
-            _ => None,
-        })
-    }
-
-    /// A single-line replacement yields the model-facing summary PLUS a
-    /// `TextView` with the exact unified diff (headers + hunk), and the view
-    /// never leaks into the model-facing `Text` (`doc/tool-streaming.md` §2–§3).
-    #[tokio::test]
-    async fn successful_edit_carries_a_ui_diff_view() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("f.txt"),
-            "a
-b
-c
-d
-e
-",
-        )
-        .unwrap();
-        let out = tool(dir.path().to_path_buf())
-            .invoke(call(
-                serde_json::json!([{ "path": "f.txt", "old": ["c"], "new": ["C"] }]),
-            ))
-            .await
-            .unwrap();
-        assert!(!out.is_error);
-        assert_eq!(text(&out), "edited f.txt (1 replacement)");
-        // The view is a JSON envelope `{ kind: "diff", files: [{ path, patch }] }`.
-        let view_json: serde_json::Value = serde_json::from_str(view(&out).unwrap()).unwrap();
-        assert_eq!(view_json["kind"], "diff");
-        assert_eq!(view_json["files"][0]["path"], "f.txt");
-        assert_eq!(
-            view_json["files"][0]["patch"].as_str().unwrap(),
-            "@@ -1,5 +1,5 @@\n a\n b\n-c\n+C\n d\n e"
-        );
-    }
-
-    /// A business failure (no match) carries only the error text — no view
-    /// (the error brief is the whole story; the debug fold shows it).
-    #[tokio::test]
-    async fn failed_edit_has_no_view() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("f.txt"),
-            "a
-b
-",
-        )
-        .unwrap();
-        let out = tool(dir.path().to_path_buf())
-            .invoke(call(
-                serde_json::json!([{ "path": "f.txt", "old": ["zzz"], "new": ["Z"] }]),
-            ))
-            .await
-            .unwrap();
-        assert!(out.is_error);
-        assert!(view(&out).is_none());
-    }
-
-    /// An identical old→new (a no-op edit) produces no view block: emitting
-    /// an empty diff would claim a change where none happened.
-    #[tokio::test]
-    async fn noop_edit_has_no_view() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("f.txt"),
-            "a
-b
-",
-        )
-        .unwrap();
-        let out = tool(dir.path().to_path_buf())
-            .invoke(call(
-                serde_json::json!([{ "path": "f.txt", "old": ["b"], "new": ["b"] }]),
-            ))
-            .await
-            .unwrap();
-        assert!(!out.is_error);
-        assert!(view(&out).is_none());
     }
 
     // --- auto-format integration (`doc/lsp.md`) --------------------------
@@ -1130,41 +951,6 @@ b
             std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
             "a\nB\nc\n"
         );
-        // The diff shows the formatted line (`+B`, not `+B   `) and names the
-        // formatter.
-        let view_json: serde_json::Value = serde_json::from_str(view(&out).unwrap()).unwrap();
-        assert_eq!(view_json["files"][0]["formatted_by"], "trim-ws");
-        // The formatter stripped trailing whitespace on one line — one change
-        // region, attributed to it (not to the model).
-        assert_eq!(view_json["files"][0]["format_adjustments"], 1);
-        let patch = view_json["files"][0]["patch"].as_str().unwrap();
-        assert!(
-            patch.contains("\n+B\n"),
-            "patch should show stripped +B: {patch}"
-        );
-        assert!(
-            !patch.contains("+B   "),
-            "patch must not show the pre-format text"
-        );
-    }
-
-    /// A file the formatter leaves unchanged carries no `formatted_by`
-    /// annotation — an already-clean file must not claim it was reformatted.
-    #[tokio::test]
-    async fn unchanged_format_has_no_annotation() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("f.txt"), "a\nb\nc\n").unwrap();
-        let t = EditTool::new(dir.path().to_path_buf()).with_format(Some(fmt_manager()));
-
-        let out = t
-            .invoke(call(serde_json::json!([
-                { "path": "f.txt", "old": ["b"], "new": ["B"] }
-            ])))
-            .await
-            .unwrap();
-        assert!(!out.is_error, "{:?}", out.content);
-        let view_json: serde_json::Value = serde_json::from_str(view(&out).unwrap()).unwrap();
-        assert!(view_json["files"][0].get("formatted_by").is_none());
     }
 
     /// Fail-closed end to end: a formatter whose binary is missing skips
@@ -1204,8 +990,6 @@ b
             std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
             "a\nB   \nc\n"
         );
-        let view_json: serde_json::Value = serde_json::from_str(view(&out).unwrap()).unwrap();
-        assert!(view_json["files"][0].get("formatted_by").is_none());
     }
 
     #[tokio::test]
@@ -1508,7 +1292,6 @@ b
             call_id: "c1".to_owned(),
             input: serde_json::json!({ "edits": { "path": "f.txt", "old": ["b"], "new": ["B"] } }),
             timeout: Duration::from_secs(5),
-            progress: None,
         };
         let out = t.invoke(input).await.unwrap();
         assert!(!out.is_error, "{:?}", out.content);

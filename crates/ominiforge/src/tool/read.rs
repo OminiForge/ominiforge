@@ -152,44 +152,11 @@ impl Tool for ReadTool {
 
         match tokio::fs::read_to_string(&path).await {
             Ok(content) => match render(&parsed, &content) {
-                Ok(text) => {
-                    // UI view: structured code content for the front-end to
-                    // highlight (tree-sitter). The model-facing `Text` keeps the
-                    // `[path]` + `N:line` anchor format the model needs for edit.
-                    // The view always carries the WHOLE file plus the window the
-                    // model actually saw — a bare read's text is capped at
-                    // MAX_BARE_LINES, and the front-end highlights the full
-                    // document (a slice breaks multi-line constructs) while
-                    // showing just the window, numbered by its absolute lines.
-                    let n = content.lines().count();
-                    let (lo, hi) = match (parsed.start, parsed.end) {
-                        (None, None) => (1, n.min(MAX_BARE_LINES)),
-                        (start, end) => {
-                            // render() bounds-checked this same window.
-                            clamp_range(start.unwrap_or(1), end.unwrap_or(n), n)
-                                .map_err(ToolError::InvalidInput)?
-                        }
-                    };
-                    let view = serde_json::json!({
-                        "kind": "code",
-                        "path": parsed.path,
-                        "content": content,
-                        "numbered": true,
-                        "start": lo,
-                        "end": hi,
-                    })
-                    .to_string();
-                    let mut output = ToolOutput {
-                        content: vec![Content::Text(text)],
-                        is_error: false,
-                        error_code: None,
-                    };
-                    output.content.push(Content::TextView {
-                        text: view,
-                        audience: crate::core::payload::AUDIENCE_UI.to_owned(),
-                    });
-                    Ok(output)
-                }
+                Ok(text) => Ok(ToolOutput {
+                    content: vec![Content::Text(text)],
+                    is_error: false,
+                    error_code: None,
+                }),
                 Err(msg) => Ok(business_error(
                     "bad_range",
                     &format!("{}: {msg}", parsed.path),
@@ -223,21 +190,9 @@ impl ReadTool {
         }
         names.sort();
         let mut parts = vec![format!("[{}/]", rel.trim_end_matches('/'))];
-        parts.extend(names.clone());
-        let view = serde_json::json!({
-            "kind": "listing",
-            "path": rel,
-            "entries": names,
-        })
-        .to_string();
+        parts.extend(names);
         ToolOutput {
-            content: vec![
-                Content::Text(parts.join("\n")),
-                Content::TextView {
-                    text: view,
-                    audience: crate::core::payload::AUDIENCE_UI.to_owned(),
-                },
-            ],
+            content: vec![Content::Text(parts.join("\n"))],
             is_error: false,
             error_code: None,
         }
@@ -351,7 +306,6 @@ mod tests {
             call_id: "c1".to_owned(),
             input: serde_json::json!({ "path": path }),
             timeout: Duration::from_secs(5),
-            progress: None,
         }
     }
 
@@ -371,7 +325,6 @@ mod tests {
             call_id: "c1".to_owned(),
             input,
             timeout: Duration::from_secs(5),
-            progress: None,
         }
     }
 
@@ -384,16 +337,6 @@ mod tests {
             Content::Text(t) => t.clone(),
             other => panic!("expected text, got {other:?}"),
         }
-    }
-
-    fn view(out: &ToolOutput) -> serde_json::Value {
-        out.content
-            .iter()
-            .find_map(|c| match c {
-                Content::TextView { text, .. } => Some(serde_json::from_str(text).unwrap()),
-                _ => None,
-            })
-            .unwrap()
     }
 
     #[tokio::test]
@@ -495,71 +438,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(text(&out), "[a.txt] (3 lines)\n1:l1\n2:l2");
-        let view = view(&out);
-        assert_eq!(view["numbered"], true);
-        assert_eq!(view["start"], 1);
-        assert_eq!(view["end"], 2);
-    }
-
-    // --- UI view (TextView) -------------------------------------------------
-
-    /// A ranged read's UI view carries the WHOLE file plus the resolved
-    /// window: the front-end highlights the full document (partial-file
-    /// parsing breaks multi-line constructs) and shows the slice. The gutter
-    /// numbers are the window's absolute lines.
-    #[tokio::test]
-    async fn ranged_read_view_is_full_content_with_window() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.txt"), "l1\nl2\nl3\nl4\nl5\n").unwrap();
-        let t = tool(dir.path().to_path_buf());
-
-        let out = t.invoke(range_input("a.txt", 2, 4)).await.unwrap();
-        let view = view(&out);
-        assert_eq!(view["kind"], "code");
-        assert_eq!(view["content"], "l1\nl2\nl3\nl4\nl5\n");
-        assert_eq!(view["numbered"], true);
-        assert_eq!(view["start"], 2);
-        assert_eq!(view["end"], 4);
-    }
-
-    /// `start`/`end` in the view are the RESOLVED window — the gutter the
-    /// front-end renders must equal the absolute lines the model's text cites.
-    #[tokio::test]
-    async fn ranged_view_window_matches_model_text() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.txt"), "l1\nl2\nl3\nl4\nl5\n").unwrap();
-        let t = tool(dir.path().to_path_buf());
-
-        let out = t.invoke(range_input("a.txt", 2, 4)).await.unwrap();
-        let view = view(&out);
-        let (start, end) = (
-            view["start"].as_u64().unwrap(),
-            view["end"].as_u64().unwrap(),
-        );
-        let model_text = text(&out);
-        let body = model_text.split_once('\n').unwrap().1;
-        let nums: Vec<u64> = body
-            .lines()
-            .map(|l| l.split_once(':').unwrap().0.parse().unwrap())
-            .collect();
-        assert_eq!(nums, (start..=end).collect::<Vec<_>>());
-    }
-
-    /// A bare read's view carries the whole file plus the resolved window —
-    /// the same shape as a ranged read — so a truncated bare read still
-    /// highlights correctly and shows exactly what the model saw.
-    #[tokio::test]
-    async fn bare_read_view_is_full_content_with_window() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.txt"), "l1\nl2\n").unwrap();
-        let t = tool(dir.path().to_path_buf());
-
-        let out = t.invoke(input("a.txt")).await.unwrap();
-        let view = view(&out);
-        assert_eq!(view["content"], "l1\nl2\n");
-        assert_eq!(view["numbered"], true);
-        assert_eq!(view["start"], 1);
-        assert_eq!(view["end"], 2);
     }
 
     #[tokio::test]
@@ -661,7 +539,6 @@ mod tests {
                 call_id: "c1".to_owned(),
                 input: serde_json::json!({ "path": "long.txt", "verbatim": true }),
                 timeout: Duration::from_secs(5),
-                progress: None,
             })
             .await
             .unwrap();
@@ -692,7 +569,6 @@ mod tests {
                     "verbatim": true,
                 }),
                 timeout: Duration::from_secs(5),
-                progress: None,
             })
             .await
             .unwrap();
@@ -719,7 +595,6 @@ mod tests {
                 call_id: "c1".to_owned(),
                 input: serde_json::json!({ "path": "big.txt", "verbatim": true }),
                 timeout: Duration::from_secs(5),
-                progress: None,
             })
             .await
             .unwrap();

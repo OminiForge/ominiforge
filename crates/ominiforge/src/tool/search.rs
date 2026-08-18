@@ -323,24 +323,8 @@ fn render(outcome: &Outcome) -> ToolOutput {
     for hit in &outcome.hits {
         let _ = write!(text, "\n{}:{}:{}", hit.path, hit.line, hit.text);
     }
-    let view = serde_json::json!({
-        "kind": "listing",
-        "path": "",
-        "entries": outcome
-            .hits
-            .iter()
-            .map(|h| format!("{}:{}:{}", h.path, h.line, h.text))
-            .collect::<Vec<_>>(),
-    })
-    .to_string();
     ToolOutput {
-        content: vec![
-            Content::Text(text),
-            Content::TextView {
-                text: view,
-                audience: crate::core::payload::AUDIENCE_UI.to_owned(),
-            },
-        ],
+        content: vec![Content::Text(text)],
         is_error: false,
         error_code: None,
     }
@@ -370,7 +354,6 @@ mod tests {
             call_id: "c1".to_owned(),
             input: serde_json::json!({ "patterns": patterns }),
             timeout: Duration::from_secs(5),
-            progress: None,
         }
     }
 

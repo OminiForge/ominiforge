@@ -42,7 +42,6 @@ use crate::session::{SessionMeta, SessionStore};
 use super::actor::{ActorHandle, Command, SessionActor};
 use super::approval::ScopedDecision;
 use super::config::GatewayConfig;
-use super::status::{ActivityStatus, StatusHub};
 
 /// Bridges the actor's per-turn model overrides to the config store: resolves
 /// a `provider/model_id` reference (against the session's profile, for its
@@ -261,9 +260,6 @@ struct RegistryInner {
     /// The persisted `hash → path` workspace map, guarded by a std mutex (all its
     /// operations are synchronous filesystem reads/writes — no await is held).
     workspaces: std::sync::Mutex<super::workspace::WorkspaceRegistry>,
-    /// Process-wide session activity status, fanned out to the session list. Every
-    /// spawned actor gets a clone so it can publish its running/idle transitions.
-    status_hub: StatusHub,
     /// Per-session sandboxes (`doc/design/runtime-architecture.md` §3.2): owns each session's
     /// execution environment, decoupled from the (ephemeral) actor that drives
     /// it. Backend is chosen once here as a deployment property.
@@ -459,7 +455,6 @@ impl SessionRegistry {
                 provider_source,
                 actors: Mutex::new(HashMap::new()),
                 workspaces,
-                status_hub: StatusHub::new(),
                 sandbox_manager,
                 lsp_service: Arc::new(crate::lsp::ProcessLspService::new().with_periods(
                     config.lsp_reclaim_grace(),
@@ -472,13 +467,6 @@ impl SessionRegistry {
                 config_write_lock: Mutex::new(()),
             }),
         })
-    }
-
-    /// The process-wide session activity status hub — the session list's live
-    /// read source (the gateway-wide `/status/events` SSE subscribes to it).
-    #[must_use]
-    pub fn status_hub(&self) -> StatusHub {
-        self.inner.status_hub.clone()
     }
 
     /// Spawn the background LSP sweeper (`doc/lsp.md` §5.2): every
@@ -1144,11 +1132,11 @@ impl SessionRegistry {
         // 404 before touching anything: don't stop an actor for a ghost.
         let _ = self.meta(id)?;
 
-        // Don't retire a session out from under a running turn. "locked" in the
-        // message maps to a 409 via the server's `conflict_or_not_found`.
-        if self.inner.status_hub.status_of(id) == Some(ActivityStatus::Running) {
+        // Don't retire a session out from under a live actor: a registered actor
+        // may have a turn in flight. "locked" maps to a 409 via the caller.
+        if self.inner.actors.lock().await.contains_key(id) {
             return Err(anyhow!(
-                "session `{}` is locked: a turn is running; cancel it before archiving",
+                "session `{}` is locked: an actor is live; cancel it before archiving",
                 id.0
             ));
         }
@@ -1351,7 +1339,6 @@ impl SessionRegistry {
             (writer, runtime),
             self.inner.idle_timeout,
             assembled.mcp_clients,
-            self.inner.status_hub.clone(),
             Some(self.scoped_rule_callback(id.clone())),
             assembled.resolved.clone(),
             assembled.profile_name.clone(),
@@ -1446,7 +1433,6 @@ impl SessionRegistry {
             (writer, runtime),
             self.inner.idle_timeout,
             assembled.mcp_clients,
-            self.inner.status_hub.clone(),
             Some(self.scoped_rule_callback(id.clone())),
             assembled.resolved.clone(),
             assembled.profile_name.clone(),
@@ -1542,7 +1528,6 @@ impl SessionRegistry {
             (writer, runtime),
             self.inner.idle_timeout,
             assembled.mcp_clients,
-            self.inner.status_hub.clone(),
             Some(self.scoped_rule_callback(id.clone())),
             assembled.resolved.clone(),
             assembled.profile_name.clone(),
@@ -1628,7 +1613,6 @@ impl SessionRegistry {
             (writer, runtime),
             self.inner.idle_timeout,
             assembled.mcp_clients,
-            self.inner.status_hub.clone(),
             Some(self.scoped_rule_callback(id.clone())),
             assembled.resolved.clone(),
             assembled.profile_name.clone(),

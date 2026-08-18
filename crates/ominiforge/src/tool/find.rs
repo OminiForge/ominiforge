@@ -247,20 +247,8 @@ fn render(outcome: &Outcome) -> ToolOutput {
         text.push('\n');
         text.push_str(path);
     }
-    let view = serde_json::json!({
-        "kind": "listing",
-        "path": "",
-        "entries": outcome.matches,
-    })
-    .to_string();
     ToolOutput {
-        content: vec![
-            Content::Text(text),
-            Content::TextView {
-                text: view,
-                audience: crate::core::payload::AUDIENCE_UI.to_owned(),
-            },
-        ],
+        content: vec![Content::Text(text)],
         is_error: false,
         error_code: None,
     }
@@ -292,7 +280,6 @@ mod tests {
             call_id: "c1".to_owned(),
             input: serde_json::json!({ "patterns": patterns }),
             timeout: Duration::from_secs(5),
-            progress: None,
         }
     }
 

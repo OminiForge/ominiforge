@@ -44,23 +44,6 @@ pub trait Sandbox: Send + Sync {
     /// backend may also enforce its own limit from [`ResourceLimits`].
     async fn exec(&self, command: &str, timeout: Duration) -> Result<ExecOutput, SandboxError>;
 
-    /// Like [`Sandbox::exec`], but streams each output chunk (stdout and
-    /// stderr interleaved as they arrive) to `on_output` as it is produced,
-    /// instead of only at the end. Used by the shell tool's stage-2 output
-    /// streaming (`doc/tool-streaming.md`). The default ignores `on_output`
-    /// and delegates to [`Sandbox::exec`] — a backend that can't stream
-    /// (`BoxLite`, TODO) silently degrades to end-only output, which the caller
-    /// already tolerates (no live frames, settled view at stage 3).
-    async fn exec_streaming(
-        &self,
-        command: &str,
-        timeout: Duration,
-        mut on_output: Box<dyn for<'a> FnMut(&'a [u8]) + Send>,
-    ) -> Result<ExecOutput, SandboxError> {
-        let _ = &mut on_output;
-        self.exec(command, timeout).await
-    }
-
     /// Capture the current filesystem state as a snapshot.
     ///
     /// **Contract**: the caller must ensure the sandbox is quiescent. The

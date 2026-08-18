@@ -122,19 +122,6 @@ impl Tool for WriteTool {
                 text: model_content.clone(),
             },
         };
-        // Record the formatter only when it actually changed the content,
-        // plus how many change regions it made (normalized content → formatted).
-        let formatter = match &outcome {
-            crate::format::FormatOutcome::Formatted { formatter, text }
-                if *text != model_content =>
-            {
-                Some((
-                    formatter.clone(),
-                    super::diffview::change_region_count(&model_content, text),
-                ))
-            }
-            _ => None,
-        };
         let content = outcome.into_text();
 
         if let Some(parent) = path.parent()
@@ -153,71 +140,12 @@ impl Tool for WriteTool {
                     is_error: false,
                     error_code: None,
                 };
-                // UI view: an overwrite diffs old→new (`similar`, same engine
-                // `write_summary` counts with); a new file's view is its full
-                // content. Never model input (`doc/tool-streaming.md`). When a
-                // formatter changed the text the diff carries `formatted_by`.
-                let view = write_view(
-                    &args.path,
-                    old.as_deref(),
-                    &content,
-                    formatter.as_ref().map(|(n, c)| (n.as_str(), *c)),
-                );
-                if let Some(text) = view {
-                    output.content.push(Content::TextView {
-                        text,
-                        audience: crate::core::payload::AUDIENCE_UI.to_owned(),
-                    });
-                }
                 append_diagnostics(self.lsp.as_ref(), &mut output, &path, &args.path, &content)
                     .await;
                 Ok(output)
             }
             Err(e) => Ok(business_error(&args.path, &e)),
         }
-    }
-
-    /// Stage-2 streaming (`doc/tool-streaming.md`): a per-call presenter that
-    /// grows a code view (new file) or a live old→new diff (overwrite) as the
-    /// `content` arg streams in.
-    fn stream_presenter(&self) -> Option<Box<dyn super::StreamPresenter>> {
-        Some(Box::new(super::write_stream::WriteStreamPresenter::new(
-            self.workspace.clone(),
-        )))
-    }
-}
-
-/// The write UI view as a JSON envelope (`doc/tool-streaming.md`): an overwrite is a
-/// `diff` of old→new; a new file is its full `code` content. `None` for a
-/// no-change write (empty diff = no block) or an empty new file. Shared by
-/// `invoke` (executed `TextView`) and `preview` (approval gate), so the gate
-/// shows exactly what the executed card will.
-fn write_view(
-    path: &str,
-    old: Option<&str>,
-    content: &str,
-    formatted: Option<(&str, usize)>,
-) -> Option<String> {
-    match old {
-        Some(old) if old != content => {
-            let body = super::diffview::write_diff_json(
-                path,
-                old,
-                content,
-                super::diffview::default_context(),
-                formatted,
-            );
-            (!body.is_empty()).then_some(body)
-        }
-        None if !content.is_empty() => Some(
-            serde_json::json!({
-                "kind": "code",
-                "path": path,
-                "content": content,
-            })
-            .to_string(),
-        ),
-        _ => None,
     }
 }
 
@@ -285,7 +213,6 @@ mod tests {
             call_id: "c1".to_owned(),
             input: serde_json::json!({ "path": path, "content": content }),
             timeout: Duration::from_secs(5),
-            progress: None,
         }
     }
 
@@ -355,96 +282,6 @@ mod tests {
         assert_eq!(normalize_to_crlf("a\nb"), "a\r\nb");
     }
 
-    fn view(out: &ToolOutput) -> Option<&str> {
-        out.content.iter().find_map(|c| match c {
-            Content::TextView { text, audience } if audience == "ui" => Some(text.as_str()),
-            _ => None,
-        })
-    }
-
-    /// A new file's view is its full content (the front-end renders it as a
-    /// code view, not a diff — there is no "before" side).
-    #[tokio::test]
-    async fn new_file_view_is_the_full_content() {
-        let dir = tempfile::tempdir().unwrap();
-        let out = WriteTool::new(dir.path().to_path_buf())
-            .invoke(input(
-                "n.rs",
-                "fn main() {}
-",
-            ))
-            .await
-            .unwrap();
-        assert!(!out.is_error);
-        // The view is a JSON envelope `{ kind: "code", path, content }`.
-        let view_json: serde_json::Value = serde_json::from_str(view(&out).unwrap()).unwrap();
-        assert_eq!(view_json["kind"], "code");
-        assert_eq!(view_json["path"], "n.rs");
-        assert_eq!(view_json["content"], "fn main() {}\n");
-    }
-
-    /// An overwrite's view is the exact old→new unified diff, built from the
-    /// real pre-write content — never a front-end reconstruction
-    /// (`doc/tool-streaming.md` §4).
-    #[tokio::test]
-    async fn overwrite_view_is_the_diff() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("f.txt"),
-            "a
-b
-c
-d
-e
-",
-        )
-        .unwrap();
-        let out = WriteTool::new(dir.path().to_path_buf())
-            .invoke(input(
-                "f.txt",
-                "a
-b
-C
-d
-e
-",
-            ))
-            .await
-            .unwrap();
-        assert!(!out.is_error);
-        // The view is a JSON envelope `{ kind: "diff", files: [{ path, patch }] }`.
-        let view_json: serde_json::Value = serde_json::from_str(view(&out).unwrap()).unwrap();
-        assert_eq!(view_json["kind"], "diff");
-        assert_eq!(view_json["files"][0]["path"], "f.txt");
-        assert_eq!(
-            view_json["files"][0]["patch"].as_str().unwrap(),
-            "@@ -1,5 +1,5 @@\n a\n b\n-c\n+C\n d\n e"
-        );
-    }
-
-    /// A no-change write produces no view (the "no change" summary is the
-    /// whole story), and a failed write (escaping path is a protocol error,
-    /// but a business failure likewise) never carries one.
-    #[tokio::test]
-    async fn no_change_write_has_no_view() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("f.txt"),
-            "same
-",
-        )
-        .unwrap();
-        let out = WriteTool::new(dir.path().to_path_buf())
-            .invoke(input(
-                "f.txt", "same
-",
-            ))
-            .await
-            .unwrap();
-        assert!(!out.is_error);
-        assert!(view(&out).is_none());
-    }
-
     // --- auto-format integration (`doc/lsp.md`) --------------------------
 
     /// A `FormatService` whose only formatter strips trailing whitespace via
@@ -467,11 +304,9 @@ e
     }
 
     /// An overwrite whose content carries trailing whitespace is written
-    /// FORMATTED, and the diff view (old → formatted) is annotated
-    /// `formatted_by` (`doc/lsp.md` §6) — the model sees the real on-disk
-    /// change, part of which is the formatter's.
+    /// FORMATTED (`doc/lsp.md` §6) — the on-disk change is the formatter's.
     #[tokio::test]
-    async fn formatted_write_diff_is_annotated() {
+    async fn formatted_write_is_applied() {
         let dir = tempfile::tempdir().unwrap();
         // Pre-write content differs from the formatted result, so the diff is
         // non-empty; the model's content carries trailing whitespace that the
@@ -487,8 +322,6 @@ e
             std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
             "a\nb\n"
         );
-        let view_json: serde_json::Value = serde_json::from_str(view(&out).unwrap()).unwrap();
-        assert_eq!(view_json["files"][0]["formatted_by"], "trim-ws");
     }
 
     /// `mode = "off"` produces no `FormatService` at all (`ProcessFormatService::new`

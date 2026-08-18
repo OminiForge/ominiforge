@@ -7,20 +7,15 @@
 //! the artifact store once that exists (Phase 2); for now it is returned
 //! inline. See `doc/tool-protocol.md`.
 
-pub(crate) mod diffview;
 pub(crate) mod edit;
-mod edit_stream;
 mod error;
 mod find;
 mod read;
 mod search;
 mod shell;
-pub mod stream_args;
-mod terminal;
 pub mod web;
 mod web_fetch;
 mod write;
-mod write_stream;
 
 pub use edit::EditTool;
 pub use error::ToolError;
@@ -82,43 +77,6 @@ pub trait Tool: Send + Sync {
 
     /// Execute the tool to completion.
     async fn invoke(&self, input: ToolInput) -> ToolResult;
-
-    /// A streaming presenter for stage 2 of the tool-call pipeline
-    /// (`doc/tool-streaming.md`): turns this call's args into render-ready view
-    /// snapshots as they stream in. The default is `None` — the card shows the
-    /// block-start skeleton and jumps straight to the settled view at stage 3,
-    /// which is the correct behavior for most tools (small args: read/find/
-    /// shell; non-renderable: todo/MCP). Override ONLY for tools with large
-    /// streamed args where a live view adds real value (currently: `write`).
-    ///
-    /// A fresh presenter is created per tool call (it may hold per-call state,
-    /// e.g. a cached pre-edit file snapshot).
-    fn stream_presenter(&self) -> Option<Box<dyn StreamPresenter>> {
-        None
-    }
-}
-
-/// Turns a tool call's accumulated raw args into a render-ready view snapshot.
-///
-/// The args arrive as a growing JSON string, possibly truncated mid-token. One
-/// presenter instance per tool call, driven by the collector under throttle
-/// (`doc/tool-streaming.md` §4). Async so a presenter may read the pre-edit
-/// file once (lazily, cached) before it can diff.
-///
-/// Contract:
-/// - `accumulated_args` is the FULL args text so far, never a delta — snapshots
-///   are self-contained so the gateway may coalesce (drop stale, keep newest).
-/// - The output is the SAME `TextView` envelope as stage 3's
-///   `preview()`/`invoke` view, so the front-end renders stage 2 and stage 3
-///   with one code path.
-/// - Return `None` when the args aren't yet renderable (e.g. `path` still
-///   streaming); the caller keeps the last good snapshot.
-/// - Must be cheap: this runs on the model stream's hot path under throttle.
-#[async_trait::async_trait]
-pub trait StreamPresenter: Send {
-    /// Render a snapshot from the accumulated args, or `None` if not yet
-    /// renderable.
-    async fn render(&mut self, accumulated_args: &str) -> Option<String>;
 }
 
 /// Static dispatch for `summarize` by tool name.
@@ -342,8 +300,7 @@ pub fn builtin_catalog() -> Vec<ToolInfo> {
     ]
 }
 
-/// A single invocation request. Not `Clone`: the optional `progress` sink is
-/// a one-shot callback. `Debug` is manual to skip that sink.
+/// A single invocation request.
 pub struct ToolInput {
     /// The model-assigned tool-call id (correlates result back to the call).
     pub call_id: String,
@@ -351,25 +308,6 @@ pub struct ToolInput {
     pub input: serde_json::Value,
     /// Wall-clock budget for this invocation.
     pub timeout: Duration,
-    /// Optional live-progress sink for tools that stream RESULTS mid-execution
-    /// (currently `shell` output, `doc/tool-streaming.md` §5). The tool calls it
-    /// with self-contained view snapshots (the same envelope as the settled
-    /// view); the agent wires it to `StreamSink::on_tool_call_progress`. `None`
-    /// (tests, headless) means no live frames — the settled view at stage 3 is
-    /// unaffected. Distinct from `stream_presenter`, which streams ARGS before
-    /// execution; this streams the RESULT during it.
-    pub progress: Option<Box<dyn FnMut(String) + Send>>,
-}
-
-impl std::fmt::Debug for ToolInput {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ToolInput")
-            .field("call_id", &self.call_id)
-            .field("input", &self.input)
-            .field("timeout", &self.timeout)
-            .field("progress", &self.progress.as_ref().map(|_| "<sink>"))
-            .finish()
-    }
 }
 
 /// A name-indexed set of tools.
@@ -400,13 +338,6 @@ impl ToolRegistry {
     #[must_use]
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.get(name).cloned()
-    }
-
-    /// A streaming presenter for `name`'s next call, or `None` if the tool has
-    /// no stage-2 streaming (the default — `doc/tool-streaming.md` §4).
-    #[must_use]
-    pub fn stream_presenter(&self, name: &str) -> Option<Box<dyn StreamPresenter>> {
-        self.tools.get(name).and_then(|t| t.stream_presenter())
     }
 
     /// The [`ToolSource`] of a registered tool, or [`ToolSource::Builtin`] if

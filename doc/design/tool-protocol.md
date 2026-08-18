@@ -10,8 +10,8 @@
 - Tool 分两类：Built-in（Rust 实现）和 MCP（外部 MCP server 提供）。
 - Agent loop 对两类 tool 使用统一接口，不区分来源。
 - 所有 tool 调用统一经过 event journal 记录。
-- MCP 是唯一的外部扩展机制，不自定义 plugin 协议。
-- Tool 是无状态的 request/response 操作，不支持 streaming。
+- 工具侧的外部扩展走 MCP，不自定义 plugin 协议。（新架构 [`runtime-architecture.md`](./runtime-architecture.md) §3 的拓展系统是三形态——数据/进程/wasm，MCP 是其中的进程型；wasm 属自拓展、仍待讨论。）
+- 对 **model** 而言 tool 是无状态的 request/response 操作。对门面的流式只剩文本/思考流式与原始事件流（见 [`tool-streaming.md`](./tool-streaming.md)）；「后端预渲染 view」的流式管线已在零 UI 转向后移除。
 - Tool 输出超 64KB 存 artifact store + 引用。
 
 ## 2. Tool 分类
@@ -339,10 +339,9 @@ edited src/lib.rs (1 replacement)
 `wrote PATH (new, N lines)` / `wrote PATH (~, +A -B)` / `wrote PATH (no change)`，
 不带正文。
 
-UI 需要的 diff **不再由前端构建**，而是后端在执行时（握着真实 pre-edit 内容）产出，
-作为 `ToolEvent::Completed` 的 `view` 字段随事件下发——见
-[`tool-streaming.md`](./tool-streaming.md)。旧方案（前端复刻匹配算法 + 文件缓存自建 diff）
-已废弃，废弃理由与该契约的完整定义见该文档。
+面向 ACP 时，edit/write 的改动映射为 `Diff { path, old_text, new_text }`——后端给原始
+文本，diff 由 Client 计算渲染（见 [`tool-streaming.md`](./tool-streaming.md) §4）。后端自身
+不产出任何渲染好的 view。
 
 ### 11.5 尚未实现
 
@@ -354,7 +353,7 @@ WASM Component + WIT 扩展方案已废弃，统一改用 MCP（任意语言进�
 stdio/SSE，完整 OS 能力，无需 ominiforge-sdk）。废弃理由见
 [`runtime-architecture.md`](./runtime-architecture.md) §3。
 
-## 12. 待后续完善
+## 13. 待后续完善
 
 - Built-in tool 的权限控制（哪些 tool 在哪些 profile 下可用）。
 - MCP server 健康检查和自动重启策略。

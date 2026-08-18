@@ -20,8 +20,6 @@ Ominiforge 是一个用 Rust 实现的**个人 agent 节点系统**：**一个�
 - **零 UI**：系统不自带任何用户界面。core 只做「干活的大脑」，UI 全部外包给现成软件（编辑器、
   项目管理工具、IM），经「门面（facade）」接入；自身只保留 CLI/TUI（运维与随身查看）与远期手机端
   （原生壳）。
-- **自我迭代**：agent 能让系统变强（用 v1.0 开发 v1.1），且**不重启、不打断当前任务**。由于 Rust
-  产物是二进制、改不了宿主，自我迭代落在**拓展层**（见 §3）。
 - **多机互联**：节点经 iroh（QUIC + NAT 穿透 + 自建 relay）互联，人可远程操作任一节点上的活
   thread，agent 也可在权限允许下委派另一节点的 agent（见 §6）。
 - **透明性**：系统透明 = 「一切状态皆可经结构化接口查询、一切过程皆可导出为标准格式」，而非自带
@@ -112,11 +110,11 @@ def crate 间默认禁止互相依赖；进程插件不产生新 crate（MCP 子
 |---|---|---|---|
 | **数据/配置型**（SKILL.md 式目录） | skill/prompt/策略/规则/AGENTS.md | watcher + 可重入重扫 + 代际注册；progressive disclosure（description 常驻、正文触发加载） | 安全边界在「谁把什么文本塞进 context」 |
 | **进程型**（MCP/ACP 子进程） | 工具/门面/外部集成/需 OS 能力的自写逻辑 | 重启子进程 + 代际（generation）+ `list_changed` 热通知；in-flight 超时+取消+退避重连 | 稳定性隔离（崩溃只带走该工具），**非安全隔离** |
-| **wasm 组件**（wasm32-wasip2+WIT） | agent 自写的新逻辑（纯计算/变换/策略）、不可信代码 | 预实例化 + hot-swap 零停机 | 指令级（线性内存外无 syscall、WASI 能力型授权、fuel+epoch 双闸限资源） |
+| **wasm 组件**（wasm32-wasip2+WIT，⚠️ 自拓展、待讨论细化） | agent 自写的新逻辑（纯计算/变换/策略）、不可信代码 | 预实例化 + hot-swap 零停机 | 指令级（线性内存外无 syscall、WASI 能力型授权、fuel+epoch 双闸限资源） |
 
 - **动态库否决**：Rust 无稳定 ABI、与宿主同地址空间零隔离、dlclose 有 UB 风险。
 - **自我迭代对象分层**：改 skill/prompt→数据型；换工具/门面→进程型；自写新逻辑→wasm；
-  **改 core 机制本身→新进程接管**（见 §5.3）。
+  **改 core 机制本身→新进程接管**（见 [`decisions/architecture-direction.md`](../decisions/architecture-direction.md) 第二部分）。
 
 ### 3.2 拓展的注册 / 依赖 / 生命周期 / 热插拔
 

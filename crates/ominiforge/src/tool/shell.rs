@@ -13,70 +13,6 @@ use serde::Deserialize;
 use super::{Tool, ToolDescriptor, ToolError, ToolInput, ToolResult};
 use crate::core::payload::{Content, ToolOutput};
 use crate::sandbox::{ExecOutput, Sandbox, SandboxError};
-use crate::tool::terminal::Terminal;
-use std::time::{Duration, Instant};
-
-/// The live-output callback `Sandbox::exec_streaming` invokes per chunk.
-type OutputCallback = Box<dyn for<'a> FnMut(&'a [u8]) + Send>;
-
-/// Minimum interval between live output frames (`doc/tool-streaming.md` §5):
-/// output can arrive in bursts, so snapshots are throttled to keep the
-/// front-end from re-rendering per chunk. Matches the args-streaming cadence.
-const OUTPUT_MIN_INTERVAL: Duration = Duration::from_millis(120);
-
-/// Drives stage-2 output streaming for one `shell` call: a terminal model fed
-/// the raw bytes, throttled, rendered to a self-contained "current screen"
-/// `terminal` view passed to the agent's progress sink. The terminal model is
-/// what makes panel-style commands (progress bars, spinners, full-screen
-/// redraws) render as in-place refresh rather than accumulating control
-/// sequences (`terminal.rs`).
-struct OutputStream {
-    command: String,
-    terminal: Terminal,
-    last_emit: Option<Instant>,
-    render: Box<dyn FnMut(String) + Send>,
-}
-
-impl OutputStream {
-    fn new(command: &str, render: Box<dyn FnMut(String) + Send>) -> Self {
-        Self {
-            command: command.to_owned(),
-            terminal: Terminal::new(),
-            last_emit: None,
-            render,
-        }
-    }
-
-    /// The `on_output` callback for `Sandbox::exec_streaming`. The terminal
-    /// model and throttle state move into the closure; the exit-code is
-    /// unknown mid-stream (`null`), filled in the settled stage-3 view.
-    fn into_callback(self) -> OutputCallback {
-        let mut this = self;
-        Box::new(move |bytes: &[u8]| {
-            this.terminal.feed(bytes);
-            let due = this
-                .last_emit
-                .is_none_or(|t| t.elapsed() >= OUTPUT_MIN_INTERVAL);
-            if due {
-                this.last_emit = Some(Instant::now());
-                (this.render)(terminal_view(&this.command, &this.terminal.screen(), None));
-            }
-        })
-    }
-}
-
-/// Render a `terminal` view envelope (same shape as `render_output`'s settled
-/// view, so the front-end uses one render path). `exit_code` is `None`
-/// mid-stream (unknown until the process exits).
-fn terminal_view(command: &str, output: &str, exit_code: Option<i32>) -> String {
-    serde_json::json!({
-        "kind": "terminal",
-        "command": command,
-        "output": output,
-        "exit_code": exit_code,
-    })
-    .to_string()
-}
 
 /// Runs a shell command inside a [`Sandbox`].
 #[derive(Clone)]
@@ -134,25 +70,11 @@ impl Tool for ShellTool {
             other => ToolError::Execution(other.to_string()),
         };
 
-        // Stage-2 output streaming (`doc/tool-streaming.md` §5): with a
-        // progress sink, feed the raw bytes to a terminal model and emit a
-        // self-contained "current screen" `terminal` view per throttled frame —
-        // ordinary commands grow, panel-style commands refresh in place. The
-        // settled stage-3 view is unaffected either way.
-        let output = match input.progress {
-            Some(render) => {
-                let on_output = OutputStream::new(&args.command, render).into_callback();
-                self.sandbox
-                    .exec_streaming(&args.command, input.timeout, on_output)
-                    .await
-                    .map_err(map_err)?
-            }
-            None => self
-                .sandbox
-                .exec(&args.command, input.timeout)
-                .await
-                .map_err(map_err)?,
-        };
+        let output = self
+            .sandbox
+            .exec(&args.command, input.timeout)
+            .await
+            .map_err(map_err)?;
 
         Ok(render_output(&args.command, &output))
     }
@@ -161,7 +83,7 @@ impl Tool for ShellTool {
 /// Combine a finished command's streams into a tool output, flagging non-zero
 /// exits as business errors. The UI view is a structured terminal envelope so
 /// the front-end renders command + output + exit code without parsing text.
-fn render_output(command: &str, output: &ExecOutput) -> ToolOutput {
+fn render_output(_command: &str, output: &ExecOutput) -> ToolOutput {
     let mut text = output.stdout.clone();
     if !output.stderr.is_empty() {
         if !text.is_empty() && !text.ends_with('\n') {
@@ -177,16 +99,8 @@ fn render_output(command: &str, output: &ExecOutput) -> ToolOutput {
             .map_or_else(|| "signal".to_owned(), |c| format!("exit_{c}"))
     });
 
-    let view = terminal_view(command, &text, output.exit_code);
-
     ToolOutput {
-        content: vec![
-            Content::Text(text),
-            Content::TextView {
-                text: view,
-                audience: crate::core::payload::AUDIENCE_UI.to_owned(),
-            },
-        ],
+        content: vec![Content::Text(text)],
         is_error: !success,
         error_code,
     }
@@ -212,7 +126,6 @@ mod tests {
             call_id: "c1".to_owned(),
             input: serde_json::json!({ "command": command }),
             timeout,
-            progress: None,
         }
     }
 
@@ -226,17 +139,8 @@ mod tests {
             .await
             .unwrap();
         assert!(!out.is_error);
-        // The model-facing text is the raw output; the UI view is a structured
-        // terminal envelope.
+        // The model-facing text is the raw output.
         assert_eq!(out.content[0], Content::Text("hello\n".to_owned()));
-        let view_json: serde_json::Value = match &out.content[1] {
-            Content::TextView { text, .. } => serde_json::from_str(text).unwrap(),
-            _ => panic!("expected TextView"),
-        };
-        assert_eq!(view_json["kind"], "terminal");
-        assert_eq!(view_json["command"], "echo hello");
-        assert_eq!(view_json["output"], "hello\n");
-        assert_eq!(view_json["exit_code"], 0);
     }
 
     #[tokio::test]
@@ -285,13 +189,6 @@ mod tests {
             .unwrap();
         assert!(!out.is_error);
         assert_eq!(out.content[0], Content::Text("active".to_owned()));
-        // The UI view is a structured terminal envelope.
-        let view_json: serde_json::Value = match &out.content[1] {
-            Content::TextView { text, .. } => serde_json::from_str(text).unwrap(),
-            _ => panic!("expected TextView"),
-        };
-        assert_eq!(view_json["kind"], "terminal");
-        assert_eq!(view_json["output"], "active");
     }
 
     #[tokio::test]

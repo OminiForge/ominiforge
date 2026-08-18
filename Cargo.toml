@@ -3,7 +3,6 @@ resolver = "2"
 members = [
   "crates/ominiforge",
   "crates/ominiforge-cli",
-  "crates/ominiforge-net",
 ]
 
 [workspace.package]

@@ -13,7 +13,7 @@
 
 **本阶段不做**：独立的 `lsp` 工具、rename/format/code-actions、补全、SSE/远程服务器、在 sandbox 内运行服务器。
 
-> 自动格式化（format）**不属于** LSP——它是无状态一次性进程调用，失败语义与本系统相反，见 `doc/lsp.md`。
+> 自动格式化（format）**不属于** LSP——它是无状态一次性进程调用，失败语义与本系统相反，见本文 §9。
 
 ## 2. 与 MCP 的异同
 
@@ -103,7 +103,7 @@ state = "starting" | "running" | "failed"
 
 - `starting`：已 spawn、`initialize` 握手完成但尚未就绪（启发式 (a1)：未首次成功返回诊断）。琥珀色，是「索引中」的瞬态指示——输入区上方的「`<name>` 索引中…」读的就是它。
 - `running`：client 存活，正在应答诊断。
-- `failed`：上次启动/同步失败，处于 30s 重试冷却（`doc/lsp.md` §4）。
+- `failed`：上次启动/同步失败，处于 30s 重试冷却（见本文 §4）。
 
 **接线**：`LspService.status(root)` 生成快照（root 级共享服务，见 §5.2）→ `registry.lsp_status(root)` → `session_runtime` handler 按 `meta.workspace` 查出 root 并入 `RuntimeInfo.lsp`。root 无激活服务器时 `lsp` 为空——服务器本就懒启动，无可报。
 

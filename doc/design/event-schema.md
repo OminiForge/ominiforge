@@ -26,7 +26,9 @@
   `"{session_id}:{seq}"`。
 - **Event Source** = `kind`（Model / Tool / Runtime / User / System / External）+ `id`
   实例标识（如 `"shell"`、`"mcp://github-server"`）。`kind` 用于快速过滤路由。无 `Plugin`
-  variant——WASM 已废弃，外部扩展统一走 MCP（`External`）。
+  variant——旧的「WASM 插件/扩展」方案已废弃；当前外部扩展统一走 MCP（`External`）。
+  （新架构 [`runtime-architecture.md`](./runtime-architecture.md) §3 另将 wasm 列为拓展形态之一，
+  属自拓展、仍待讨论细化，与本句所说的旧插件方案不是同一回事。）
 
 ## 3. Payload 分域
 

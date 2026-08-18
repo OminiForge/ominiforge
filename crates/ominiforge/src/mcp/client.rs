@@ -347,7 +347,6 @@ for line in sys.stdin:
             call_id: "c1".to_owned(),
             input: value,
             timeout: Duration::from_secs(5),
-            progress: None,
         }
     }
 

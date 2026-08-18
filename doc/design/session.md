@@ -63,7 +63,7 @@ fork_at_seq = 42           # 仅 fork 时存在
 
 设计决策：
 
-- **无 status 字段**。Session 不需要显式生命周期状态。Session 存在即可用，任何 session 随时可被 fork。UI 需要区分"当前在用"与"历史"时，从 `last_event_at`（索引数据库缓存）或是否有子 session 派生判断。**例外：归档标记不进 `session.toml`**，而是 session 目录下的 sidecar 文件 `.archived`（§6.2.9），刻意让元数据保持无生命周期状态——归档是带外的"退役"信号，不是 session 身份的一部分。
+- **无 status 字段**。Session 不需要显式生命周期状态。Session 存在即可用，任何 session 随时可被 fork。UI 需要区分"当前在用"与"历史"时，从 `last_event_at`（索引数据库缓存）或是否有子 session 派生判断。**例外：归档标记不进 `session.toml`**，而是 session 目录下的 sidecar 文件 `.archived`（见「Session 生命周期：归档与删除」），刻意让元数据保持无生命周期状态——归档是带外的"退役"信号，不是 session 身份的一部分。
 - **无 reason 字段**。Kind 已足够表达来源语义。
 - **parent_id 统一**。Fork、compaction、reconfiguration 都用同一个 parent_id 字段，kind 区分语义。
 - **workspace 可选**。CLI 默认填 CWD，GPUI 客户端由用户显式选择，研究/聊天类 session 可不设置。workspace = None 时 filesystem tools 不可用或受限。

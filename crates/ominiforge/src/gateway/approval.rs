@@ -28,7 +28,6 @@
 //! `gateway.toml`).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use tokio::sync::{broadcast, oneshot};
@@ -37,12 +36,9 @@ use crate::agent::{
     ApprovalDecision, ApprovalGate, ApprovalOutcome, ApprovalRequest, ApprovalResolution,
     ApprovalScope,
 };
-use crate::core::SessionId;
 use crate::permission::{Decision, PermissionPolicy, Rule, rule_from_call};
 
 use super::actor::GatewayEvent;
-use super::status::{ActivityStatus, SessionStatus, StatusHub};
-use super::workspace::WorkspaceId;
 
 /// A decision delivered to a parked ask.
 #[derive(Debug, Clone, Copy)]
@@ -96,13 +92,6 @@ pub struct GatewayApprovalGate {
     pending: PendingApprovals,
     /// The session's outbound stream — carries the `ApprovalRequested` event.
     outbound: broadcast::Sender<GatewayEvent>,
-    /// Process-wide status publisher, so the list shows `AwaitingInput`.
-    status: StatusHub,
-    session_id: SessionId,
-    workspace_id: WorkspaceId,
-    /// The session's latest committed `seq`, kept current by the actor's event
-    /// forwarder — stamped on each published status (same source the actor uses).
-    latest_seq: Arc<AtomicU64>,
     /// The session's live policy, shared with the agent: scoped decisions are
     /// pinned here and take effect on the next `dispatch_tool` evaluation.
     policy: Arc<RwLock<PermissionPolicy>>,
@@ -113,40 +102,21 @@ pub struct GatewayApprovalGate {
 }
 
 impl GatewayApprovalGate {
-    /// Build a gate sharing the actor's `pending` table, outbound stream, status
-    /// hub, latest-seq cache, and the agent's live policy handle.
+    /// Build a gate sharing the actor's `pending` table, outbound stream, and
+    /// the agent's live policy handle.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
     pub const fn new(
         pending: PendingApprovals,
         outbound: broadcast::Sender<GatewayEvent>,
-        status: StatusHub,
-        session_id: SessionId,
-        workspace_id: WorkspaceId,
-        latest_seq: Arc<AtomicU64>,
         policy: Arc<RwLock<PermissionPolicy>>,
         on_scoped: Option<Arc<dyn Fn(ScopedDecision) + Send + Sync>>,
     ) -> Self {
         Self {
             pending,
             outbound,
-            status,
-            session_id,
-            workspace_id,
-            latest_seq,
             policy,
             on_scoped,
         }
-    }
-
-    /// Publish one activity-status transition for this session.
-    fn publish(&self, status: ActivityStatus) {
-        self.status.publish(SessionStatus {
-            session_id: self.session_id.clone(),
-            workspace_id: self.workspace_id.clone(),
-            status,
-            latest_seq: self.latest_seq.load(Ordering::Relaxed),
-        });
     }
 
     /// Pin a scoped decision: compile the call into a rule and merge it into
@@ -270,9 +240,8 @@ impl ApprovalGate for GatewayApprovalGate {
             );
         }
 
-        self.publish(ActivityStatus::AwaitingInput);
         // Ephemeral, like a `Delta`: a client connecting after this fires learns
-        // of the pending ask from the `AwaitingInput` status, not a replay.
+        // of the pending ask from the event, not a replay.
         // Cloned — the request itself is still needed after the await to
         // compile a scoped rule.
         let _ = self.outbound.send(GatewayEvent::ApprovalRequested {
@@ -285,7 +254,7 @@ impl ApprovalGate for GatewayApprovalGate {
         // (cancel/shutdown/all-handles-gone → `clear_pending`). A delivered value
         // is a human decision (or a pinned rule's); a dropped channel is a
         // no-human auto-denial.
-        let outcome = rx.await.map_or(
+        rx.await.map_or(
             ApprovalOutcome {
                 resolution: ApprovalResolution::AutoDenied,
                 scope: None,
@@ -315,19 +284,7 @@ impl ApprovalGate for GatewayApprovalGate {
                     scope: Some(answer.scope),
                 }
             },
-        );
-
-        // The turn is resuming — but light the session back to `Running` only
-        // when no ask of this session is still pending: with parallel asks
-        // outstanding the first answer must not flap the status while the rest
-        // still wait. A poisoned lock keeps the safer `AwaitingInput`.
-        let no_pending = self.pending.lock().map_or(false, |p| p.is_empty());
-        self.publish(if no_pending {
-            ActivityStatus::Running
-        } else {
-            ActivityStatus::AwaitingInput
-        });
-        outcome
+        )
     }
 
     /// The gateway routes decisions over the shared [`PendingApprovals`] table,
@@ -360,10 +317,6 @@ mod tests {
         let gate = GatewayApprovalGate::new(
             Arc::clone(&pending),
             outbound,
-            StatusHub::new(),
-            SessionId("s1".to_owned()),
-            WorkspaceId::none(),
-            Arc::new(AtomicU64::new(0)),
             Arc::clone(&policy),
             on_scoped,
         );

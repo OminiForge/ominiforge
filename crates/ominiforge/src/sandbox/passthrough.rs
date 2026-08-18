@@ -124,17 +124,6 @@ fn spawn_pipe_reader<R>(
 #[async_trait::async_trait]
 impl Sandbox for PassthroughSandbox {
     async fn exec(&self, command: &str, timeout: Duration) -> Result<ExecOutput, SandboxError> {
-        // Non-streaming is streaming with the chunks dropped.
-        self.exec_streaming(command, timeout, Box::new(|_| {}))
-            .await
-    }
-
-    async fn exec_streaming(
-        &self,
-        command: &str,
-        timeout: Duration,
-        mut on_output: Box<dyn for<'a> FnMut(&'a [u8]) + Send>,
-    ) -> Result<ExecOutput, SandboxError> {
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c").arg(command).current_dir(&self.workspace);
         apply_env_overlay(&mut cmd, &self.env_overlay);
@@ -168,7 +157,6 @@ impl Sandbox for PassthroughSandbox {
             let mut out_buf: Vec<u8> = Vec::new();
             let mut err_buf: Vec<u8> = Vec::new();
             while let Some((is_err, chunk)) = rx.recv().await {
-                on_output(&chunk);
                 if is_err {
                     err_buf.extend_from_slice(&chunk);
                 } else {
@@ -279,32 +267,6 @@ mod tests {
 
         let result = sb.exec("sleep 5", Duration::from_millis(50)).await;
         assert!(matches!(result, Err(SandboxError::Timeout(_))));
-    }
-
-    #[tokio::test]
-    async fn exec_streaming_forwards_chunks_live() {
-        let dir = tempfile::tempdir().unwrap();
-        let sb = sandbox(dir.path().to_path_buf());
-        let chunks = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let chunks2 = std::sync::Arc::clone(&chunks);
-        // Two writes separated by a pause arrive as (at least) two chunks, and
-        // the assembled ExecOutput still carries the full streams.
-        let out = sb
-            .exec_streaming(
-                "printf one; sleep 0.05; printf two",
-                Duration::from_secs(5),
-                Box::new(move |c| {
-                    chunks2
-                        .lock()
-                        .unwrap()
-                        .push(String::from_utf8_lossy(c).into_owned());
-                }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(out.stdout, "onetwo");
-        let got = chunks.lock().unwrap().join("");
-        assert_eq!(got, "onetwo", "every byte forwarded live, in order");
     }
 
     #[tokio::test]
