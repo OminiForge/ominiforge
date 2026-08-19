@@ -12,7 +12,7 @@ on:
 # release-plz drives releases: it parses Conventional Commits to maintain a Release PR
 # (bump version + generate CHANGELOG); on merge it tags, creates a GitHub Release, and
 # publishes the publishable crates to crates.io in topological order
-# (ominiforge -> ominiforge-net -> ominiforge-cli).
+# (ominiforge -> ominiforge-cli).
 # No manual version edits needed. (The GPUI GUI desktop package was removed in the zero-UI
 # pivot; only the CLI ships binaries.)
 

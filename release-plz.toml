@@ -2,7 +2,7 @@
 #
 # 对**用户**只有一个产品 ominiforge、一个版本号、一个 tag（v0.x.0）。该 tag 的 GitHub
 # Release 正文是汇总 changelog，并挂载两类二进制（纯 CLI、未来的 GUI+CLI），各覆盖
-# Linux/macOS/Windows。对 **crates.io** 仍 per-crate 发布（core/net/cli 各自 publish），
+# Linux/macOS/Windows。对 **crates.io** 仍 per-crate 发布（core/cli 各自 publish），
 # 与 git tag/release 相互独立。
 #
 # 单 tag 的正确做法（release-plz 官方）：默认关闭所有 crate 的 git tag/release，
@@ -23,13 +23,9 @@ git_release_enable = false
 name = "ominiforge"
 version_group = "product"
 
-[[package]]
-name = "ominiforge-net"
-version_group = "product"
-
 # ominiforge-cli 是面向用户的主产物：
 # - 唯一的 tag/Release 由它产生，tag 名为 v<version>（去 crate 前缀）。
-# - 它的 changelog 指向仓库根并聚合 core/net，作为该单 Release 的正文来源。
+# - 它的 changelog 指向仓库根并聚合 core，作为该单 Release 的正文来源。
 [[package]]
 name = "ominiforge-cli"
 version_group = "product"
@@ -39,6 +35,6 @@ git_tag_name = "v{{ version }}"
 git_release_name = "v{{ version }}"
 git_release_body = "{{ changelog }}"
 changelog_path = "CHANGELOG.md"
-changelog_include = ["ominiforge", "ominiforge-net"]
+changelog_include = ["ominiforge"]
 
 # ominiforge-ui / ominiforge-gui 为 publish = false，不发 crates.io，也不打 tag。

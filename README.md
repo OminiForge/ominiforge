@@ -61,8 +61,7 @@ These are the load-bearing ideas; the full rationale lives in
 | Crate | Responsibility |
 | ----- | -------------- |
 | [`crates/ominiforge`](crates/ominiforge) | The core: the UI-agnostic agent runtime — tools, providers, sessions, gateway, LSP/MCP integration. A pure library, published to crates.io as `ominiforge`. |
-| [`crates/ominiforge-net`](crates/ominiforge-net) | The client protocol abstraction (`ClientProtocol`) connecting any facade to a local or remote core. |
-| [`crates/ominiforge-cli`](crates/ominiforge-cli) | The `ominiforge` command line — `serve` today, a TUI later. Published to crates.io and as binaries on GitHub Releases. |
+| [`crates/ominiforge-cli`](crates/ominiforge-cli) | The `ominiforge` command line (a TUI later). Published to crates.io and as binaries on GitHub Releases. |
 
 > The workspace is being restructured toward the thin composition runtime +
 > plugins layout (`ofg-*` crates) described in

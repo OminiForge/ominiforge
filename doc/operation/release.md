@@ -17,7 +17,7 @@
 [`decisions/architecture-direction.md`](../decisions/architecture-direction.md)。）
 
 - **统一版本**：所有 crate 继承 `[workspace.package].version`，同号发布。
-- **crates.io 边界**：发布面 = `ominiforge` + `ominiforge-net` + `ominiforge-cli`。
+- **crates.io 边界**：发布面 = `ominiforge` + `ominiforge-cli`。
 - **内部依赖**：一律 `path + version` 双写——本地开发用 path（即时联动），
   `cargo publish` 时用 version（path 被剥离）。同步正确性由三层机制保证，不靠人工：
   cargo publish 硬校验上游版本存在、release-plz 按拓扑序发布、`cargo package` 剥离
