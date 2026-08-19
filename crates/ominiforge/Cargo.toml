@@ -86,21 +86,6 @@ ulid = "1"
 # (both sandbox-escape CVEs, patched >= 0.9.0).
 boxlite = { version = "0.9.7", optional = true }
 
-# Gateway: HTTP/SSE/WS server — the transport host for local/LAN facades and
-# webhook integrations. Unconditional: `ominiforge serve` is the node's
-# long-running service. See doc/design/runtime-architecture.md §7.3.
-axum = { version = "0.8", features = ["ws"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
-# Response compression (gzip/br) for the gateway. The folded conversation
-# view (`GET /sessions/{id}/view`) is multi-MB of highly compressible JSON;
-# over a relayed link (SSH forward / reverse proxy) compression is the
-# difference between a 10s and a 1s session open.
-tower-http = { version = "0.7", features = [
-  "compression-gzip",
-  "compression-br",
-  "fs",
-] }
-
 ignore = "0.4.31"
 globset = "0.4.19"
 # Content search (src/tool/search.rs): ripgrep's own crates, pure Rust — no

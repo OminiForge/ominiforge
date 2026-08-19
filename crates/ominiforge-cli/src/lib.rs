@@ -12,7 +12,6 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 
-
 /// Ominiforge command-line interface.
 #[derive(Debug, Parser)]
 #[command(
@@ -61,4 +60,3 @@ pub fn run() -> Result<()> {
         }
     }
 }
-
