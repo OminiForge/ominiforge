@@ -68,7 +68,7 @@ jobs:
         uses: DeterminateSystems/nix-installer-action@v16
       - name: Use Cachix
         if: steps.manual.outputs.run == 'true' || steps.filter-pr.outputs.build == 'true' || steps.filter-push.outputs.build == 'true'
-        uses: cachix/cachix-action@v15
+        uses: cachix/cachix-action@v17
         with:
           name: ominiforge
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
