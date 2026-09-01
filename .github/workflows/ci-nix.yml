@@ -42,7 +42,7 @@ jobs:
       - name: Detect build/dependency changes (PR)
         if: github.event_name == 'pull_request'
         id: filter-pr
-        uses: dorny/paths-filter@v3
+        uses: dorny/paths-filter@v4
         with:
           filters: |
             build:
